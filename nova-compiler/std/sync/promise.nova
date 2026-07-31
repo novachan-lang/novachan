@@ -1,0 +1,65 @@
+// std/sync/promise — single-assignment future value
+//
+// WHAT:
+//   A promise starts empty. Exactly one producer resolves it via
+//   promise_set(p, val); any number of consumers block on promise_get(p)
+//   until it is resolved, then all observe the same value (JS Promise /
+//   C++ std::promise-std::future / Java CompletableFuture, minus chaining).
+//
+// NOVA WAY:
+//   The resolved flag + value are plain struct fields guarded by a mutex
+//   (std/sync/mutex) for the SET side (so a racing double-set is caught
+//   deterministically as an error, not a silent overwrite). The GET side is a
+//   cooperative poll (`sleep(0)` yields the green task/carrier) on the
+//   resolved flag — this lets an unbounded number of getters observe the
+//   same resolution, which a single-token channel could not do (a channel
+//   send only ever wakes and hands the value to ONE parked receiver).
+//
+// CAUTION:
+//   • promise_set is single-assignment: a second call returns err() and does
+//     NOT overwrite the first value.
+//   • promise_get on a promise that is never set blocks forever — pair with
+//     a timeout at the call site if that risk matters to the caller.
+//
+// FIELD NAMING: fields are prefixed `prom_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type Promise
+    prom_is_set: int
+    prom_value: any
+    prom_m: any
+
+// promise_new() -> Promise
+//   Creates a new, unresolved promise.
+fn promise_new()
+    return Promise(0, 0, mutex_new())
+
+// promise_set(p, val) -> Result
+//   Resolves the promise exactly once. ok(1) on success; err(...) if the
+//   promise was already resolved (the existing value is left untouched).
+fn promise_set(p, val)
+    lock(p.prom_m)
+    if p.prom_is_set == 1
+        unlock(p.prom_m)
+        return err("promise already resolved")
+    p.prom_value = val
+    p.prom_is_set = 1
+    unlock(p.prom_m)
+    return ok(1)
+
+// promise_get(p) -> any
+//   Blocks until the promise is resolved, then returns the resolved value.
+//   Returns immediately if already resolved.
+fn promise_get(p)
+    while p.prom_is_set == 0
+        sleep(0)
+    return p.prom_value
+
+// promise_is_set(p) -> bool
+//   Non-blocking check: has the promise been resolved yet?
+fn promise_is_set(p)
+    return p.prom_is_set

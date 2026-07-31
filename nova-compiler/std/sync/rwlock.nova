@@ -1,0 +1,83 @@
+// std/sync/rwlock — cooperative reader-writer lock
+//
+// WHAT:
+//   Multiple concurrent readers OR one exclusive writer, never both at once
+//   (POSIX pthread_rwlock_t / Rust std::sync::RwLock / Java
+//   ReentrantReadWriteLock, minus reentrancy and fairness policy).
+//
+// NOVA WAY:
+//   Two counters (active reader count, writer-active flag) guarded by the
+//   existing mutex (std/sync/mutex) for the check-and-update, plus a
+//   cooperative poll (`sleep(0)` yields the green task/carrier) for the
+//   "wait until the lock shape I need is available" part. This is
+//   COOPERATIVE, not preemptive: correctness (mutual exclusion between
+//   readers and a writer) is guaranteed by the mutex-guarded state
+//   transition; FAIRNESS is not — a steady stream of readers can starve a
+//   waiting writer (writer-starvation is the well-known failure mode of the
+//   simplest reader-preference rwlock design; a priority scheme is future
+//   work, not needed for the common read-mostly workload this targets).
+//
+// CAUTION:
+//   • NOT re-entrant: a task that holds the read (or write) lock and calls
+//     rw_write_lock again deadlocks against itself, same as mutex.
+//   • Call rw_read_unlock/rw_write_unlock EXACTLY ONCE per successful
+//     lock — an unbalanced call corrupts the reader count or leaves the
+//     writer flag stuck at 1, hanging every future locker.
+//
+// FIELD NAMING: fields are prefixed `rw_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type RwLock
+    rw_readers: int
+    rw_writer_active: int
+    rw_m: any
+
+// rw_new() -> RwLock
+//   Creates a new, unlocked reader-writer lock.
+fn rw_new()
+    return RwLock(0, 0, mutex_new())
+
+// rw_read_lock(rw)
+//   Acquires a shared read lock. Blocks while a writer holds (or is
+//   mid-acquire for) the lock; any number of readers may hold it together.
+fn rw_read_lock(rw)
+    while true
+        lock(rw.rw_m)
+        if rw.rw_writer_active == 0
+            rw.rw_readers = rw.rw_readers + 1
+            unlock(rw.rw_m)
+            return
+        unlock(rw.rw_m)
+        sleep(0)
+
+// rw_read_unlock(rw)
+//   Releases one shared read lock.
+fn rw_read_unlock(rw)
+    lock(rw.rw_m)
+    if rw.rw_readers > 0
+        rw.rw_readers = rw.rw_readers - 1
+    unlock(rw.rw_m)
+
+// rw_write_lock(rw)
+//   Acquires the exclusive write lock. Blocks until no readers and no other
+//   writer hold the lock.
+fn rw_write_lock(rw)
+    while true
+        lock(rw.rw_m)
+        if rw.rw_writer_active == 0 and rw.rw_readers == 0
+            rw.rw_writer_active = 1
+            unlock(rw.rw_m)
+            return
+        unlock(rw.rw_m)
+        sleep(0)
+
+// rw_write_unlock(rw)
+//   Releases the exclusive write lock.
+fn rw_write_unlock(rw)
+    lock(rw.rw_m)
+    rw.rw_writer_active = 0
+    unlock(rw.rw_m)

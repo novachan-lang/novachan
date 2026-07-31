@@ -1,0 +1,121 @@
+// ============================================================================
+// NOVA Standard Library — std/net/eth_frame2
+// ============================================================================
+// Ethernet II frame parse/build, operating on a plain `list` of byte values
+// (0..255), with 802.1Q VLAN tag detection/injection composed from
+// std/net/vlan_tag. Named eth_frame2 (not ethframe) to avoid colliding with
+// the existing `bytes`-typed std/net/ethframe.nova module.
+//
+// Wire layout — untagged (14-byte header):
+//   Bytes  0- 5 : dst_mac (6 bytes)
+//   Bytes  6-11 : src_mac (6 bytes)
+//   Bytes 12-13 : ethertype (u16)
+//   Bytes 14..  : payload
+//
+// Wire layout — 802.1Q tagged (18-byte header):
+//   Bytes  0- 5 : dst_mac  (6 bytes)
+//   Bytes  6-11 : src_mac  (6 bytes)
+//   Bytes 12-13 : TPID     0x8100 (u16) — VLAN tag present marker
+//   Bytes 14-15 : TCI      (u16): pcp(3b) | dei(1b) | vlan_id(12b)
+//   Bytes 16-17 : ethertype (u16) — the real EtherType of the payload
+//   Bytes 18..  : payload
+//
+// PUBLIC API:
+//   eth_parse(bytes: list) -> dict
+//     Returns {} if fewer than 14 bytes, or if a VLAN TPID (0x8100) is
+//     detected at bytes 12-13 but fewer than 18 bytes are available.
+//     Keys: dst_mac (list, 6), src_mac (list, 6), ethertype (int, u16 — the
+//     real payload EtherType, i.e. AFTER any VLAN tag), payload (list),
+//     is_vlan (0/1), vlan_id (int, -1 if is_vlan==0), vlan_pcp, vlan_dei.
+//
+//   eth_build(hdr: dict) -> list
+//     hdr keys: dst_mac (list, 6 bytes; default 6 zero bytes), src_mac
+//     (same), ethertype (default 0), payload (default []). If hdr contains
+//     "vlan_id", an 802.1Q tag is inserted (tpid=0x8100, pcp/dei default 0,
+//     vlan_id taken from hdr) between the MACs and the ethertype.
+//
+// LEAF — imports std/net/vlan_tag.
+// ============================================================================
+
+import std/net/vlan_tag
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn _ef2_r16(b: list, i: int) -> int
+    ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF)
+
+// Append exactly 6 bytes from mac (zero-padded if shorter) to out.
+fn _ef2_w_mac(out: list, mac: list) -> list
+    let n = len(mac)
+    let k = 0
+    while k < 6
+        let v = 0
+        if k < n
+            v = mac[k]
+        push(out, v & 0xFF)
+        k = k + 1
+    out
+
+fn _ef2_slice(b: list, i: int, n: int) -> list
+    let r = []
+    let k = 0
+    while k < n
+        push(r, b[i + k] & 0xFF)
+        k = k + 1
+    r
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+fn eth_parse(bytes: list) -> dict
+    if len(bytes) < 14
+        return {}
+    let dst = _ef2_slice(bytes, 0, 6)
+    let src = _ef2_slice(bytes, 6, 6)
+    let tpid = _ef2_r16(bytes, 12)
+    if tpid == 0x8100
+        if len(bytes) < 18
+            return {}
+        let vt = vlan_parse(_ef2_slice(bytes, 12, 4))
+        let etype = _ef2_r16(bytes, 16)
+        let payload = _ef2_slice(bytes, 18, len(bytes) - 18)
+        return {"dst_mac": dst, "src_mac": src, "ethertype": etype, "payload": payload, "is_vlan": 1, "vlan_id": vt["vlan_id"], "vlan_pcp": vt["pcp"], "vlan_dei": vt["dei"]}
+    let etype = tpid
+    let payload = _ef2_slice(bytes, 14, len(bytes) - 14)
+    {"dst_mac": dst, "src_mac": src, "ethertype": etype, "payload": payload, "is_vlan": 0, "vlan_id": -1, "vlan_pcp": 0, "vlan_dei": 0}
+
+fn eth_build(hdr: dict) -> list
+    let dst = []
+    if contains(hdr, "dst_mac")
+        dst = hdr["dst_mac"]
+    let src = []
+    if contains(hdr, "src_mac")
+        src = hdr["src_mac"]
+    let etype = 0
+    if contains(hdr, "ethertype")
+        etype = hdr["ethertype"]
+    let payload = []
+    if contains(hdr, "payload")
+        payload = hdr["payload"]
+    let out = []
+    out = _ef2_w_mac(out, dst)
+    out = _ef2_w_mac(out, src)
+    if contains(hdr, "vlan_id")
+        let pcp = 0
+        if contains(hdr, "vlan_pcp")
+            pcp = hdr["vlan_pcp"]
+        let dei = 0
+        if contains(hdr, "vlan_dei")
+            dei = hdr["vlan_dei"]
+        let tagbytes = vlan_build({"tpid": 0x8100, "pcp": pcp, "dei": dei, "vlan_id": hdr["vlan_id"]})
+        let i = 0
+        while i < len(tagbytes)
+            push(out, tagbytes[i])
+            i = i + 1
+    push(out, (etype >> 8) & 0xFF)
+    push(out, etype & 0xFF)
+    let j = 0
+    let n = len(payload)
+    while j < n
+        push(out, payload[j] & 0xFF)
+        j = j + 1
+    out

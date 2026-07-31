@@ -1,0 +1,141 @@
+// ============================================================================
+// NOVA Standard Library — std/net/tcp_header
+// ============================================================================
+// RFC 793 §3.1 — 20-byte TCP fixed header parse/build, operating on a plain
+// `list` of byte values (0..255). See std/net/tcphdr.nova for the
+// `bytes`-typed equivalent (which exposes flags as a raw int rather than a
+// per-bit dict). TCP options (when data_offset > 5) are handled separately
+// by std/net/tcp_options.
+//
+// Wire layout (20 bytes, all multi-byte fields big-endian):
+//   Bytes  0-1  : src_port   (u16)
+//   Bytes  2-3  : dst_port   (u16)
+//   Bytes  4-7  : seq_num    (u32)
+//   Bytes  8-11 : ack_num    (u32)
+//   Byte  12    : (data_offset << 4) | reserved
+//   Byte  13    : flags — bit0 FIN, bit1 SYN, bit2 RST, bit3 PSH,
+//                          bit4 ACK, bit5 URG, bit6 ECE, bit7 CWR
+//   Bytes 14-15 : window     (u16)
+//   Bytes 16-17 : checksum   (u16)
+//   Bytes 18-19 : urgent_ptr (u16)
+//
+// PUBLIC API:
+//   tcp_parse(bytes: list) -> dict
+//     Returns {} if fewer than 20 bytes or data_offset < 5.
+//     Keys: src_port, dst_port, seq_num, ack_num, data_offset,
+//           flags (dict: syn, ack, fin, rst, psh, urg — each int 0/1),
+//           window, checksum, urgent_ptr.
+//
+//   tcp_build(hdr: dict) -> list
+//     Builds a 20-byte header. data_offset defaults to 5 and is clamped up
+//     to 5 if lower (RFC 793 minimum). "flags" may be a per-bit dict (same
+//     shape as tcp_parse's output — missing sub-keys default to 0); other
+//     fields default to 0. The checksum field is written verbatim from
+//     hdr["checksum"] (default 0) — TCP checksum requires the pseudo-header
+//     (see std/net/pseudo_header) plus payload, so it is NOT computed here.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn _tch_get(h: dict, key: string) -> int
+    if contains(h, key)
+        return h[key]
+    0
+
+fn _tch_r16(b: list, i: int) -> int
+    ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF)
+
+fn _tch_r32(b: list, i: int) -> int
+    let hi = ((b[i] & 0xFF) << 24) | ((b[i + 1] & 0xFF) << 16)
+    let lo = ((b[i + 2] & 0xFF) << 8) | (b[i + 3] & 0xFF)
+    (hi | lo) & 0xFFFFFFFF
+
+fn _tch_w16(out: list, v: int) -> list
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+    out
+
+fn _tch_w32(out: list, v: int) -> list
+    push(out, (v >> 24) & 0xFF)
+    push(out, (v >> 16) & 0xFF)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+    out
+
+// Decode the flags byte into a per-bit dict.
+fn _tch_flags_dict(f: int) -> dict
+    let fin = f & 0x01
+    let syn = (f >> 1) & 0x01
+    let rst = (f >> 2) & 0x01
+    let psh = (f >> 3) & 0x01
+    let ack = (f >> 4) & 0x01
+    let urg = (f >> 5) & 0x01
+    {"fin": fin, "syn": syn, "rst": rst, "psh": psh, "ack": ack, "urg": urg}
+
+// Read one bit-flag sub-key from a flags dict, default 0.
+fn _tch_fbit(flags: dict, key: string) -> int
+    if contains(flags, key)
+        if flags[key] != 0
+            return 1
+        return 0
+    0
+
+// Encode a per-bit flags dict into the wire flags byte.
+fn _tch_flags_byte(flags: dict) -> int
+    let f = 0
+    f = f | _tch_fbit(flags, "fin")
+    f = f | (_tch_fbit(flags, "syn") << 1)
+    f = f | (_tch_fbit(flags, "rst") << 2)
+    f = f | (_tch_fbit(flags, "psh") << 3)
+    f = f | (_tch_fbit(flags, "ack") << 4)
+    f = f | (_tch_fbit(flags, "urg") << 5)
+    f & 0xFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+fn tcp_parse(bytes: list) -> dict
+    if len(bytes) < 20
+        return {}
+    let src = _tch_r16(bytes, 0)
+    let dst = _tch_r16(bytes, 2)
+    let seq = _tch_r32(bytes, 4)
+    let ack = _tch_r32(bytes, 8)
+    let b12 = bytes[12] & 0xFF
+    let b13 = bytes[13] & 0xFF
+    let doff = (b12 >> 4) & 0xF
+    if doff < 5
+        return {}
+    let win = _tch_r16(bytes, 14)
+    let csum = _tch_r16(bytes, 16)
+    let urg = _tch_r16(bytes, 18)
+    {"src_port": src, "dst_port": dst, "seq_num": seq, "ack_num": ack, "data_offset": doff, "flags": _tch_flags_dict(b13), "window": win, "checksum": csum, "urgent_ptr": urg}
+
+fn tcp_build(hdr: dict) -> list
+    let src = _tch_get(hdr, "src_port")
+    let dst = _tch_get(hdr, "dst_port")
+    let seq = _tch_get(hdr, "seq_num")
+    let ack = _tch_get(hdr, "ack_num")
+    let doff = 5
+    if contains(hdr, "data_offset")
+        doff = hdr["data_offset"]
+    if doff < 5
+        doff = 5
+    let flags_byte = 0
+    if contains(hdr, "flags")
+        flags_byte = _tch_flags_byte(hdr["flags"])
+    let win = _tch_get(hdr, "window")
+    let csum = _tch_get(hdr, "checksum")
+    let urg = _tch_get(hdr, "urgent_ptr")
+    let out = []
+    out = _tch_w16(out, src & 0xFFFF)
+    out = _tch_w16(out, dst & 0xFFFF)
+    out = _tch_w32(out, seq & 0xFFFFFFFF)
+    out = _tch_w32(out, ack & 0xFFFFFFFF)
+    push(out, (doff & 0xF) << 4)
+    push(out, flags_byte & 0xFF)
+    out = _tch_w16(out, win & 0xFFFF)
+    out = _tch_w16(out, csum & 0xFFFF)
+    out = _tch_w16(out, urg & 0xFFFF)
+    out

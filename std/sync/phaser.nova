@@ -1,0 +1,70 @@
+// std/sync/phaser — reusable barrier with an observable phase number
+//
+// WHAT:
+//   Like barrier, but exposes the round number as an explicit `phase`
+//   counter and splits arrival from waiting into two calls (Java Phaser,
+//   simplified — no dynamic party registration/deregistration). This
+//   decoupling lets a party do useful work BETWEEN arriving and awaiting the
+//   next phase, or await a phase it observed from elsewhere without itself
+//   being one of the arriving parties.
+//
+// NOVA WAY:
+//   Same epoch-counter technique as barrier (see its header for the full
+//   rationale): parties/arrived/phase are struct fields guarded by a mutex
+//   (std/sync/mutex); ph_await_advance is a cooperative poll (`sleep(0)`
+//   yields the green task/carrier) on "has phase moved past the value the
+//   caller observed". The last arrival to reach `parties` resets the
+//   arrival count and increments phase in one mutex-guarded step.
+//
+// CAUTION:
+//   • ph_await_advance(p, phase) call the phase you observed BEFORE this
+//     round's arrivals complete (typically via ph_phase(p) right after your
+//     own ph_arrive) — passing the phase AFTER it has already advanced
+//     blocks until the round after next.
+//   • parties < 1 is clamped to 1.
+//
+// FIELD NAMING: fields are prefixed `ph_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type Phaser
+    ph_parties: int
+    ph_arrived: int
+    ph_phase: int
+    ph_m: any
+
+// ph_new(parties) -> Phaser
+//   Creates a phaser for `parties` participants (< 1 clamped to 1), phase 0.
+fn ph_new(parties)
+    let p = parties
+    if p < 1
+        p = 1
+    return Phaser(p, 0, 0, mutex_new())
+
+// ph_arrive(p)
+//   Records one arrival for the current phase. The arrival that completes
+//   the party count advances `phase` and resets the arrival count for the
+//   next round. Does NOT block — pair with ph_await_advance to wait for the
+//   round to complete.
+fn ph_arrive(p)
+    lock(p.ph_m)
+    p.ph_arrived = p.ph_arrived + 1
+    if p.ph_arrived >= p.ph_parties
+        p.ph_arrived = 0
+        p.ph_phase = p.ph_phase + 1
+    unlock(p.ph_m)
+
+// ph_await_advance(p, phase)
+//   Blocks until the phaser's phase has moved past `phase`. Returns
+//   immediately if it already has.
+fn ph_await_advance(p, phase)
+    while p.ph_phase == phase
+        sleep(0)
+
+// ph_phase(p) -> int
+//   The current phase number (non-blocking).
+fn ph_phase(p)
+    return p.ph_phase

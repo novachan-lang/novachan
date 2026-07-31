@@ -1,0 +1,128 @@
+// ============================================================================
+// NOVA Standard Library — std/net/tcp_options
+// ============================================================================
+// RFC 793 / RFC 1323 / RFC 2018 / RFC 7323 — TCP options-field parsing,
+// operating on a plain `list` of byte values (0..255). Consumes the options
+// region that follows the fixed 20-byte header parsed by std/net/tcp_header
+// (options exist iff data_offset > 5). See std/net/tcpopts.nova for the
+// `bytes`-typed equivalent (which also provides an encoder).
+//
+// Recognized kinds (others are returned as opaque TLVs with raw "data"):
+//   0  EOL           — 1 byte, ends the option list
+//   1  NOP           — 1 byte, padding
+//   2  MSS           — len=4;  "value" = u16 Maximum Segment Size
+//   3  WSCALE        — len=3;  "value" = u8 window scale shift count
+//   4  SACK_PERMITTED— len=2;  no value
+//   5  SACK          — len=2+8n; "blocks" = list of [left_u32, right_u32]
+//   8  TIMESTAMPS    — len=10; "tsval" u32, "tsecr" u32
+//
+// PUBLIC API:
+//   tcp_opts_parse(bytes: list, data_offset: int) -> list
+//     `bytes` is the full header buffer starting at offset 0 (byte 0 =
+//     src_port hi byte, options begin at byte 20). `data_offset` is the
+//     header length in 32-bit words (as decoded by tcp_header.tcp_parse);
+//     the options region spans bytes [20, data_offset*4).
+//     Returns a list of option dicts, each with at least "type" and
+//     "length" plus kind-specific keys as listed above. Stops (returning
+//     what was decoded so far) at EOL, end of the options region, or any
+//     malformed/truncated option. Bounds-safe; returns [] if data_offset < 5.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn _tco_r16(b: list, i: int) -> int
+    ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF)
+
+fn _tco_r32(b: list, i: int) -> int
+    let hi = ((b[i] & 0xFF) << 24) | ((b[i + 1] & 0xFF) << 16)
+    let lo = ((b[i + 2] & 0xFF) << 8) | (b[i + 3] & 0xFF)
+    (hi | lo) & 0xFFFFFFFF
+
+fn _tco_slice(b: list, i: int, n: int) -> list
+    let r = []
+    let k = 0
+    while k < n
+        push(r, b[i + k] & 0xFF)
+        k = k + 1
+    r
+
+// Decode SACK blocks (nb pairs of u32) starting at byte offset base.
+// Caller ensures base + nb*8 <= len(b).
+fn _tco_sack_blocks(b: list, base: int, nb: int) -> list
+    let blocks = []
+    let bi = 0
+    while bi < nb
+        let lo = base + bi * 8
+        push(blocks, [_tco_r32(b, lo), _tco_r32(b, lo + 4)])
+        bi = bi + 1
+    blocks
+
+// Decode one TLV option (kind k, wire length optlen) at offset i and push
+// it onto result. Returns 1 on success, 0 if the kind's fixed length
+// requirement is violated (caller stops parsing on 0).
+fn _tco_decode_one(result: list, b: list, i: int, k: int, optlen: int) -> int
+    if k == 2
+        if optlen != 4
+            return 0
+        push(result, {"type": 2, "length": optlen, "value": _tco_r16(b, i + 2)})
+        return 1
+    if k == 3
+        if optlen != 3
+            return 0
+        push(result, {"type": 3, "length": optlen, "value": b[i + 2] & 0xFF})
+        return 1
+    if k == 4
+        if optlen != 2
+            return 0
+        push(result, {"type": 4, "length": optlen})
+        return 1
+    if k == 5
+        let datalen = optlen - 2
+        if datalen < 0 or (datalen % 8) != 0
+            return 0
+        push(result, {"type": 5, "length": optlen, "blocks": _tco_sack_blocks(b, i + 2, datalen / 8)})
+        return 1
+    if k == 8
+        if optlen != 10
+            return 0
+        push(result, {"type": 8, "length": optlen, "tsval": _tco_r32(b, i + 2), "tsecr": _tco_r32(b, i + 6)})
+        return 1
+    push(result, {"type": k, "length": optlen, "data": _tco_slice(b, i + 2, optlen - 2)})
+    1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+fn tcp_opts_parse(bytes: list, data_offset: int) -> list
+    let opts = []
+    if data_offset < 5
+        return opts
+    let n = len(bytes)
+    let region_end = data_offset * 4
+    if region_end > n
+        region_end = n
+    let i = 20
+    let running = 1
+    while running == 1 and i < region_end
+        let k = bytes[i] & 0xFF
+        if k == 0
+            push(opts, {"type": 0, "length": 1})
+            running = 0
+        else if k == 1
+            push(opts, {"type": 1, "length": 1})
+            i = i + 1
+        else
+            if i + 1 >= region_end
+                running = 0
+            else
+                let optlen = bytes[i + 1] & 0xFF
+                if optlen < 2 or i + optlen > region_end
+                    running = 0
+                else
+                    let ok = _tco_decode_one(opts, bytes, i, k, optlen)
+                    if ok == 0
+                        running = 0
+                    else
+                        i = i + optlen
+    opts

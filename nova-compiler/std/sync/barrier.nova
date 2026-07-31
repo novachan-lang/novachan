@@ -1,0 +1,82 @@
+// std/sync/barrier — reusable cyclic barrier for N cooperating parties
+//
+// WHAT:
+//   A barrier lets N parties rendezvous: each party calls bar_wait(b) and
+//   blocks until all N have called it, then ALL are released together. Unlike
+//   a countdown latch (one-shot), a barrier is CYCLIC — it automatically
+//   resets and can be reused for the next round the moment the last party
+//   arrives, giving repeated "run a phase, sync, run the next phase" loops
+//   (Java CyclicBarrier / MPI MPI_Barrier / OpenMP #pragma omp barrier).
+//
+// NOVA WAY — an epoch counter, not a wakeup queue:
+//   Rather than a channel that must fan a single "release" out to N-1 sleeping
+//   receivers (a channel send only ever wakes ONE parked waiter), the barrier
+//   tracks an `epoch` integer. Every waiter that is NOT the last arrival spins
+//   cooperatively (`sleep(0)` — yields the green task/carrier, never an OS
+//   spin) on "has the epoch advanced past the value I observed on arrival?".
+//   The last arrival advances the epoch exactly once, which every waiter's
+//   poll loop observes on its next check. This composes on top of the
+//   existing mutex (std/sync/mutex) purely for the shared-counter update —
+//   no new runtime primitive needed.
+//
+// CAUTION:
+//   • n < 1 is clamped to 1 (a 1-party barrier is a trivial always-pass gate).
+//   • bar_reset MUST only be called when no party is currently parked in
+//     bar_wait — resetting mid-round leaves those waiters spinning on an
+//     epoch value that will never be produced by the new round.
+//
+// FIELD NAMING: every field below is prefixed `bar_` and kept globally
+// unique across ALL std/sync struct types on purpose — the NOVA compiler
+// (as of this writing) resolves a struct field write by NAME, not
+// (type, name), so two different struct types declared in the same
+// compilation unit that happen to share a field name (e.g. both using
+// plain `count`) can miscompile the write to the WRONG struct's memory.
+// Prefixing every field avoids the collision entirely; see std/sync's
+// sibling modules for the same convention. Tracked as a real compiler
+// defect (struct-field codegen keyed by name across distinct types) — do
+// not remove the prefixing until that is fixed upstream and reverified.
+import std/sync/mutex
+
+type Barrier
+    bar_n: int
+    bar_count: int
+    bar_epoch: int
+    bar_m: any
+
+// bar_new(n) -> Barrier
+//   Creates a barrier for n parties (n < 1 clamped to 1).
+fn bar_new(n)
+    let cap = n
+    if cap < 1
+        cap = 1
+    return Barrier(cap, 0, 0, mutex_new())
+
+// bar_wait(b)
+//   Arrive at the barrier and block until all n parties have arrived. The
+//   party that completes the round (the n-th arrival) resets the counter and
+//   advances the epoch — releasing every other waiter — and returns without
+//   blocking itself.
+fn bar_wait(b)
+    lock(b.bar_m)
+    let my_epoch = b.bar_epoch
+    b.bar_count = b.bar_count + 1
+    if b.bar_count >= b.bar_n
+        b.bar_count = 0
+        b.bar_epoch = b.bar_epoch + 1
+        unlock(b.bar_m)
+    else
+        unlock(b.bar_m)
+        while b.bar_epoch == my_epoch
+            sleep(0)
+
+// bar_reset(b, n)
+//   Reconfigure the barrier for a fresh party count and clear any partial
+//   round. Only safe when no party is currently parked in bar_wait.
+fn bar_reset(b, n)
+    lock(b.bar_m)
+    let cap = n
+    if cap < 1
+        cap = 1
+    b.bar_n = cap
+    b.bar_count = 0
+    unlock(b.bar_m)

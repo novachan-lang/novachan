@@ -1,0 +1,369 @@
+// _kat_sync_coord.nova — KAT for the 12 pure-NOVA sync-coordination modules
+// (std/sync/{barrier,promise,event_flag,once_cell,rwlock,countdown,mailbox,
+// broadcast,work_queue,gate,phaser,select_first}).
+//
+// SINGLE-THREADED ONLY: every check below either satisfies its own blocking
+// precondition before calling a blocking function (e.g. submit before take,
+// set before get, decrement-to-zero before wait) or calls only the
+// non-blocking half of an API. No spawn/multi-task behavior is exercised
+// here — that is covered separately for the underlying mutex/semaphore.
+
+import std/sync/barrier
+import std/sync/promise
+import std/sync/event_flag
+import std/sync/once_cell
+import std/sync/rwlock
+import std/sync/countdown
+import std/sync/mailbox
+import std/sync/broadcast
+import std/sync/work_queue
+import std/sync/gate
+import std/sync/phaser
+import std/sync/select_first
+
+fn main()
+    let _c = [0, 0]
+
+    // ── barrier: n=1 party self-releases immediately, epoch advances ──
+    let bar = bar_new(1)
+    bar_wait(bar)
+    if bar.bar_epoch == 1
+        _c[0] = _c[0] + 1
+        print("  ok barrier_n1_epoch_advances")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL barrier_n1_epoch_advances: want 1 got " + str(bar.bar_epoch))
+
+    // bar_reset keeps n=1 (single-threaded KAT: an n>1 partial round would block
+    // forever waiting for parties that never arrive, so only self-releasing
+    // n=1 rounds are exercised here).
+    bar_reset(bar, 1)
+    if bar.bar_n == 1 and bar.bar_count == 0
+        _c[0] = _c[0] + 1
+        print("  ok barrier_reset_state")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL barrier_reset_state: n=" + str(bar.bar_n) + " count=" + str(bar.bar_count))
+
+    bar_wait(bar)
+    if bar.bar_count == 0 and bar.bar_epoch == 2
+        _c[0] = _c[0] + 1
+        print("  ok barrier_reset_round_completes")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL barrier_reset_round_completes: want count=0 epoch=2 got count=" + str(bar.bar_count) + " epoch=" + str(bar.bar_epoch))
+
+    // ── promise: set + get, double-set rejected, is_set toggles ──
+    let p = promise_new()
+    if promise_is_set(p) == 0
+        _c[0] = _c[0] + 1
+        print("  ok promise_starts_unset")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL promise_starts_unset")
+
+    let pset1 = promise_set(p, 42)
+    if is_ok(pset1) and promise_get(p) == 42
+        _c[0] = _c[0] + 1
+        print("  ok promise_set_get")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL promise_set_get: got " + str(promise_get(p)))
+
+    let pset2 = promise_set(p, 99)
+    if is_err(pset2) and promise_get(p) == 42
+        _c[0] = _c[0] + 1
+        print("  ok promise_double_set_rejected")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL promise_double_set_rejected")
+
+    // ── event_flag: starts unset, set/wait/clear ──
+    let ef = ef_new()
+    if ef_is_set(ef) == 0
+        _c[0] = _c[0] + 1
+        print("  ok ef_starts_unset")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL ef_starts_unset")
+
+    ef_set(ef)
+    ef_wait(ef)
+    if ef_is_set(ef) == 1
+        _c[0] = _c[0] + 1
+        print("  ok ef_set_wait")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL ef_set_wait")
+
+    ef_clear(ef)
+    if ef_is_set(ef) == 0
+        _c[0] = _c[0] + 1
+        print("  ok ef_clear")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL ef_clear")
+
+    // ── once_cell: get-before-set errors, set once, double-set rejected ──
+    let oc = oc_new()
+    let ocget0 = oc_get(oc)
+    if is_err(ocget0) and oc_is_set(oc) == 0
+        _c[0] = _c[0] + 1
+        print("  ok oncecell_get_before_set_errs")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL oncecell_get_before_set_errs")
+
+    let ocset1 = oc_set(oc, "hello")
+    let ocget1 = oc_get(oc)
+    if is_ok(ocset1) and is_ok(ocget1) and unwrap(ocget1) == "hello"
+        _c[0] = _c[0] + 1
+        print("  ok oncecell_set_get")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL oncecell_set_get")
+
+    let ocset2 = oc_set(oc, "world")
+    if is_err(ocset2) and unwrap(oc_get(oc)) == "hello"
+        _c[0] = _c[0] + 1
+        print("  ok oncecell_double_set_rejected")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL oncecell_double_set_rejected")
+
+    // ── rwlock: multiple readers concurrently, writer only after readers drain ──
+    let rw = rw_new()
+    rw_read_lock(rw)
+    rw_read_lock(rw)
+    if rw.rw_readers == 2 and rw.rw_writer_active == 0
+        _c[0] = _c[0] + 1
+        print("  ok rwlock_multi_reader")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL rwlock_multi_reader: readers=" + str(rw.rw_readers))
+
+    rw_read_unlock(rw)
+    rw_read_unlock(rw)
+    rw_write_lock(rw)
+    if rw.rw_writer_active == 1 and rw.rw_readers == 0
+        _c[0] = _c[0] + 1
+        print("  ok rwlock_write_after_drain")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL rwlock_write_after_drain")
+
+    rw_write_unlock(rw)
+    if rw.rw_writer_active == 0
+        _c[0] = _c[0] + 1
+        print("  ok rwlock_write_unlock")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL rwlock_write_unlock")
+
+    // ── countdown: decrement to zero unblocks wait, count reads correctly ──
+    let cd = cd_new(2)
+    if cd_count(cd) == 2
+        _c[0] = _c[0] + 1
+        print("  ok countdown_initial_count")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL countdown_initial_count: got " + str(cd_count(cd)))
+
+    cd_decrement(cd)
+    cd_decrement(cd)
+    cd_decrement(cd)
+    cd_wait(cd)
+    if cd_count(cd) == 0
+        _c[0] = _c[0] + 1
+        print("  ok countdown_decrement_clamped_and_wait")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL countdown_decrement_clamped_and_wait: got " + str(cd_count(cd)))
+
+    // ── mailbox: send/recv preserves order, size tracks, try_recv on empty errs ──
+    let mb = mb_new(4)
+    mb_send(mb, "a")
+    mb_send(mb, "b")
+    if mb_size(mb) == 2
+        _c[0] = _c[0] + 1
+        print("  ok mailbox_size_after_sends")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL mailbox_size_after_sends: got " + str(mb_size(mb)))
+
+    let m1 = mb_recv(mb)
+    let m2 = mb_recv(mb)
+    if m1 == "a" and m2 == "b" and mb_size(mb) == 0
+        _c[0] = _c[0] + 1
+        print("  ok mailbox_fifo_order")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL mailbox_fifo_order: got " + m1 + "," + m2)
+
+    let mtr = mb_try_recv(mb)
+    if is_err(mtr)
+        _c[0] = _c[0] + 1
+        print("  ok mailbox_try_recv_empty_errs")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL mailbox_try_recv_empty_errs")
+
+    // ── broadcast: every subscriber sees a published value; late subscriber doesn't see the past ──
+    let bc = bc_new()
+    let sub1 = bc_subscribe(bc)
+    let sub2 = bc_subscribe(bc)
+    bc_send(bc, 7)
+    let bv1 = bc_recv(sub1)
+    let bv2 = bc_recv(sub2)
+    if bv1 == 7 and bv2 == 7
+        _c[0] = _c[0] + 1
+        print("  ok broadcast_fanout")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL broadcast_fanout: got " + str(bv1) + "," + str(bv2))
+
+    let sub3 = bc_subscribe(bc)
+    bc_send(bc, 9)
+    let bv3 = bc_recv(sub3)
+    if bv3 == 9
+        _c[0] = _c[0] + 1
+        print("  ok broadcast_late_subscriber_sees_new")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL broadcast_late_subscriber_sees_new: got " + str(bv3))
+
+    // ── work_queue: FIFO take, size, drain empties atomically ──
+    let wq = wq_new()
+    wq_submit(wq, "x")
+    wq_submit(wq, "y")
+    wq_submit(wq, "z")
+    if wq_size(wq) == 3
+        _c[0] = _c[0] + 1
+        print("  ok workqueue_size_after_submits")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL workqueue_size_after_submits: got " + str(wq_size(wq)))
+
+    let wt1 = wq_take(wq)
+    if wt1 == "x" and wq_size(wq) == 2
+        _c[0] = _c[0] + 1
+        print("  ok workqueue_fifo_take")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL workqueue_fifo_take: got " + wt1)
+
+    let drained = wq_drain(wq)
+    if len(drained) == 2 and drained[0] == "y" and drained[1] == "z" and wq_size(wq) == 0
+        _c[0] = _c[0] + 1
+        print("  ok workqueue_drain")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL workqueue_drain: len=" + str(len(drained)))
+
+    // ── gate: starts closed, open releases wait, close re-blocks future waits ──
+    let g = gate_new()
+    if gate_is_open(g) == 0
+        _c[0] = _c[0] + 1
+        print("  ok gate_starts_closed")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL gate_starts_closed")
+
+    gate_open(g)
+    gate_wait(g)
+    if gate_is_open(g) == 1
+        _c[0] = _c[0] + 1
+        print("  ok gate_open_wait")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL gate_open_wait")
+
+    gate_close(g)
+    if gate_is_open(g) == 0
+        _c[0] = _c[0] + 1
+        print("  ok gate_close")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL gate_close")
+
+    // ── phaser: arrival at party count advances phase; await_advance on a stale phase returns immediately ──
+    let ph = ph_new(2)
+    if ph_phase(ph) == 0
+        _c[0] = _c[0] + 1
+        print("  ok phaser_starts_phase0")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL phaser_starts_phase0")
+
+    ph_arrive(ph)
+    if ph_phase(ph) == 0
+        _c[0] = _c[0] + 1
+        print("  ok phaser_partial_arrival_no_advance")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL phaser_partial_arrival_no_advance")
+
+    ph_arrive(ph)
+    if ph_phase(ph) == 1
+        _c[0] = _c[0] + 1
+        print("  ok phaser_full_arrival_advances")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL phaser_full_arrival_advances: got " + str(ph_phase(ph)))
+
+    ph_await_advance(ph, 0)
+    if ph_phase(ph) == 1
+        _c[0] = _c[0] + 1
+        print("  ok phaser_await_advance_stale_phase_returns")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL phaser_await_advance_stale_phase_returns")
+
+    // ── select_first: picks the ready channel, round-robin advances past the winner ──
+    let cA = channel_bounded(4)
+    let cB = channel_bounded(4)
+    let cC = channel_bounded(4)
+    send(cB, 100)
+    let sf = sf_new([cA, cB, cC])
+    let r1 = sf_recv(sf)
+    if is_ok(r1)
+        let pair1 = unwrap(r1)
+        if pair1[0] == 1 and pair1[1] == 100
+            _c[0] = _c[0] + 1
+            print("  ok selectfirst_picks_ready_channel")
+        else
+            _c[1] = _c[1] + 1
+            print("  FAIL selectfirst_picks_ready_channel: idx=" + str(pair1[0]) + " val=" + str(pair1[1]))
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL selectfirst_picks_ready_channel: got err")
+
+    send(cA, 200)
+    send(cC, 300)
+    let r2 = sf_recv(sf)
+    if is_ok(r2)
+        let pair2 = unwrap(r2)
+        if pair2[0] == 2 and pair2[1] == 300
+            _c[0] = _c[0] + 1
+            print("  ok selectfirst_round_robin_skips_winner")
+        else
+            _c[1] = _c[1] + 1
+            print("  FAIL selectfirst_round_robin_skips_winner: idx=" + str(pair2[0]) + " val=" + str(pair2[1]))
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL selectfirst_round_robin_skips_winner: got err")
+
+    let sfEmpty = sf_new([])
+    let rEmpty = sf_recv(sfEmpty)
+    if is_err(rEmpty)
+        _c[0] = _c[0] + 1
+        print("  ok selectfirst_empty_list_errs")
+    else
+        _c[1] = _c[1] + 1
+        print("  FAIL selectfirst_empty_list_errs")
+
+    // ── Summary ──
+    print("")
+    print("sync_coord: " + str(_c[0]) + " passed, " + str(_c[1]) + " failed")
+    if _c[1] > 0
+        exit(1)

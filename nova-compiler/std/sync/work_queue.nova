@@ -1,0 +1,77 @@
+// std/sync/work_queue — FIFO work-item queue with drain
+//
+// WHAT:
+//   Producers submit items, workers take them in FIFO order, plus a
+//   size query and a drain (snapshot-and-clear all pending items at once —
+//   useful for graceful shutdown / batch handoff, which a plain channel has
+//   no equivalent for).
+//
+// NOVA WAY:
+//   Backed by a plain NOVA `list` (push at the tail, wq_take reads index 0
+//   then re-slices — via the generic, RC-safe `list_slice` builtin — the
+//   remainder as the new backing list), NOT the raw `deque_*` runtime
+//   primitive: deque stores opaque machine words with no reference-counting
+//   integration, so pushing arbitrary NOVA values (strings, structs, lists)
+//   through it risks a use-after-free once the pushing scope's own
+//   reference is dropped. `list`'s push/slice ARE RC-aware, so work_queue
+//   stays sound for any item type the caller submits, not just plain ints
+//   — the O(n) re-slice per take is the accepted cost for that safety.
+//   The list + size check are guarded by a mutex (std/sync/mutex); wq_take
+//   polls (`sleep(0)` yields the green task/carrier) while empty.
+//
+// CAUTION:
+//   • wq_take on a queue that never receives another submit blocks forever.
+//   • wq_drain returns the pending items AND empties the queue atomically
+//     under the same lock — no item can be both drained and later taken.
+//
+// FIELD NAMING: fields are prefixed `wq_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type WorkQueue
+    wq_items: list
+    wq_m: any
+
+// wq_new() -> WorkQueue
+//   Creates an empty work queue.
+fn wq_new()
+    return WorkQueue([], mutex_new())
+
+// wq_submit(wq, item)
+//   Appends item to the tail of the queue.
+fn wq_submit(wq, item)
+    lock(wq.wq_m)
+    push(wq.wq_items, item)
+    unlock(wq.wq_m)
+
+// wq_take(wq) -> any
+//   Removes and returns the head item (FIFO), blocking while the queue is
+//   empty.
+fn wq_take(wq)
+    while true
+        lock(wq.wq_m)
+        if len(wq.wq_items) > 0
+            let item = wq.wq_items[0]
+            wq.wq_items = list_slice(wq.wq_items, 1, len(wq.wq_items))
+            unlock(wq.wq_m)
+            return item
+        unlock(wq.wq_m)
+        sleep(0)
+
+// wq_size(wq) -> int
+//   Number of items currently pending (non-blocking).
+fn wq_size(wq)
+    return len(wq.wq_items)
+
+// wq_drain(wq) -> list
+//   Atomically removes and returns ALL pending items (FIFO order), leaving
+//   the queue empty.
+fn wq_drain(wq)
+    lock(wq.wq_m)
+    let out = wq.wq_items
+    wq.wq_items = []
+    unlock(wq.wq_m)
+    return out

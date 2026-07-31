@@ -1,0 +1,179 @@
+// skipmap — ordered map (int key -> value) backed by a skip list.
+//
+// Level assignment is DETERMINISTIC (NOVA has no PRNG): level(key) = number
+// of trailing zero bits of a Knuth multiplicative hash of key, capped at
+// SM_MAXLEVEL-1. Same scheme as std/collections/skiplist.nova (an ordered
+// SET of ints), extended here to carry a value per key and support range
+// queries over the ordered keys.
+//
+// Representation:
+//   skipmap dict:
+//     "head" -> sentinel node (key = SM_SENTINEL, never exposed to callers)
+//     "size" -> int
+//
+//   each node is a dict:
+//     "k"    -> int key
+//     "v"    -> stored value (meaningless on the sentinel)
+//     "next" -> list of forward-pointer nodes, one per level (null = end-of-level)
+//
+// The list is linked at level 0 in ascending key order; higher levels are
+// express lanes that skip over multiple nodes, giving O(log n) expected
+// search/insert/delete.
+//
+// Public API:
+//   sm_new()               -> skipmap
+//   sm_insert(m, key, val) -> dict  (insert, or overwrite val if present; returns m)
+//   sm_lookup(m, key)      -> any   (stored value, or 0 if key absent)
+//   sm_delete(m, key)      -> dict  (remove key if present; returns m)
+//   sm_range(m, lo, hi)    -> list  (keys k with lo <= k <= hi, ascending)
+
+let SM_MAXLEVEL = 8
+// Sentinel key: smaller than any real key that can appear.
+let SM_SENTINEL = -2147483648
+
+// _sm_hash: Knuth multiplicative hash, 32-bit mask (same scheme as skiplist.nova).
+fn _sm_hash(key)
+    let h = key * 2654435761
+    let base = 4294967296
+    let r = h - (h / base) * base
+    if r < 0
+        r = r + base
+    return r
+
+// _sm_level: trailing zero bits of the hash, capped at SM_MAXLEVEL - 1. Gives
+// a geometric-like distribution: level 0 always, level k with probability
+// roughly 1/2^(k+1) over arbitrary key sets.
+fn _sm_level(key)
+    let h = _sm_hash(key)
+    let lv = 0
+    let v = h
+    while lv < SM_MAXLEVEL - 1
+        let bit = v - (v / 2) * 2
+        if bit != 0
+            return lv
+        lv = lv + 1
+        v = v / 2
+    return lv
+
+// _sm_node: create a node with `lv+1` null forward pointers.
+fn _sm_node(key, val, lv)
+    let nd = {}
+    nd["k"] = key
+    nd["v"] = val
+    let fwd = []
+    let i = 0
+    while i <= lv
+        fwd.push(null)
+        i = i + 1
+    nd["next"] = fwd
+    return nd
+
+// _sm_head: sentinel head node with SM_MAXLEVEL forward pointers.
+fn _sm_head()
+    return _sm_node(SM_SENTINEL, 0, SM_MAXLEVEL - 1)
+
+// sm_new: create a new empty skip map.
+fn sm_new()
+    let t = {}
+    t["head"] = _sm_head()
+    t["size"] = 0
+    return t
+
+// _sm_find_preds: for each level, the predecessor node just before where
+// `key` would appear. Returns a list of SM_MAXLEVEL predecessor nodes.
+fn _sm_find_preds(t, key)
+    let preds = []
+    let i = 0
+    while i < SM_MAXLEVEL
+        preds.push(null)
+        i = i + 1
+    let cur = t["head"]
+    let lv = SM_MAXLEVEL - 1
+    while lv >= 0
+        let fwd = cur["next"]
+        let nx = fwd[lv]
+        while nx != null
+            if nx["k"] < key
+                cur = nx
+                fwd = cur["next"]
+                nx = fwd[lv]
+            else
+                nx = null
+        preds[lv] = cur
+        lv = lv - 1
+    return preds
+
+// sm_insert: insert key -> val, or overwrite val if key is already present.
+fn sm_insert(m, key, val)
+    let preds = _sm_find_preds(m, key)
+    let pred0 = preds[0]
+    let fwd0 = pred0["next"]
+    let nx0 = fwd0[0]
+    if nx0 != null
+        if nx0["k"] == key
+            nx0["v"] = val
+            return m
+    let lv = _sm_level(key)
+    let nd = _sm_node(key, val, lv)
+    let ndfwd = nd["next"]
+    let i = 0
+    while i <= lv
+        let pr = preds[i]
+        let prfwd = pr["next"]
+        ndfwd[i] = prfwd[i]
+        prfwd[i] = nd
+        i = i + 1
+    m["size"] = m["size"] + 1
+    return m
+
+// sm_lookup: return the value stored at key, or 0 if key is absent.
+fn sm_lookup(m, key)
+    let preds = _sm_find_preds(m, key)
+    let pred0 = preds[0]
+    let fwd0 = pred0["next"]
+    let nx0 = fwd0[0]
+    if nx0 == null
+        return 0
+    if nx0["k"] != key
+        return 0
+    return nx0["v"]
+
+// sm_delete: remove key if present. No-op if absent.
+fn sm_delete(m, key)
+    let preds = _sm_find_preds(m, key)
+    let pred0 = preds[0]
+    let fwd0 = pred0["next"]
+    let target = fwd0[0]
+    if target == null
+        return m
+    if target["k"] != key
+        return m
+    let tfwd = target["next"]
+    let nlvs = len(tfwd)
+    let i = 0
+    while i < nlvs
+        let pr = preds[i]
+        let prfwd = pr["next"]
+        if prfwd[i] == target
+            prfwd[i] = tfwd[i]
+        i = i + 1
+    m["size"] = m["size"] - 1
+    return m
+
+// sm_range: return all keys k with lo <= k <= hi, ascending. Starts the level-0
+// walk just before lo (found via _sm_find_preds) so only the matching span is
+// visited, not the whole list.
+fn sm_range(m, lo, hi)
+    let preds = _sm_find_preds(m, lo)
+    let cur = preds[0]
+    let fwd = cur["next"]
+    let nx = fwd[0]
+    let out = []
+    while nx != null
+        if nx["k"] > hi
+            nx = null
+        else
+            out.push(nx["k"])
+            fwd = nx["next"]
+            nx = fwd[0]
+    return out

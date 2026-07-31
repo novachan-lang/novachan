@@ -1,0 +1,273 @@
+// Consolidated KAT for the std/data/ subtitle library (SRT/WebVTT).
+//
+// Covers all 12 modules (built under TASK 26, commit c755af8e; this KAT was
+// added, plus targeted correctness/perf fixes, on top of that pre-existing
+// work — see per-module comments below for what each check exercises):
+//   sub_timecode, sub_srt_parse, sub_srt_build, sub_vtt_parse, sub_vtt_build,
+//   sub_convert (SRT<->VTT round-trip), sub_shift, sub_merge, sub_split,
+//   sub_filter, sub_reindex, sub_scale.
+//
+// _c = [checks, fails] pass/fail counter pattern (matches _kat_phonetics.nova
+// etc.). Prints "PASS=N FAIL=M" and exit(1) on any failure.
+
+import std/data/sub_timecode
+import std/data/sub_srt_parse
+import std/data/sub_srt_build
+import std/data/sub_vtt_parse
+import std/data/sub_vtt_build
+import std/data/sub_convert
+import std/data/sub_shift
+import std/data/sub_merge
+import std/data/sub_split
+import std/data/sub_filter
+import std/data/sub_reindex
+import std/data/sub_scale
+
+let _c = [0, 0]
+
+fn cki(label: string, got: int, want: int)
+    _c[0] = _c[0] + 1
+    if got != want
+        _c[1] = _c[1] + 1
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+
+fn cks(label: string, got: string, want: string)
+    _c[0] = _c[0] + 1
+    if got != want
+        _c[1] = _c[1] + 1
+        print("FAIL " + label + ": got='" + got + "' want='" + want + "'")
+
+fn _contains(s: string, sub: string) -> int
+    let n = len(s)
+    let m = len(sub)
+    let found = 0
+    let i = 0
+    while i <= n - m
+        if slice(s, i, i + m) == sub
+            found = 1
+            i = n
+        i = i + 1
+    found
+
+fn _cue(idx: int, s: int, e: int, txt: string) -> dict
+    let d = {}
+    d["index"] = idx
+    d["start"] = s
+    d["end"] = e
+    d["text"] = txt
+    d
+
+fn main()
+    let nl = chr(10)
+
+    // ── sub_timecode ─────────────────────────────────────────────────────
+    cki("tc-srt-parse", srt_tc_parse("01:02:03,456"), 3723456)
+    cks("tc-srt-format", srt_tc_format(3723456), "01:02:03,456")
+    cki("tc-vtt-parse-hms", vtt_tc_parse("01:02:03.456"), 3723456)
+    cki("tc-vtt-parse-ms", vtt_tc_parse("02:03.456"), 123456)
+    cks("tc-vtt-format", vtt_tc_format(3723456), "01:02:03.456")
+    let hms = ms_to_hms(3723456)
+    cki("tc-hms-h", hms[0], 1)
+    cki("tc-hms-ms", hms[3], 456)
+
+    // ── sub_srt_parse ────────────────────────────────────────────────────
+    let srt_doc = "1" + nl + "00:00:01,000 --> 00:00:04,000" + nl + "Hello" + nl + "World" + nl + nl + "2" + nl + "00:00:05,500 --> 00:00:08,200" + nl + "Second cue" + nl + nl
+    let parsed = srt_parse(srt_doc)
+    cki("srt-parse-count", len(parsed), 2)
+    cki("srt-parse-c0-start", parsed[0]["start"], 1000)
+    cki("srt-parse-c0-end", parsed[0]["end"], 4000)
+    cks("srt-parse-c0-text", parsed[0]["text"], "Hello" + nl + "World")
+    cks("srt-parse-c1-text", parsed[1]["text"], "Second cue")
+    cki("srt-cue-count", srt_cue_count(srt_doc), 2)
+    // Regression: two IDENTICAL consecutive text lines must both survive
+    // (a prior bug compared accumulated text to the incoming line and
+    // silently dropped the second "La la la").
+    let dup_doc = "1" + nl + "00:00:01,000 --> 00:00:02,000" + nl + "La la la" + nl + "La la la" + nl + nl
+    let dup_parsed = srt_parse(dup_doc)
+    cks("srt-dup-line-text", dup_parsed[0]["text"], "La la la" + nl + "La la la")
+    // BOM handling: a leading UTF-8 BOM must not corrupt the first index/timing.
+    let bom = chr(239) + chr(187) + chr(191)
+    let bom_doc = bom + srt_doc
+    let bom_parsed = srt_parse(bom_doc)
+    cki("srt-bom-count", len(bom_parsed), 2)
+    cki("srt-bom-c0-index", bom_parsed[0]["index"], 1)
+    cki("srt-bom-c0-start", bom_parsed[0]["start"], 1000)
+
+    // ── sub_srt_build ────────────────────────────────────────────────────
+    let build_cues = []
+    build_cues.push(_cue(1, 1000, 4000, "Hi there"))
+    build_cues.push(_cue(2, 5500, 8200, "Second"))
+    let built_srt = srt_build(build_cues)
+    cki("srt-build-contains-tc1", _contains(built_srt, "00:00:01,000 --> 00:00:04,000"), 1)
+    cki("srt-build-contains-tc2", _contains(built_srt, "00:00:05,500 --> 00:00:08,200"), 1)
+    cki("srt-build-contains-text", _contains(built_srt, "Hi there"), 1)
+    // Round-trip srt_build -> srt_parse
+    let rt = srt_parse(built_srt)
+    cki("srt-build-roundtrip-count", len(rt), 2)
+    cks("srt-build-roundtrip-text", rt[1]["text"], "Second")
+
+    // ── sub_vtt_parse ────────────────────────────────────────────────────
+    let vtt_doc = "WEBVTT" + nl + nl + "00:00:01.000 --> 00:00:04.000" + nl + "Hello VTT" + nl + nl + "00:00:05.500 --> 00:00:08.200" + nl + "Second" + nl + nl
+    cki("vtt-has-header", vtt_has_header(vtt_doc), 1)
+    cki("vtt-has-header-neg", vtt_has_header("not a vtt file"), 0)
+    let vparsed = vtt_parse(vtt_doc)
+    cki("vtt-parse-count", len(vparsed), 2)
+    cki("vtt-parse-c0-start", vparsed[0]["start"], 1000)
+    cki("vtt-parse-c0-end", vparsed[0]["end"], 4000)
+    cks("vtt-parse-c0-text", vparsed[0]["text"], "Hello VTT")
+    // NOTE block must be skipped.
+    let vtt_note = "WEBVTT" + nl + nl + "NOTE this is a comment" + nl + nl + "00:00:01.000 --> 00:00:02.000" + nl + "After note" + nl + nl
+    let vparsed2 = vtt_parse(vtt_note)
+    cki("vtt-note-count", len(vparsed2), 1)
+    cks("vtt-note-text", vparsed2[0]["text"], "After note")
+    // BOM handling on WebVTT (BOM + "WEBVTT" header must still be recognised).
+    let vtt_bom_doc = bom + vtt_doc
+    cki("vtt-bom-has-header", vtt_has_header(vtt_bom_doc), 1)
+    let vbom_parsed = vtt_parse(vtt_bom_doc)
+    cki("vtt-bom-count", len(vbom_parsed), 2)
+    cki("vtt-bom-c0-start", vbom_parsed[0]["start"], 1000)
+
+    // ── sub_vtt_build ────────────────────────────────────────────────────
+    let built_vtt = vtt_build(build_cues)
+    cki("vtt-build-starts-webvtt", _contains(built_vtt, "WEBVTT"), 1)
+    cki("vtt-build-contains-tc1", _contains(built_vtt, "00:00:01.000 --> 00:00:04.000"), 1)
+    cki("vtt-build-contains-text", _contains(built_vtt, "Second"), 1)
+    let vrt = vtt_parse(built_vtt)
+    cki("vtt-build-roundtrip-count", len(vrt), 2)
+    cks("vtt-build-roundtrip-text", vrt[0]["text"], "Hi there")
+
+    // ── sub_convert (SRT <-> VTT round-trip, format detection) ─────────────
+    cks("conv-detect-srt", detect_format(srt_doc), "srt")
+    cks("conv-detect-vtt", detect_format(vtt_doc), "vtt")
+    cks("conv-detect-unknown", detect_format("plain text file"), "unknown")
+    let s2v = srt_to_vtt(srt_doc)
+    cki("conv-s2v-webvtt", _contains(s2v, "WEBVTT"), 1)
+    cki("conv-s2v-dot-tc", _contains(s2v, "00:00:01.000 --> 00:00:04.000"), 1)
+    let v2s = vtt_to_srt(vtt_doc)
+    cki("conv-v2s-comma-tc", _contains(v2s, "00:00:01,000 --> 00:00:04,000"), 1)
+    cki("conv-v2s-text", _contains(v2s, "Hello VTT"), 1)
+    // BOM must not break format detection.
+    cks("conv-detect-bom-vtt", detect_format(bom + vtt_doc), "vtt")
+
+    // ── sub_shift (format-agnostic on parsed cue dicts) ─────────────────────
+    let shifted = sub_shift(parsed, 500)
+    cki("shift-c0-start", shifted[0]["start"], 1500)
+    cki("shift-c0-end", shifted[0]["end"], 4500)
+    let shifted_neg = sub_shift(parsed, -2000)
+    cki("shift-clamp-zero", shifted_neg[0]["start"], 0)
+    let shifted_range = sub_shift_range(parsed, 1000, 0, 2000)
+    cki("shift-range-c0", shifted_range[0]["start"], 2000)
+    cki("shift-range-c1-unchanged", shifted_range[1]["start"], 5500)
+
+    // ── sub_merge ────────────────────────────────────────────────────────
+    let mc = sub_concat(parsed, vparsed)
+    cki("merge-concat-len", len(mc), 4)
+    let list_a = []
+    list_a.push(_cue(0, 0, 2000, "A1"))
+    list_a.push(_cue(0, 5000, 7000, "A2"))
+    let list_b = []
+    list_b.push(_cue(0, 1000, 3000, "B1"))
+    list_b.push(_cue(0, 6000, 8000, "B2"))
+    let merged = sub_merge_sorted(list_a, list_b)
+    cki("merge-sorted-len", len(merged), 4)
+    cki("merge-sorted-order-0", merged[0]["start"], 0)
+    cki("merge-sorted-order-1", merged[1]["start"], 1000)
+    cki("merge-sorted-order-2", merged[2]["start"], 5000)
+    cki("merge-sorted-order-3", merged[3]["start"], 6000)
+    cks("merge-sorted-text-1", merged[1]["text"], "B1")
+    let overlap_in = []
+    overlap_in.push(_cue(0, 0, 2000, "X"))
+    overlap_in.push(_cue(0, 1500, 4000, "Y"))
+    overlap_in.push(_cue(0, 9000, 10000, "Z"))
+    let overlap_out = sub_merge_overlaps(overlap_in)
+    cki("merge-overlaps-len", len(overlap_out), 2)
+    cki("merge-overlaps-end", overlap_out[0]["end"], 4000)
+    let dedup_in = []
+    dedup_in.push(_cue(0, 0, 1000, "same"))
+    dedup_in.push(_cue(0, 0, 1000, "same"))
+    dedup_in.push(_cue(0, 2000, 3000, "diff"))
+    let dedup_out = sub_dedup(dedup_in)
+    cki("dedup-len", len(dedup_out), 2)
+
+    // ── sub_split ────────────────────────────────────────────────────────
+    let span_in = []
+    span_in.push(_cue(0, 0, 4000, "spans"))
+    let split_out = sub_split_at(span_in, 2000)
+    cki("split-at-len", len(split_out), 2)
+    cki("split-at-left-end", split_out[0]["end"], 2000)
+    cki("split-at-right-start", split_out[1]["start"], 2000)
+    let long_in = []
+    long_in.push(_cue(0, 0, 9000, "long one"))
+    let split_long = sub_split_long(long_in, 4000)
+    cki("split-long-parts", len(split_long), 3)
+    let part_in = []
+    part_in.push(_cue(0, 0, 1000, "before"))
+    part_in.push(_cue(0, 1000, 5000, "spanning"))
+    part_in.push(_cue(0, 6000, 7000, "after"))
+    let partitioned = sub_partition_at(part_in, 3000)
+    let before_list = partitioned[0]
+    let after_list = partitioned[1]
+    cki("partition-before-len", len(before_list), 2)
+    cki("partition-after-len", len(after_list), 2)
+    cki("partition-before-c1-end", before_list[1]["end"], 3000)
+    cki("partition-after-c0-start", after_list[0]["start"], 3000)
+    cki("partition-before-idx", before_list[1]["index"], 2)
+    cki("partition-after-idx", after_list[0]["index"], 1)
+
+    // ── sub_filter ───────────────────────────────────────────────────────
+    let in_range = sub_in_range(parsed, 0, 3000)
+    cki("filter-in-range-len", len(in_range), 1)
+    let searched = sub_search(parsed, "Second")
+    cki("filter-search-len", len(searched), 1)
+    let at5900 = sub_at(parsed, 5900)
+    cks("filter-at-text", at5900["text"], "Second cue")
+    let at4500 = sub_at(parsed, 4500)
+    cki("filter-at-gap-empty", len(keys(at4500)), 0)
+    let removed = sub_remove_range(parsed, 0, 3000)
+    cki("filter-remove-range-len", len(removed), 1)
+    let empty_in = []
+    empty_in.push(_cue(0, 0, 1000, "real text"))
+    empty_in.push(_cue(0, 1000, 2000, ""))
+    empty_in.push(_cue(0, 2000, 3000, "   "))
+    empty_in.push(_cue(0, 3000, 4000, "more text"))
+    let no_empty = sub_remove_empty(empty_in)
+    cki("filter-remove-empty-len", len(no_empty), 2)
+    cks("filter-remove-empty-0", no_empty[0]["text"], "real text")
+    cks("filter-remove-empty-1", no_empty[1]["text"], "more text")
+
+    // ── sub_reindex ──────────────────────────────────────────────────────
+    let unordered = []
+    unordered.push(_cue(9, 5000, 6000, "c"))
+    unordered.push(_cue(2, 1000, 2000, "a"))
+    let reindexed = sub_reindex(unordered)
+    cki("reindex-0", reindexed[0]["index"], 1)
+    cki("reindex-1", reindexed[1]["index"], 2)
+    let sorted = sub_sort(unordered)
+    cki("reindex-sort-0-start", sorted[0]["start"], 1000)
+    cki("reindex-sort-1-start", sorted[1]["start"], 5000)
+    let renumbered = sub_renumber_from(unordered, 10)
+    cki("reindex-renumber-0", renumbered[0]["index"], 10)
+    cki("reindex-renumber-1", renumbered[1]["index"], 11)
+    let valid_cues = []
+    valid_cues.push(_cue(1, 0, 1000, "a"))
+    valid_cues.push(_cue(2, 1000, 2000, "b"))
+    cki("reindex-validate-ok", sub_validate(valid_cues), 1)
+    cki("reindex-validate-bad", sub_validate(unordered), 0)
+
+    // ── sub_scale ────────────────────────────────────────────────────────
+    let scale_in = []
+    scale_in.push(_cue(1, 1000, 2000, "s"))
+    let scaled = sub_scale(scale_in, 2, 1)
+    cki("scale-2x-start", scaled[0]["start"], 2000)
+    cki("scale-2x-end", scaled[0]["end"], 4000)
+    let fps_conv = sub_fps_convert(scale_in, 24, 25)
+    cki("scale-fps-start", fps_conv[0]["start"], 960)
+    let stretched = sub_stretch(scale_in, 1000, 3, 1)
+    cki("scale-stretch-anchor-fixed", stretched[0]["start"], 1000)
+    cki("scale-stretch-end", stretched[0]["end"], 4000)
+
+    if _c[1] == 0
+        print("PASS=" + str(_c[0]) + " FAIL=0")
+    else
+        print("PASS=" + str(_c[0] - _c[1]) + " FAIL=" + str(_c[1]))
+        exit(1)

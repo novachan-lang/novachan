@@ -1,0 +1,62 @@
+// std/sync/select_first — round-robin multi-channel receive
+//
+// WHAT:
+//   Given a fixed list of channels, receive from whichever one has data
+//   first, without starving any single channel the way always scanning
+//   from index 0 would (Go `select {}` over N cases / Erlang `receive`
+//   pattern-matching across mailboxes — NOVA's own `select`/`select_timeout`
+//   builtins give "first ready, scanning from index 0 every time"; this
+//   module additionally guarantees round-robin FAIRNESS across repeated
+//   calls).
+//
+// NOVA WAY:
+//   A struct remembers `rr_idx`, the channel to start scanning from on the
+//   NEXT call. Each sf_recv sweeps all n channels starting at rr_idx via
+//   try_recv (non-blocking, no runtime change needed), and on a hit advances
+//   rr_idx to one past the winner — so a channel that just won moves to the
+//   back of the queue instead of being re-checked first again, giving every
+//   channel a turn under sustained multi-source traffic. Between sweeps
+//   (nothing ready anywhere) it cooperatively yields with `sleep(0)`.
+//
+// CAUTION:
+//   • sf_recv on an empty channel list returns err() immediately.
+//   • sf_recv when NO channel ever produces a value blocks forever.
+//
+// FIELD NAMING: fields are prefixed `sf_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+
+type SelectFirst
+    sf_chans: list
+    sf_rr_idx: int
+
+// sf_new(channels) -> SelectFirst
+//   Wraps a list of channels for round-robin-fair polling.
+fn sf_new(channels)
+    return SelectFirst(channels, 0)
+
+// sf_recv(sf) -> Result
+//   Blocks until any wrapped channel has a value, then returns
+//   ok([winner_index, value]). Scans round-robin starting from the channel
+//   just after the previous winner, so no single channel is starved.
+fn sf_recv(sf)
+    let n = len(sf.sf_chans)
+    if n == 0
+        return err("select_first: no channels")
+    while true
+        let i = 0
+        while i < n
+            let idx = sf.sf_rr_idx + i
+            if idx >= n
+                idx = idx - n
+            let r = try_recv(sf.sf_chans[idx])
+            if r[0] == 1
+                let nxt = idx + 1
+                if nxt >= n
+                    nxt = 0
+                sf.sf_rr_idx = nxt
+                return ok([idx, r[1]])
+            i = i + 1
+        sleep(0)

@@ -1,0 +1,141 @@
+// ============================================================================
+// NOVA Standard Library — std/net/smtp_mailfrom
+// ============================================================================
+// MAIL FROM / RCPT TO argument parsing (RFC 5321 §4.1.1.2 / §4.1.1.3).
+//
+// Grammar (simplified): "FROM:<reverse-path> [SP mail-parameters]" and
+// "TO:<forward-path> [SP rcpt-parameters]" — an angle-bracketed address
+// followed by zero or more "PARAM" or "PARAM=VALUE" ESMTP extension tokens
+// (RFC 1869), e.g. "FROM:<a@b.com> SIZE=1000 BODY=8BITMIME".
+//
+// The input line is the command's ARGUMENT (what std/net/smtp_command's
+// smtp_cmd_parse returns as "arg" for verb MAIL/RCPT) — i.e. it still
+// contains the "FROM:"/"TO:" tag, which is stripped here.
+//
+// PUBLIC API:
+//   smtp_mail_parse(line: string) -> dict
+//     "address" : string — the reverse-path, from inside "<...>"
+//                          ("" for the null reverse-path "<>")
+//     "params"  : dict   — {PARAM_NAME (uppercased) -> value string}
+//                          value is "" for a bare flag param (no "=").
+//
+//   smtp_rcpt_parse(line: string) -> dict
+//     Same shape as smtp_mail_parse, for the forward-path / rcpt-parameters.
+//
+// EXAMPLES:
+//   smtp_mail_parse("FROM:<a@b.com> SIZE=1000 BODY=8BITMIME")
+//     -> address="a@b.com", params={"SIZE":"1000","BODY":"8BITMIME"}
+//   smtp_rcpt_parse("TO:<c@d.com>")
+//     -> address="c@d.com", params={}
+//   smtp_mail_parse("FROM:<>")           -> address="", params={}  (null sender)
+//   smtp_mail_parse("<a@b.com>")         -> tolerates a missing "FROM:" tag
+//   smtp_mail_parse("a@b.com SIZE=100")  -> tolerates a bare (unbracketed) address
+//
+// DESIGN NOTES:
+//   * Matching is on the first "<" / first ">" after it — RFC 5321 addresses
+//     do not contain "<"/">" themselves, so this is unambiguous for
+//     well-formed input. Malformed input (no closing ">") yields an empty
+//     address and treats the whole remainder as unparsed (no params).
+//   * Private helpers prefixed _smtpm_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+fn _smtpm_trim(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n and (slice(s, start, start + 1) == " " or slice(s, start, start + 1) == chr(9))
+        start = start + 1
+    let stop = n
+    while stop > start and (slice(s, stop - 1, stop) == " " or slice(s, stop - 1, stop) == chr(9))
+        stop = stop - 1
+    slice(s, start, stop)
+
+// _smtpm_strip_tag: remove a leading "FROM:" or "TO:" tag (case-insensitive),
+// tolerating its absence entirely.
+fn _smtpm_strip_tag(s: string, tag: string) -> string
+    let tlen = len(tag)
+    let slen = len(s)
+    if slen >= tlen and upper(slice(s, 0, tlen)) == tag
+        return slice(s, tlen, slen)
+    s
+
+// _smtpm_parse_params: split a "PARAM=VALUE PARAM2 ..." tail into a dict.
+fn _smtpm_parse_params(tail: string) -> dict
+    let out = {}
+    let t = _smtpm_trim(tail)
+    let n = len(t)
+    let i = 0
+    while i < n
+        // find end of this token (next space or end)
+        let j = i
+        while j < n and slice(t, j, j + 1) != " "
+            j = j + 1
+        let tok = slice(t, i, j)
+        if len(tok) > 0
+            // split on first '='
+            let k = 0
+            let tlen = len(tok)
+            while k < tlen and slice(tok, k, k + 1) != "="
+                k = k + 1
+            let key = upper(slice(tok, 0, k))
+            let val = ""
+            if k < tlen
+                val = slice(tok, k + 1, tlen)
+            out[key] = val
+        // skip whitespace to next token
+        i = j
+        while i < n and slice(t, i, i + 1) == " "
+            i = i + 1
+    out
+
+// _smtpm_parse_core: shared MAIL FROM / RCPT TO argument parser.
+fn _smtpm_parse_core(line: string, tag: string) -> dict
+    let out = {}
+    out["address"] = ""
+    out["params"] = {}
+
+    let s = _smtpm_trim(_smtpm_strip_tag(_smtpm_trim(line), tag))
+    let n = len(s)
+
+    // Find bracketed address "<...>".
+    let lt = -1
+    let i = 0
+    while i < n and lt == -1
+        if slice(s, i, i + 1) == "<"
+            lt = i
+        i = i + 1
+    if lt == -1
+        // No brackets: tolerate a bare address token.
+        let j = 0
+        while j < n and slice(s, j, j + 1) != " "
+            j = j + 1
+        out["address"] = slice(s, 0, j)
+        out["params"] = _smtpm_parse_params(slice(s, j, n))
+        return out
+
+    let gt = -1
+    let k = lt + 1
+    while k < n and gt == -1
+        if slice(s, k, k + 1) == ">"
+            gt = k
+        k = k + 1
+    if gt == -1
+        // Malformed: unterminated bracket, no reliable address or params.
+        return out
+
+    out["address"] = slice(s, lt + 1, gt)
+    out["params"] = _smtpm_parse_params(slice(s, gt + 1, n))
+    out
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// smtp_mail_parse: parse a MAIL FROM argument.
+fn smtp_mail_parse(line: string) -> dict
+    _smtpm_parse_core(line, "FROM:")
+
+// smtp_rcpt_parse: parse a RCPT TO argument.
+fn smtp_rcpt_parse(line: string) -> dict
+    _smtpm_parse_core(line, "TO:")

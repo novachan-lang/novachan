@@ -1,0 +1,190 @@
+// quotientfilter — probabilistic set membership with SUPPORT FOR DELETION
+// (the property a Bloom filter lacks: std/collections/bloomfilter.nova can
+// never un-set a bit without risking false negatives for other members).
+//
+// Design note: the original quotient filter (Bender et al., "Don't Thrash:
+// How to Cache Your Hash on Flash", VLDB 2012) bit-packs three metadata bits
+// per slot (is_occupied / is_continuation / is_shifted) to get a byte-tight,
+// cache-line-friendly layout for on-disk/in-cache-line storage. NOVA has no
+// manual bit-packing story (nothing in std/collections bit-packs — even
+// bloomfilter.nova stores one plain int per bit), so that packing buys
+// nothing here. This module keeps the two ideas that DO matter at this
+// level — fingerprint hashing instead of storing full keys, and O(1)
+// amortised insert/contains/DELETE — via an open-addressing linear-probe
+// table with backward-shift deletion (the classic tombstone-free deletion
+// algorithm for linear probing: Knuth, TAOCP Vol. 3, Algorithm R). Each slot
+// stores the (quotient, remainder) fingerprint split explicitly rather than
+// bit-packed, which is the honest equivalent in a dict/list-based stdlib.
+//
+// Fingerprint: h = 32-bit FNV-1a hash of str(key), masked to a table of
+// `2^bits` slots. quotient = h mod table_size (the slot's ideal/home index);
+// remainder = (h / table_size) mod 65536 (a further 16 bits, so two keys
+// only collide if they agree on quotient AND remainder — false positives
+// are possible, as with any fingerprint filter, but false negatives never
+// happen for a key that was inserted and not since deleted).
+//
+// Representation (dict f):
+//   "m"     -> int table_size = 2^bits
+//   "used"  -> list of int (0/1), one per slot
+//   "rem"   -> list of int remainder, one per slot (meaningful iff used[i]==1)
+//   "home"  -> list of int quotient/home-slot, one per slot (meaningful iff used[i]==1)
+//   "count" -> int number of items currently present
+//
+// Public API:
+//   qf_new(bits)     -> dict  (table_size = 2^bits slots)
+//   qf_insert(f, key) -> dict (returns f; no-op if already present or table full)
+//   qf_contains(f, key) -> int (1 if present, 0 otherwise)
+//   qf_delete(f, key) -> dict  (returns f; no-op if absent)
+//   qf_load(f)        -> int  (count of items currently present)
+
+// _qf_pow2: 2^n via repeated doubling.
+fn _qf_pow2(n)
+    let p = 1
+    let i = 0
+    while i < n
+        p = p * 2
+        i = i + 1
+    return p
+
+// _qf_hash: FNV-1a 32-bit hash of str(key) (same scheme as bloomfilter.nova).
+fn _qf_hash(key)
+    let s = str(key)
+    let h = 2166136261
+    let i = 0
+    let n = len(s)
+    while i < n
+        h = (h * 16777619 + ord(char_at(s, i))) & 0xFFFFFFFF
+        i = i + 1
+    return h
+
+// _qf_fp: return [quotient, remainder] for key against a table of size m.
+fn _qf_fp(key, m)
+    let h = _qf_hash(key)
+    let q = h % m
+    let r = (h / m) % 65536
+    let out = []
+    out.push(q)
+    out.push(r)
+    return out
+
+// _qf_fwd_dist: cyclic forward distance from slot a to slot b in a table of
+// size m (how many steps of +1 mod m it takes to walk from a to b).
+fn _qf_fwd_dist(a, b, m)
+    let d = (b - a) % m
+    if d < 0
+        d = d + m
+    return d
+
+// qf_new: create a new empty quotient filter with 2^bits slots.
+fn qf_new(bits)
+    let m = _qf_pow2(bits)
+    let used = []
+    let rem = []
+    let home = []
+    let i = 0
+    while i < m
+        used.push(0)
+        rem.push(0)
+        home.push(0)
+        i = i + 1
+    let f = {}
+    f["m"] = m
+    f["used"] = used
+    f["rem"] = rem
+    f["home"] = home
+    f["count"] = 0
+    return f
+
+// _qf_find_slot: linear-probe from quotient q looking for a slot matching
+// (q, r). Returns the matching slot index, or -1 if not found (probing stops
+// at the first empty slot, or after a full lap of the table).
+fn _qf_find_slot(f, q, r)
+    let m = f["m"]
+    let used = f["used"]
+    let rem = f["rem"]
+    let home = f["home"]
+    let slot = q
+    let probes = 0
+    while probes < m
+        if used[slot] == 0
+            return -1
+        if home[slot] == q
+            if rem[slot] == r
+                return slot
+        slot = (slot + 1) % m
+        probes = probes + 1
+    return -1
+
+// qf_insert: insert key's fingerprint. No-op if already present. If the
+// table is completely full (every slot used, no free slot reachable within
+// one lap) the insert is silently dropped rather than corrupting the table
+// or looping forever — callers sizing `bits` for their expected load (as
+// with a Bloom filter) will not hit this in practice.
+fn qf_insert(f, key)
+    let m = f["m"]
+    let fp = _qf_fp(key, m)
+    let q = fp[0]
+    let r = fp[1]
+    if _qf_find_slot(f, q, r) >= 0
+        return f
+    let used = f["used"]
+    let rem = f["rem"]
+    let home = f["home"]
+    let slot = q
+    let probes = 0
+    while probes < m
+        if used[slot] == 0
+            used[slot] = 1
+            rem[slot] = r
+            home[slot] = q
+            f["count"] = f["count"] + 1
+            return f
+        slot = (slot + 1) % m
+        probes = probes + 1
+    return f
+
+// qf_contains: 1 if key's fingerprint is present, 0 otherwise.
+fn qf_contains(f, key)
+    let m = f["m"]
+    let fp = _qf_fp(key, m)
+    if _qf_find_slot(f, fp[0], fp[1]) >= 0
+        return 1
+    return 0
+
+// qf_delete: remove key's fingerprint if present, using backward-shift
+// deletion so no tombstone is ever left behind (keeps future probe chains
+// exactly as short as they'd be if the deleted key had never been inserted).
+fn qf_delete(f, key)
+    let m = f["m"]
+    let fp = _qf_fp(key, m)
+    let slot = _qf_find_slot(f, fp[0], fp[1])
+    if slot < 0
+        return f
+    let used = f["used"]
+    let rem = f["rem"]
+    let home = f["home"]
+    used[slot] = 0
+    let i = slot
+    let done = 0
+    while done == 0
+        let j = (i + 1) % m
+        if used[j] == 0
+            done = 1
+        else
+            let k = home[j]
+            let dist_j = _qf_fwd_dist(k, j, m)
+            let dist_i = _qf_fwd_dist(k, i, m)
+            if dist_i <= dist_j
+                rem[i] = rem[j]
+                home[i] = home[j]
+                used[i] = 1
+                used[j] = 0
+                i = j
+            else
+                done = 1
+    f["count"] = f["count"] - 1
+    return f
+
+// qf_load: number of items currently present.
+fn qf_load(f)
+    return f["count"]

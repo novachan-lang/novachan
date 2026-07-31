@@ -1,0 +1,233 @@
+// KAT for the SMTP/IMAP/POP3 framing module family:
+//   std/net/smtp_command, smtp_response, smtp_ehlo, smtp_mailfrom, smtp_data,
+//   smtp_auth, smtp_status, imap_line, imap_tag, smtp_envelope.
+import std/net/smtp_command
+import std/net/smtp_response
+import std/net/smtp_ehlo
+import std/net/smtp_mailfrom
+import std/net/smtp_data
+import std/net/smtp_auth
+import std/net/smtp_status
+import std/net/imap_line
+import std/net/imap_tag
+import std/net/smtp_envelope
+
+// ── Assert helpers ───────────────────────────────────────────────────────────
+
+fn assert_s(label: string, got: string, want: string)
+    if got != want
+        print("FAIL smtp-framing " + label + ": got='" + got + "' want='" + want + "'")
+        exit(1)
+
+fn assert_i(label: string, got: int, want: int)
+    if got != want
+        print("FAIL smtp-framing " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn main()
+    let crlf = chr(13) + chr(10)
+
+    // ── smtp_command ─────────────────────────────────────────────────────────
+    let c1 = smtp_cmd_parse("EHLO example.com" + crlf)
+    assert_s("cmd-ehlo-verb", c1["verb"], "EHLO")
+    assert_s("cmd-ehlo-arg", c1["arg"], "example.com")
+
+    let c2 = smtp_cmd_parse("MAIL FROM:<a@b.com> SIZE=100" + crlf)
+    assert_s("cmd-mail-verb", c2["verb"], "MAIL")
+    assert_s("cmd-mail-arg", c2["arg"], "FROM:<a@b.com> SIZE=100")
+
+    let c3 = smtp_cmd_parse("quit" + crlf)
+    assert_s("cmd-quit-verb-upper", c3["verb"], "QUIT")
+    assert_s("cmd-quit-arg-empty", c3["arg"], "")
+
+    let c4 = smtp_cmd_parse("")
+    assert_s("cmd-empty-verb", c4["verb"], "")
+
+    assert_s("cmd-build-with-arg", smtp_cmd_build("EHLO", "example.com"), "EHLO example.com" + crlf)
+    assert_s("cmd-build-no-arg", smtp_cmd_build("QUIT", ""), "QUIT" + crlf)
+    print("PASS smtp_command")
+
+    // ── smtp_response ────────────────────────────────────────────────────────
+    let r1 = smtp_resp_parse("250-example.com" + crlf)
+    assert_i("resp-continued-code", r1["code"], 250)
+    assert_s("resp-continued-text", r1["text"], "example.com")
+    assert_i("resp-continued-flag", r1["continued"], 1)
+
+    let r2 = smtp_resp_parse("250 OK" + crlf)
+    assert_i("resp-final-code", r2["code"], 250)
+    assert_s("resp-final-text", r2["text"], "OK")
+    assert_i("resp-final-flag", r2["continued"], 0)
+
+    let r3 = smtp_resp_parse("250" + crlf)
+    assert_i("resp-bare-code", r3["code"], 250)
+    assert_s("resp-bare-text", r3["text"], "")
+    assert_i("resp-bare-flag", r3["continued"], 0)
+
+    let r4 = smtp_resp_parse("garbage" + crlf)
+    assert_i("resp-malformed-code", r4["code"], 0)
+
+    assert_i("resp-is-ok-250", smtp_resp_is_ok(r2), 1)
+    let r5 = smtp_resp_parse("550 no such user" + crlf)
+    assert_i("resp-is-ok-550", smtp_resp_is_ok(r5), 0)
+    print("PASS smtp_response")
+
+    // ── smtp_ehlo ────────────────────────────────────────────────────────────
+    let ehlo_lines = []
+    push(ehlo_lines, "SIZE 10485760")
+    push(ehlo_lines, "STARTTLS")
+    push(ehlo_lines, "AUTH PLAIN LOGIN")
+    let exts = smtp_ehlo_parse(ehlo_lines)
+    assert_s("ehlo-size", exts["SIZE"], "10485760")
+    assert_s("ehlo-starttls", exts["STARTTLS"], "")
+    assert_s("ehlo-auth", exts["AUTH"], "PLAIN LOGIN")
+    print("PASS smtp_ehlo")
+
+    // ── smtp_mailfrom ────────────────────────────────────────────────────────
+    let m1 = smtp_mail_parse("FROM:<a@b.com> SIZE=1000 BODY=8BITMIME")
+    assert_s("mail-addr", m1["address"], "a@b.com")
+    let m1p = m1["params"]
+    assert_s("mail-param-size", m1p["SIZE"], "1000")
+    assert_s("mail-param-body", m1p["BODY"], "8BITMIME")
+
+    let m2 = smtp_rcpt_parse("TO:<c@d.com>")
+    assert_s("rcpt-addr", m2["address"], "c@d.com")
+    assert_i("rcpt-params-empty", len(m2["params"]), 0)
+
+    let m3 = smtp_mail_parse("FROM:<>")
+    assert_s("mail-null-sender", m3["address"], "")
+
+    let m4 = smtp_mail_parse("a@b.com SIZE=100")
+    assert_s("mail-bare-addr", m4["address"], "a@b.com")
+    assert_s("mail-bare-param", m4["params"]["SIZE"], "100")
+    print("PASS smtp_mailfrom")
+
+    // ── smtp_data ────────────────────────────────────────────────────────────
+    let body = "." + "Hello" + crlf + "World" + crlf + "." + "End"
+    let stuffed = smtp_dot_stuff(body)
+    assert_s("dot-stuff", stuffed, ".." + "Hello" + crlf + "World" + crlf + ".." + "End")
+    let unstuffed = smtp_dot_unstuff(stuffed)
+    assert_s("dot-unstuff-roundtrip", unstuffed, body)
+
+    assert_i("data-end-yes", smtp_data_end("Hello" + crlf + "." + crlf), 1)
+    assert_i("data-end-empty-body", smtp_data_end("." + crlf), 1)
+    assert_i("data-end-no", smtp_data_end("Hello" + crlf), 0)
+    print("PASS smtp_data")
+
+    // ── smtp_auth ────────────────────────────────────────────────────────────
+    assert_s("auth-plain-encode", smtp_auth_plain("user", "pass"), "AHVzZXIAcGFzcw==")
+
+    let a1 = smtp_auth_parse("PLAIN AHVzZXIAcGFzcw==")
+    assert_s("auth-parse-mech", a1["mechanism"], "PLAIN")
+    assert_s("auth-parse-initial", a1["initial_response"], "AHVzZXIAcGFzcw==")
+
+    let a2 = smtp_auth_parse("AUTH LOGIN" + crlf)
+    assert_s("auth-parse-tagged-mech", a2["mechanism"], "LOGIN")
+    assert_s("auth-parse-tagged-initial-empty", a2["initial_response"], "")
+
+    let a3 = smtp_auth_parse("PLAIN =")
+    assert_s("auth-parse-equals-marker", a3["initial_response"], "")
+    print("PASS smtp_auth")
+
+    // ── smtp_status ──────────────────────────────────────────────────────────
+    assert_s("class-positive", smtp_class(250), "positive")
+    assert_s("class-intermediate", smtp_class(354), "intermediate")
+    assert_s("class-transient", smtp_class(421), "negative_transient")
+    assert_s("class-permanent", smtp_class(550), "negative_permanent")
+    assert_s("class-info", smtp_class(120), "info")
+    assert_s("class-unknown", smtp_class(999), "unknown")
+
+    assert_s("status-text-250", smtp_status_text(250), "Requested mail action okay, completed")
+    assert_s("status-text-354", smtp_status_text(354), "Start mail input; end with <CRLF>.<CRLF>")
+    assert_s("status-text-unknown", smtp_status_text(999), "")
+    print("PASS smtp_status")
+
+    // ── imap_line ────────────────────────────────────────────────────────────
+    assert_s("imap-build-with-args", imap_cmd_build("A001", "LOGIN", "user pass"), "A001 LOGIN user pass" + crlf)
+    assert_s("imap-build-no-args", imap_cmd_build("A002", "NOOP", ""), "A002 NOOP" + crlf)
+
+    let ir1 = imap_resp_parse("A001 OK LOGIN completed" + crlf)
+    assert_s("imap-tagged-tag", ir1["tag"], "A001")
+    assert_s("imap-tagged-type", ir1["type"], "OK")
+    assert_s("imap-tagged-text", ir1["text"], "LOGIN completed")
+
+    let ir2 = imap_resp_parse("* OK IMAP4rev1 Service Ready" + crlf)
+    assert_s("imap-untagged-tag", ir2["tag"], "*")
+    assert_s("imap-untagged-type", ir2["type"], "OK")
+    assert_s("imap-untagged-text", ir2["text"], "IMAP4rev1 Service Ready")
+
+    let ir3 = imap_resp_parse("* 18 EXISTS" + crlf)
+    assert_s("imap-data-tag", ir3["tag"], "*")
+    assert_s("imap-data-type", ir3["type"], "DATA")
+    assert_s("imap-data-text", ir3["text"], "18 EXISTS")
+    print("PASS imap_line")
+
+    // ── imap_tag ─────────────────────────────────────────────────────────────
+    let s0 = imap_tag_new()
+    let step1 = imap_tag_next(s0)
+    let tag1 = step1[0]
+    let s1 = step1[1]
+    assert_s("imap-tag-first", tag1, "A001")
+
+    let step2 = imap_tag_next(s1)
+    let tag2 = step2[0]
+    assert_s("imap-tag-second", tag2, "A002")
+
+    assert_i("imap-tag-valid", imap_tag_is_valid("A001"), 1)
+    assert_i("imap-tag-invalid-star", imap_tag_is_valid("*"), 0)
+    assert_i("imap-tag-invalid-empty", imap_tag_is_valid(""), 0)
+    assert_i("imap-tag-invalid-space", imap_tag_is_valid("A 1"), 0)
+    print("PASS imap_tag")
+
+    // ── smtp_envelope ────────────────────────────────────────────────────────
+    let recipients = []
+    push(recipients, "c@d.com")
+    push(recipients, "e@f.com")
+    let msg_body = "Subject: hi" + crlf + crlf + "." + "World" + crlf
+    let env = smtp_env_new("a@b.com", recipients, msg_body)
+    let cmds = smtp_env_commands(env)
+    assert_i("env-cmd-count", len(cmds), 6)
+    assert_s("env-mail-from", cmds[0], "MAIL FROM:<a@b.com>" + crlf)
+    assert_s("env-rcpt-1", cmds[1], "RCPT TO:<c@d.com>" + crlf)
+    assert_s("env-rcpt-2", cmds[2], "RCPT TO:<e@f.com>" + crlf)
+    assert_s("env-data-cmd", cmds[3], "DATA" + crlf)
+    assert_s("env-body-stuffed", cmds[4], smtp_dot_stuff(msg_body))
+    assert_s("env-terminator", cmds[5], "." + crlf)
+    print("PASS smtp_envelope")
+
+    // ── adversarial / edge cases ────────────────────────────────────────────
+    let e1 = smtp_cmd_parse("  RCPT   TO:<a@b>  ")
+    assert_s("adv-cmd-multi-space-verb", e1["verb"], "RCPT")
+    assert_s("adv-cmd-multi-space-arg", e1["arg"], "TO:<a@b>")
+
+    let e2 = smtp_resp_parse("ab")
+    assert_i("adv-resp-too-short", e2["code"], 0)
+
+    let ehlo_blank = []
+    push(ehlo_blank, "")
+    push(ehlo_blank, "SIZE 100")
+    push(ehlo_blank, "  ")
+    let exts2 = smtp_ehlo_parse(ehlo_blank)
+    assert_i("adv-ehlo-blank-skipped-count", len(exts2), 1)
+    assert_s("adv-ehlo-blank-skipped-value", exts2["SIZE"], "100")
+
+    let m5 = smtp_mail_parse("FROM:<unterminated")
+    assert_s("adv-mail-unterminated-addr", m5["address"], "")
+    assert_i("adv-mail-unterminated-params", len(m5["params"]), 0)
+
+    let a4 = smtp_auth_parse("")
+    assert_s("adv-auth-empty-mech", a4["mechanism"], "")
+    assert_s("adv-auth-empty-initial", a4["initial_response"], "")
+
+    let ir4 = imap_resp_parse("+ send literal" + crlf)
+    assert_s("adv-imap-cont-tag", ir4["tag"], "+")
+    assert_s("adv-imap-cont-type", ir4["type"], "DATA")
+    assert_s("adv-imap-cont-text", ir4["text"], "send literal")
+
+    let no_recip = []
+    let env2 = smtp_env_new("a@b.com", no_recip, "x" + crlf)
+    let cmds2 = smtp_env_commands(env2)
+    assert_i("adv-env-no-recipients-count", len(cmds2), 4)
+    assert_s("adv-env-no-recipients-data", cmds2[1], "DATA" + crlf)
+    print("PASS adversarial")
+
+    print("SMTP-FRAMING KAT PASS")

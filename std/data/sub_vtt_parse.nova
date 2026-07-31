@@ -26,15 +26,39 @@
 //   - Uses 'and'/'or'/'not' (not &&/||/!).
 // ============================================================================
 
-// ── Private: CRLF normalisation ──────────────────────────────────────────────
+// ── Private: BOM + CRLF normalisation ────────────────────────────────────────
+// Byte-indexed (str_to_bytes/bytes_get, O(1) random access) and accumulates
+// via buffer()/buf_append_char (O(1)-amortized append), so both helpers are
+// O(n) over the whole document. A per-character loop using text[i] + string
+// concatenation (`clean = clean + ch`) would be O(n^2): the `[]` string
+// index re-scans via strlen() on every call, and string concatenation
+// re-copies the accumulated prefix on every call — an ordinary multi-hundred-
+// KB WebVTT file (a feature-length movie easily has 1-2k cues) would already
+// be unacceptably slow under that pattern.
 
-fn _vtt_strip_cr(line) -> string
-    let n = len(line)
-    let result = line
-    if n > 0
-        if ord(line[n - 1]) == 13
-            result = slice(line, 0, n - 1)
+// Strip a leading UTF-8 BOM (bytes 0xEF,0xBB,0xBF), if present. Common in
+// VTT files saved by Windows editors; left unstripped it breaks the
+// "WEBVTT" header match (vtt_has_header / the header-skip state machine).
+fn _vtt_strip_bom(text) -> string
+    let result = text
+    if len(text) >= 3
+        if ord(slice(text, 0, 1)) == 239 and ord(slice(text, 1, 2)) == 187 and ord(slice(text, 2, 3)) == 191
+            result = slice(text, 3, len(text))
     result
+
+// Remove all CR (13) bytes from text, normalising CRLF and lone-CR line
+// endings to LF-only. O(n): single byte-indexed scan, buffer()-accumulated.
+fn _vtt_normalize_crlf(text) -> string
+    let bts = str_to_bytes(text)
+    let n = bytes_len(bts)
+    let out = buffer()
+    let i = 0
+    while i < n
+        let b = bytes_get(bts, i)
+        if b != 13
+            buf_append_char(out, b)
+        i = i + 1
+    buf_to_str(out)
 
 // ── Private: timecode "HH:MM:SS.mmm" -> milliseconds ────────────────────────
 // Splits on ':' and '.' to extract h, m, s, ms.
@@ -130,9 +154,10 @@ fn _vtt_parse_timing(line) -> list
 // ── Public: vtt_has_header ────────────────────────────────────────────────────
 
 fn vtt_has_header(text) -> int
+    let clean = _vtt_strip_bom(text)
     let result = 0
-    if len(text) >= 6
-        if slice(text, 0, 6) == "WEBVTT"
+    if len(clean) >= 6
+        if slice(clean, 0, 6) == "WEBVTT"
             result = 1
     result
 
@@ -141,30 +166,15 @@ fn vtt_has_header(text) -> int
 fn vtt_parse(text) -> list
     let cues = []
     let nl = chr(10)
-    // Normalise CRLF: remove all chr(13)
-    let clean = ""
-    let tlen = len(text)
-    let ci = 0
-    while ci < tlen
-        let ch = text[ci]
-        if ord(ch) != 13
-            clean = clean + ch
-        ci = ci + 1
+    // Strip BOM, then normalise CRLF: remove all chr(13). O(n) — see the
+    // normalisation note above _vtt_strip_bom.
+    let clean = _vtt_normalize_crlf(_vtt_strip_bom(text))
     // Split into lines
     let lines = split(clean, nl)
     let nlines = len(lines)
-    let idx = 0
-    // Skip header line(s) until first blank line
-    while idx < nlines
-        let l = lines[idx]
-        if len(l) == 0
-            idx = idx + 1
-            // break
-            idx = nlines + 1
-        idx = idx + 1
-    // idx now points to first line after the blank that follows the header
-    // Correct: after the while we've incremented once extra; walk cue blocks
-    // Reset to use a proper state machine
+    // A state machine (below) walks the lines: it finds the blank line that
+    // ends the "WEBVTT" header block, then alternates between a timing line
+    // and the cue's text lines.
     let cue_idx = 0
     let state = 0
     // state 0: looking for timing line (or "NOTE" to skip)

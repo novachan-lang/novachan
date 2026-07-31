@@ -1,0 +1,252 @@
+// KAT for the internet-protocol header parse/build modules (std/net):
+//   inet_checksum, ipv4_header, ipv6_header, tcp_header, udp_header,
+//   icmp_echo, arp_packet, eth_frame2, vlan_tag, pseudo_header,
+//   ip_options, tcp_options.
+//
+// All packet data is a plain `list` of int byte values (0..255). Known
+// vectors are hand-assembled from RFC 791/793/768/792/826/8200/8200 §8.1 /
+// IEEE 802.1Q field layouts, or built with each module's own *_build and
+// round-tripped through its *_parse.
+
+import std/net/inet_checksum
+import std/net/ipv4_header
+import std/net/ipv6_header
+import std/net/tcp_header
+import std/net/udp_header
+import std/net/icmp_echo
+import std/net/arp_packet
+import std/net/eth_frame2
+import std/net/vlan_tag
+import std/net/pseudo_header
+import std/net/ip_options
+import std/net/tcp_options
+
+fn check(name: string, cond: bool) -> int
+    if cond
+        print("PASS " + name)
+        return 0
+    print("FAIL " + name)
+    return 1
+
+fn main()
+    let fails = 0
+
+    // ── inet_checksum ───────────────────────────────────────────────────────
+    // Canonical RFC 1071 example: a 20-byte IPv4 header with checksum field
+    // zeroed sums to 0xB861 (same vector used by std/net/ipv4hdr's KAT).
+    let ipv4_zero_cksum = [0x45,0x00,0x00,0x73,0x00,0x00,0x40,0x00,0x40,0x11,
+        0x00,0x00,0xC0,0xA8,0x00,0x01,0xC0,0xA8,0x00,0xC7]
+    fails = fails + check("cksum_known_vector", inet_cksum(ipv4_zero_cksum) == 0xB861)
+    fails = fails + check("cksum_empty", inet_cksum([]) == 0xFFFF)
+    // Embedding the correct checksum and re-summing must fold to 0xFFFF.
+    let ipv4_with_cksum = [0x45,0x00,0x00,0x73,0x00,0x00,0x40,0x00,0x40,0x11,
+        0xB8,0x61,0xC0,0xA8,0x00,0x01,0xC0,0xA8,0x00,0xC7]
+    fails = fails + check("cksum_verify_true", inet_cksum_verify(ipv4_with_cksum))
+    fails = fails + check("cksum_verify_false", not inet_cksum_verify(ipv4_zero_cksum))
+
+    // ── ipv4_header ──────────────────────────────────────────────────────────
+    let iph = ipv4_parse(ipv4_with_cksum)
+    fails = fails + check("ipv4_version", iph["version"] == 4)
+    fails = fails + check("ipv4_ihl", iph["ihl"] == 5)
+    fails = fails + check("ipv4_total_length", iph["total_length"] == 0x73)
+    fails = fails + check("ipv4_ttl", iph["ttl"] == 64)
+    fails = fails + check("ipv4_protocol", iph["protocol"] == 17)
+    fails = fails + check("ipv4_checksum", iph["checksum"] == 0xB861)
+    fails = fails + check("ipv4_src_ip", iph["src_ip"] == 0xC0A80001)
+    fails = fails + check("ipv4_dst_ip", iph["dst_ip"] == 0xC0A800C7)
+    fails = fails + check("ipv4_flags", iph["flags"] == 2)
+    let rebuilt4 = ipv4_build({"tos": 0, "total_length": 0x73, "identification": 0, "flags": 2, "fragment_offset": 0, "ttl": 64, "protocol": 17, "src_ip": 0xC0A80001, "dst_ip": 0xC0A800C7})
+    fails = fails + check("ipv4_rebuild_len", len(rebuilt4) == 20)
+    fails = fails + check("ipv4_rebuild_bytes", rebuilt4 == ipv4_with_cksum)
+    fails = fails + check("ipv4_short_input", len(ipv4_parse([0x45,0x00])) == 0)
+    fails = fails + check("ipv4_bad_version", len(ipv4_parse([0x55,0x00,0x00,0x73,0x00,0x00,0x40,0x00,0x40,0x11,0xB8,0x61,0xC0,0xA8,0x00,0x01,0xC0,0xA8,0x00,0xC7])) == 0)
+
+    // ── ipv6_header ──────────────────────────────────────────────────────────
+    let src6 = [0x2001,0x0db8,0,0,0,0,0,1]
+    let dst6 = [0x2001,0x0db8,0,0,0,0,0,2]
+    let ipv6_bytes = ipv6_build({"traffic_class": 0, "flow_label": 0, "payload_length": 20, "next_header": 6, "hop_limit": 64, "src_ip": src6, "dst_ip": dst6})
+    fails = fails + check("ipv6_build_len", len(ipv6_bytes) == 40)
+    fails = fails + check("ipv6_build_byte0", ipv6_bytes[0] == 0x60)
+    let iph6 = ipv6_parse(ipv6_bytes)
+    fails = fails + check("ipv6_version", iph6["version"] == 6)
+    fails = fails + check("ipv6_payload_length", iph6["payload_length"] == 20)
+    fails = fails + check("ipv6_next_header", iph6["next_header"] == 6)
+    fails = fails + check("ipv6_hop_limit", iph6["hop_limit"] == 64)
+    fails = fails + check("ipv6_src", iph6["src_ip"] == src6)
+    fails = fails + check("ipv6_dst", iph6["dst_ip"] == dst6)
+    fails = fails + check("ipv6_short_input", len(ipv6_parse([1,2,3])) == 0)
+
+    // ── tcp_header — SYN packet ─────────────────────────────────────────────
+    let tcp_syn = tcp_build({"src_port": 0x1F90, "dst_port": 0x0050, "seq_num": 0x12345678, "ack_num": 0, "data_offset": 5, "flags": {"syn": 1}, "window": 0x7210, "checksum": 0x1234, "urgent_ptr": 0})
+    fails = fails + check("tcp_syn_len", len(tcp_syn) == 20)
+    let tp = tcp_parse(tcp_syn)
+    fails = fails + check("tcp_syn_src_port", tp["src_port"] == 0x1F90)
+    fails = fails + check("tcp_syn_dst_port", tp["dst_port"] == 0x0050)
+    fails = fails + check("tcp_syn_seq", tp["seq_num"] == 0x12345678)
+    fails = fails + check("tcp_syn_data_offset", tp["data_offset"] == 5)
+    let synflags = tp["flags"]
+    fails = fails + check("tcp_flags_syn_set", synflags["syn"] == 1)
+    fails = fails + check("tcp_flags_ack_clear", synflags["ack"] == 0)
+    fails = fails + check("tcp_flags_fin_clear", synflags["fin"] == 0)
+    // SYN-ACK: both bits set.
+    let tcp_synack = tcp_build({"src_port": 80, "dst_port": 8080, "flags": {"syn": 1, "ack": 1}})
+    let tpsa = tcp_parse(tcp_synack)
+    let saflags = tpsa["flags"]
+    fails = fails + check("tcp_synack_syn", saflags["syn"] == 1)
+    fails = fails + check("tcp_synack_ack", saflags["ack"] == 1)
+    fails = fails + check("tcp_synack_rst_clear", saflags["rst"] == 0)
+    fails = fails + check("tcp_min_data_offset", tcp_parse(tcp_build({"data_offset": 0}))["data_offset"] == 5)
+    fails = fails + check("tcp_short_input", len(tcp_parse([1,2,3])) == 0)
+
+    // ── udp_header ───────────────────────────────────────────────────────────
+    let udp_wire = udp_build({"src_port": 0xC000, "dst_port": 53, "length": 0x26, "checksum": 0})
+    fails = fails + check("udp_len", len(udp_wire) == 8)
+    fails = fails + check("udp_bytes_exact", udp_wire == [0xC0,0x00,0x00,0x35,0x00,0x26,0x00,0x00])
+    let up = udp_parse(udp_wire)
+    fails = fails + check("udp_src_port", up["src_port"] == 0xC000)
+    fails = fails + check("udp_dst_port", up["dst_port"] == 53)
+    fails = fails + check("udp_length", up["length"] == 0x26)
+    fails = fails + check("udp_short_input", len(udp_parse([1,2,3,4,5])) == 0)
+
+    // ── icmp_echo ────────────────────────────────────────────────────────────
+    let icmp_req = icmp_build({"type": 8, "code": 0, "identifier": 0x1234, "sequence": 1, "data": [104, 101, 108, 108, 111]})
+    fails = fails + check("icmp_req_len", len(icmp_req) == 13)
+    let ip1 = icmp_parse(icmp_req)
+    fails = fails + check("icmp_type_request", ip1["type"] == 8)
+    fails = fails + check("icmp_identifier", ip1["identifier"] == 0x1234)
+    fails = fails + check("icmp_sequence", ip1["sequence"] == 1)
+    fails = fails + check("icmp_data", ip1["data"] == [104, 101, 108, 108, 111])
+    // Checksum over the built message (with the checksum field embedded)
+    // must fold to 0xFFFF, per RFC 1071.
+    fails = fails + check("icmp_checksum_valid", inet_cksum_verify(icmp_req))
+    let icmp_reply = icmp_build({"type": 0, "identifier": 0x1234, "sequence": 1})
+    fails = fails + check("icmp_type_reply", icmp_parse(icmp_reply)["type"] == 0)
+    fails = fails + check("icmp_short_input", len(icmp_parse([1,2,3])) == 0)
+
+    // ── arp_packet — who-has request ────────────────────────────────────────
+    let sender_mac = [0xDE,0xAD,0xBE,0xEF,0x00,0x01]
+    let arp_req = arp_build({"opcode": 1, "sender_hw": sender_mac, "sender_ip": [192,168,0,1], "target_hw": [0,0,0,0,0,0], "target_ip": [192,168,0,199]})
+    fails = fails + check("arp_len", len(arp_req) == 28)
+    fails = fails + check("arp_bytes_exact", arp_req == [0x00,0x01,0x08,0x00,0x06,0x04,0x00,0x01,0xDE,0xAD,0xBE,0xEF,0x00,0x01,0xC0,0xA8,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0xC0,0xA8,0x00,0xC7])
+    let ap = arp_parse(arp_req)
+    fails = fails + check("arp_hw_type", ap["hw_type"] == 1)
+    fails = fails + check("arp_proto_type", ap["proto_type"] == 0x0800)
+    fails = fails + check("arp_opcode_request", ap["opcode"] == 1)
+    fails = fails + check("arp_sender_hw", ap["sender_hw"] == sender_mac)
+    fails = fails + check("arp_sender_ip", ap["sender_ip"] == [192,168,0,1])
+    fails = fails + check("arp_target_ip", ap["target_ip"] == [192,168,0,199])
+    fails = fails + check("arp_short_input", len(arp_parse([1,2,3])) == 0)
+
+    // ── vlan_tag ─────────────────────────────────────────────────────────────
+    let vtag = vlan_build({"pcp": 3, "dei": 1, "vlan_id": 100})
+    fails = fails + check("vlan_len", len(vtag) == 4)
+    fails = fails + check("vlan_bytes_exact", vtag == [0x81,0x00,0x70,0x64])
+    let vp = vlan_parse(vtag)
+    fails = fails + check("vlan_tpid", vp["tpid"] == 0x8100)
+    fails = fails + check("vlan_pcp", vp["pcp"] == 3)
+    fails = fails + check("vlan_dei", vp["dei"] == 1)
+    fails = fails + check("vlan_id", vp["vlan_id"] == 100)
+    fails = fails + check("vlan_short_input", len(vlan_parse([1,2])) == 0)
+
+    // ── eth_frame2 ───────────────────────────────────────────────────────────
+    let dst_mac = [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF]
+    let src_mac = [0x00,0x11,0x22,0x33,0x44,0x55]
+    let eth_plain = eth_build({"dst_mac": dst_mac, "src_mac": src_mac, "ethertype": 0x0800, "payload": [1,2,3]})
+    fails = fails + check("eth_plain_len", len(eth_plain) == 17)
+    let ep = eth_parse(eth_plain)
+    fails = fails + check("eth_plain_dst", ep["dst_mac"] == dst_mac)
+    fails = fails + check("eth_plain_src", ep["src_mac"] == src_mac)
+    fails = fails + check("eth_plain_ethertype", ep["ethertype"] == 0x0800)
+    fails = fails + check("eth_plain_payload", ep["payload"] == [1,2,3])
+    fails = fails + check("eth_plain_no_vlan", ep["is_vlan"] == 0)
+    fails = fails + check("eth_plain_vlan_id", ep["vlan_id"] == -1)
+    // VLAN-tagged: 802.1Q detection.
+    let eth_vlan = eth_build({"dst_mac": dst_mac, "src_mac": src_mac, "ethertype": 0x0800, "vlan_id": 42, "payload": [9,9]})
+    fails = fails + check("eth_vlan_len", len(eth_vlan) == 20)
+    let ev = eth_parse(eth_vlan)
+    fails = fails + check("eth_vlan_detected", ev["is_vlan"] == 1)
+    fails = fails + check("eth_vlan_id", ev["vlan_id"] == 42)
+    fails = fails + check("eth_vlan_real_ethertype", ev["ethertype"] == 0x0800)
+    fails = fails + check("eth_vlan_payload", ev["payload"] == [9,9])
+    fails = fails + check("eth_short_input", len(eth_parse([1,2,3])) == 0)
+
+    // ── pseudo_header ────────────────────────────────────────────────────────
+    // RFC 793 example: src=192.168.0.1 dst=192.168.0.199 proto=TCP(6) len=20.
+    let ph4 = pseudo_v4(0xC0A80001, 0xC0A800C7, 6, 20)
+    fails = fails + check("pseudo_v4_len", len(ph4) == 12)
+    fails = fails + check("pseudo_v4_bytes", ph4 == [0xC0,0xA8,0x00,0x01,0xC0,0xA8,0x00,0xC7,0x00,0x06,0x00,0x14])
+    let ph6 = pseudo_v6(src6, dst6, 6, 20)
+    fails = fails + check("pseudo_v6_len", len(ph6) == 40)
+    fails = fails + check("pseudo_v6_next_header", ph6[39] == 6)
+    fails = fails + check("pseudo_v6_length_field", ph6[35] == 20)
+    // Combine pseudo-header + TCP segment (checksum field zeroed) and verify
+    // the whole thing checksums correctly once the real checksum is embedded.
+    let seg_nocksum = tcp_build({"src_port": 1234, "dst_port": 80, "seq_num": 1, "flags": {"syn": 1}})
+    let combined = ph4
+    let ci = 0
+    while ci < len(seg_nocksum)
+        push(combined, seg_nocksum[ci])
+        ci = ci + 1
+    let tcp_cksum = inet_cksum(combined)
+    let seg_final = tcp_build({"src_port": 1234, "dst_port": 80, "seq_num": 1, "flags": {"syn": 1}, "checksum": tcp_cksum})
+    let combined2 = pseudo_v4(0xC0A80001, 0xC0A800C7, 6, 20)
+    let cj = 0
+    while cj < len(seg_final)
+        push(combined2, seg_final[cj])
+        cj = cj + 1
+    fails = fails + check("pseudo_tcp_checksum_valid", inet_cksum_verify(combined2))
+
+    // ── ip_options ───────────────────────────────────────────────────────────
+    // IHL=8 -> 32-byte header: 20 fixed + 12 bytes options (NOP, NOP,
+    // then a 4-byte Record Route stub [type=7,len=4,ptr=4,addr byte], then EOL pad).
+    let ip_hdr_opts = [0x48,0x00,0x00,0x20,0x00,0x00,0x40,0x00,0x40,0x11,
+        0x00,0x00,0xC0,0xA8,0x00,0x01,0xC0,0xA8,0x00,0xC7,
+        0x01,0x01,0x07,0x04,0x04,0x09,0x00,0x00,0x00,0x00,0x00,0x00]
+    let opts4 = ip_opts_parse(ip_hdr_opts, 8)
+    fails = fails + check("ipopts_count", len(opts4) == 4)
+    fails = fails + check("ipopts_nop1", opts4[0]["type"] == 1)
+    fails = fails + check("ipopts_nop2", opts4[1]["type"] == 1)
+    fails = fails + check("ipopts_rr_type", opts4[2]["type"] == 7)
+    fails = fails + check("ipopts_rr_len", opts4[2]["length"] == 4)
+    fails = fails + check("ipopts_rr_data", opts4[2]["data"] == [4, 9])
+    fails = fails + check("ipopts_eol_stops", opts4[3]["type"] == 0)
+    fails = fails + check("ipopts_ihl_too_small", len(ip_opts_parse(ip_hdr_opts, 5)) == 0)
+    fails = fails + check("ipopts_no_options", len(ip_opts_parse(ipv4_with_cksum, 5)) == 0)
+
+    // ── tcp_options ──────────────────────────────────────────────────────────
+    // data_offset=10 -> 40-byte header: 20 fixed + 20 bytes options
+    // (MSS=1460, WSCALE=7, SACK_PERMITTED, NOP, then a zero byte that is
+    // itself a valid EOL option — parsing correctly stops there).
+    let tcp_hdr_opts = [0x1F,0x90,0x00,0x50,0x12,0x34,0x56,0x78,0x00,0x00,
+        0x00,0x00,0xA0,0x02,0x72,0x10,0x12,0x34,0x00,0x00,
+        0x02,0x04,0x05,0xB4,0x03,0x03,0x07,0x04,0x02,0x01,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00]
+    let topts = tcp_opts_parse(tcp_hdr_opts, 10)
+    fails = fails + check("tcpopts_count", len(topts) == 5)
+    fails = fails + check("tcpopts_mss_type", topts[0]["type"] == 2)
+    fails = fails + check("tcpopts_mss_value", topts[0]["value"] == 1460)
+    fails = fails + check("tcpopts_wscale_value", topts[1]["value"] == 7)
+    fails = fails + check("tcpopts_sackperm_type", topts[2]["type"] == 4)
+    fails = fails + check("tcpopts_nop", topts[3]["type"] == 1)
+    fails = fails + check("tcpopts_eol_stops", topts[4]["type"] == 0)
+    // SACK option with one block, followed by 2 bytes of NOP padding
+    // (10-byte SACK + 20 fixed = 30, rounded up to the next 32-bit word
+    // boundary = 32 bytes -> data_offset=8).
+    let tcp_sack = [0x1F,0x90,0x00,0x50,0x00,0x00,0x00,0x01,0x00,0x00,
+        0x00,0x00,0x80,0x10,0x72,0x10,0x00,0x00,0x00,0x00,
+        0x05,0x0A,0x00,0x00,0x00,0x64,0x00,0x00,0x00,0xC8,
+        0x01,0x01]
+    let sackopts = tcp_opts_parse(tcp_sack, 8)
+    fails = fails + check("tcpopts_sack_count", len(sackopts) == 3)
+    fails = fails + check("tcpopts_sack_kind", sackopts[0]["type"] == 5)
+    let sblk = sackopts[0]["blocks"]
+    fails = fails + check("tcpopts_sack_block_left", sblk[0][0] == 100)
+    fails = fails + check("tcpopts_sack_block_right", sblk[0][1] == 200)
+    fails = fails + check("tcpopts_sack_pad_nop1", sackopts[1]["type"] == 1)
+    fails = fails + check("tcpopts_sack_pad_nop2", sackopts[2]["type"] == 1)
+    fails = fails + check("tcpopts_no_options_below_min", len(tcp_opts_parse(tcp_hdr_opts, 5)) == 0)
+
+    print("---")
+    print("total fails: " + str(fails))
+    assert(fails == 0, "some INETPROTO checks failed")
+    print("INETPROTO KAT PASS")

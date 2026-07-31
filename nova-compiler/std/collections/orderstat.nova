@@ -1,0 +1,219 @@
+// orderstat — Order-Statistics Tree: an AVL BST augmented with per-node
+// duplicate counts and subtree element totals, supporting O(log n) k-th
+// smallest, rank, insert and DELETE over a multiset of int values.
+//
+// NOTE ON NAMING: std/collections/ostree.nova already implements a smaller
+// order-statistics tree (ost_new/ost_insert/ost_select/ost_rank/ost_size)
+// but treats keys as a plain SET (no duplicates) and has no delete. This
+// module is a genuinely different structure (multiset semantics, adds
+// delete, renames select->kth) but was specified with the SAME `ost_`
+// public-function-name prefix. A program that imports BOTH
+// std/collections/ostree and std/collections/orderstat in the same
+// compilation unit will hit "duplicate function definition" at compile
+// time (NOVA's module functions share one global namespace on import).
+// Every function name below matches the exact API this module was
+// commissioned to provide; the collision is called out here rather than
+// silently renamed, since resolving it (rename one file's public API, or
+// keep them mutually exclusive by convention) is a call for whoever owns
+// both modules, not something to paper over quietly.
+//
+// Each node is a dict:
+//   {"k": int, "cnt": int, "h": int, "sz": int, "l": node|null, "r": node|null}
+//   k   = key value
+//   cnt = number of times this exact value has been inserted (>= 1)
+//   h   = height (leaf = 1, null = 0) — used for AVL balancing
+//   sz  = subtree total element count INCLUDING duplicates (sum of cnt over
+//         the subtree), used for kth/rank
+//   l/r = left/right child
+//
+// The tree dict itself: {"root": node|null}
+//
+// Public API:
+//   ost_new()            -> tree
+//   ost_insert(t, val)   -> dict (inserts, or bumps cnt if val already present; returns t)
+//   ost_kth(t, k)        -> int  (0-indexed k-th smallest value, counting duplicates)
+//   ost_rank(t, val)     -> int  (number of elements strictly less than val)
+//   ost_delete(t, val)   -> dict (removes one occurrence of val, if present; returns t)
+//   ost_size(t)          -> int  (total element count, including duplicates)
+
+// _ostat_ht: height of a node, 0 for null.
+fn _ostat_ht(nd)
+    if nd == null
+        return 0
+    return nd["h"]
+
+// _ostat_sz: subtree element total (including duplicates) of a node, 0 for null.
+fn _ostat_sz(nd)
+    if nd == null
+        return 0
+    return nd["sz"]
+
+// _ostat_fix: recompute h and sz from children + this node's own cnt. Must be
+// called after any structural change to nd's children (or nd's own cnt).
+fn _ostat_fix(nd)
+    let lh = _ostat_ht(nd["l"])
+    let rh = _ostat_ht(nd["r"])
+    let mx = lh
+    if rh > lh
+        mx = rh
+    nd["h"] = mx + 1
+    nd["sz"] = _ostat_sz(nd["l"]) + _ostat_sz(nd["r"]) + nd["cnt"]
+    return 0
+
+// _ostat_bf: balance factor = height(left) - height(right).
+fn _ostat_bf(nd)
+    return _ostat_ht(nd["l"]) - _ostat_ht(nd["r"])
+
+// _ostat_rot_right: right rotation around nd. Returns new subtree root.
+fn _ostat_rot_right(nd)
+    let lc = nd["l"]
+    let lr = lc["r"]
+    lc["r"] = nd
+    nd["l"] = lr
+    _ostat_fix(nd)
+    _ostat_fix(lc)
+    return lc
+
+// _ostat_rot_left: left rotation around nd. Returns new subtree root.
+fn _ostat_rot_left(nd)
+    let rc = nd["r"]
+    let rl = rc["l"]
+    rc["l"] = nd
+    nd["r"] = rl
+    _ostat_fix(nd)
+    _ostat_fix(rc)
+    return rc
+
+// _ostat_balance: fix nd's h/sz, apply AVL rotations if unbalanced. Returns
+// the (possibly new) subtree root.
+fn _ostat_balance(nd)
+    _ostat_fix(nd)
+    let bf = _ostat_bf(nd)
+    if bf > 1
+        let lc = nd["l"]
+        if _ostat_bf(lc) < 0
+            nd["l"] = _ostat_rot_left(lc)
+        return _ostat_rot_right(nd)
+    if bf < -1
+        let rc = nd["r"]
+        if _ostat_bf(rc) > 0
+            nd["r"] = _ostat_rot_right(rc)
+        return _ostat_rot_left(nd)
+    return nd
+
+// _ostat_new_node: a fresh leaf holding one occurrence of key.
+fn _ostat_new_node(key)
+    let node = {}
+    node["k"] = key
+    node["cnt"] = 1
+    node["h"] = 1
+    node["sz"] = 1
+    node["l"] = null
+    node["r"] = null
+    return node
+
+// _ostat_insert: recursive insert into subtree rooted at nd. A value already
+// present has its cnt bumped rather than creating a duplicate node. Returns
+// the (possibly new) subtree root.
+fn _ostat_insert(nd, key)
+    if nd == null
+        return _ostat_new_node(key)
+    let nk = nd["k"]
+    if key < nk
+        nd["l"] = _ostat_insert(nd["l"], key)
+    else
+        if key > nk
+            nd["r"] = _ostat_insert(nd["r"], key)
+        else
+            nd["cnt"] = nd["cnt"] + 1
+    return _ostat_balance(nd)
+
+// _ostat_kth: return the 0-indexed k-th smallest value in subtree nd,
+// counting each duplicate as its own position. Precondition: 0 <= k < _ostat_sz(nd).
+fn _ostat_kth(nd, k)
+    let ls = _ostat_sz(nd["l"])
+    if k < ls
+        return _ostat_kth(nd["l"], k)
+    if k < ls + nd["cnt"]
+        return nd["k"]
+    return _ostat_kth(nd["r"], k - ls - nd["cnt"])
+
+// _ostat_rank: number of elements (counting duplicates) strictly less than
+// val in subtree nd.
+fn _ostat_rank(nd, val)
+    if nd == null
+        return 0
+    let nk = nd["k"]
+    if val <= nk
+        return _ostat_rank(nd["l"], val)
+    return _ostat_sz(nd["l"]) + nd["cnt"] + _ostat_rank(nd["r"], val)
+
+// _ostat_min_node: leftmost node of subtree nd (nd must not be null).
+fn _ostat_min_node(nd)
+    let cur = nd
+    while cur["l"] != null
+        cur = cur["l"]
+    return cur
+
+// _ostat_delete_min: remove the leftmost node ENTIRELY (all of its cnt) from
+// subtree nd. Returns the new subtree root.
+fn _ostat_delete_min(nd)
+    if nd["l"] == null
+        return nd["r"]
+    nd["l"] = _ostat_delete_min(nd["l"])
+    return _ostat_balance(nd)
+
+// _ostat_delete: remove one occurrence of val from subtree nd (decrementing
+// cnt, or removing the node structurally when its last occurrence goes).
+// No-op (returns nd unchanged) if val is absent. Returns the new subtree root.
+fn _ostat_delete(nd, val)
+    if nd == null
+        return null
+    let nk = nd["k"]
+    if val < nk
+        nd["l"] = _ostat_delete(nd["l"], val)
+        return _ostat_balance(nd)
+    if val > nk
+        nd["r"] = _ostat_delete(nd["r"], val)
+        return _ostat_balance(nd)
+    if nd["cnt"] > 1
+        nd["cnt"] = nd["cnt"] - 1
+        return _ostat_balance(nd)
+    if nd["l"] == null
+        return nd["r"]
+    if nd["r"] == null
+        return nd["l"]
+    let succ = _ostat_min_node(nd["r"])
+    nd["k"] = succ["k"]
+    nd["cnt"] = succ["cnt"]
+    nd["r"] = _ostat_delete_min(nd["r"])
+    return _ostat_balance(nd)
+
+// ost_new: create a new empty order-statistics multiset.
+fn ost_new()
+    let t = {}
+    t["root"] = null
+    return t
+
+// ost_insert: insert val (bumping its count if already present). Returns t.
+fn ost_insert(t, val)
+    t["root"] = _ostat_insert(t["root"], val)
+    return t
+
+// ost_kth: return the 0-indexed k-th smallest value, counting duplicates.
+// Precondition: 0 <= k < ost_size(t).
+fn ost_kth(t, k)
+    return _ostat_kth(t["root"], k)
+
+// ost_rank: number of elements strictly less than val (counting duplicates).
+fn ost_rank(t, val)
+    return _ostat_rank(t["root"], val)
+
+// ost_delete: remove one occurrence of val, if present. Returns t.
+fn ost_delete(t, val)
+    t["root"] = _ostat_delete(t["root"], val)
+    return t
+
+// ost_size: total element count, including duplicates.
+fn ost_size(t)
+    return _ostat_sz(t["root"])

@@ -1,0 +1,182 @@
+// arc_cache — Adaptive Replacement Cache (Megiddo & Modha, "ARC: A Self-Tuning,
+// Low Overhead Replacement Cache", FAST 2003).
+//
+// ARC keeps two resident lists and two ghost (history-only) lists of int keys,
+// each in LRU..MRU order (index 0 = least recently used; the list's end = most
+// recently used):
+//   T1 — resident items seen exactly once since their last miss (recency)
+//   T2 — resident items seen more than once (frequency)
+//   B1 — ghost list: keys recently evicted from T1 (key only, no value)
+//   B2 — ghost list: keys recently evicted from T2 (key only, no value)
+// Invariants: |T1|+|T2| <= capacity; |T1|+|B1| <= capacity; |T2|+|B2| <= 2*capacity.
+//
+// `p` is the adaptive target size for T1. A B1 ghost hit means "we evicted
+// this too early while favouring frequency" so p grows (favour recency more).
+// A B2 ghost hit means the opposite, so p shrinks (favour frequency more).
+// This lets ARC track the workload's actual recency/frequency balance without
+// any manual tuning or a fixed LRU/LFU split.
+//
+// Representation (dict c):
+//   "cap"  -> int capacity (max resident items, |T1|+|T2|)
+//   "p"    -> int adaptive target size for T1 (0 <= p <= cap)
+//   "t1","t2","b1","b2" -> list of int keys, LRU-first
+//   "data" -> dict str(key) -> stored value, defined exactly for keys
+//             currently resident in T1 or T2
+//
+// Public API:
+//   arc_new(capacity)    -> dict
+//   arc_get(c, key)      -> any (cached value, or 0 on miss; promotes on hit)
+//   arc_put(c, key, val) -> dict (insert/update; runs the full ARC replacement policy)
+//   arc_contains(c, key) -> int  (1 if key is currently resident, 0 otherwise)
+//   arc_size(c)          -> int  (number of resident items, |T1|+|T2|)
+
+// arc_new: create a new empty ARC cache with the given resident capacity.
+fn arc_new(capacity)
+    let c = {}
+    c["cap"] = capacity
+    c["p"] = 0
+    c["t1"] = []
+    c["t2"] = []
+    c["b1"] = []
+    c["b2"] = []
+    c["data"] = {}
+    return c
+
+// _arc_evict_lru: pop the LRU (front) element off lst and return it.
+fn _arc_evict_lru(lst)
+    let v = lst[0]
+    remove(lst, v)
+    return v
+
+// _arc_touch: move key to the MRU end of lst (key must already be present).
+fn _arc_touch(lst, key)
+    remove(lst, key)
+    lst.push(key)
+
+// _arc_replace: the ARC REPLACE procedure — evict exactly one resident item
+// into its ghost list. `key_in_b2` is 1 when replacement was triggered by a
+// B2 ghost hit (case III of the algorithm), else 0.
+fn _arc_replace(c, key_in_b2)
+    let t1 = c["t1"]
+    let t2 = c["t2"]
+    let data = c["data"]
+    let take_from_t1 = 0
+    if len(t1) > 0
+        if len(t1) > c["p"]
+            take_from_t1 = 1
+        else
+            if key_in_b2 == 1
+                if len(t1) == c["p"]
+                    take_from_t1 = 1
+    if take_from_t1 == 1
+        let old = _arc_evict_lru(t1)
+        del(data, str(old))
+        c["b1"].push(old)
+    else
+        let old = _arc_evict_lru(t2)
+        del(data, str(old))
+        c["b2"].push(old)
+
+// arc_get: return the cached value for key, or 0 on a miss. A hit (whether
+// currently in T1 or T2) promotes the key to the MRU end of T2 — any repeat
+// access marks an item as "frequent", not just a second-time hit in T2.
+fn arc_get(c, key)
+    let k = str(key)
+    let data = c["data"]
+    if not contains(data, k)
+        return 0
+    let t1 = c["t1"]
+    if contains(t1, key)
+        remove(t1, key)
+        c["t2"].push(key)
+    else
+        _arc_touch(c["t2"], key)
+    return data[k]
+
+// arc_contains: 1 if key is currently resident (in T1 or T2), 0 otherwise.
+fn arc_contains(c, key)
+    return contains(c["data"], str(key))
+
+// arc_size: number of resident items (|T1| + |T2|).
+fn arc_size(c)
+    return len(c["t1"]) + len(c["t2"])
+
+// arc_put: insert or update key -> val, running the full ARC policy (the four
+// cases of Megiddo & Modha's algorithm: resident hit, B1 ghost hit, B2 ghost
+// hit, and a genuinely new key).
+fn arc_put(c, key, val)
+    let cap = c["cap"]
+    if cap <= 0
+        return c
+    let k = str(key)
+    let data = c["data"]
+
+    // Case I: already resident — just update the value and treat it as an access.
+    if contains(data, k)
+        data[k] = val
+        let t1 = c["t1"]
+        if contains(t1, key)
+            remove(t1, key)
+            c["t2"].push(key)
+        else
+            _arc_touch(c["t2"], key)
+        return c
+
+    let b1 = c["b1"]
+    let b2 = c["b2"]
+
+    // Case II: B1 ghost hit — grow p (favour recency), replace, then resurrect
+    // the key straight into T2 (a ghost hit already proves it's worth a repeat).
+    if contains(b1, key)
+        let delta = 1
+        if len(b2) > len(b1)
+            delta = len(b2) / len(b1)
+        let newp = c["p"] + delta
+        if newp > cap
+            newp = cap
+        c["p"] = newp
+        _arc_replace(c, 0)
+        remove(b1, key)
+        c["t2"].push(key)
+        data[k] = val
+        return c
+
+    // Case III: B2 ghost hit — shrink p (favour frequency), same resurrection.
+    if contains(b2, key)
+        let delta = 1
+        if len(b1) > len(b2)
+            delta = len(b1) / len(b2)
+        let newp = c["p"] - delta
+        if newp < 0
+            newp = 0
+        c["p"] = newp
+        _arc_replace(c, 1)
+        remove(b2, key)
+        c["t2"].push(key)
+        data[k] = val
+        return c
+
+    // Case IV: key seen for the first time ever (not in T1, T2, B1, or B2).
+    let t1 = c["t1"]
+    let t2 = c["t2"]
+    let l1 = len(t1) + len(b1)
+    let l2 = len(t2) + len(b2)
+    if l1 == cap
+        if len(t1) < cap
+            if len(b1) > 0
+                _arc_evict_lru(b1)
+            _arc_replace(c, 0)
+        else
+            // T1 exactly full and B1 empty: drop T1's LRU directly, no ghost.
+            let old = _arc_evict_lru(t1)
+            del(data, str(old))
+    else
+        if l1 < cap
+            if l1 + l2 >= cap
+                if l1 + l2 >= 2 * cap
+                    if len(b2) > 0
+                        _arc_evict_lru(b2)
+                _arc_replace(c, 0)
+    t1.push(key)
+    data[k] = val
+    return c

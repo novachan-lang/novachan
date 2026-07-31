@@ -1,0 +1,318 @@
+import std/collections/triemap
+import std/collections/skipmap
+import std/collections/arc_cache
+import std/collections/lfu_cache
+import std/collections/circularbuf
+import std/collections/quotientfilter
+import std/collections/weightedunion
+import std/collections/orderstat
+import std/collections/maxheap
+
+// Helper: check int/any equality, print FAIL and exit on mismatch.
+fn cki(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    return 0
+
+// Helper: check list equality (length + every element), print FAIL and exit
+// on mismatch.
+fn ckl(label, got, want)
+    let n = len(got)
+    if n != len(want)
+        print("FAIL " + label + ": length got=" + str(n) + " want=" + str(len(want)))
+        exit(1)
+    let i = 0
+    while i < n
+        if got[i] != want[i]
+            print("FAIL " + label + " at index " + str(i) + ": got=" + str(got[i]) + " want=" + str(want[i]))
+            exit(1)
+        i = i + 1
+    return 0
+
+// ===========================================================================
+// 1. triemap — insert/lookup/contains/delete/keys/prefix_keys
+// ===========================================================================
+let tm = tm_new()
+tm_insert(tm, "cat", 1)
+tm_insert(tm, "car", 2)
+tm_insert(tm, "card", 3)
+tm_insert(tm, "dog", 4)
+
+cki("tm_lookup_car", tm_lookup(tm, "car"), 2)
+cki("tm_lookup_card", tm_lookup(tm, "card"), 3)
+cki("tm_lookup_missing", tm_lookup(tm, "cow"), 0)
+cki("tm_contains_ca", tm_contains(tm, "ca"), 0)
+cki("tm_contains_cat", tm_contains(tm, "cat"), 1)
+
+let tm_all = ["car", "card", "cat", "dog"]
+ckl("tm_keys", tm_keys(tm), tm_all)
+
+let tm_ca = ["car", "card", "cat"]
+ckl("tm_prefix_ca", tm_prefix_keys(tm, "ca"), tm_ca)
+
+tm_delete(tm, "car")
+cki("tm_contains_car_after_delete", tm_contains(tm, "car"), 0)
+cki("tm_lookup_car_after_delete", tm_lookup(tm, "car"), 0)
+// "card" still present — the shared "car" prefix path must survive deletion
+// of the shorter word stored along it.
+cki("tm_lookup_card_survives", tm_lookup(tm, "card"), 3)
+
+let tm_ca2 = ["card", "cat"]
+ckl("tm_prefix_ca_after_delete", tm_prefix_keys(tm, "ca"), tm_ca2)
+
+print("triemap OK")
+
+// ===========================================================================
+// 2. skipmap — insert/lookup/delete/range
+// ===========================================================================
+let sm = sm_new()
+sm_insert(sm, 5, 50)
+sm_insert(sm, 3, 30)
+sm_insert(sm, 8, 80)
+sm_insert(sm, 1, 10)
+sm_insert(sm, 9, 90)
+
+cki("sm_lookup_3", sm_lookup(sm, 3), 30)
+cki("sm_lookup_9", sm_lookup(sm, 9), 90)
+cki("sm_lookup_missing", sm_lookup(sm, 7), 0)
+
+let sm_r1 = [1, 3, 5, 8]
+ckl("sm_range_1_8", sm_range(sm, 1, 8), sm_r1)
+
+// Overwrite an existing key: value updates, key set unchanged.
+sm_insert(sm, 5, 500)
+cki("sm_lookup_5_overwritten", sm_lookup(sm, 5), 500)
+
+sm_delete(sm, 8)
+cki("sm_lookup_8_after_delete", sm_lookup(sm, 8), 0)
+
+let sm_r2 = [1, 3, 5, 9]
+ckl("sm_range_after_delete", sm_range(sm, 1, 9), sm_r2)
+
+print("skipmap OK")
+
+// ===========================================================================
+// 3. arc_cache — adaptive get/put with eviction and ghost-driven adaptation
+// ===========================================================================
+let arc = arc_new(2)
+arc_put(arc, 1, 100)
+arc_put(arc, 2, 200)
+cki("arc_size_2", arc_size(arc), 2)
+
+cki("arc_get_1_hit", arc_get(arc, 1), 100)
+
+// Inserting a 3rd key over capacity 2 must evict — key 2 (T1's LRU) goes to
+// the B1 ghost list since key 1 was already promoted to T2 by the get above.
+arc_put(arc, 3, 300)
+cki("arc_size_after_evict", arc_size(arc), 2)
+cki("arc_contains_2_evicted", arc_contains(arc, 2), 0)
+cki("arc_contains_1_resident", arc_contains(arc, 1), 1)
+cki("arc_contains_3_resident", arc_contains(arc, 3), 1)
+cki("arc_get_2_miss", arc_get(arc, 2), 0)
+
+// Re-inserting key 2 is a B1 GHOST HIT: p must grow, and this must in turn
+// evict from T2 (key 1) into B2 rather than dropping key 3.
+arc_put(arc, 2, 999)
+cki("arc_size_after_ghost_hit", arc_size(arc), 2)
+cki("arc_get_1_now_gone", arc_get(arc, 1), 0)
+cki("arc_get_2_resurrected", arc_get(arc, 2), 999)
+cki("arc_get_3_untouched", arc_get(arc, 3), 300)
+
+print("arc_cache OK")
+
+// ===========================================================================
+// 4. lfu_cache — frequency-based eviction with LRU tie-break
+// ===========================================================================
+let lfu = lfu_new(2)
+lfu_put(lfu, 1, 100)
+lfu_put(lfu, 2, 200)
+cki("lfu_get_1_bump", lfu_get(lfu, 1), 100)
+// Key 1 now has frequency 2, key 2 still frequency 1 — inserting a 3rd key
+// must evict key 2 (the sole minimum-frequency resident).
+lfu_put(lfu, 3, 300)
+cki("lfu_size_after_evict", lfu_size(lfu), 2)
+cki("lfu_get_2_evicted", lfu_get(lfu, 2), 0)
+cki("lfu_get_1_survives", lfu_get(lfu, 1), 100)
+cki("lfu_get_3_survives", lfu_get(lfu, 3), 300)
+
+print("lfu_cache OK")
+
+// ===========================================================================
+// 5. circularbuf — push/pop/overflow
+// ===========================================================================
+let cb = cb_new(3)
+cb_push(cb, 10)
+cb_push(cb, 20)
+cb_push(cb, 30)
+cki("cb_is_full_1", cb_is_full(cb), 1)
+
+let cb_l1 = [10, 20, 30]
+ckl("cb_to_list_full", cb_to_list(cb), cb_l1)
+
+// Overflow: pushing a 4th element overwrites the oldest (10).
+cb_push(cb, 40)
+let cb_l2 = [20, 30, 40]
+ckl("cb_to_list_after_overwrite", cb_to_list(cb), cb_l2)
+
+let cb_pop1 = cb_pop(cb)
+cki("cb_pop_val", cb_pop1[0], 20)
+cki("cb_peek_after_pop", cb_peek(cb), 30)
+cki("cb_size_after_pop", cb_size(cb), 2)
+cki("cb_is_full_after_pop", cb_is_full(cb), 0)
+
+cb_push(cb, 50)
+let cb_l3 = [30, 40, 50]
+ckl("cb_to_list_final", cb_to_list(cb), cb_l3)
+cki("cb_is_full_final", cb_is_full(cb), 1)
+
+// Pop-on-empty sentinel behaviour.
+let cb_empty = cb_new(1)
+let cb_pop_empty = cb_pop(cb_empty)
+cki("cb_pop_empty_sentinel", cb_pop_empty[0], -1)
+
+print("circularbuf OK")
+
+// ===========================================================================
+// 6. quotientfilter — insert/contains/delete
+// ===========================================================================
+let qf = qf_new(4)
+qf_insert(qf, 100)
+qf_insert(qf, 200)
+qf_insert(qf, 300)
+qf_insert(qf, 400)
+qf_insert(qf, 500)
+cki("qf_load_after_5_inserts", qf_load(qf), 5)
+
+cki("qf_contains_100", qf_contains(qf, 100), 1)
+cki("qf_contains_500", qf_contains(qf, 500), 1)
+cki("qf_contains_never_inserted", qf_contains(qf, 999999), 0)
+
+// Duplicate insert is a no-op — load must not double-count.
+qf_insert(qf, 100)
+cki("qf_load_after_duplicate_insert", qf_load(qf), 5)
+
+qf_delete(qf, 200)
+cki("qf_load_after_delete", qf_load(qf), 4)
+cki("qf_contains_200_after_delete", qf_contains(qf, 200), 0)
+// Deleting key 200 (mid-cluster, under linear probing) must NOT disturb the
+// other resident keys — this is exactly what backward-shift deletion exists
+// to guarantee.
+cki("qf_contains_100_survives_delete", qf_contains(qf, 100), 1)
+cki("qf_contains_300_survives_delete", qf_contains(qf, 300), 1)
+cki("qf_contains_400_survives_delete", qf_contains(qf, 400), 1)
+cki("qf_contains_500_survives_delete", qf_contains(qf, 500), 1)
+
+// Deleting an absent key is a no-op.
+qf_delete(qf, 777)
+cki("qf_load_delete_absent_noop", qf_load(qf), 4)
+
+// Re-insert after delete.
+qf_insert(qf, 200)
+cki("qf_load_after_reinsert", qf_load(qf), 5)
+cki("qf_contains_200_after_reinsert", qf_contains(qf, 200), 1)
+
+print("quotientfilter OK")
+
+// ===========================================================================
+// 7. weightedunion — union/find/connected
+// ===========================================================================
+let wuf = wuf_new(6)
+wuf_union(wuf, 0, 1)
+wuf_union(wuf, 1, 2)
+wuf_union(wuf, 3, 4)
+
+cki("wuf_size_after_3_unions", wuf_size(wuf), 3)
+cki("wuf_connected_0_2", wuf_connected(wuf, 0, 2), 1)
+cki("wuf_connected_0_3", wuf_connected(wuf, 0, 3), 0)
+cki("wuf_connected_5_alone", wuf_connected(wuf, 5, 0), 0)
+
+// Union already-connected pair: no-op, component count unchanged.
+wuf_union(wuf, 0, 2)
+cki("wuf_size_after_redundant_union", wuf_size(wuf), 3)
+
+wuf_union(wuf, 2, 5)
+cki("wuf_size_after_merge", wuf_size(wuf), 2)
+cki("wuf_connected_0_5", wuf_connected(wuf, 0, 5), 1)
+
+let wuf_r3 = wuf_find(wuf, 3)
+let wuf_r4 = wuf_find(wuf, 4)
+cki("wuf_find_3_4_same_root", wuf_r3[0], wuf_r4[0])
+
+print("weightedunion OK")
+
+// ===========================================================================
+// 8. orderstat — kth/rank over a multiset, with delete
+// ===========================================================================
+let ost = ost_new()
+ost_insert(ost, 5)
+ost_insert(ost, 3)
+ost_insert(ost, 8)
+ost_insert(ost, 3)
+ost_insert(ost, 1)
+ost_insert(ost, 3)
+// Sorted multiset: [1, 3, 3, 3, 5, 8]
+cki("ost_size_6", ost_size(ost), 6)
+cki("ost_kth_0", ost_kth(ost, 0), 1)
+cki("ost_kth_1", ost_kth(ost, 1), 3)
+cki("ost_kth_3", ost_kth(ost, 3), 3)
+cki("ost_kth_4", ost_kth(ost, 4), 5)
+cki("ost_kth_5", ost_kth(ost, 5), 8)
+cki("ost_rank_3", ost_rank(ost, 3), 1)
+cki("ost_rank_5", ost_rank(ost, 5), 4)
+cki("ost_rank_8", ost_rank(ost, 8), 5)
+
+// Delete one occurrence of 3 (two remain): [1, 3, 3, 5, 8]
+ost_delete(ost, 3)
+cki("ost_size_after_1_delete", ost_size(ost), 5)
+cki("ost_kth_1_after_delete", ost_kth(ost, 1), 3)
+cki("ost_kth_2_after_delete", ost_kth(ost, 2), 3)
+
+// Delete the remaining two occurrences of 3: [1, 5, 8]
+ost_delete(ost, 3)
+ost_delete(ost, 3)
+cki("ost_size_after_all_3_gone", ost_size(ost), 3)
+cki("ost_kth_0_final", ost_kth(ost, 0), 1)
+cki("ost_kth_1_final", ost_kth(ost, 1), 5)
+cki("ost_kth_2_final", ost_kth(ost, 2), 8)
+cki("ost_rank_5_final", ost_rank(ost, 5), 1)
+
+// Deleting an absent value is a no-op.
+ost_delete(ost, 99)
+cki("ost_size_delete_absent_noop", ost_size(ost), 3)
+
+print("orderstat OK")
+
+// ===========================================================================
+// 9. maxheap — push/pop ordering
+// ===========================================================================
+let mxh = mxh_new()
+mxh_push(mxh, 5)
+mxh_push(mxh, 3)
+mxh_push(mxh, 8)
+mxh_push(mxh, 1)
+mxh_push(mxh, 9)
+mxh_push(mxh, 2)
+
+cki("mxh_peek_max", mxh_peek(mxh), 9)
+cki("mxh_size_6", mxh_size(mxh), 6)
+
+// Popping everything must yield strictly descending order: 9,8,5,3,2,1
+let mxh_expected = [9, 8, 5, 3, 2, 1]
+let mxh_got = []
+let mi = 0
+while mi < 6
+    let popped = mxh_pop(mxh)
+    mxh_got.push(popped[0])
+    mxh = popped[1]
+    mi = mi + 1
+ckl("mxh_pop_order", mxh_got, mxh_expected)
+cki("mxh_size_empty", mxh_size(mxh), 0)
+cki("mxh_peek_empty", mxh_peek(mxh), -1)
+
+let mxh_pop_empty = mxh_pop(mxh)
+cki("mxh_pop_empty_sentinel", mxh_pop_empty[0], -1)
+
+print("maxheap OK")
+
+print("ORDMAP-EXT KAT PASS")

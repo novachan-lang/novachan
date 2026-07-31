@@ -1,0 +1,78 @@
+// std/sync/mailbox — bounded, size-observable typed mailbox
+//
+// WHAT:
+//   A bounded FIFO message box: mb_send blocks while full, mb_recv blocks
+//   while empty, plus a non-blocking mb_try_recv and a live mb_size query
+//   (Erlang process mailbox / Go buffered channel, with size introspection
+//   the raw channel builtin does not expose).
+//
+// NOVA WAY:
+//   The FIFO + blocking/parking behavior is NOT reimplemented — it's
+//   `channel_bounded(capacity)`, which already gives green-task-aware
+//   park/wake for free (see std/sync/mutex's header for why that beats a
+//   hand-rolled queue + condition variable). The one thing the raw channel
+//   builtin lacks is a size query, so mailbox adds a counter field updated
+//   under a mutex (std/sync/mutex) alongside every send/recv — the mutex
+//   only ever protects the COUNTER bookkeeping, never the message transfer
+//   itself (that stays on the channel's own lock-free-to-the-caller park/
+//   wake path).
+//
+// CAUTION:
+//   • mb_size is a best-effort snapshot: under concurrent senders/receivers
+//     it can be stale the instant after it's read (inherent to any live
+//     queue depth query, same caveat as chan_len in Go).
+//   • capacity < 1 is clamped to 1.
+//
+// FIELD NAMING: fields are prefixed `mb_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type Mailbox
+    mb_ch: any
+    mb_m: any
+    mb_size: int
+
+// mb_new(capacity) -> Mailbox
+//   Creates a mailbox holding at most `capacity` unread messages
+//   (capacity < 1 clamped to 1).
+fn mb_new(capacity)
+    let cap = capacity
+    if cap < 1
+        cap = 1
+    return Mailbox(channel_bounded(cap), mutex_new(), 0)
+
+// mb_send(mb, msg)
+//   Sends a message, blocking while the mailbox is full.
+fn mb_send(mb, msg)
+    send(mb.mb_ch, msg)
+    lock(mb.mb_m)
+    mb.mb_size = mb.mb_size + 1
+    unlock(mb.mb_m)
+
+// mb_recv(mb) -> any
+//   Receives the next message, blocking while the mailbox is empty.
+fn mb_recv(mb)
+    let v = recv(mb.mb_ch)
+    lock(mb.mb_m)
+    mb.mb_size = mb.mb_size - 1
+    unlock(mb.mb_m)
+    return v
+
+// mb_try_recv(mb) -> Result
+//   Non-blocking receive: ok(msg) if one was waiting, err(...) if empty.
+fn mb_try_recv(mb)
+    let r = try_recv(mb.mb_ch)
+    if r[0] == 1
+        lock(mb.mb_m)
+        mb.mb_size = mb.mb_size - 1
+        unlock(mb.mb_m)
+        return ok(r[1])
+    return err("mailbox empty")
+
+// mb_size(mb) -> int
+//   Number of currently unread messages (best-effort snapshot).
+fn mb_size(mb)
+    return mb.mb_size

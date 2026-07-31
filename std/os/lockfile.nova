@@ -1,0 +1,83 @@
+// std/os/lockfile — Simple file-based mutual exclusion lock.
+//
+// API:
+//   lf_acquire(path)              -> Result   ok(path) if a lock file was created; err(msg) if
+//                                              a lock already exists at path or the write failed
+//   lf_release(path)              -> bool     delete the lock file; true if it's gone afterward
+//                                              (including if it never existed)
+//   lf_is_locked(path)            -> bool     true iff a lock file currently exists at path
+//   lf_stale(path, max_age_ms)    -> bool     true iff a lock file exists AND is older than
+//                                              max_age_ms (a missing lock is not "stale" — there
+//                                              is nothing to reclaim); a lock file that can't be
+//                                              parsed is conservatively treated as stale
+//
+// This is advisory locking (same trust model as a PID file): acquire/release only ever look at
+// whether the file exists and what it contains — there is no OS-level exclusive-create/flock
+// primitive available from NOVA, so two acquirers racing on the same path (e.g. from separate
+// processes) can both observe "no lock" before either writes. It is safe for coordinating
+// within a single NOVA process, and adequate for the common "avoid a duplicate cron run" case
+// when combined with lf_stale-based reclamation, but is NOT a substitute for a real OS lock in
+// a high-contention multi-process setting. Lock file body: "<pseudo-id>\n<acquired_at_ms>\n".
+// Private helpers prefixed _lf_.
+
+// true iff s is a non-empty string of digits (optionally leading "-").
+fn _lf_is_int(s: string) -> bool
+    if len(s) == 0
+        return false
+    let start = 0
+    if char_at(s, 0) == "-"
+        start = 1
+    if start >= len(s)
+        return false
+    let i = start
+    while i < len(s)
+        let c = ord(char_at(s, i))
+        if c < 48 or c > 57
+            return false
+        i = i + 1
+    return true
+
+// Mix a time_ms() reading into a positive-looking pseudo-identifier (see procutil for the
+// same technique — kept local here so this module has no cross-module import dependency).
+fn _lf_mix(seed: int) -> int
+    let a = (seed * 2654435761) + 1
+    if a < 0
+        a = 0 - a
+    return a & 2147483647
+
+// lf_acquire(path) -> Result
+fn lf_acquire(path: string) -> any
+    if file_exists(path)
+        return err("lock already held: " + path)
+    let marker = _lf_mix(time_ms())
+    let acquired_at = time_ms()
+    write_file(path, str(marker) + chr(10) + str(acquired_at) + chr(10))
+    if file_exists(path) == false
+        return err("failed to write lock file: " + path)
+    return ok(path)
+
+// lf_release(path) -> bool
+fn lf_release(path: string) -> bool
+    if file_exists(path) == false
+        return true
+    remove_file(path)
+    return file_exists(path) == false
+
+// lf_is_locked(path) -> bool
+fn lf_is_locked(path: string) -> bool
+    return file_exists(path)
+
+// lf_stale(path, max_age_ms) -> bool
+fn lf_stale(path: string, max_age_ms: int) -> bool
+    if file_exists(path) == false
+        return false
+    let lines = split(read_file(path), chr(10))
+    if len(lines) < 2
+        return true
+    let ts_str = trim(lines[1])
+    if _lf_is_int(ts_str) == false
+        return true
+    let age = time_ms() - parse_int(ts_str)
+    if age < 0
+        age = 0
+    return age > max_age_ms

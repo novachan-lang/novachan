@@ -1,0 +1,70 @@
+// std/sync/broadcast — fan-out publish to many subscribers
+//
+// WHAT:
+//   One publisher, many independent subscribers, every subscriber sees every
+//   published value (Go sync-broadcast pattern / Rust tokio::sync::broadcast,
+//   minus lag-detection). Contrast with mailbox (one message goes to exactly
+//   one receiver): broadcast delivers each value to EVERY subscriber that
+//   existed at send time.
+//
+// NOVA WAY:
+//   A plain NOVA channel already wakes exactly one parked receiver per send
+//   — which is exactly wrong for fan-out. So each subscriber gets its OWN
+//   private unbounded channel() (bc_recv is just recv() on it — no new
+//   receive-side primitive needed), and bc_send loops over the subscriber
+//   list sending the value to each one individually. The subscriber list
+//   itself is guarded by a mutex (std/sync/mutex) so bc_subscribe (append)
+//   can't race a concurrent bc_send (iterate).
+//
+// CAUTION:
+//   • Subscribers only receive values sent AFTER they subscribed — there is
+//     no replay of history (same as every broadcast channel design; keep a
+//     separate log if replay is needed).
+//   • Each subscriber's channel is unbounded, so a subscriber that never
+//     calls bc_recv accumulates memory for every value sent — this trades
+//     "bc_send never blocks the publisher" for "a slow/absent subscriber is
+//     the caller's leak to manage", the same tradeoff Go's unbuffered
+//     broadcast patterns make.
+//
+// FIELD NAMING: fields are prefixed `bc_` and kept globally unique across
+// ALL std/sync struct types — see std/sync/barrier.nova's header for why
+// (a real compiler defect resolves struct field writes by name, not by
+// (type, name), so two co-declared struct types sharing a field name can
+// miscompile). Do not de-prefix until that upstream bug is fixed+reverified.
+import std/sync/mutex
+
+type Broadcast
+    bc_subs: list
+    bc_m: any
+
+// bc_new() -> Broadcast
+//   Creates a broadcast with no subscribers yet.
+fn bc_new()
+    return Broadcast([], mutex_new())
+
+// bc_subscribe(bc) -> channel
+//   Registers a new subscriber and returns its private receive channel —
+//   pass this to bc_recv. Only values sent after this call are seen.
+fn bc_subscribe(bc)
+    let sub = channel()
+    lock(bc.bc_m)
+    push(bc.bc_subs, sub)
+    unlock(bc.bc_m)
+    return sub
+
+// bc_send(bc, val)
+//   Publishes val to every current subscriber.
+fn bc_send(bc, val)
+    lock(bc.bc_m)
+    let subs_snapshot = bc.bc_subs
+    unlock(bc.bc_m)
+    let i = 0
+    while i < len(subs_snapshot)
+        send(subs_snapshot[i], val)
+        i = i + 1
+
+// bc_recv(sub) -> any
+//   Blocks until the next value published after this subscription. `sub` is
+//   the channel returned by bc_subscribe.
+fn bc_recv(sub)
+    return recv(sub)
