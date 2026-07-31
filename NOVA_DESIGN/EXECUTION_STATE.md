@@ -42,6 +42,10 @@ break/continue [deferred gen3], numeric separators [already existed], unicode es
 - `c488cace` docs: comprehensive plan audit — tick 25+ items verified against live code
 - `d50fcf1d` pack float support + model loaders (ONNX/GGUF/SafeTensors) + AWS SQS/SNS — 7 modules, all KAT-verified
 - `b218a912` enhanced @test runner: per-test PASS/FAIL output, NOVA_TEST_FILTER env var, auto-call when no main(). Self-compile verified.
+- `01aa11b5` safetensors_loader: 5 missing dtypes (U16/U32/U64/F8_E4M3/F8_E5M2)
+- `7fcf7444` stdlib fleet: uritemplate RFC 6570 + cli + phonetics (tseries removed as duplicate `42e9c73f`)
+- `42e9c73f` L8 call-overload: type inference + IR dispatch source-done (blocked by gen3 truncation)
+- `4fca2ed3` plan file updates
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic
@@ -130,11 +134,11 @@ but not the strategic bottleneck.
 | constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ✅ `secure_zero` + `ct_eq` DONE `bab9fa57` (C runtime + compiler 4 sites + 5 callsites; `@redact`/`Secret<T>` = Phase 2) | bab9fa57 |
 | sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE (`bc5acb27`..`fe6177a6`); inc3c-part2 (slot-flow for runtime-valued sized vars) ATTEMPTED but gen3 hangs — DEFERRED for deep investigation | |
 | module namespacing `@mod__fn` (LOCK-1) | ceil | A | 🔄 Phase-1 collision DETECTION done `724dad65` (two modules same-name → clear error); full mangling deferred (map in L11_NAMESPACING_MAP.md). | 724dad65 |
-| annotations→codegen (LOCK-2) | ceil | A(XL) | ⬜ | |
-| macros/comptime | ceil | A(XL) | ⬜ | |
+| annotations→codegen (LOCK-2) | ceil | A(XL) | ✅ Phase-1 DONE: 15 annotation types (`1a65d7c0`..`e099c1ac`). Phase-2 user-extensible = OPEN (L1b, XL) | 1a65d7c0 |
+| macros/comptime | ceil | A(XL) | ✅ Phase-1+2 DONE `55d3fb7e`+`b7a5e1ca` (comptime eval + unicode escapes). Phase-3 quasi-quote = OPEN (L2b, XL) | b7a5e1ca |
 | const generics · variance · assoc types | ceil | A | ⬜ | |
-| custom index/iter/call operators (L8) | ceil | A | ✅ index+iter DONE `49f28f4f` (obj[i]/obj[i]=v/for x in obj → struct methods; call-overload backlog) | 49f28f4f |
-| enforced immutability `let mut` | ceil | A | ⬜ | |
+| custom index/iter/call operators (L8) | ceil | A | ✅ index+iter DONE `49f28f4f`; call-overload source-done `42e9c73f` (type inference + IR dispatch in nova_compiler.nova; blocked by gen3 truncation until reconverge) | 49f28f4f 42e9c73f |
+| enforced immutability `let mut` | ceil | A | ✅ DONE `1a65d7c0` (parser accepts `let mut`; existing `let` = immutable) | 1a65d7c0 |
 | `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | ⬜ | |
 | monotonic type-id vtables | ceil | A | ⬜ | |
 | explicit SIMD path | ceil | A | ⬜ | |
