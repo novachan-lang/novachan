@@ -2401,6 +2401,55 @@ int64_t nova_rt_list_reduce(int64_t handle, int64_t init, int64_t closure) {
     return acc;
 }
 
+int64_t nova_rt_str_zfill(int64_t s, int64_t width) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    if (width <= 0 || (size_t)width <= slen) return s;
+    size_t pad = (size_t)width - slen;
+    char* out = (char*)nova_heap_alloc((size_t)width + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    int neg = (str[0] == '-') ? 1 : 0;
+    size_t pos = 0;
+    if (neg) out[pos++] = '-';
+    for (size_t i = 0; i < pad; i++) out[pos++] = '0';
+    memcpy(out + pos, str + neg, slen - neg + 1);
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_list_index_where(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return -1;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(l->data[i])) return i;
+    }
+    return -1;
+}
+
+int64_t nova_rt_list_last(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->size == 0) return 0;
+    return l->data[l->size - 1];
+}
+
+int64_t nova_rt_list_first(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->size == 0) return 0;
+    return l->data[0];
+}
+
+int64_t nova_rt_list_contains(int64_t handle, int64_t val) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], val)) return 1;
+    }
+    return 0;
+}
+
 int64_t nova_rt_split(int64_t s, int64_t delim) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
