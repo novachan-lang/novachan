@@ -35,7 +35,12 @@
 > `fn`: the catch handler loop leaves the cursor directly on the following token (not on a NEWLINE), so that
 > `fn` reached the trailing-lambda parser and the next DECLARATION was parsed as a lambda. Guarded by
 > `_tf_is_trailing` (a trailing fn must be indented past the statement column); trailing-fn IR verified
-> byte-identical. **L8 call-overload 🔄** — works when the callee's type is already resolved; the
+> byte-identical.
+> **BOOL RENDERING ✅ `2cbb8688`** (certified `bd8dc1dd`) — `print(x == y)` printed `1` instead of `true`,
+> a direct Python-parity failure found by dogfooding. Comparisons and logical ops now yield a bool on BOTH
+> paths (inference for runtime values, const-fold for literals); `neg`/`bitnot` deliberately stay ints.
+> Also cleared a latent LOCK-4 interaction where a comparison result inherited the operand's sized width.
+> **L8 call-overload 🔄** — works when the callee's type is already resolved; the
 > `let d = Doubler(3)` case needs DEFERRED call constraints (measured: callee is still a type var at
 > constrain time). *Dev-mode: compile-checked + KAT-gated; full both-mode regression batched.*
 >
