@@ -2625,6 +2625,117 @@ int64_t nova_rt_dict_reject_keys(int64_t handle, int64_t key_list) {
     return result;
 }
 
+int64_t nova_rt_str_is_blank(int64_t s) {
+    const char* str = nova_str_safe(s);
+    for (int64_t i = 0; str[i]; i++) {
+        char c = str[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' && c != '\v') return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_str_remove_all(int64_t s, int64_t sub) {
+    const char* str = nova_str_safe(s);
+    const char* needle = nova_str_safe(sub);
+    size_t slen = strlen(str);
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || slen == 0) {
+        char* out = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+        if (!out) return s;
+        memcpy(out, str, slen + 1);
+        return (int64_t)(uintptr_t)out;
+    }
+    char* out = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    size_t oi = 0;
+    for (size_t i = 0; i < slen; ) {
+        if (i + nlen <= slen && memcmp(str + i, needle, nlen) == 0) {
+            i += nlen;
+        } else {
+            out[oi++] = str[i++];
+        }
+    }
+    out[oi] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_str_count_lines(int64_t s) {
+    const char* str = nova_str_safe(s);
+    if (!str[0]) return 0;
+    int64_t count = 1;
+    for (int64_t i = 0; str[i]; i++) {
+        if (str[i] == '\n') count++;
+    }
+    return count;
+}
+
+int64_t nova_rt_list_sorted_by(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t sz = l->size;
+    if (sz <= 1) {
+        int64_t r = nova_rt_list_create();
+        for (int64_t i = 0; i < sz; i++) nova_rt_list_append(r, l->data[i]);
+        return r;
+    }
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* items = (int64_t*)malloc(sz * sizeof(int64_t));
+    int64_t* kvals = (int64_t*)malloc(sz * sizeof(int64_t));
+    if (!items || !kvals) { free(items); free(kvals); return nova_rt_list_create(); }
+    for (int64_t i = 0; i < sz; i++) {
+        items[i] = l->data[i];
+        kvals[i] = fn(closure, l->data[i]);
+    }
+    for (int64_t i = 1; i < sz; i++) {
+        int64_t kv = kvals[i]; int64_t iv = items[i]; int64_t j = i - 1;
+        while (j >= 0 && kvals[j] > kv) { kvals[j+1] = kvals[j]; items[j+1] = items[j]; j--; }
+        kvals[j+1] = kv; items[j+1] = iv;
+    }
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < sz; i++) nova_rt_list_append(result, items[i]);
+    free(items); free(kvals);
+    return result;
+}
+
+int64_t nova_rt_list_transpose(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* outer = (NovaList*)(uintptr_t)handle;
+    if (outer->size == 0) return nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)outer->data[0]) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* first_row = (NovaList*)(uintptr_t)outer->data[0];
+    int64_t cols = first_row->size;
+    int64_t result = nova_rt_list_create();
+    for (int64_t c = 0; c < cols; c++) {
+        int64_t col_list = nova_rt_list_create();
+        for (int64_t r = 0; r < outer->size; r++) {
+            if (nova_mem_find_tag((void*)(uintptr_t)outer->data[r]) != NOVA_MEM_LIST) {
+                nova_rt_list_append(col_list, 0);
+            } else {
+                NovaList* row = (NovaList*)(uintptr_t)outer->data[r];
+                nova_rt_list_append(col_list, c < row->size ? row->data[c] : 0);
+            }
+        }
+        nova_rt_list_append(result, col_list);
+    }
+    return result;
+}
+
+int64_t nova_rt_dict_map_keys(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return nova_rt_dict_create();
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t result = nova_rt_dict_create();
+    for (int64_t j = 0; j < d->size; j++) {
+        int64_t new_key = fn(closure, d->keys[j]);
+        nova_rt_dict_set(result, new_key, d->vals[j]);
+    }
+    return result;
+}
+
 int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
