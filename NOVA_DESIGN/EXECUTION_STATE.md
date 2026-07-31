@@ -23,11 +23,21 @@
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
-## Current focus — UPDATED 2026-07-25 (position reconciled; this file IS the master-plan tracker)
-**Where we are:** Phase 0-A soundness ✅ DONE. Stdlib breadth ✅ (std/ tree + 100-task campaign). Phase **0-C
-runtime/platform reach = the ACTIVE front** — recently landed: module non-scalar globals (GAP 5 `ccb70ba6`),
-Windows TLS server (`3c1f746d`), signals+file-perms (`2ce90c6d`), HTTP redirects+cookies (`e11935a3`), pkg
-lockfile (`dcd8fae8`), REPL fix (`2543df3c`). Also this session: OPERATING_MODEL + NOVA_LANGUAGE_FEATURES.md.
+## Current focus — UPDATED 2026-07-31 (rapid-dev session: language ceilings + gaps)
+**Where we are:** Phase 0-A soundness ✅ DONE. Stdlib breadth ✅. Phase 3 **language ceilings** making rapid
+progress — L6, L1a Phase-1, L2a Phase-1+2 all DONE. All 4 appendix gaps CLOSED (for-in-channel, labeled
+break/continue [deferred gen3], numeric separators [already existed], unicode escapes).
+
+**This session (rapid-dev branch, batch reconverge deferred):**
+- `1a65d7c0` L6 `let mut` syntax + L1a `@entity`/`@service` annotations
+- `55d3fb7e` L2a comptime-fn Phase 1 (compile-time evaluation)
+- `fea32392` L1a `@middleware`/`@inject` annotations
+- `216183e2` L1a `@deprecated` annotation with runtime warnings
+- `de63bcae` L1a batch 2 (`@validate`/`@builder`/`@log`/`@retry`/`@timeout`/`@singleton`)
+- `e099c1ac` L1a batch 3 (`@observable`/`@async`/`@cache`/`@event`) + `str_repeat` builtin
+- `b7a5e1ca` L2a comptime Phase 2 + `\u{XXXX}` unicode escapes (GAP-4 closed)
+- `9c81807c` for-in-channel iteration (GAP-2 closed: `for val in ch` drains until close)
+- `9aee01e4` labeled break/continue parser+codegen (GAP-1 DEFERRED: gen3 truncation)
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic

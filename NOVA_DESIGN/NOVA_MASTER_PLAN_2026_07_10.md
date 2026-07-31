@@ -1562,12 +1562,12 @@ gap is open.**
 
 - **[lang]** L11 module namespacing (M) — do first (hard link-error wall; prerequisite for L1).
 - **[lang]** L12 + L13 ✅ DONE (2026-07-22) (S each) — parser gotchas, do anytime.
-- **[lang]** L6 enforced immutability (M) — gradual migration; correctness + concurrency + optimization lever.
-- **[lang]** L7 sized numerics + f32 (M) — unblocks embedded/wire/GPU + L5; folds in the `1<<64` guard.
-- **[lang]** L8 custom operators (M) — library ergonomics; unblocks Cortex/Pulse indexing.
+- **[lang]** L6 enforced immutability (M) — ✅ DONE `1a65d7c0` (`let` vs `let mut` syntax).
+- **[lang]** L7 sized numerics + f32 (M) — 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE; inc3c-part2+inc3d OPEN.
+- **[lang]** L8 custom operators (M) — 🔄 index+iter DONE `49f28f4f`; call-overload = backlog.
 - **[lang]** L3 variance (L) — after the trait-conformance fix.
-- **[lang]** **L1 annotations + codegen (XL)** — THE #1 lever. Phase-1 built-in hooks (L) deliver 80%.
-- **[lang]** **L2 macros/comptime (XL)** — provides L1's substrate; erases the compiler's own ~700 AST sites.
+- **[lang]** **L1 annotations + codegen (XL)** — ✅ Phase-1 DONE: 15 annotation types across 5 batches (`1a65d7c0`..`e099c1ac`). Phase-2 (user-extensible) = OPEN.
+- **[lang]** **L2 macros/comptime (XL)** — ✅ Phase-1 DONE: comptime-fn `55d3fb7e` + value propagation `b7a5e1ca`. Phase-2 (hygienic macros) = OPEN.
 - **[lang]** L5 const generics (L, after L7+L2) · L9 auto-bignum (L, after L7) · L10 weak/Drop (M, after Wave
   B) · L4 associated types (XL, after L3+L1).
 - *Governing rule:* each ceiling avoids its drawback (comptime ≠ template hell; sized numerics ≠ C's promotion
@@ -1683,8 +1683,8 @@ drawback* — is the discipline that carries NOVA from "a better language" to "e
 > - **RECLASSIFY hot code reload from EXCLUDED → FUTURE-POSSIBLE.** The process/message model is *structurally*
 >   built for it (swap a process's code, keep its state) — it's how Erlang hits 99.999% uptime, which NOVA
 >   claims parity on. Don't permanently exclude; track as a natural consequence of the Three Primitives.
-> - **MINOR [lexer/parser]** — numeric literal separators (`1_000_000`), labeled break/continue, verify
->   `\u{XXXX}` unicode escapes, and state "channels ARE async iterators" + verify `for x in channel`. S each.
+> - **MINOR [lexer/parser]** — ✅ ALL CLOSED: numeric literal separators (already existed), labeled break/continue
+>   (`9aee01e4`, deferred gen3), `\u{XXXX}` unicode escapes (`b7a5e1ca`), `for x in channel` (`9c81807c`). S each.
 >
 > Everything else in the matrix is HAVE, PLANNED (with the plan item id), or DELIBERATELY-EXCLUDED (with the
 > NOVA-way reason). **No large capability is missing.** The full evidence-grounded matrix:
@@ -1875,7 +1875,7 @@ Legend:
 | Generators / yield | **HAVE** | `yield` :1716, `nova_rt_gen_yield` :6482 |
 | for-else / while-else | **EXCLUDED** | Not planned; Python-ism deemed non-essential |
 | goto | **EXCLUDED** | Structured control flow only |
-| Labeled break/continue | **GAP** | See analysis below |
+| Labeled break/continue | **PLANNED** | Parser+codegen implemented `9aee01e4` (DEFERRED: gen3 truncation; activates after reconverge) |
 | do-while / repeat-until | **EXCLUDED** | `loop` + `break` covers this |
 
 ## 12. ASYNC & I/O MODEL
@@ -1935,38 +1935,28 @@ that are NOT in the plan AND NOT deliberately excluded:
 ## GENUINELY MISSING (not in any plan item, would cause a real problem)
 
 ### GAP-1: Labeled break/continue (nested loop control)
-**Severity: CONCERN**
-Languages that have it: Rust (`'label: loop`), Java (`label:`), Go (`label:`), Kotlin,
-Swift, JS, Zig.
-NOVA has `break`/`continue` but grep for `labeled_break`, `break_label`, `label:`,
-`loop_label` in the compiler = 0. In nested loops (common in graph algorithms, matrix
-ops, parsers), you must use boolean flags to break an outer loop. This is a daily
-papercut for systems/algorithm code. The 570 KAT-gated algorithm modules likely work
-around this with flags or early returns. Not in any L# item.
+**Severity: RESOLVED (DEFERRED)**
+**Status:** Parser + codegen implemented `9aee01e4`. Syntax: `outer: while cond` / `break outer`.
+Both IrBuilder and CodeGen backends updated. DEFERRED: gen3 silently drops the code (same
+truncation-class bug that affects `let`-handler additions). Will activate after reconverge
+when gen4+ becomes the bootstrap compiler. Test `_test_labeled_break.nova` ready.
 
 ### GAP-2: Async generators / async iteration protocol
-**Severity: CONCERN**
-Languages that have it: JS (`async function*`), Python (`async for`), C# (`IAsyncEnumerable`),
-Kotlin (`Flow`).
-NOVA has generators (`yield`) and implicit async, but there is no way to `yield` values
-from an async producer to be consumed lazily. A database cursor streaming 1M rows, a
-paginated API, or a real-time event feed must either buffer everything into a list or use
-channels (which is the NOVA-way workaround). This is arguably covered by channels, but
-channels require explicit `send`/`recv` ceremony vs the `for row in cursor` pattern. The
-L8 custom-iterator plan does not mention async iteration. If the NOVA thesis is "channels
-are async iterators," it should be stated explicitly and the `for x in channel` sugar
-should be verified (it may already work -- needs confirmation).
+**Severity: RESOLVED** — ✅ CLOSED `9c81807c`
+**Channels ARE async iterators.** `for val in channel` is now a first-class language
+feature: the runtime detects `NOVA_MEM_CHANNEL` in `nova_rt_for_iter_init` and drains
+values via blocking `nova_rt_chan_for_recv` (green-task park+yield or condvar wait) until
+closed. Both named-function and anonymous-closure producers pass. Type checker accepts
+channel as iterable. No `send`/`recv` ceremony needed for the consumer side.
 
 ### GAP-3: No numeric literal separators (`1_000_000`)
-**Severity: MINOR**
-Every modern language has this: Rust, Swift, Kotlin, Java, Python, Go, C#, Zig, C23.
-Trivial lexer change. Not in any plan item. A readability papercut for the crypto/finance
-code that is a stated NOVA target.
+**Severity: RESOLVED** — already implemented in lexer (hex, binary, and decimal paths
+all skip underscores: lines 509-512, 522-524, 531-534). `1_000_000`, `0xFF_FF`,
+`0b1010_0101` all tokenize correctly.
 
 ### GAP-4: No string escape sequences beyond the basics (no `\u{XXXX}` unicode escapes verified)
-**Severity: MINOR**
-Needs verification -- may already exist. If not, `\u{1F600}` for emoji/unicode outside
-BMP is missing. All modern languages support this.
+**Severity: RESOLVED** — ✅ CLOSED `b7a5e1ca`. `\u{XXXX}` unicode escapes implemented
+in lexer + parser. Supports full Unicode range including BMP and supplementary planes.
 
 ## FEATURES THE PLAN COVERS BUT WHOSE ABSENCE IS MORE DANGEROUS THAN THE PLAN ADMITS
 
