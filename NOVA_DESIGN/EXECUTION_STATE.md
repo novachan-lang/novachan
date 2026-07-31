@@ -46,6 +46,13 @@ break/continue [deferred gen3], numeric separators [already existed], unicode es
 - `7fcf7444` stdlib fleet: uritemplate RFC 6570 + cli + phonetics (tseries removed as duplicate `42e9c73f`)
 - `42e9c73f` L8 call-overload: type inference + IR dispatch source-done (blocked by gen3 truncation)
 - `4fca2ed3` plan file updates
+- `43b49e88` docs: update EXECUTION_STATE — tick L1a/L2a/L6/L8 + add session commits
+- `0ead6771` 6 stdlib fleet batches — 55 new modules + 6 KATs
+- `ca390a5f` compiler from_json_safe + max/min float + 3 fleet batches (ops/ml/crypto)
+- `2c3fd004` fix(compiler): call-arg ")" no longer breaks parsing
+- `a44b8303` parser bracket-depth fix + 6 str builtins + std/core expansion + image/game/ui fleet (22 files)
+- `92917ea4` 4 new string builtins — str_reverse, str_chars, str_count_char, str_replace_first
+- `0ead6771` feat(std): 6 stdlib batches — sync(12)/os(12)/inetproto(12)/ordmap(9)/smtp(10)/subtitles-bugfix — 55 modules, 6 KATs, all Opus-verified
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic

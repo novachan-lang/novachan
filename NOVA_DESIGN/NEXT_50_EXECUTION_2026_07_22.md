@@ -189,9 +189,16 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - F3 Cortex autodiff — NOT STARTED (needs grad compiler pass)
 - Sentinel/Mesh/Ops/Reactor/Edge — framework-level, gated on LOCKs
 
-**2026-07-31 compiler enhancement:**
+**2026-07-31 compiler + stdlib:**
 - `b218a912` enhanced @test runner: per-test PASS/FAIL, NOVA_TEST_FILTER, auto-call (advances T-Test per-fn ergonomics)
 - Stdlib fleet launched: semver, cli, phonetics, uritemplate (4 new modules; tseries duplicate removed `42e9c73f`)
 - `42e9c73f` L8 call-overload: type inference + IR dispatch in nova_compiler.nova source (blocked by gen3 truncation until reconverge)
+- `0ead6771` 6 stdlib fleet batches — 55 new modules + 6 KATs (sync/12, os/12, inetproto/12, ordmap_ext/9, smtp/10, subtitles bugfixes). Discovered+documented struct-field-name-collision compiler defect (field_set resolves by name not type,name — workaround: prefix all struct fields).
+
+**2026-07-31 continued (rapid-dev session 2):**
+- `ca390a5f` compiler from_json_safe + max/min float promotion + 3 fleet batches (ops/ml/crypto)
+- `2c3fd004` fix(compiler): call-arg ")" parsing fix (bracket-depth sync)
+- `a44b8303` parser bracket-depth fix + 6 str builtins (pad_left/right/center + remove_prefix/suffix + insert) + std/core expansion (list 7, dict 6, seq 10 new fns) + image/game/ui fleet (6 modules, KAT-gated)
+- `92917ea4` 4 more string builtins: str_reverse, str_chars, str_count_char, str_replace_first (fully wired)
 
 **Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
