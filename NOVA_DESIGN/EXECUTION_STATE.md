@@ -53,6 +53,8 @@ break/continue [deferred gen3], numeric separators [already existed], unicode es
 - `a44b8303` parser bracket-depth fix + 6 str builtins + std/core expansion + image/game/ui fleet (22 files)
 - `92917ea4` 4 new string builtins — str_reverse, str_chars, str_count_char, str_replace_first
 - `0ead6771` feat(std): 6 stdlib batches — sync(12)/os(12)/inetproto(12)/ordmap(9)/smtp(10)/subtitles-bugfix — 55 modules, 6 KATs, all Opus-verified
+- `e6c37455` fleet 4: 6 stdlib modules (102 KAT) + runtime C bug fix
+- `b20fbb62` fn_ptr("name") compiler intrinsic (LOCK-6 Phase 1) + fleet 5 (6 modules, 96 KAT) + 17 builtins (1099 total)
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic
@@ -146,7 +148,7 @@ but not the strategic bottleneck.
 | const generics · variance · assoc types | ceil | A | ⬜ | |
 | custom index/iter/call operators (L8) | ceil | A | ✅ index+iter DONE `49f28f4f`; call-overload source-done `42e9c73f` (type inference + IR dispatch in nova_compiler.nova; blocked by gen3 truncation until reconverge) | 49f28f4f 42e9c73f |
 | enforced immutability `let mut` | ceil | A | ✅ DONE `1a65d7c0` (parser accepts `let mut`; existing `let` = immutable) | 1a65d7c0 |
-| `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | ⬜ | |
+| `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | 🔄 Phase 1 DONE `b20fbb62` (`fn_ptr("name")` intrinsic → ptrtoint ptr @name to i64). Phase 2 (@cdecl annotation + C calling convention + trampoline) = OPEN | b20fbb62 |
 | monotonic type-id vtables | ceil | A | ⬜ | |
 | explicit SIMD path | ceil | A | ⬜ | |
 | runtime builtins: math (D11) | rt | C | ✅ DONE (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf; reconverge pending) | (batch 2) |

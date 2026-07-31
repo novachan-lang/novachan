@@ -238,4 +238,24 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `c6730615` 7 builtins: str_word_count/words/squeeze/lines, list_zip_with/scan/partition
 - `6a2d1d3d` fix: remove duplicate registrations, add str_center_pad/squeeze/lines
 
-**Total builtins: 896.** Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
+**2026-07-31 continued (rapid-dev session 4 — builtins to 1000 + 3 stdlib fleets):**
+- `92440d54` 18 builtins (929 total) + fleet 1: 6 stdlib modules (wordladder/tdigest/rollinghash/cuckoohash/dsu_rollback/ttlcache) — 111/111 KAT
+- `8a0ddb5c` 11 builtins (940 total) — URI, text, collections
+- `4798e631` 10 builtins (949 total) + fleet 2: 6 stdlib modules (binary_trie/fibonacci_heap/rose_tree/traveling_salesman/longest_increasing_path/vcard) — 111/111 KAT
+- `b0c76135` 15 builtins (964 total) — HTML, validation, collections
+- `20a6d2d0` 36 builtins (**1000 total milestone**) — dict/str/list comprehensive coverage
+- `4a549d1d` fleet 3: 6 stdlib modules (red_black_tree/bech32/diff_patch/json_patch/sparse_matrix/leaky_bucket) — 120/120 KAT
+
+**Rapid-dev session 5 (builtins 1000→1081 + fleet 4 + runtime fix):**
+- `4090ef64` 29 builtins (1029) — math/set/copy/string-case
+- `0257f963` 15 builtins (1044) — format, chunk, group, set ops, hex, bytes
+- `6b0f0017` 14 builtins (1058) — levenshtein, split-lines, dict-reduce, cross-product
+- `0c902d10` 8 builtins (1066) — combinations, permutations, group-runs, flatten-depth
+- `c00e7f8d` 8 builtins (1074) — binary/octal conversion, combinatorics, matching
+- `d098f2c7` 7 builtins (1081) — span, sample, similarity, map-pairs, dict-count
+- `e6c37455` fleet 4: 6 stdlib modules (unbounded_knapsack/topological_sort/edit_distance/csv_writer/ini_writer/majority_element) — 102/102 KAT + runtime C bug fix (28 broken casts, 88 list_create void args, 5 duplicate functions, 1 type_pred arity)
+
+**Rapid-dev session 6 (fn_ptr intrinsic + fleet 5 + 17 builtins):**
+- `b20fbb62` fn_ptr("name") compiler intrinsic (LOCK-6 Phase 1) + fleet 5: 6 stdlib modules (skyline/systematic_sampling/longest_palindromic_subseq/soundex_refined/continued_fraction/chunked_reader) — 96/96 KAT + 17 new builtins (1099 total: str_byte_at/len, str_chars_list, str_remove_char, list_cumsum/reverse_copy/repeat_val/of_range/adjacent_pairs, dict_sorted_by_value, math_abs_float, list_product_float, dict_keys_count, str_is_printable, list_to_string, str_char_code, list_flatten_n)
+
+**Total builtins: 1099.** 1790+ stdlib modules. LOCK-6 Phase 1 (fn_ptr intrinsic) DONE — foundation for @cdecl FFI callbacks. Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
