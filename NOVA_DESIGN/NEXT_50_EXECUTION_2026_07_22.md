@@ -263,4 +263,15 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `568c6ad0` 8 builtins (1123) — list_every_nth, dict_values_sorted, list_running_max/min, str_repeat_n, list_pairs_to_dict, list_uncons, list_tails
 - `39e87db1` 7 builtins (1130) — str_split_chars, list_prefixes/suffixes, list_zip_pairs, list_without_index, str_remove_whitespace, list_count_eq
 
-**Total builtins: 1130.** 1800+ stdlib modules. LOCK-6 Phase 1 (fn_ptr intrinsic) DONE. Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
+**Rapid-dev session 7 (builtins 1130→1198 + fleets 7+8):**
+- `cfcaab9c` fleet 7: 6 stdlib modules (amicable/floyd_cycle/lexical_props/bitmatrix/pollard_rho/dutch_flag) — 120/120 KAT + 5 builtins (1135: list_windowed, str_center_with, dict_keys_list, str_extract_between, list_to_set_list)
+- `d3b739ac` 8 builtins (1143) — dict_values_count, str_remove_suffix_all, list_zip_with_index, list_flatten_all, str_capitalize_words, list_partition_at, str_word_at
+- `4a22a89d` 8 builtins (1151) — str_remove_all_chars, dict_has_value, list_pairs, list_group_by_size, list_windows_with_step, dict_merge_all, list_rotate_n, str_pad_center
+- `9267cfa1` 8 builtins (1159) — str_trim_chars, list_unique_count, list_head, list_tail_n, list_max_consecutive, str_remove_consecutive, str_overlay
+- `c9e22776` 8 builtins (1167) — str_reverse_chars, list_take_right, list_drop_right, dict_keys_sorted_desc, str_is_balanced, list_argmin, list_argmax
+- `00a434b1` 8 builtins (1175) — list_diff, str_lines_count, str_between_last, list_cartesian, str_count_occurrences, list_cumulative_min, dict_filter_values, list_flatten_once
+- `8a44357a` 7 builtins (1182) — list_range_step, str_truncate_ellipsis, dict_update_value, str_replace_chars, list_nth_or, list_sliding_max, list_sliding_min
+- `87b2f290` fleet 8: 6 stdlib modules (pancake_sort/cycle_sort/sparse_vector/lucas_theorem/discrete_log/tonelli_shanks) — 75/75 KAT + 8 builtins (1190: list_group_equal, list_alternate, str_is_vowel, list_majority_element, dict_filter_by_key_prefix, list_count_distinct, str_split_every)
+- `b60b9e7b` 8 builtins (1198) — str_hamming_distance, list_dot_product, dict_symmetric_diff, str_is_consonant, list_mismatch, str_remove_digits, dict_values_sum, list_weighted_sum
+
+**Total builtins: 1198.** 1830+ stdlib modules. Fleet 9 in-flight. Critical path: Block A (#1 RC leak shared root) + LOCK-4 sized numerics (strategic bottleneck).
