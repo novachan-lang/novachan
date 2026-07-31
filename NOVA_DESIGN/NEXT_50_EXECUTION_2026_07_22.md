@@ -189,4 +189,8 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - F3 Cortex autodiff — NOT STARTED (needs grad compiler pass)
 - Sentinel/Mesh/Ops/Reactor/Edge — framework-level, gated on LOCKs
 
+**2026-07-31 compiler enhancement:**
+- `b218a912` enhanced @test runner: per-test PASS/FAIL, NOVA_TEST_FILTER, auto-call (advances T-Test per-fn ergonomics)
+- Stdlib fleet launched: semver, cli, tseries, phonetics, uritemplate (5 new modules)
+
 **Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.

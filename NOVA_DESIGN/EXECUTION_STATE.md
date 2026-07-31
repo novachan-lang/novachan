@@ -40,9 +40,8 @@ break/continue [deferred gen3], numeric separators [already existed], unicode es
 - `9aee01e4` labeled break/continue parser+codegen (GAP-1 DEFERRED: gen3 truncation)
 - `a6355d99` docs: tick plan files — L6/L1a/L2a DONE, all 4 appendix gaps CLOSED
 - `c488cace` docs: comprehensive plan audit — tick 25+ items verified against live code
-- (pending) pack module float support: f64/f32 pack/unpack via IEEE 754 bitcast (47-check KAT)
-- (pending) model loaders: ONNX 565L + GGUF 497L + SafeTensors 956L (all KAT-verified GREEN)
-- (pending) AWS SQS 506L + SNS 752L std modules (verifying)
+- `d50fcf1d` pack float support + model loaders (ONNX/GGUF/SafeTensors) + AWS SQS/SNS — 7 modules, all KAT-verified
+- `b218a912` enhanced @test runner: per-test PASS/FAIL output, NOVA_TEST_FILTER env var, auto-call when no main(). Self-compile verified.
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic

@@ -3272,7 +3272,7 @@ Mostly small mechanical builtins over syscalls the runtime *already links* (pthr
 ### Phase 4 — Quality & observability tooling (the "robust"/"fast" promises, verifiable by the user)
 
 20. ✅ **Property-based testing** — **DONE** `722d48d2` (`forge_test_prop`: seeded LCG, tp_check/tp_int_range/tp_bool/tp_string; KAT gated).
-21. 🔄 **Per-`fn` test ergonomics** — PARTIAL (`@test` annotation + `inject_tests` codegen + `nova test`; filter/parallel/diff NOT YET).
+21. 🔄 **Per-`fn` test ergonomics** — `b218a912` ENHANCED: per-test PASS/FAIL output + `NOVA_TEST_FILTER` env var filter + auto-call `__nova_run_tests()` when no `main()` exists (zero-ceremony). REMAINING: parallel execution, rich diff output.
 22. ✅ **Profiler** — **DONE** `44d0967d` (`forge_profiler`: enter/exit/calls/total_time/hotspot/report; KAT gated).
 23. ✅ **LSP** — **DONE** v0.4.0 (ALL 14 features: hover/goto/sig-help/inlay/completions/refs/rename/tokens/actions/symbols). Quality improvement (inferer-backed) = follow-on.
 
