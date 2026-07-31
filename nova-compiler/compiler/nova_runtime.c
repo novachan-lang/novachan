@@ -2973,6 +2973,9 @@ int64_t nova_rt_dict_items(int64_t handle) {
     return list;
 }
 
+int64_t nova_rt_chan_for_recv(int64_t handle);
+int64_t nova_rt_index_get(int64_t obj, int64_t index);
+
 int64_t nova_rt_for_iter_init(int64_t obj) {
     if (obj == 0) return nova_rt_list_create();
     void* ptr = (void*)(uintptr_t)obj;
@@ -2997,6 +3000,17 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
            index-get/set dynamic-path guards); the compiler rewrites every RESOLVED `for x in struct` to
            `for x in struct.iter()` (a list), so a struct only reaches here in the unresolvable/malformed case. */
         nova_panic("for-in over a struct whose type is not statically known, or which has no `iter(self) -> list` method: define iter and make the receiver's type resolvable (annotate the parameter if it is inferred only from `for` usage)");
+    }
+    if (tag == NOVA_MEM_CHANNEL) {
+        int64_t result = nova_rt_list_create();
+        for (;;) {
+            int64_t pair = nova_rt_chan_for_recv(obj);
+            int64_t got = nova_rt_index_get(pair, 0);
+            if (got == 0) break;
+            int64_t val = nova_rt_index_get(pair, 1);
+            nova_rt_list_append(result, val);
+        }
+        return result;
     }
     if (tag == NOVA_MEM_LIST) nova_list_deopt(obj);  /* S4.2: for-in runs the boxed path in v1 */
     return obj;
@@ -5131,6 +5145,100 @@ int64_t nova_rt_channel_close(int64_t handle) {
     pthread_mutex_unlock(&ch->lock);
 #endif
     return 0;
+}
+
+/* For-in channel iteration: blocking recv that unambiguously distinguishes
+   "received a value" from "channel closed+empty".
+   Returns a 2-element list [got, value]:
+     got=1, value=received  — a value was dequeued
+     got=0, value=0         — channel is closed and empty (iteration ends) */
+int64_t nova_rt_chan_for_recv(int64_t handle) {
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (nova_sched_in_task()) {
+        for (;;) {
+#ifdef _WIN32
+            EnterCriticalSection(&ch->lock);
+            if (ch->count > 0) {
+                int64_t v = channel_dequeue(ch);
+                WakeConditionVariable(&ch->not_full);
+                nova_sched_wake_send_one(ch);
+                LeaveCriticalSection(&ch->lock);
+                nova_rt_list_append(result, 1);
+                nova_rt_list_append(result, v);
+                return result;
+            }
+            if (ch->closed) {
+                LeaveCriticalSection(&ch->lock);
+                nova_rt_list_append(result, 0);
+                nova_rt_list_append(result, 0);
+                return result;
+            }
+            nova_sched_park_on(ch);
+            LeaveCriticalSection(&ch->lock);
+#else
+            pthread_mutex_lock(&ch->lock);
+            if (ch->count > 0) {
+                int64_t v = channel_dequeue(ch);
+                pthread_cond_signal(&ch->not_full);
+                nova_sched_wake_send_one(ch);
+                pthread_mutex_unlock(&ch->lock);
+                nova_rt_list_append(result, 1);
+                nova_rt_list_append(result, v);
+                return result;
+            }
+            if (ch->closed) {
+                pthread_mutex_unlock(&ch->lock);
+                nova_rt_list_append(result, 0);
+                nova_rt_list_append(result, 0);
+                return result;
+            }
+            nova_sched_park_on(ch);
+            pthread_mutex_unlock(&ch->lock);
+#endif
+            nova_sched_yield_now();
+        }
+    }
+#ifdef _WIN32
+    EnterCriticalSection(&ch->lock);
+    while (ch->count == 0) {
+        if (ch->closed) {
+            LeaveCriticalSection(&ch->lock);
+            nova_rt_list_append(result, 0);
+            nova_rt_list_append(result, 0);
+            return result;
+        }
+        SleepConditionVariableCS(&ch->not_empty, &ch->lock, INFINITE);
+    }
+    {
+        int64_t value = channel_dequeue(ch);
+        WakeConditionVariable(&ch->not_full);
+        nova_sched_wake_send_one(ch);
+        LeaveCriticalSection(&ch->lock);
+        nova_rt_list_append(result, 1);
+        nova_rt_list_append(result, value);
+    }
+#else
+    pthread_mutex_lock(&ch->lock);
+    while (ch->count == 0) {
+        if (ch->closed) {
+            pthread_mutex_unlock(&ch->lock);
+            nova_rt_list_append(result, 0);
+            nova_rt_list_append(result, 0);
+            return result;
+        }
+        pthread_cond_wait(&ch->not_empty, &ch->lock);
+    }
+    {
+        int64_t value = channel_dequeue(ch);
+        pthread_cond_signal(&ch->not_full);
+        nova_sched_wake_send_one(ch);
+        pthread_mutex_unlock(&ch->lock);
+        nova_rt_list_append(result, 1);
+        nova_rt_list_append(result, value);
+    }
+#endif
+    return result;
 }
 
 /* Non-blocking try-receive: returns 1 and stores value if available, 0 otherwise.
