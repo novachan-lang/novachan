@@ -85,6 +85,16 @@ See memory `[[builtin-needs-type-tag-check]]`, `[[novadict-dense-layout]]`,
   (raw int, or BOXED float). Float comprehensions still correctly yield floats.
 - ✅ `2a720dd6` **CYCLE 3-G part 2 — `min()`/`max()` over a comprehension had the same bug** (1.0/5.0
   instead of 1/5). Same root, same fix: `nova_rt_list_min_any`/`nova_rt_list_max_any`.
+- ✅ `2cbb8688` (certified `bd8dc1dd`) **comparisons yield BOOL — `print(x == y)` printed `1`, not `true`.**
+  Found by dogfooding; a direct Python-parity failure given NOVA's "simpler than Python" bar. Only bool
+  LITERALS rendered correctly. TWO independent paths both needed fixing: (1) `ir_infer_one` typed the
+  RESULT register of eq/neq/lt/le/gt/ge and not/and/or as "int" — the instruction's own IrType is the
+  OPERAND type (it picks the float/str/int compare variant) and is unchanged; only `rt[dest]` moved to
+  "bool". (2) const-folded literal comparisons never reach inference, so 7 `ir_const_fold` sites now emit
+  a bool-typed constant. Also fixed a latent LOCK-4 interaction: the int/int compare propagated the
+  operand WIDTH (`@w@`) onto its result, so a `u8` operand would have made the backend mask a boolean.
+  SCOPE GUARD: `neg`/`bitnot` stay INTS (an initial mis-patch made `neg` bool; the probe caught it and
+  the KAT now pins it). KAT `_kat_bool_render` covers folded + runtime + the neg/bitnot guard.
 - 🔄 **L8 call-overload — root cause identified, partially working.** `obj(args)` → `Struct__call`
   works when the callee's type is already resolved (`let d: Doubler = ...`, a param, a field).
   It does NOT work for `let d = Doubler(3)` because at constrain time the callee is still an
