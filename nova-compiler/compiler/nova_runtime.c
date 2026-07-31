@@ -8249,7 +8249,26 @@ static int nova_sched_poll_io(int timeout_ms) {
             if (rem < (int64_t)timeout_ms) timeout_ms = (int)rem;
         }
     }
+    /* FD_SETSIZE GUARD (POSIX). On Windows fd_set is { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; },
+       so raising FD_SETSIZE above (to 4096) genuinely resizes it and FD_SET is bounded by fd_count.
+       On POSIX fd_set is a FIXED BITMAP indexed BY DESCRIPTOR NUMBER, and glibc pins it at 1024
+       regardless of any FD_SETSIZE we define. So FD_SET(fd, ...) with fd >= FD_SETSIZE writes past
+       the end of a STACK object — a stack buffer overflow, reachable from any server that simply
+       accepts more than ~1024 concurrent connections.
+
+       Degrade safely instead: never FD_SET an out-of-range descriptor, and remember that we saw one
+       so the post-select scan can wake those waiters anyway. A spurious wake is harmless here — the
+       task just retries its syscall and re-parks (the same property the POLL_WRITE/exceptfds comment
+       above relies on) — whereas silently skipping them would park those tasks forever. The cost is a
+       busier poll loop above the limit, which is the right trade against memory corruption.
+
+       This is a mitigation, not the real fix: POSIX above 1024 FDs wants poll()/epoll(), which is a
+       separate backend change. Tracked as such. */
+    int over_fd_limit = 0;
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
+#ifndef _WIN32
+        if ((int)w->fd < 0 || (int)w->fd >= FD_SETSIZE) { over_fd_limit = 1; continue; }
+#endif
         if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
         /* A non-blocking connect parks on POLL_WRITE: success shows in writefds, but on Windows
            a FAILURE (e.g. ECONNREFUSED — peer down) shows ONLY in exceptfds, so watch both — else
@@ -8263,6 +8282,10 @@ static int nova_sched_poll_io(int timeout_ms) {
 #endif
     }
     nova_sched_unlock();
+    /* An out-of-range descriptor cannot be in any fd_set, so select() knows nothing about it.
+       Cap the blocking wait so the retry-wake below happens promptly instead of after the caller's
+       full timeout. */
+    if (over_fd_limit && timeout_ms > 1) timeout_ms = 1;
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -8283,7 +8306,12 @@ static int nova_sched_poll_io(int timeout_ms) {
     while (*pp) {
         NovaIOWaiter* w = *pp;
         int ready = 0;
-        if (sel_ready) {
+#ifndef _WIN32
+        /* Out-of-range descriptor (see the FD_SETSIZE guard above): it was never added to a set, so
+           FD_ISSET would read the wrong bit. Wake it unconditionally and let it retry its syscall. */
+        if ((int)w->fd < 0 || (int)w->fd >= FD_SETSIZE) ready = 1;
+#endif
+        if (!ready && sel_ready) {
             if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
             if ((w->events & NOVA_POLL_WRITE) && (FD_ISSET(w->fd, &wfds) || FD_ISSET(w->fd, &efds))) ready = 1;
         }
