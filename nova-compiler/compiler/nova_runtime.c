@@ -14190,6 +14190,30 @@ int64_t nova_rt_sum(int64_t handle) {
     return acc;
 }
 
+/* CYCLE 3-G: sum() over a list whose element type the compiler could NOT determine
+   statically. A comprehension desugars to map(), whose result type is plain "list",
+   and the old dispatch treated every non-"intlist" as a float list — so
+   `sum([x * 2 for x in xs])` returned 20.0 instead of 20.
+
+   This variant decides at RUNTIME and makes the result SELF-DESCRIBING: a raw int
+   for an integer list, a BOXED float for a float list, so str()/any_to_str renders
+   it correctly either way. The statically-typed paths are untouched and stay
+   unboxed/fast — nova_rt_sum for a known intlist, nova_rt_sum_f for a known
+   floatlist; only the genuinely-unknown case pays for the box. */
+int64_t nova_rt_sum_any(int64_t handle) {
+    NovaList* l = nova_as_list(handle);
+    if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_box_float(nova_rt_sum_f(handle));
+    /* elem_kind 0/1: a boxed float may still be present in an Any/heterogeneous
+       list, so only take the exact integer path when every element is a plain int. */
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_is_box(l->data[i])) return nova_rt_box_float(nova_rt_sum_f(handle));
+    }
+    int64_t acc = 0;
+    for (int64_t i = 0; i < l->size; i++) acc += l->data[i];
+    return acc;
+}
+
 int64_t nova_rt_index_of(int64_t handle, int64_t item) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return -1;  /* SOUNDNESS: non-list -> not found, no wild deref */
     nova_list_deopt(handle);  /* S4.2 */

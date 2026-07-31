@@ -9678,6 +9678,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_list_min(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_max(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_sum_f(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_sum_any(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_min_f(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_max_f(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_set_create() nounwind")
@@ -16597,9 +16598,26 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                 let _co_redir = 0
                 match _co_walked
                     NType(_co_k, _co_n, _co_p, _co_i) =>
+                        // NOTE: _co_walked is only a struct here when the callee's type is ALREADY
+                        // resolved at this point (e.g. `let d: Doubler = ...`, a param, or a field).
+                        // For `let d = Doubler(3)` it is still an unresolved type VARIABLE, because
+                        // constraint solving is deferred — so the redirect cannot fire and the call
+                        // falls through to the fn constraint below. See the limitation note on the
+                        // fallback branch.
                         if _co_k == "struct" and _co_n != ""
                             let _co_call = _co_n + "__call"
+                            // Resolve against ti_type_methods (type -> its method names), the same
+                            // table the method-call path uses. ti_has_name only walks ti_scope +
+                            // ti_stdlib, which do not carry `Type__method` entries — so the original
+                            // ti_has_name guard was always 0 and this redirect never fired, leaving
+                            // `d(7)` to hit the fallback and report "expected Doubler, found (int) -> ?T".
+                            let _co_known = 0
+                            if contains(st.ti_type_methods, _co_n)
+                                if list_contains(st.ti_type_methods[_co_n], "call")
+                                    _co_known = 1
                             if ti_has_name(st, _co_call) == 1
+                                _co_known = 1
+                            if _co_known == 1
                                 let _co_ft = ti_lookup(st, _co_call, eline)
                                 let _co_args = [fn_t]
                                 for _co_a in arg_types
@@ -16608,6 +16626,13 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                 ti_constrain(st, _co_ft, _co_exp, eline)
                                 _co_redir = 1
                 if _co_redir == 0
+                    // KNOWN LIMITATION (L8 call-overload): if fn_t is still an unresolved type
+                    // variable we constrain it to a function type here, which later conflicts once
+                    // it resolves to a callable struct — `let d = Doubler(3); d(7)` reports
+                    // "expected Doubler, found (int) -> ?T". Annotating the binding
+                    // (`let d: Doubler = Doubler(3)`) resolves the type eagerly and works today.
+                    // A full fix needs the call constraint DEFERRED until fn_t is resolved (the
+                    // ti_bound_checks pattern), which is inferrer-deep — tracked, not bolted on here.
                     let expected_fn = nt_fn(arg_types, ret_var)
                     ti_constrain(st, fn_t, expected_fn, eline)
                 if contains(st.ti_fn_bounds, value)
@@ -19609,6 +19634,19 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 // Numeric aggregates over a NON-int list (float/Any) are routed to the
                 // float-aware variants and typed float. Pure int lists ("intlist") fall
                 // through to the integer variants below (exact, any magnitude).
+                // CYCLE 3-G: sum() over a list of UNKNOWN element type must not be assumed
+                // float. A comprehension desugars to map(), whose result is typed plain
+                // "list", so the old `!= "intlist"` test sent it to the float variant and
+                // `sum([x * 2 for x in xs])` printed 20.0 instead of 20. Route the unknown
+                // case to nova_rt_sum_any, which decides at runtime on elem_kind and returns
+                // a self-describing value (raw int, or a BOXED float) — typed "any" so str()
+                // renders whichever it actually is. Known intlist/floatlist are unchanged.
+                if value == "nova_rt_sum" and len(args) == 1
+                    let _sat = ir_reg_type(rt, args[0])
+                    if _sat != "intlist" and _sat != "floatlist" and _sat != "float"
+                        if dest != ""
+                            rt[dest] = "any"
+                        return IrInst(op, dest, ir_type_any(), args, "nova_rt_sum_any", num, effect, line)
                 if (value == "nova_rt_sum" or value == "nova_rt_list_min" or value == "nova_rt_list_max") and len(args) == 1
                     if ir_reg_type(rt, args[0]) != "intlist"
                         let fv = "nova_rt_sum_f"
@@ -23656,6 +23694,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_list_min(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_list_max(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_sum_f(i64) nounwind readonly")
+    ire_line(e, "declare i64 @nova_rt_sum_any(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_min_f(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_list_max_f(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_set_create() nounwind")
