@@ -1,0 +1,283 @@
+// KAT for 6 new pure-NOVA stdlib modules:
+//   std/concurrency/barrier, std/concurrency/pool, std/database/migration,
+//   std/database/query_builder, std/config/env, std/template/simple
+// All expected values hand-computed. Prints "PASS _kat_concurrency_db_config"
+// iff every check passes; otherwise prints one FAIL line per failing check
+// and a final FAILED count.
+
+import std/concurrency/barrier as br
+import std/concurrency/pool as tp
+import std/database/migration as mg
+import std/database/query_builder as qb
+import std/config/env as ce
+import std/template/simple as tpl
+
+fn check(name: string, cond: bool) -> int
+    if not cond
+        print("FAIL: " + name)
+        return 1
+    return 0
+
+fn check_int(name: string, got: int, want: int) -> int
+    if got != want
+        print("FAIL: " + name + " got=" + str(got) + " want=" + str(want))
+        return 1
+    return 0
+
+fn check_str(name: string, got: string, want: string) -> int
+    if got != want
+        print("FAIL: " + name + " got=[" + got + "] want=[" + want + "]")
+        return 1
+    return 0
+
+// ---------------------------------------------------------------------------
+// std/concurrency/barrier
+// ---------------------------------------------------------------------------
+fn test_barrier() -> int
+    let f = 0
+    let b = br.br_new(3)
+    f = f + check_int("barrier.count", br.br_count(b), 3)
+    f = f + check_int("barrier.arrived.0", br.br_arrived(b), 0)
+    f = f + check_int("barrier.is_complete.0", br.br_is_complete(b), 0)
+
+    f = f + check_int("barrier.arrive.1", br.br_arrive(b), 1)
+    f = f + check_int("barrier.is_complete.1", br.br_is_complete(b), 0)
+    f = f + check_int("barrier.arrive.2", br.br_arrive(b), 2)
+    f = f + check_int("barrier.is_complete.2", br.br_is_complete(b), 0)
+    f = f + check_int("barrier.arrive.3", br.br_arrive(b), 3)
+    f = f + check_int("barrier.is_complete.3", br.br_is_complete(b), 1)
+
+    // extra arrivals beyond total are no-ops, count stays clamped at total
+    f = f + check_int("barrier.arrive.extra", br.br_arrive(b), 3)
+    f = f + check_int("barrier.arrived.after_extra", br.br_arrived(b), 3)
+
+    br.br_reset(b)
+    f = f + check_int("barrier.reset.arrived", br.br_arrived(b), 0)
+    f = f + check_int("barrier.reset.is_complete", br.br_is_complete(b), 0)
+    f = f + check_int("barrier.reset.count_unchanged", br.br_count(b), 3)
+
+    // count < 1 clamps to 1, and a 1-party barrier completes on first arrival
+    let b1 = br.br_new(0)
+    f = f + check_int("barrier.clamp.count", br.br_count(b1), 1)
+    f = f + check_int("barrier.clamp.arrive", br.br_arrive(b1), 1)
+    f = f + check_int("barrier.clamp.complete", br.br_is_complete(b1), 1)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/concurrency/pool
+// ---------------------------------------------------------------------------
+fn test_pool() -> int
+    let f = 0
+    let p = tp.tp_new(2)
+    f = f + check_int("pool.size.empty", tp.tp_size(p), 0)
+    f = f + check_int("pool.is_full.empty", tp.tp_is_full(p), 0)
+    f = f + check_int("pool.next.empty", tp.tp_next(p), 0)
+
+    f = f + check_int("pool.submit.1", tp.tp_submit(p, 100), 1)
+    f = f + check_int("pool.submit.2", tp.tp_submit(p, 200), 1)
+    f = f + check_int("pool.is_full.at_cap", tp.tp_is_full(p), 1)
+    f = f + check_int("pool.submit.rejected", tp.tp_submit(p, 300), 0)
+    f = f + check_int("pool.size.at_cap", tp.tp_size(p), 2)
+
+    f = f + check_int("pool.next.fifo.1", tp.tp_next(p), 100)
+    f = f + check_int("pool.is_full.after_take", tp.tp_is_full(p), 0)
+    f = f + check_int("pool.submit.after_take", tp.tp_submit(p, 300), 1)
+    f = f + check_int("pool.next.fifo.2", tp.tp_next(p), 200)
+    f = f + check_int("pool.next.fifo.3", tp.tp_next(p), 300)
+    f = f + check_int("pool.next.drained", tp.tp_next(p), 0)
+
+    tp.tp_submit(p, 1)
+    tp.tp_submit(p, 2)
+    tp.tp_clear(p)
+    f = f + check_int("pool.clear.size", tp.tp_size(p), 0)
+
+    // max_size <= 0 means unbounded
+    let up = tp.tp_new(0)
+    let k = 0
+    while k < 50
+        tp.tp_submit(up, k)
+        k = k + 1
+    f = f + check_int("pool.unbounded.size", tp.tp_size(up), 50)
+    f = f + check_int("pool.unbounded.is_full", tp.tp_is_full(up), 0)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/database/migration
+// ---------------------------------------------------------------------------
+fn test_migration() -> int
+    let f = 0
+    let t = mg.mg_new()
+    f = f + check_int("migration.count.empty", mg.mg_count(t), 0)
+    let latest0 = mg.mg_latest(t)
+    f = f + check_int("migration.latest.empty", len(keys(latest0)), 0)
+
+    // add out of order to verify sorted-insertion
+    mg.mg_add(t, 3, "add index", "CREATE INDEX ix ON t(c)", "DROP INDEX ix")
+    mg.mg_add(t, 1, "create table", "CREATE TABLE t(id INT)", "DROP TABLE t")
+    mg.mg_add(t, 2, "add column", "ALTER TABLE t ADD c INT", "ALTER TABLE t DROP COLUMN c")
+    f = f + check_int("migration.count.3", mg.mg_count(t), 3)
+
+    let latest = mg.mg_latest(t)
+    f = f + check_int("migration.latest.version", latest["version"], 3)
+    f = f + check_str("migration.latest.desc", latest["description"], "add index")
+
+    let g2 = mg.mg_get(t, 2)
+    f = f + check_str("migration.get.desc", g2["description"], "add column")
+    f = f + check_str("migration.get.up", g2["up_sql"], "ALTER TABLE t ADD c INT")
+    let missing = mg.mg_get(t, 99)
+    f = f + check_int("migration.get.missing", len(keys(missing)), 0)
+
+    let pending = mg.mg_pending(t, 1)
+    f = f + check_int("migration.pending.len", len(pending), 2)
+    f = f + check_int("migration.pending.0", pending[0]["version"], 2)
+    f = f + check_int("migration.pending.1", pending[1]["version"], 3)
+
+    let pending_none = mg.mg_pending(t, 3)
+    f = f + check_int("migration.pending.none", len(pending_none), 0)
+
+    f = f + check_int("migration.applied.empty", len(mg.mg_applied(t)), 0)
+    f = f + check_int("migration.apply.hit", mg.mg_apply(t, 1), 1)
+    f = f + check_int("migration.apply.miss", mg.mg_apply(t, 99), 0)
+    let applied = mg.mg_applied(t)
+    f = f + check_int("migration.applied.len", len(applied), 1)
+    f = f + check_int("migration.applied.0.version", applied[0]["version"], 1)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/database/query_builder
+// ---------------------------------------------------------------------------
+fn test_query_builder() -> int
+    let f = 0
+    let q1 = qb.qb_select("users", ["id", "name"])
+    qb.qb_where(q1, "age > 18")
+    qb.qb_where(q1, "active = 1")
+    qb.qb_order_by(q1, "name", "ASC")
+    qb.qb_limit(q1, 10)
+    f = f + check_str("qb.select.build", qb.qb_build(q1), "SELECT id, name FROM users WHERE age > 18 AND active = 1 ORDER BY name ASC LIMIT 10")
+
+    let q2 = qb.qb_select("users", [])
+    f = f + check_str("qb.select.star", qb.qb_build(q2), "SELECT * FROM users")
+
+    let q3 = qb.qb_insert("users", ["id", "name"], ["1", "'Alice'"])
+    f = f + check_str("qb.insert.build", qb.qb_build(q3), "INSERT INTO users (id, name) VALUES (1, 'Alice')")
+
+    let sets = {}
+    sets["name"] = "'Bob'"
+    sets["age"] = "30"
+    let q4 = qb.qb_update("users", sets, "id = 1")
+    f = f + check_str("qb.update.build", qb.qb_build(q4), "UPDATE users SET name = 'Bob', age = 30 WHERE id = 1")
+
+    let q5 = qb.qb_update("users", sets, "")
+    let built5 = qb.qb_build(q5)
+    f = f + check("qb.update.no_where", not contains_str(built5, "WHERE"))
+
+    let q6 = qb.qb_delete("users", "id = 5")
+    f = f + check_str("qb.delete.build", qb.qb_build(q6), "DELETE FROM users WHERE id = 5")
+
+    let q7 = qb.qb_delete("users", "")
+    f = f + check_str("qb.delete.no_where", qb.qb_build(q7), "DELETE FROM users")
+    return f
+
+fn contains_str(haystack: string, needle: string) -> bool
+    find(haystack, needle) >= 0
+
+// ---------------------------------------------------------------------------
+// std/config/env
+// ---------------------------------------------------------------------------
+fn test_env() -> int
+    let f = 0
+    f = f + check_str("env.get.unset_default", ce.ce_get("NOVA_KAT_UNSET_VAR_XYZ", "fallback"), "fallback")
+    f = f + check_int("env.is_set.unset", int(ce.ce_is_set("NOVA_KAT_UNSET_VAR_XYZ")), 0)
+
+    set_env("NOVA_KAT_TEST_STR", "hello")
+    set_env("NOVA_KAT_TEST_INT", "42")
+    set_env("NOVA_KAT_TEST_BOOL", "true")
+    set_env("NOVA_KAT_PFX_ONE", "1")
+    set_env("NOVA_KAT_PFX_TWO", "2")
+
+    f = f + check_str("env.get.set", ce.ce_get("NOVA_KAT_TEST_STR", "fallback"), "hello")
+    f = f + check_int("env.is_set.set", int(ce.ce_is_set("NOVA_KAT_TEST_STR")), 1)
+    f = f + check_int("env.get_int.set", ce.ce_get_int("NOVA_KAT_TEST_INT", -1), 42)
+    f = f + check_int("env.get_int.unset_default", ce.ce_get_int("NOVA_KAT_UNSET_VAR_XYZ", -1), -1)
+    f = f + check_int("env.get_bool.set", int(ce.ce_get_bool("NOVA_KAT_TEST_BOOL", false)), 1)
+    f = f + check_int("env.get_bool.unset_default", int(ce.ce_get_bool("NOVA_KAT_UNSET_VAR_XYZ", true)), 1)
+
+    let req = ce.ce_require("NOVA_KAT_TEST_STR")
+    f = f + check("env.require.ok", is_ok(req))
+    f = f + check_str("env.require.value", unwrap(req), "hello")
+    let req_missing = ce.ce_require("NOVA_KAT_UNSET_VAR_XYZ")
+    f = f + check("env.require.missing_is_err", is_err(req_missing))
+
+    let candidates = ["ONE", "TWO", "THREE"]
+    let pfx = ce.ce_prefix("NOVA_KAT_PFX_", candidates)
+    f = f + check_int("env.prefix.count", len(keys(pfx)), 2)
+    f = f + check_str("env.prefix.one", pfx["NOVA_KAT_PFX_ONE"], "1")
+    f = f + check_str("env.prefix.two", pfx["NOVA_KAT_PFX_TWO"], "2")
+    return f
+
+// ---------------------------------------------------------------------------
+// std/template/simple
+// ---------------------------------------------------------------------------
+fn test_template() -> int
+    let f = 0
+    let t1 = "Hello, \{\{name\}\}! You are \{\{age\}\} years old."
+    let vars = {}
+    vars["name"] = "World"
+    vars["age"] = 42
+    f = f + check_str("tpl.render.basic", tpl.tpl_render(t1, vars), "Hello, World! You are 42 years old.")
+
+    let missing_vars = {}
+    missing_vars["name"] = "Solo"
+    f = f + check_str("tpl.render.missing_key", tpl.tpl_render(t1, missing_vars), "Hello, Solo! You are  years old.")
+
+    f = f + check("tpl.has_vars.true", tpl.tpl_has_vars(t1))
+    f = f + check("tpl.has_vars.false", not tpl.tpl_has_vars("no placeholders here"))
+
+    let ks = tpl.tpl_extract_vars(t1)
+    f = f + check_int("tpl.extract_vars.len", len(ks), 2)
+    f = f + check_str("tpl.extract_vars.0", ks[0], "name")
+    f = f + check_str("tpl.extract_vars.1", ks[1], "age")
+
+    // duplicate key references dedup to first-seen order
+    let t2 = "\{\{a\}\} and \{\{b\}\} and \{\{a\}\} again"
+    let ks2 = tpl.tpl_extract_vars(t2)
+    f = f + check_int("tpl.extract_vars.dedup.len", len(ks2), 2)
+    f = f + check_str("tpl.extract_vars.dedup.0", ks2[0], "a")
+    f = f + check_str("tpl.extract_vars.dedup.1", ks2[1], "b")
+
+    // unterminated placeholder degrades to literal text
+    let t3 = "broken \{\{unclosed"
+    f = f + check_str("tpl.render.unterminated", tpl.tpl_render(t3, {}), "broken \{\{unclosed")
+    f = f + check("tpl.has_vars.unterminated", not tpl.tpl_has_vars(t3))
+
+    // no-brace text passes through verbatim
+    f = f + check_str("tpl.render.plain", tpl.tpl_render("plain text", vars), "plain text")
+
+    let rows = []
+    let r1 = {}
+    r1["name"] = "Alice"
+    r1["age"] = 30
+    let r2 = {}
+    r2["name"] = "Bob"
+    r2["age"] = 25
+    push(rows, r1)
+    push(rows, r2)
+    let rendered = tpl.tpl_render_list("\{\{name\}\} is \{\{age\}\}", rows)
+    f = f + check_int("tpl.render_list.len", len(rendered), 2)
+    f = f + check_str("tpl.render_list.0", rendered[0], "Alice is 30")
+    f = f + check_str("tpl.render_list.1", rendered[1], "Bob is 25")
+    return f
+
+// ---------------------------------------------------------------------------
+let failures = 0
+failures = failures + test_barrier()
+failures = failures + test_pool()
+failures = failures + test_migration()
+failures = failures + test_query_builder()
+failures = failures + test_env()
+failures = failures + test_template()
+
+if failures == 0
+    print("PASS _kat_concurrency_db_config")
+else
+    print("FAILED " + str(failures) + " checks")

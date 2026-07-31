@@ -1,0 +1,195 @@
+// std/database/query_builder — SQL string builder (data-only)
+//
+// WHAT:
+//   Accumulates the parts of a SQL statement (SELECT/INSERT/UPDATE/DELETE)
+//   into a dict and renders them to a single SQL string via qb_build. This
+//   module does NOT execute queries, does NOT connect to a database, and
+//   does NOT escape or quote values — every string passed in (column
+//   names, condition text, literal values) is emitted into the output
+//   VERBATIM. Callers are responsible for quoting/escaping any value that
+//   originates from untrusted input before passing it to qb_where /
+//   qb_insert / qb_update; this module has no way to know which strings are
+//   trusted identifiers vs. untrusted data, so it makes no unsafe promise
+//   of automatic escaping. (See std/forge's real driver layer for
+//   parameterized-query execution — this module is for building the SQL
+//   text itself, e.g. for logging, migration scripts, or hand-off to a
+//   driver that does its own parameter binding.)
+//
+// Representation: a single dict accumulates one of four query "kinds":
+//   select: {"kind":"select","table":str,"columns":list<str>,
+//            "where":list<str>,"order_col":str,"order_dir":str,"limit":int}
+//            (order_col=="" means no ORDER BY; limit<0 means no LIMIT)
+//   insert: {"kind":"insert","table":str,"columns":list<str>,"values":list<str>}
+//   update: {"kind":"update","table":str,"sets":dict<str,str>,"where":str}
+//   delete: {"kind":"delete","table":str,"where":str}
+//
+// Public API:
+//   qb_select(table, columns)            -> dict   Start a SELECT. columns
+//                                                   == [] renders "SELECT *".
+//   qb_where(query, condition)           -> dict   Append an AND-ed WHERE
+//                                                   condition (SELECT only;
+//                                                   no-op + returns query
+//                                                   unchanged on other kinds).
+//   qb_order_by(query, column, direction)-> dict   Set ORDER BY (SELECT only).
+//   qb_limit(query, n)                   -> dict   Set LIMIT n (SELECT only).
+//   qb_build(query)                      -> str    Render the accumulated
+//                                                   query to a SQL string.
+//   qb_insert(table, columns, values)    -> dict   A ready-to-build INSERT
+//                                                   (columns[i] pairs with
+//                                                   values[i] by position).
+//   qb_update(table, sets, where_clause) -> dict   A ready-to-build UPDATE
+//                                                   (sets is a dict of
+//                                                   column -> new value).
+//   qb_delete(table, where_clause)       -> dict   A ready-to-build DELETE.
+//
+// LEAF — imports nothing.
+// ============================================================================
+
+// _qb_join: join a list of strings with ", " between elements (no builtin
+// list-join is assumed available here — written directly for a leaf module).
+fn _qb_join(items, sep) -> str
+    let n = len(items)
+    let out = ""
+    let i = 0
+    while i < n
+        if i > 0
+            out = out + sep
+        out = out + items[i]
+        i = i + 1
+    return out
+
+// qb_select: start building a SELECT query. columns == [] means "SELECT *".
+fn qb_select(table, columns) -> dict
+    let q = {}
+    q["kind"] = "select"
+    q["table"] = table
+    q["columns"] = columns
+    q["where"] = []
+    q["order_col"] = ""
+    q["order_dir"] = ""
+    q["limit"] = -1
+    return q
+
+// qb_where: append an AND-ed WHERE condition. Only meaningful for SELECT
+// queries built via qb_select — on any other kind this is a documented
+// no-op that still returns the query unchanged (chaining stays safe).
+fn qb_where(query, condition) -> dict
+    if query["kind"] == "select"
+        let w = query["where"]
+        w.push(condition)
+    return query
+
+// qb_order_by: set the ORDER BY column and direction (e.g. "ASC" / "DESC").
+// SELECT only; no-op on other kinds.
+fn qb_order_by(query, column, direction) -> dict
+    if query["kind"] == "select"
+        query["order_col"] = column
+        query["order_dir"] = direction
+    return query
+
+// qb_limit: set a LIMIT n clause. SELECT only; no-op on other kinds.
+fn qb_limit(query, n) -> dict
+    if query["kind"] == "select"
+        query["limit"] = n
+    return query
+
+// _qb_build_select: render a SELECT-kind query dict to SQL text.
+fn _qb_build_select(query) -> str
+    let columns = query["columns"]
+    let col_sql = "*"
+    if len(columns) > 0
+        col_sql = _qb_join(columns, ", ")
+    let sql = "SELECT " + col_sql + " FROM " + query["table"]
+    let w = query["where"]
+    if len(w) > 0
+        sql = sql + " WHERE " + _qb_join(w, " AND ")
+    if len(query["order_col"]) > 0
+        sql = sql + " ORDER BY " + query["order_col"]
+        if len(query["order_dir"]) > 0
+            sql = sql + " " + query["order_dir"]
+    if query["limit"] >= 0
+        sql = sql + " LIMIT " + str(query["limit"])
+    return sql
+
+// _qb_build_insert: render an INSERT-kind query dict to SQL text.
+fn _qb_build_insert(query) -> str
+    let columns = query["columns"]
+    let values = query["values"]
+    let sql = "INSERT INTO " + query["table"]
+    sql = sql + " (" + _qb_join(columns, ", ") + ")"
+    sql = sql + " VALUES (" + _qb_join(values, ", ") + ")"
+    return sql
+
+// _qb_build_update: render an UPDATE-kind query dict to SQL text.
+fn _qb_build_update(query) -> str
+    let sets = query["sets"]
+    let ks = keys(sets)
+    let n = len(ks)
+    let assigns = []
+    let i = 0
+    while i < n
+        let k = ks[i]
+        assigns.push(k + " = " + sets[k])
+        i = i + 1
+    let sql = "UPDATE " + query["table"] + " SET " + _qb_join(assigns, ", ")
+    let w = query["where"]
+    if len(w) > 0
+        sql = sql + " WHERE " + w
+    return sql
+
+// _qb_build_delete: render a DELETE-kind query dict to SQL text.
+fn _qb_build_delete(query) -> str
+    let sql = "DELETE FROM " + query["table"]
+    let w = query["where"]
+    if len(w) > 0
+        sql = sql + " WHERE " + w
+    return sql
+
+// qb_build: render the accumulated query to a single SQL string. Dispatches
+// on the "kind" tag set by whichever qb_select/qb_insert/qb_update/qb_delete
+// constructed the query dict.
+fn qb_build(query) -> str
+    let kind = query["kind"]
+    if kind == "select"
+        return _qb_build_select(query)
+    if kind == "insert"
+        return _qb_build_insert(query)
+    if kind == "update"
+        return _qb_build_update(query)
+    if kind == "delete"
+        return _qb_build_delete(query)
+    return ""
+
+// qb_insert: build an INSERT query. columns[i] pairs with values[i] by
+// position (both lists must be the same length — the caller's
+// responsibility, matching this module's no-validation stance).
+fn qb_insert(table, columns, values) -> dict
+    let q = {}
+    q["kind"] = "insert"
+    q["table"] = table
+    q["columns"] = columns
+    q["values"] = values
+    return q
+
+// qb_update: build an UPDATE query. sets is a dict mapping column name to
+// the (already-formatted) new value text; where_clause is emitted verbatim
+// after WHERE (empty string means no WHERE clause — matches every row).
+fn qb_update(table, sets, where_clause) -> dict
+    let q = {}
+    q["kind"] = "update"
+    q["table"] = table
+    q["sets"] = sets
+    q["where"] = where_clause
+    return q
+
+// qb_delete: build a DELETE query. where_clause is emitted verbatim after
+// WHERE (empty string means no WHERE clause — matches every row).
+fn qb_delete(table, where_clause) -> dict
+    let q = {}
+    q["kind"] = "delete"
+    q["table"] = table
+    q["where"] = where_clause
+    return q
+
+fn main()
+    print("database query_builder module loaded")

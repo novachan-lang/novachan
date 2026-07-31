@@ -2243,6 +2243,57 @@ int64_t nova_rt_str_is_space(int64_t s) {
     return 1;
 }
 
+int64_t nova_rt_list_for_each(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef void (*nova_vfn1)(int64_t);
+    nova_vfn1 fn = (nova_vfn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) fn(l->data[i]);
+    return 0;
+}
+
+int64_t nova_rt_list_map_indexed(int64_t handle, int64_t closure) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) nova_rt_list_append(out, fn(i, l->data[i]));
+    return out;
+}
+
+int64_t nova_rt_dict_update(int64_t a, int64_t b) {
+    if (nova_mem_find_tag((void*)(uintptr_t)a) != NOVA_MEM_DICT) return a;
+    if (nova_mem_find_tag((void*)(uintptr_t)b) != NOVA_MEM_DICT) return a;
+    NovaDict* db = (NovaDict*)(uintptr_t)b;
+    for (int64_t i = 0; i < db->size; i++) {
+        nova_rt_dict_set(a, db->keys[i], db->vals[i]);
+    }
+    return a;
+}
+
+int64_t nova_rt_dict_filter(int64_t handle, int64_t closure) {
+    int64_t out = nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return out;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)closure;
+    for (int64_t i = 0; i < d->size; i++) {
+        if (fn(d->keys[i], d->vals[i])) nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+    }
+    return out;
+}
+
+int64_t nova_rt_dict_map_values(int64_t handle, int64_t closure) {
+    int64_t out = nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return out;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < d->size; i++) nova_rt_dict_set(out, d->keys[i], fn(d->vals[i]));
+    return out;
+}
+
 int64_t nova_rt_list_group_by(int64_t handle, int64_t closure) {
     int64_t out = nova_rt_dict_create();
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
