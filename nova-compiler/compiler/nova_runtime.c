@@ -28419,3 +28419,106 @@ int64_t nova_rt_list_sliding_min(int64_t handle, int64_t k) {
     }
     return out;
 }
+
+/* nova_rt_list_group_equal: group consecutive equal elements */
+int64_t nova_rt_list_group_equal(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t group = (int64_t)(uintptr_t)nova_rt_list_create();
+    nova_rt_list_append(group, l->data[0]);
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] == l->data[i - 1]) {
+            nova_rt_list_append(group, l->data[i]);
+        } else {
+            nova_rt_list_append(out, group);
+            group = (int64_t)(uintptr_t)nova_rt_list_create();
+            nova_rt_list_append(group, l->data[i]);
+        }
+    }
+    nova_rt_list_append(out, group);
+    return out;
+}
+
+/* nova_rt_list_alternate: interleave two lists by alternating elements */
+int64_t nova_rt_list_alternate(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t alen = a ? a->size : 0;
+    int64_t blen = b ? b->size : 0;
+    int64_t maxlen = alen > blen ? alen : blen;
+    for (int64_t i = 0; i < maxlen; i++) {
+        if (i < alen) nova_rt_list_append(out, a->data[i]);
+        if (i < blen) nova_rt_list_append(out, b->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_str_is_vowel: check if single char is a vowel */
+int64_t nova_rt_str_is_vowel(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s || s[1] != 0) return 0;
+    char c = (char)tolower((unsigned char)s[0]);
+    return (c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u') ? 1 : 0;
+}
+
+/* nova_rt_list_majority_element: find element appearing more than n/2 times (Boyer-Moore voting) */
+int64_t nova_rt_list_majority_element(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t candidate = l->data[0], count = 1;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (count == 0) { candidate = l->data[i]; count = 1; }
+        else if (l->data[i] == candidate) count++;
+        else count--;
+    }
+    int64_t verify = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (l->data[i] == candidate) verify++;
+    }
+    return (verify > l->size / 2) ? candidate : 0;
+}
+
+/* nova_rt_dict_filter_by_key_prefix: keep entries whose key starts with prefix */
+int64_t nova_rt_dict_filter_by_key_prefix(int64_t handle, int64_t prefix_handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    const char* prefix = (const char*)(uintptr_t)prefix_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d || !prefix) return out;
+    size_t plen = strlen(prefix);
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            if (k && strncmp(k, prefix, plen) == 0) {
+                nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+            }
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_count_distinct: count number of distinct elements */
+int64_t nova_rt_list_count_distinct(int64_t handle) {
+    return nova_rt_list_unique_count(handle);
+}
+
+/* nova_rt_str_split_every: split string into chunks of n characters */
+int64_t nova_rt_str_split_every(int64_t str_handle, int64_t n) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!s || n <= 0) return out;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i += (size_t)n) {
+        size_t chunk = (size_t)n;
+        if (i + chunk > len) chunk = len - i;
+        char* buf = (char*)malloc(chunk + 1);
+        if (!buf) return out;
+        memcpy(buf, s + i, chunk);
+        buf[chunk] = 0;
+        int64_t cs = nova_rt_create_string(buf);
+        free(buf);
+        nova_rt_list_append(out, cs);
+    }
+    return out;
+}
