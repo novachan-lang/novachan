@@ -27094,3 +27094,117 @@ int64_t nova_rt_dict_sorted_by_value(int64_t handle) {
     return out;
 }
 
+/* nova_rt_str_from_char_code: create single-char string from ASCII code */
+int64_t nova_rt_str_from_char_code(int64_t code) {
+    if (code < 0 || code > 127) code = 63;
+    char buf[2] = {(char)code, 0};
+    return nova_rt_create_string(buf);
+}
+
+/* nova_rt_str_replace_n: replace first n occurrences of pattern */
+int64_t nova_rt_str_replace_n(int64_t str_val, int64_t old_val, int64_t new_val, int64_t max_n) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* old_s = (const char*)(uintptr_t)old_val;
+    const char* new_s = (const char*)(uintptr_t)new_val;
+    if (!s || !old_s || !new_s) return str_val;
+    int64_t slen = (int64_t)strlen(s);
+    int64_t olen = (int64_t)strlen(old_s);
+    int64_t nlen = (int64_t)strlen(new_s);
+    if (olen == 0 || max_n <= 0) return str_val;
+    int64_t buf_cap = slen + max_n * (nlen > olen ? nlen - olen : 0) + 1;
+    char* buf = (char*)malloc(buf_cap);
+    if (!buf) return str_val;
+    int64_t pos = 0, count = 0;
+    const char* p = s;
+    while (*p && count < max_n) {
+        const char* found = strstr(p, old_s);
+        if (!found) break;
+        int64_t prefix = (int64_t)(found - p);
+        memcpy(buf + pos, p, prefix); pos += prefix;
+        memcpy(buf + pos, new_s, nlen); pos += nlen;
+        p = found + olen;
+        count++;
+    }
+    int64_t rest = (int64_t)strlen(p);
+    memcpy(buf + pos, p, rest); pos += rest;
+    buf[pos] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_str_index_of_last: last index of substring, -1 if not found */
+int64_t nova_rt_str_index_of_last(int64_t str_val, int64_t sub_val) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* sub = (const char*)(uintptr_t)sub_val;
+    if (!s || !sub) return -1;
+    int64_t slen = (int64_t)strlen(s);
+    int64_t sublen = (int64_t)strlen(sub);
+    if (sublen == 0) return slen;
+    if (sublen > slen) return -1;
+    for (int64_t i = slen - sublen; i >= 0; i--) {
+        if (memcmp(s + i, sub, sublen) == 0) return i;
+    }
+    return -1;
+}
+
+/* nova_rt_list_split_at: split list at index -> [left, right] */
+int64_t nova_rt_list_split_at(int64_t handle, int64_t idx) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t left = nova_rt_list_create();
+    int64_t right = nova_rt_list_create();
+    int64_t out = nova_rt_list_create();
+    if (!l) { nova_rt_list_append(out, left); nova_rt_list_append(out, right); return out; }
+    if (idx < 0) idx = 0;
+    if (idx > l->size) idx = l->size;
+    for (int64_t i = 0; i < idx; i++) nova_rt_list_append(left, l->data[i]);
+    for (int64_t i = idx; i < l->size; i++) nova_rt_list_append(right, l->data[i]);
+    nova_rt_list_append(out, left);
+    nova_rt_list_append(out, right);
+    return out;
+}
+
+/* nova_rt_math_round_to: round float to n decimal places */
+int64_t nova_rt_math_round_to(int64_t val, int64_t places) {
+    double d;
+    memcpy(&d, &val, sizeof(double));
+    double factor = 1.0;
+    int64_t p = places < 0 ? 0 : (places > 15 ? 15 : places);
+    for (int64_t i = 0; i < p; i++) factor *= 10.0;
+    d = (double)((int64_t)(d * factor + (d >= 0 ? 0.5 : -0.5))) / factor;
+    int64_t result;
+    memcpy(&result, &d, sizeof(int64_t));
+    return result;
+}
+
+/* nova_rt_str_remove_prefix_all: remove all leading occurrences of prefix */
+int64_t nova_rt_str_remove_prefix_all(int64_t str_val, int64_t prefix_val) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* prefix = (const char*)(uintptr_t)prefix_val;
+    if (!s || !prefix) return str_val;
+    int64_t plen = (int64_t)strlen(prefix);
+    if (plen == 0) return str_val;
+    while (strncmp(s, prefix, plen) == 0) s += plen;
+    return nova_rt_create_string(s);
+}
+
+/* nova_rt_list_group_consecutive: group consecutive equal elements */
+int64_t nova_rt_list_group_consecutive(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t group = nova_rt_list_create();
+    nova_rt_list_append(group, l->data[0]);
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] == l->data[i - 1]) {
+            nova_rt_list_append(group, l->data[i]);
+        } else {
+            nova_rt_list_append(out, group);
+            group = nova_rt_list_create();
+            nova_rt_list_append(group, l->data[i]);
+        }
+    }
+    nova_rt_list_append(out, group);
+    return out;
+}
+
