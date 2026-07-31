@@ -30046,3 +30046,101 @@ int64_t nova_rt_dict_to_query_string(int64_t handle) {
     free(buf);
     return result;
 }
+
+/* nova_rt_str_remove_suffix_if: remove suffix only if string ends with it */
+int64_t nova_rt_str_remove_suffix_if(int64_t str_handle, int64_t suffix_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* suf = (const char*)(uintptr_t)suffix_handle;
+    if (!s || !suf) return str_handle;
+    size_t slen = strlen(s), suflen = strlen(suf);
+    if (suflen > slen || memcmp(s + slen - suflen, suf, suflen) != 0) return str_handle;
+    char* buf = (char*)malloc(slen - suflen + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, slen - suflen);
+    buf[slen - suflen] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_group_by_mod: group elements by value mod n */
+int64_t nova_rt_list_group_by_mod(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!l || n <= 0) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t mod = ((l->data[i] % n) + n) % n;
+        char key[32];
+        snprintf(key, sizeof(key), "%lld", (long long)mod);
+        int64_t key_s = nova_rt_create_string(key);
+        int64_t existing = nova_rt_dict_get(out, key_s);
+        if (existing == 0) {
+            int64_t lst = (int64_t)(uintptr_t)nova_rt_list_create();
+            nova_rt_list_append(lst, l->data[i]);
+            nova_rt_dict_set(out, key_s, lst);
+        } else {
+            nova_rt_list_append(existing, l->data[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_dict_keys_shortest: key with shortest string length */
+int64_t nova_rt_dict_keys_shortest(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_create_string("");
+    int64_t best = 0;
+    size_t best_len = (size_t)-1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            size_t klen = k ? strlen(k) : 0;
+            if (klen < best_len) { best = d->keys[i]; best_len = klen; }
+        }
+    }
+    return best ? best : nova_rt_create_string("");
+}
+
+/* nova_rt_str_is_upper_only: true if all chars are uppercase letters */
+int64_t nova_rt_str_is_upper_only(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    for (size_t i = 0; s[i]; i++)
+        if (s[i] < 'A' || s[i] > 'Z') return 0;
+    return 1;
+}
+
+/* nova_rt_list_running_avg: running average (integer division) */
+int64_t nova_rt_list_running_avg(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        sum += l->data[i];
+        nova_rt_list_append(out, sum / (i + 1));
+    }
+    return out;
+}
+
+/* nova_rt_dict_values_flat: flat list of all values */
+int64_t nova_rt_dict_values_flat(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++)
+        if (d->hashes[i] != 0) nova_rt_list_append(out, d->vals[i]);
+    return out;
+}
+
+/* nova_rt_str_byte_count: number of bytes in string */
+int64_t nova_rt_str_byte_count(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    return (int64_t)strlen(s);
+}
+
+/* nova_rt_list_zip_map: zip two lists into a dict (keys from first, values from second) */
+int64_t nova_rt_list_zip_map(int64_t keys_handle, int64_t vals_handle) {
+    return nova_rt_dict_zip_lists(keys_handle, vals_handle);
+}
