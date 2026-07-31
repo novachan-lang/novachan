@@ -29582,3 +29582,102 @@ int64_t nova_rt_list_replace_all(int64_t handle, int64_t old_val, int64_t new_va
         nova_rt_list_append(out, l->data[i] == old_val ? new_val : l->data[i]);
     return out;
 }
+
+/* nova_rt_dict_merge_left: merge two dicts, left wins on conflict */
+int64_t nova_rt_dict_merge_left(int64_t ha, int64_t hb) {
+    NovaDict* a = (NovaDict*)(uintptr_t)ha;
+    NovaDict* b = (NovaDict*)(uintptr_t)hb;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (b) {
+        for (int64_t i = 0; i < b->cap; i++)
+            if (b->hashes[i] != 0) nova_rt_dict_set(out, b->keys[i], b->vals[i]);
+    }
+    if (a) {
+        for (int64_t i = 0; i < a->cap; i++)
+            if (a->hashes[i] != 0) nova_rt_dict_set(out, a->keys[i], a->vals[i]);
+    }
+    return out;
+}
+
+/* nova_rt_str_lstrip: strip leading whitespace */
+int64_t nova_rt_str_lstrip(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    return nova_rt_create_string(s);
+}
+
+/* nova_rt_list_sum_pairs: sum adjacent pairs [a,b,c,d] -> [a+b, c+d] */
+int64_t nova_rt_list_sum_pairs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i + 1 < l->size; i += 2)
+        nova_rt_list_append(out, l->data[i] + l->data[i + 1]);
+    if (l->size % 2 == 1)
+        nova_rt_list_append(out, l->data[l->size - 1]);
+    return out;
+}
+
+/* nova_rt_dict_flip_kv: flip keys and values (string keys only) */
+int64_t nova_rt_dict_flip_kv(int64_t handle) {
+    return nova_rt_dict_invert_unique(handle);
+}
+
+/* nova_rt_list_range_inclusive: create list [start..end] inclusive */
+int64_t nova_rt_list_range_inclusive(int64_t start, int64_t end) {
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (start <= end) {
+        for (int64_t i = start; i <= end; i++) nova_rt_list_append(out, i);
+    } else {
+        for (int64_t i = start; i >= end; i--) nova_rt_list_append(out, i);
+    }
+    return out;
+}
+
+/* nova_rt_str_rstrip: strip trailing whitespace */
+int64_t nova_rt_str_rstrip(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r'))
+        len--;
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, len);
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_sum_by_sign: [positive_sum, negative_sum] */
+int64_t nova_rt_list_sum_by_sign(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t pos = 0, neg = 0;
+    if (l) {
+        for (int64_t i = 0; i < l->size; i++) {
+            if (l->data[i] >= 0) pos += l->data[i];
+            else neg += l->data[i];
+        }
+    }
+    nova_rt_list_append(out, pos);
+    nova_rt_list_append(out, neg);
+    return out;
+}
+
+/* nova_rt_str_first_word: get first word (up to first space) */
+int64_t nova_rt_str_first_word(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t i = 0;
+    while (s[i] && s[i] != ' ') i++;
+    char* buf = (char*)malloc(i + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, i);
+    buf[i] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
