@@ -28632,3 +28632,98 @@ int64_t nova_rt_dict_values_sum(int64_t handle) {
 int64_t nova_rt_list_weighted_sum(int64_t ha, int64_t hb) {
     return nova_rt_list_dot_product(ha, hb);
 }
+
+/* nova_rt_list_mean: arithmetic mean of int list (integer division) */
+int64_t nova_rt_list_mean(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < l->size; i++) sum += l->data[i];
+    return sum / l->size;
+}
+
+/* nova_rt_str_remove_letters: remove all alphabetic characters */
+int64_t nova_rt_str_remove_letters(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z')))
+            buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_accumulate: running total (cumulative sum) */
+int64_t nova_rt_list_accumulate(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t acc = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        acc += l->data[i];
+        nova_rt_list_append(out, acc);
+    }
+    return out;
+}
+
+/* nova_rt_str_is_sentence: check if string starts with uppercase and ends with sentence punct */
+int64_t nova_rt_str_is_sentence(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    if (!(s[0] >= 'A' && s[0] <= 'Z')) return 0;
+    size_t len = strlen(s);
+    char last = s[len - 1];
+    return (last == '.' || last == '!' || last == '?') ? 1 : 0;
+}
+
+/* nova_rt_dict_values_max: maximum value in dict (assumed int) */
+int64_t nova_rt_dict_values_max(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int first = 1;
+    int64_t mx = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            if (first || d->vals[i] > mx) { mx = d->vals[i]; first = 0; }
+        }
+    }
+    return mx;
+}
+
+/* nova_rt_list_span_indices: list of indices where value equals target */
+int64_t nova_rt_list_span_indices(int64_t handle, int64_t target) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (l->data[i] == target) nova_rt_list_append(out, i);
+    }
+    return out;
+}
+
+/* nova_rt_str_squeeze_char: replace consecutive runs of char c with a single c */
+int64_t nova_rt_str_squeeze_char(int64_t str_handle, int64_t char_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* ch = (const char*)(uintptr_t)char_handle;
+    if (!s || !ch || !*ch) return str_handle;
+    char c = ch[0];
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == c && j > 0 && buf[j - 1] == c) continue;
+        buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
