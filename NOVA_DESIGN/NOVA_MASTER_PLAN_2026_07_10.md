@@ -19,6 +19,21 @@
 > accessors + 14 arithmetic fixes. **New standing gate:** `_run_builtin_soundness.ps1` (no compiler needed).
 > **Builtins: 1305.** *Builtin count is no longer a goal — see `EXECUTION_STATE.md` for the rule.*
 >
+> **✅ 2026-08-01 MASTER-PLAN BATCH** — `f88e622a` **reconverge CERTIFIED gen5==gen6** (new bootstrap
+> 1.77→2.34 MB), which also unblocked the "gen3 truncation" backlog (the old bootstrap silently dropped
+> newly-added compiler code, leaving several source-done features dead). On top of it:
+> **LOCK-4 / L7 #36 inc3c-part2 ✅ `4f524b26`** — sized numerics are USABLE: `let x: u8 = <expr>` wraps for
+> RUNTIME-valued vars (loop accumulators, fn results, reassignment), via slot width flow + an annotation
+> bridge. It terminates because the slot width is a MONOTONIC lattice (absent → width → conflicted), which
+> is exactly what the earlier oscillating attempt lacked. KAT 11/11; default int unchanged.
+> **GAP-1 labeled break/continue ✅ `7e9b4e11`** — codegen was in tree but the parser rejected every labeled
+> loop as "empty body" (body-indent measured from the keyword's column, which sits right of the label).
+> **CYCLE 3-G ✅ `3e56c6e1`** — `sum()` over a comprehension returned a float because the dispatch read
+> "unknown element type" as "float"; unknown now routes to a runtime `elem_kind` dispatch returning a
+> self-describing value. **L8 call-overload 🔄** — works when the callee's type is already resolved; the
+> `let d = Doubler(3)` case needs DEFERRED call constraints (measured: callee is still a type var at
+> constrain time). *Dev-mode: compile-checked + KAT-gated; full both-mode regression batched.*
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*

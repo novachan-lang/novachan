@@ -60,8 +60,42 @@ size-arithmetic contract against the actual struct definition, never against the
 See memory `[[builtin-needs-type-tag-check]]`, `[[novadict-dense-layout]]`,
 `[[duplicate-declare-breaks-all-links]]`.
 
-**NEXT (the real critical path — resume here):** LOCK-4 inc3c-part2 (sized numerics, #1 risk) ·
-Wave-B #6 RC leak (MOVE-on-insert) · LOCK-6 Phase 2 (`@cdecl`) · LOCK-5 (safepoint+kill).
+**MASTER-PLAN WORK LANDED (2026-08-01, after the soundness campaign):**
+- ✅ `f88e622a` **RECONVERGE CERTIFIED gen5==gen6 byte-identical** — new bootstrap installed
+  (1.77 MB → 2.34 MB, all 1305 builtins). This ALSO unblocked the "gen3 truncation" backlog:
+  the old Jul-26 gen3 silently dropped newly-added compiler code, which is why several
+  source-done features were dead.
+- ✅ `4f524b26` **LOCK-4 / L7 #36 inc3c-part2 — sized numerics are now USABLE.** `let x: u8 = <expr>`
+  wraps, including RUNTIME-valued vars (loop accumulators, fn results, reassignment) that
+  const-fold cannot forward. 4 hooks: `_lock4_ann_width`, the annotation bridge at typed-let
+  lowering, `copy` honouring a builder-seeded width, and SLOT WIDTH FLOW (slot_store records /
+  slot_load restores). **Why it no longer hangs:** the slot width is a MONOTONIC lattice
+  (absent → `<width>` → `""` conflicted/absorbing), so each slot changes state at most twice and
+  `ir_infer_types`' fixpoint always terminates; the earlier attempt oscillated. KAT 11/11,
+  default int verified byte-identical-behaviour.
+- ✅ `7e9b4e11` **GAP-1 labeled break/continue CLOSED — it now actually works.** Codegen had been
+  in tree since `9aee01e4` but the parser rejected every labeled loop as "empty body": the label
+  branch went through `parse_stmt(pos+2)`, so the loop parsers took their body-indent reference
+  from the KEYWORD's column, which sits right of the label. Gave the loop parsers an explicit
+  `ref_col`, split out `parse_loop_stmt`, and dispatch labeled loops via `_ll_parse_loop`.
+- ✅ `3e56c6e1` **CYCLE 3-G CLOSED — `sum()` over a comprehension returned a float.** A comprehension
+  desugars to `map()`, typed plain "list"; the dispatch treated every non-`intlist` as float, i.e.
+  read "unknown" as "float". Now only a KNOWN float type takes the float variant; unknown routes to
+  `nova_rt_sum_any`, which decides from `elem_kind` at runtime and returns a self-describing value
+  (raw int, or BOXED float). Float comprehensions still correctly yield floats.
+- 🔄 **L8 call-overload — root cause identified, partially working.** `obj(args)` → `Struct__call`
+  works when the callee's type is already resolved (`let d: Doubler = ...`, a param, a field).
+  It does NOT work for `let d = Doubler(3)` because at constrain time the callee is still an
+  unresolved type VARIABLE (measured: `kind=var`) — constraint solving is deferred, and the
+  "expected Doubler" in the error is the type printed after later zonking. Also fixed the guard to
+  consult `ti_type_methods` (`ti_has_name` never carries `Type__method` entries, so the redirect
+  could never fire at all). Full fix needs the call constraint DEFERRED until fn_t resolves
+  (the `ti_bound_checks` pattern) — inferrer-deep, tracked with an in-code limitation note.
+
+**NEXT (resume here):** Wave-B #6 RC leak — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
+introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
+LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
+fix · CYCLE 2 map/HOF float boxing (explicitly "needs a focused session").
 
 ---
 
