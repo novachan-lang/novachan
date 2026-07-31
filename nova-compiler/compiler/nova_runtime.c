@@ -27801,3 +27801,128 @@ int64_t nova_rt_str_word_at(int64_t str_handle, int64_t n) {
     return nova_rt_create_string("");
 }
 
+/* nova_rt_str_remove_all_chars: remove all occurrences of chars in charset from string */
+int64_t nova_rt_str_remove_all_chars(int64_t str_handle, int64_t charset_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* charset = (const char*)(uintptr_t)charset_handle;
+    if (!s || !charset || !*charset) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!strchr(charset, s[i])) buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_has_value: check if dict contains a specific value */
+int64_t nova_rt_dict_has_value(int64_t handle, int64_t val) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0 && d->vals[i] == val) return 1;
+    }
+    return 0;
+}
+
+/* nova_rt_list_pairs: group elements into consecutive pairs */
+int64_t nova_rt_list_pairs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i + 1 < l->size; i += 2) {
+        int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(pair, l->data[i + 1]);
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
+/* nova_rt_list_group_by_size: split list into groups of n elements */
+int64_t nova_rt_list_group_by_size(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    for (int64_t i = 0; i < l->size; i += n) {
+        int64_t group = (int64_t)(uintptr_t)nova_rt_list_create();
+        for (int64_t j = i; j < i + n && j < l->size; j++) {
+            nova_rt_list_append(group, l->data[j]);
+        }
+        nova_rt_list_append(out, group);
+    }
+    return out;
+}
+
+/* nova_rt_list_windows_with_step: sliding windows of size n with step s */
+int64_t nova_rt_list_windows_with_step(int64_t handle, int64_t n, int64_t step) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0 || step <= 0 || n > l->size) return out;
+    for (int64_t i = 0; i + n <= l->size; i += step) {
+        int64_t win = (int64_t)(uintptr_t)nova_rt_list_create();
+        for (int64_t j = 0; j < n; j++) {
+            nova_rt_list_append(win, l->data[i + j]);
+        }
+        nova_rt_list_append(out, win);
+    }
+    return out;
+}
+
+/* nova_rt_dict_merge_all: merge a list of dicts into one (later dicts win) */
+int64_t nova_rt_dict_merge_all(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        NovaDict* d = (NovaDict*)(uintptr_t)l->data[i];
+        if (!d) continue;
+        for (int64_t j = 0; j < d->cap; j++) {
+            if (d->hashes[j] != 0) {
+                nova_rt_dict_set(out, d->keys[j], d->vals[j]);
+            }
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_rotate_n: rotate list by n positions (positive=left, negative=right) */
+int64_t nova_rt_list_rotate_n(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t sz = l->size;
+    n = ((n % sz) + sz) % sz;
+    for (int64_t i = 0; i < sz; i++) {
+        nova_rt_list_append(out, l->data[(i + n) % sz]);
+    }
+    return out;
+}
+
+/* nova_rt_str_pad_center: center string with padding char to target width */
+int64_t nova_rt_str_pad_center(int64_t str_handle, int64_t width, int64_t pad_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* pad = (const char*)(uintptr_t)pad_handle;
+    if (!s) s = "";
+    if (!pad || !*pad) pad = " ";
+    int64_t slen = (int64_t)strlen(s);
+    if (slen >= width) return str_handle;
+    char pc = pad[0];
+    int64_t total_pad = width - slen;
+    int64_t left_pad = total_pad / 2;
+    int64_t right_pad = total_pad - left_pad;
+    char* buf = (char*)malloc((size_t)width + 1);
+    if (!buf) return str_handle;
+    memset(buf, pc, (size_t)left_pad);
+    memcpy(buf + left_pad, s, (size_t)slen);
+    memset(buf + left_pad + slen, pc, (size_t)right_pad);
+    buf[width] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
