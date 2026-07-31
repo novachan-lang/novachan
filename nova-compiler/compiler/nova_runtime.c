@@ -25678,6 +25678,300 @@ int64_t nova_rt_hex_to_bytes(int64_t val) {
     return bh;
 }
 
+/* --- Batch: math + set-ops + copy + string case --- */
+
+int64_t nova_rt_math_gcd(int64_t a, int64_t b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b != 0) { int64_t t = b; b = a % b; a = t; }
+    return a;
+}
+
+int64_t nova_rt_math_lcm(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) return 0;
+    int64_t g = nova_rt_math_gcd(a, b);
+    int64_t aa = a < 0 ? -a : a;
+    int64_t bb = b < 0 ? -b : b;
+    return (aa / g) * bb;
+}
+
+int64_t nova_rt_math_factorial(int64_t n) {
+    if (n < 0) return 0;
+    if (n > 20) return 0; /* overflow beyond 20! for i64 */
+    int64_t r = 1;
+    for (int64_t i = 2; i <= n; i++) r *= i;
+    return r;
+}
+
+int64_t nova_rt_math_is_prime(int64_t n) {
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if (n % 2 == 0 || n % 3 == 0) return 0;
+    for (int64_t i = 5; i * i <= n; i += 6) {
+        if (n % i == 0 || n % (i + 2) == 0) return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_math_fibonacci(int64_t n) {
+    if (n <= 0) return 0;
+    if (n == 1) return 1;
+    int64_t a = 0, b = 1;
+    for (int64_t i = 2; i <= n; i++) { int64_t t = a + b; a = b; b = t; }
+    return b;
+}
+
+int64_t nova_rt_list_distinct(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size);
+    for (int64_t i = 0; i < l->size; i++) {
+        int found = 0;
+        NovaList* ol = (NovaList*)(uintptr_t)out;
+        for (int64_t j = 0; j < ol->size; j++) {
+            if (nova_rt_eq(l->data[i], ol->data[j])) { found = 1; break; }
+        }
+        if (!found) nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+int64_t nova_rt_list_intersection(int64_t a, int64_t b) {
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    if (!la || !lb) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(la->size < lb->size ? la->size : lb->size);
+    for (int64_t i = 0; i < la->size; i++) {
+        int found = 0;
+        for (int64_t j = 0; j < lb->size; j++) {
+            if (nova_rt_eq(la->data[i], lb->data[j])) { found = 1; break; }
+        }
+        if (found) {
+            NovaList* ol = (NovaList*)(uintptr_t)out;
+            int dup = 0;
+            for (int64_t k = 0; k < ol->size; k++) {
+                if (nova_rt_eq(la->data[i], ol->data[k])) { dup = 1; break; }
+            }
+            if (!dup) nova_rt_list_append(out, la->data[i]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_union(int64_t a, int64_t b) {
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    int64_t out = nova_rt_list_create((la ? la->size : 0) + (lb ? lb->size : 0));
+    if (la) {
+        for (int64_t i = 0; i < la->size; i++) {
+            NovaList* ol = (NovaList*)(uintptr_t)out;
+            int dup = 0;
+            for (int64_t j = 0; j < ol->size; j++) {
+                if (nova_rt_eq(la->data[i], ol->data[j])) { dup = 1; break; }
+            }
+            if (!dup) nova_rt_list_append(out, la->data[i]);
+        }
+    }
+    if (lb) {
+        for (int64_t i = 0; i < lb->size; i++) {
+            NovaList* ol = (NovaList*)(uintptr_t)out;
+            int dup = 0;
+            for (int64_t j = 0; j < ol->size; j++) {
+                if (nova_rt_eq(lb->data[i], ol->data[j])) { dup = 1; break; }
+            }
+            if (!dup) nova_rt_list_append(out, lb->data[i]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_difference(int64_t a, int64_t b) {
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    if (!la) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(la->size);
+    for (int64_t i = 0; i < la->size; i++) {
+        int found = 0;
+        if (lb) {
+            for (int64_t j = 0; j < lb->size; j++) {
+                if (nova_rt_eq(la->data[i], lb->data[j])) { found = 1; break; }
+            }
+        }
+        if (!found) nova_rt_list_append(out, la->data[i]);
+    }
+    return out;
+}
+
+int64_t nova_rt_list_copy(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size);
+    for (int64_t i = 0; i < l->size; i++) nova_rt_list_append(out, l->data[i]);
+    return out;
+}
+
+int64_t nova_rt_dict_copy(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_dict_create();
+    int64_t out = nova_rt_dict_create();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_str_compare(int64_t a, int64_t b) {
+    const char* sa = nova_str(a);
+    const char* sb = nova_str(b);
+    int r = strcmp(sa, sb);
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
+}
+
+int64_t nova_rt_str_to_upper(int64_t val) {
+    const char* s = nova_str(val);
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return val;
+    for (size_t i = 0; i < len; i++) buf[i] = (char)toupper((unsigned char)s[i]);
+    buf[len] = '\0';
+    int64_t r = nova_rt_create_string(buf);
+    free(buf);
+    return r;
+}
+
+int64_t nova_rt_str_to_lower(int64_t val) {
+    const char* s = nova_str(val);
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return val;
+    for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)s[i]);
+    buf[len] = '\0';
+    int64_t r = nova_rt_create_string(buf);
+    free(buf);
+    return r;
+}
+
+int64_t nova_rt_str_byte_length(int64_t val) {
+    return (int64_t)strlen(nova_str(val));
+}
+
+int64_t nova_rt_bytes_equal(int64_t a, int64_t b) {
+    NovaBytes* ba = (NovaBytes*)(uintptr_t)a;
+    NovaBytes* bb = (NovaBytes*)(uintptr_t)b;
+    if (!ba && !bb) return 1;
+    if (!ba || !bb) return 0;
+    if (ba->size != bb->size) return 0;
+    return memcmp(ba->data, bb->data, ba->size) == 0 ? 1 : 0;
+}
+
+int64_t nova_rt_bytes_from_list(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_bytes_create(0);
+    int64_t bh = nova_rt_bytes_create(l->size);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)bh;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t v = l->data[i] & 0xFF;
+        b->data[i] = (uint8_t)v;
+    }
+    b->size = l->size;
+    return bh;
+}
+
+int64_t nova_rt_bytes_to_list(int64_t handle) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b || b->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(b->size);
+    for (int64_t i = 0; i < (int64_t)b->size; i++) {
+        nova_rt_list_append(out, (int64_t)b->data[i]);
+    }
+    return out;
+}
+
+int64_t nova_rt_math_pow_int(int64_t base, int64_t exp) {
+    if (exp < 0) return 0;
+    int64_t r = 1;
+    while (exp > 0) {
+        if (exp & 1) r *= base;
+        base *= base;
+        exp >>= 1;
+    }
+    return r;
+}
+
+int64_t nova_rt_list_symmetric_difference(int64_t a, int64_t b) {
+    int64_t ab = nova_rt_list_difference(a, b);
+    int64_t ba = nova_rt_list_difference(b, a);
+    NovaList* lab = (NovaList*)(uintptr_t)ab;
+    NovaList* lba = (NovaList*)(uintptr_t)ba;
+    int64_t out = nova_rt_list_create((lab ? lab->size : 0) + (lba ? lba->size : 0));
+    if (lab) for (int64_t i = 0; i < lab->size; i++) nova_rt_list_append(out, lab->data[i]);
+    if (lba) for (int64_t i = 0; i < lba->size; i++) nova_rt_list_append(out, lba->data[i]);
+    return out;
+}
+
+int64_t nova_rt_list_is_subset(int64_t a, int64_t b) {
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    if (!la || la->size == 0) return 1;
+    if (!lb) return 0;
+    for (int64_t i = 0; i < la->size; i++) {
+        int found = 0;
+        for (int64_t j = 0; j < lb->size; j++) {
+            if (nova_rt_eq(la->data[i], lb->data[j])) { found = 1; break; }
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_list_is_superset(int64_t a, int64_t b) {
+    return nova_rt_list_is_subset(b, a);
+}
+
+int64_t nova_rt_str_codepoint_at(int64_t val, int64_t idx) {
+    const char* s = nova_str(val);
+    int64_t ci = 0;
+    for (const char* p = s; *p; ) {
+        if (ci == idx) {
+            unsigned char c = (unsigned char)*p;
+            if (c < 0x80) return (int64_t)c;
+            if ((c & 0xE0) == 0xC0 && p[1]) return (int64_t)(((c & 0x1F) << 6) | (p[1] & 0x3F));
+            if ((c & 0xF0) == 0xE0 && p[1] && p[2]) return (int64_t)(((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F));
+            if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) return (int64_t)(((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F));
+            return (int64_t)c;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) p++;
+        else if ((c & 0xE0) == 0xC0) p += 2;
+        else if ((c & 0xF0) == 0xE0) p += 3;
+        else p += 4;
+        ci++;
+    }
+    return -1;
+}
+
+int64_t nova_rt_list_sort_by(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return nova_rt_list_create(l ? l->size : 0);
+    int64_t out = nova_rt_list_create(l->size);
+    NovaList* ol = (NovaList*)(uintptr_t)out;
+    for (int64_t i = 0; i < l->size; i++) nova_rt_list_append(out, l->data[i]);
+    ol = (NovaList*)(uintptr_t)out;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < ol->size - 1; i++) {
+        for (int64_t j = 0; j < ol->size - 1 - i; j++) {
+            int64_t ka = fn(closure, ol->data[j]);
+            int64_t kb = fn(closure, ol->data[j+1]);
+            if (ka > kb) { int64_t t = ol->data[j]; ol->data[j] = ol->data[j+1]; ol->data[j+1] = t; }
+        }
+    }
+    return out;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
