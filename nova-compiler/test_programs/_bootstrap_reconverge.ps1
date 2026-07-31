@@ -9,24 +9,27 @@ Write-Host "[pass 1] gen3_test.exe -> gen4 (nova_p1.exe)"
 $r1 = Invoke-Timed -FilePath (Resolve-Path ".\gen3_test.exe").Path -Arguments "..\compiler\nova_compiler.nova nova_compiler.ll" -TimeoutMs 450000
 if ($r1.ExitCode -ne 0) { Write-Host "FAIL pass 1 (exit=$($r1.ExitCode))"; exit 1 }
 Copy-Item nova_compiler.ll nova_p1.ll -Force
+Remove-Item nova_p1.exe -Force -ErrorAction SilentlyContinue   # a stale exe satisfies Test-Path and silently poisons the next pass
 $l1 = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o nova_p1.exe nova_p1.ll ..\compiler\nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 120000
-if (!(Test-Path nova_p1.exe)) { Write-Host "FAIL link p1"; exit 1 }
+if ($l1.ExitCode -ne 0 -or !(Test-Path nova_p1.exe)) { Write-Host "FAIL link p1 (exit=$($l1.ExitCode))"; Write-Host $l1.Output; exit 1 }
 Write-Host "  nova_p1.exe ($((Get-Item nova_p1.exe).Length) bytes)"
 
 Write-Host "[pass 2] gen4 -> gen5 (nova_p2.exe)"
 $r2 = Invoke-Timed -FilePath (Resolve-Path ".\nova_p1.exe").Path -Arguments "..\compiler\nova_compiler.nova nova_compiler.ll" -TimeoutMs 450000
 if ($r2.ExitCode -ne 0) { Write-Host "FAIL pass 2 (exit=$($r2.ExitCode))"; exit 1 }
 Copy-Item nova_compiler.ll nova_p2.ll -Force
+Remove-Item nova_p2.exe -Force -ErrorAction SilentlyContinue
 $l2 = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o nova_p2.exe nova_p2.ll ..\compiler\nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 120000
-if (!(Test-Path nova_p2.exe)) { Write-Host "FAIL link p2"; exit 1 }
+if ($l2.ExitCode -ne 0 -or !(Test-Path nova_p2.exe)) { Write-Host "FAIL link p2 (exit=$($l2.ExitCode))"; Write-Host $l2.Output; exit 1 }
 Write-Host "  nova_p2.exe ($((Get-Item nova_p2.exe).Length) bytes)"
 
 Write-Host "[pass 3] gen5 -> gen6 (nova_p3.exe)"
 $r3 = Invoke-Timed -FilePath (Resolve-Path ".\nova_p2.exe").Path -Arguments "..\compiler\nova_compiler.nova nova_compiler.ll" -TimeoutMs 450000
 if ($r3.ExitCode -ne 0) { Write-Host "FAIL pass 3 (exit=$($r3.ExitCode))"; exit 1 }
 Copy-Item nova_compiler.ll nova_p3.ll -Force
+Remove-Item nova_p3.exe -Force -ErrorAction SilentlyContinue
 $l3 = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o nova_p3.exe nova_p3.ll ..\compiler\nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 120000
-if (!(Test-Path nova_p3.exe)) { Write-Host "FAIL link p3"; exit 1 }
+if ($l3.ExitCode -ne 0 -or !(Test-Path nova_p3.exe)) { Write-Host "FAIL link p3 (exit=$($l3.ExitCode))"; Write-Host $l3.Output; exit 1 }
 Write-Host "  nova_p3.exe ($((Get-Item nova_p3.exe).Length) bytes)"
 
 $h5 = (Get-FileHash nova_p2.ll -Algorithm SHA256).Hash
