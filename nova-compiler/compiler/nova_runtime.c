@@ -24139,65 +24139,6 @@ int64_t nova_rt_str_squeeze(int64_t val) {
     return r;
 }
 
-/* nova_rt_list_zip_with: zip two lists with a function */
-int64_t nova_rt_list_zip_with(int64_t h1, int64_t h2, int64_t closure) {
-    NovaList* a = (NovaList*)(uintptr_t)h1;
-    NovaList* b = (NovaList*)(uintptr_t)h2;
-    int64_t r = nova_rt_list_new();
-    if (!a || !b) return r;
-    int64_t minlen = a->size < b->size ? a->size : b->size;
-    int64_t* rec = (int64_t*)(uintptr_t)closure;
-    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
-    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
-    for (int64_t i = 0; i < minlen; i++) {
-        nova_rt_list_append(r, fn(closure, a->data[i], b->data[i]));
-    }
-    return r;
-}
-
-/* nova_rt_list_scan: like fold but returns list of all intermediate results */
-int64_t nova_rt_list_scan(int64_t handle, int64_t init, int64_t closure) {
-    NovaList* l = (NovaList*)(uintptr_t)handle;
-    int64_t r = nova_rt_list_new();
-    nova_rt_list_append(r, init);
-    if (!l) return r;
-    int64_t* rec = (int64_t*)(uintptr_t)closure;
-    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
-    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
-    int64_t acc = init;
-    for (int64_t i = 0; i < l->size; i++) {
-        acc = fn(closure, acc, l->data[i]);
-        nova_rt_list_append(r, acc);
-    }
-    return r;
-}
-
-/* nova_rt_list_partition: split list into [matches, non-matches] */
-int64_t nova_rt_list_partition(int64_t handle, int64_t closure) {
-    NovaList* l = (NovaList*)(uintptr_t)handle;
-    int64_t yes = nova_rt_list_new();
-    int64_t no = nova_rt_list_new();
-    int64_t result = nova_rt_list_new();
-    if (!l) {
-        nova_rt_list_append(result, yes);
-        nova_rt_list_append(result, no);
-        return result;
-    }
-    int64_t* rec = (int64_t*)(uintptr_t)closure;
-    typedef int64_t (*nova_fn1)(int64_t, int64_t);
-    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
-    for (int64_t i = 0; i < l->size; i++) {
-        if (fn(closure, l->data[i])) {
-            nova_rt_list_append(yes, l->data[i]);
-        } else {
-            nova_rt_list_append(no, l->data[i]);
-        }
-    }
-    nova_rt_list_append(result, yes);
-    nova_rt_list_append(result, no);
-    return result;
-}
-
 /* nova_rt_str_lines: split string by newlines into list of lines */
 int64_t nova_rt_str_lines(int64_t val) {
     const char* s = (const char*)(uintptr_t)val;
@@ -24218,6 +24159,29 @@ int64_t nova_rt_str_lines(int64_t val) {
             start = i + 1;
         }
     }
+    return r;
+}
+
+/* nova_rt_str_center_pad: center string with fill char to given width */
+int64_t nova_rt_str_center_pad(int64_t str_val, int64_t width_val, int64_t fill_val) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* fill = (const char*)(uintptr_t)fill_val;
+    if (!s) return nova_rt_create_string((void*)"");
+    int64_t width = width_val;
+    size_t slen = strlen(s);
+    if ((int64_t)slen >= width) return str_val;
+    char fc = (fill && fill[0]) ? fill[0] : ' ';
+    int64_t pad = width - (int64_t)slen;
+    int64_t left = pad / 2;
+    int64_t right = pad - left;
+    char* buf = (char*)malloc((size_t)width + 1);
+    if (!buf) return str_val;
+    memset(buf, fc, (size_t)left);
+    memcpy(buf + left, s, slen);
+    memset(buf + left + (int64_t)slen, fc, (size_t)right);
+    buf[width] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
     return r;
 }
 
