@@ -24185,6 +24185,80 @@ int64_t nova_rt_str_center_pad(int64_t str_val, int64_t width_val, int64_t fill_
     return r;
 }
 
+/* nova_rt_str_is_ascii: true if all bytes are 0-127 */
+int64_t nova_rt_str_is_ascii(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return 1;
+    for (size_t i = 0; s[i]; i++) {
+        if ((unsigned char)s[i] > 127) return 0;
+    }
+    return 1;
+}
+
+/* nova_rt_str_is_hex: true if all chars are 0-9 a-f A-F */
+int64_t nova_rt_str_is_hex(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return 0;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return 0;
+    }
+    return 1;
+}
+
+/* nova_rt_list_sum_int: sum all elements as integers */
+int64_t nova_rt_list_sum_int(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        sum += l->data[i];
+    }
+    return sum;
+}
+
+/* nova_rt_list_min_val: minimum integer value in list */
+int64_t nova_rt_list_min_val(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t m = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < m) m = l->data[i];
+    }
+    return m;
+}
+
+/* nova_rt_list_max_val: maximum integer value in list */
+int64_t nova_rt_list_max_val(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t m = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] > m) m = l->data[i];
+    }
+    return m;
+}
+
+/* nova_rt_dict_is_empty: true if dict has no entries */
+int64_t nova_rt_dict_is_empty(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 1;
+    return d->size == 0 ? 1 : 0;
+}
+
+/* nova_rt_list_is_empty: true if list has no elements */
+int64_t nova_rt_list_is_empty(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 1;
+    return l->size == 0 ? 1 : 0;
+}
+
+/* nova_rt_str_is_empty: true if string is "" or null */
+int64_t nova_rt_str_is_empty(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    return (!s || s[0] == '\0') ? 1 : 0;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
