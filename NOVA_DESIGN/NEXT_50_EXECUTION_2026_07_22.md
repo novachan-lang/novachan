@@ -207,4 +207,16 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `b3afbd52` json_stringify_pretty (indented multi-line JSON) + trim_left/trim_right + math_clamp/math_lerp + list_unique + 6 stdlib modules (testing/mock ext, testing/snapshot ext, debug/trace, debug/inspect, web/url_builder, web/form) — all KAT-gated
 - `a5290c6e` 12 new builtins: str_capitalize, str_title, str_is_digit/alpha/alnum/space, list_take/drop/chunk/zip/enumerate, dict_from_list
 
+- `c531ad0d` 6 stdlib modules (cache/lru, stream/pipeline, queue/priority, event/emitter, security/sanitize, regex/glob) + 2 KATs
+- `5c814592` 4 builtins: str_is_upper/lower, list_flat_map, list_reduce (closure-based)
+- `f15c4023` 3 builtins: list_group_by, list_windows, list_partition (closure-based)
+- `444ae596` 5 builtins (list_for_each, list_map_indexed, dict_update, dict_filter, dict_map_values) + 6 stdlib modules (concurrency/barrier, concurrency/pool, database/migration, database/query_builder, config/env, template/simple) + 2 KATs
+- `a63f95a7` 5 builtins: str_zfill, list_index_where, list_first, list_last, list_contains
+- `7e98be77` 3 builtins: list_filled, dict_get_or, dict_has_key
+- `6b9fe87e` 5 string builtins: str_ljust/rjust/swapcase/word_count/words
+- `0f4f9e86` url_encode/decode + 6 stdlib modules (validation/i18n/retry/ring_buffer/diff/rate_limit)
+- `ce8c439c` 4 mutable collection builtins: clear, dict_clear, extend, list_filled
+- `913dfbbc` 3 functional builtins: list_min_by, list_max_by, list_sum_by
+- `d04ad7c6` html_escape/unescape (XSS-safe entity encoding)
+
 **Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
