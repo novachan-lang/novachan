@@ -1,0 +1,179 @@
+// template_engine — Mustache-like {{var}} / {{#sec}}...{{/sec}} /
+// {{^sec}}...{{/sec}} rendering.
+//
+// Distinct from std/text/template.nova's `template_render` (plain {{key}}
+// substitution only) and `tpl_render` family (single-brace {key}, Result-
+// returning): this engine adds Mustache's SECTION tags on top of variable
+// substitution, prefixed `tme_` to stay collision-free (`te_` is already
+// used by std/tensor/tsr_elementwise.nova and std/math/tetration.nova).
+//
+// Supported tags:
+//   {{key}}        variable substitution — str(context[key]), or "" if the
+//                  key is absent (never crashes on a missing key).
+//   {{#key}}...{{/key}}   section — the inner text is rendered iff `key` is
+//                  TRUTHY in context (present AND non-zero/non-empty; see
+//                  "truthiness" below). A closing {{/anything}} always
+//                  closes the nearest open section (by nesting depth, not
+//                  by name match) — sections MAY nest.
+//   {{^key}}...{{/key}}   inverted section — the inner text is rendered iff
+//                  `key` is FALSY (absent, or present but 0 / "" / []).
+//
+// No partials ({{> name}}) and no loop/list-iteration sections — this is a
+// deliberately small subset (variable + conditional/inverted sections only).
+//
+// Truthiness of context[key]:
+//   int    -> falsy iff 0            (this also covers bool: NOVA booleans
+//                                      are ints, so `false` == 0 is falsy)
+//   string -> falsy iff ""
+//   list   -> falsy iff []
+//   dict / anything else -> truthy if the key is present at all
+//   key absent from context -> always falsy
+//
+// Brace detection uses byte values (123 = '{', 125 = '}') via
+// ord(char_at(s,i)) — never a bare "{"/"}" string-literal comparison, which
+// would collide with NOVA's own "{...}" string-interpolation syntax (the
+// same proven convention std/text/template.nova documents and uses).
+//
+// Public API:
+//   tme_render(template_str, context_dict) -> string
+//
+// LEAF module — imports nothing.
+
+// _tme_tokenize: scan `template` into a flat token list. Each token is a
+// 2-element list [kind, text]:
+//   ["TXT", literal_text]
+//   ["VAR", key]     from {{key}}
+//   ["SEC", key]     from {{#key}}
+//   ["INV", key]     from {{^key}}
+//   ["END", key]     from {{/key}}   (key kept for readability; not matched
+//                                     by name — see module header)
+// An unterminated "{{..." with no closing "}}" degrades to literal text
+// (bad input never crashes the tokenizer), matching template.nova's policy.
+fn _tme_tokenize(template)
+    let toks = []
+    let txt = ""
+    let i = 0
+    let n = len(template)
+    while i < n
+        if i + 1 < n and ord(char_at(template, i)) == 123 and ord(char_at(template, i + 1)) == 123
+            if len(txt) > 0
+                let t = []
+                t.push("TXT")
+                t.push(txt)
+                toks.push(t)
+                txt = ""
+            let j = i + 2
+            let inner = ""
+            let closed = 0
+            while j < n and closed == 0
+                if j + 1 < n and ord(char_at(template, j)) == 125 and ord(char_at(template, j + 1)) == 125
+                    closed = 1
+                else
+                    inner = inner + char_at(template, j)
+                    j = j + 1
+            if closed == 1
+                let trimmed = trim(inner)
+                if len(trimmed) > 0 and char_at(trimmed, 0) == "#"
+                    let t = []
+                    t.push("SEC")
+                    t.push(trim(slice(trimmed, 1, len(trimmed))))
+                    toks.push(t)
+                else if len(trimmed) > 0 and char_at(trimmed, 0) == "^"
+                    let t = []
+                    t.push("INV")
+                    t.push(trim(slice(trimmed, 1, len(trimmed))))
+                    toks.push(t)
+                else if len(trimmed) > 0 and char_at(trimmed, 0) == "/"
+                    let t = []
+                    t.push("END")
+                    t.push(trim(slice(trimmed, 1, len(trimmed))))
+                    toks.push(t)
+                else
+                    let t = []
+                    t.push("VAR")
+                    t.push(trimmed)
+                    toks.push(t)
+                i = j + 2
+            else
+                txt = txt + "\{\{" + inner
+                i = j
+        else
+            txt = txt + char_at(template, i)
+            i = i + 1
+    if len(txt) > 0
+        let t = []
+        t.push("TXT")
+        t.push(txt)
+        toks.push(t)
+    return toks
+
+// _tme_truthy: 1 if context[key] counts as truthy (see module header), else 0.
+fn _tme_truthy(context, key)
+    if not contains(context, key)
+        return 0
+    let v = context[key]
+    let kind = type_of(v)
+    if kind == "int"
+        if v == 0
+            return 0
+        return 1
+    if kind == "string"
+        if len(v) == 0
+            return 0
+        return 1
+    if kind == "list"
+        if len(v) == 0
+            return 0
+        return 1
+    return 1
+
+// _tme_render_tokens: render tokens starting at pos[0], stopping at (and
+// consuming) the nearest END token, or at the end of the token list.
+// `pos` is a 1-element list used as a mutable cursor — sections recurse:
+// opening a SEC/INV token advances the cursor, recurses to render the
+// section body (which itself terminates at that section's own END), and
+// the outer call then continues from wherever the cursor landed. This
+// makes properly-nested sections "just work" without explicit stack
+// bookkeeping — matching nesting depth is exactly what call-stack nesting
+// gives for free.
+fn _tme_render_tokens(toks, pos, context)
+    let out = ""
+    let n = len(toks)
+    while pos[0] < n
+        let tok = toks[pos[0]]
+        let kind = tok[0]
+        if kind == "TXT"
+            out = out + tok[1]
+            pos[0] = pos[0] + 1
+        else if kind == "VAR"
+            let key = tok[1]
+            if contains(context, key)
+                out = out + str(context[key])
+            pos[0] = pos[0] + 1
+        else if kind == "SEC"
+            let key = tok[1]
+            pos[0] = pos[0] + 1
+            let truthy = _tme_truthy(context, key)
+            let inner = _tme_render_tokens(toks, pos, context)
+            if truthy == 1
+                out = out + inner
+        else if kind == "INV"
+            let key = tok[1]
+            pos[0] = pos[0] + 1
+            let truthy = _tme_truthy(context, key)
+            let inner = _tme_render_tokens(toks, pos, context)
+            if truthy == 0
+                out = out + inner
+        else
+            // END — closes the nearest enclosing section; stop this frame.
+            pos[0] = pos[0] + 1
+            return out
+    return out
+
+// tme_render: render `template_str` against `context_dict`. See the module
+// header for the supported {{var}} / {{#sec}} / {{^sec}} tag forms.
+fn tme_render(template_str, context_dict)
+    let toks = _tme_tokenize(template_str)
+    let pos = []
+    pos.push(0)
+    return _tme_render_tokens(toks, pos, context_dict)
