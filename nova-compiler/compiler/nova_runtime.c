@@ -2416,6 +2416,57 @@ int64_t nova_rt_str_zfill(int64_t s, int64_t width) {
     return (int64_t)(uintptr_t)out;
 }
 
+int64_t nova_rt_url_encode(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    char* out = (char*)nova_heap_alloc(slen * 3 + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    size_t pos = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[pos++] = c;
+        } else {
+            out[pos++] = '%';
+            out[pos++] = "0123456789ABCDEF"[c >> 4];
+            out[pos++] = "0123456789ABCDEF"[c & 0xF];
+        }
+    }
+    out[pos] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+int64_t nova_rt_url_decode(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    char* out = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    size_t pos = 0;
+    for (size_t i = 0; i < slen; i++) {
+        if (str[i] == '%' && i + 2 < slen) {
+            int h = hex_val(str[i+1]);
+            int l = hex_val(str[i+2]);
+            if (h >= 0 && l >= 0) {
+                out[pos++] = (char)((h << 4) | l);
+                i += 2;
+                continue;
+            }
+        }
+        if (str[i] == '+') out[pos++] = ' ';
+        else out[pos++] = str[i];
+    }
+    out[pos] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
 int64_t nova_rt_str_ljust(int64_t s, int64_t width) {
     const char* str = nova_str_safe(s);
     size_t slen = strlen(str);
