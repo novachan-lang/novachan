@@ -1,0 +1,531 @@
+// ============================================================================
+// NOVA Standard Library — std/net/uritemplate
+// ============================================================================
+// RFC 6570 URI Template — Levels 1-4 (scalar-value expansion).
+//
+// A URI Template is ordinary text interspersed with "expressions" delimited
+// by braces, e.g. "http://example.com/~{username}/". Each expression names
+// one or more variables and an optional leading operator that controls how
+// the substituted value is encoded and joined:
+//
+//   (none)  Level 1  simple string expansion            {var}    -> value
+//   "+"     Level 2  reserved expansion (no re-encoding  {+var}  -> value
+//                     of reserved/gen-delims chars)
+//   "#"     Level 2  fragment expansion (like "+", with  {#var}  -> #value
+//                     a leading "#" when any var is set)
+//   "."     Level 3  label expansion, dot-prefixed        {.var}  -> .value
+//   "/"     Level 3  path-segment expansion                {/var}  -> /value
+//   ";"     Level 3  path-style parameter (matrix) expn   {;var}  -> ;var=value
+//   "?"     Level 3  form-style query expansion            {?var}  -> ?var=value
+//   "&"     Level 3  form-style query continuation         {&var}  -> &var=value
+//
+// This module implements the SCALAR (string-valued variable) subset of RFC
+// 6570 — the part that covers the overwhelming majority of real templates
+// (REST API path/query templates, OpenAPI `server.url` templates, HAL/Siren
+// link templates). List/associative-array variable VALUES and the ":N"
+// prefix / "*" explode VARSPEC modifiers are supported at the single-name
+// helper level (ut_explode) and via the ":N" prefix-length modifier inside
+// ut_expand; the explode ("*") modifier on a *template* variable is parsed
+// but is a no-op for scalar values (which is exactly RFC 6570's own
+// behaviour — explode only changes output for array/object-valued
+// variables).
+//
+// PUBLIC API:
+//   ut_parse(template: string) -> Result
+//     Parse a URI Template into its literal/expression segments. Ok(dict)
+//     with keys "kinds" (list<string>, each "lit" or "expr") and "texts"
+//     (list<string>, the literal text or the raw brace CONTENT — i.e. with
+//     the surrounding '{'/'}' stripped but the leading operator character,
+//     if any, still attached). Err(string) on an unterminated '{' or an
+//     empty "{}" expression.
+//
+//   ut_vars(template: string) -> list
+//     Every distinct variable name referenced anywhere in the template, in
+//     first-occurrence order, with any ":N" / "*" varspec modifier
+//     stripped. [] on a template that fails to parse.
+//
+//   ut_expand(template: string, vars: dict) -> string
+//     Expand every expression against `vars` (a dict of string variable
+//     name -> string value). A variable name absent from `vars` is
+//     "undefined" per RFC 6570 and contributes nothing — not even the
+//     expression's operator prefix, if it is the only variable in that
+//     expression. "" on a template that fails to parse.
+//
+//   ut_simple(name, value) -> string    Level 1  {name}   (no operator)
+//   ut_reserved(name, value) -> string  Level 2  {+name}
+//   ut_fragment(name, value) -> string  Level 2  {#name}
+//   ut_label(name, value) -> string     Level 3  {.name}
+//   ut_path(name, value) -> string      Level 3  {/name}
+//   ut_query(name, value) -> string     Level 3  {?name}
+//   ut_form(name, value) -> string      Level 3  {&name}
+//   ut_matrix(name, value) -> string    Level 3  {;name}
+//     Single-variable expansion helpers — the RFC 6570 operator behaviour
+//     for exactly one already-known name/value pair, without needing a
+//     template string. `name` is ignored by ut_simple/ut_reserved (the
+//     default and "+" operators never emit "name="); it is used by
+//     ut_matrix/ut_query/ut_form ("name=value" form) and is otherwise kept
+//     for a consistent signature across every expander.
+//
+//   ut_explode(name, values: list) -> string    Level 4  {name*}
+//     Default-operator explode expansion of an array-valued variable, e.g.
+//     ut_explode("list", ["red","green","blue"]) -> "red,green,blue". Per
+//     RFC 6570 Table 1, the default operator's item separator (between
+//     array elements) IS "," — the same character used to join sibling
+//     variables — so {list} and {list*} render identically for a plain
+//     array; this is not a bug, it is section 3.2.1's specified behaviour.
+//
+// DESIGN NOTES:
+//   * chr(123)/chr(125) are used everywhere a literal '{'/'}' is needed in
+//     a STRING LITERAL, never the bare character — a bare '{' inside a
+//     NOVA string literal starts \{...\}-style interpolation. See the
+//     "{ starts interpolation" project gotcha. Doc comments above are not
+//     string literals, so plain braces there are fine.
+//   * Percent-encoding follows RFC 3986 unreserved (A-Za-z0-9-._~) plus,
+//     for the "+"/"#" (reserved) operators only, the gen-delims/sub-delims
+//     set — mirroring std/net/uri's uri_encode_component but with that
+//     extra "allow reserved" mode switchable per RFC 6570 Table 1.
+//   * SCANNING IS BYTE-INDEXED for the outer '{'/'}' template scan (see
+//     std/net/uri's identical note) so a literal segment containing raw
+//     multi-byte UTF-8 text is sliced correctly. Inside one expression,
+//     varspec names are RFC 6570 VARCHAR (ALPHA / DIGIT / "_" / a limited
+//     pct-encoded triplet) — always ASCII by grammar — so char_at()
+//     codepoint indexing and slice()/len() byte indexing coincide there.
+//   * dict keys are strings; a missing key returns int 0 not "" — every
+//     reader here guards with contains() before reading a string value.
+//   * NOVA dicts require a homogeneous value type; ut_parse's result dict
+//     maps both "kinds" and "texts" to list<string>, so it stays uniform.
+//
+// SYMBOL COLLISION GUARD: every private helper is prefixed _ut_.
+//
+// LEAF — imports nothing.
+
+// ── Private: percent-encoding ────────────────────────────────────────────
+
+// _ut_is_unreserved: RFC 3986 unreserved characters — A-Z, a-z, 0-9, '-',
+// '.', '_', '~' — the set left untouched by every RFC 6570 operator.
+fn _ut_is_unreserved(b: int) -> bool
+    if b >= 65 and b <= 90
+        return true
+    if b >= 97 and b <= 122
+        return true
+    if b >= 48 and b <= 57
+        return true
+    if b == 45 or b == 46 or b == 95 or b == 126
+        return true
+    false
+
+// _ut_is_reserved: RFC 3986 gen-delims (":" "/" "?" "#" "[" "]" "@") plus
+// sub-delims ("!" "$" "&" "'" "(" ")" "*" "+" "," ";" "="). Left unescaped
+// only by the "+" and "#" (reserved-expansion) operators.
+fn _ut_is_reserved(b: int) -> bool
+    if b == 58 or b == 47 or b == 63 or b == 35 or b == 91 or b == 93 or b == 64
+        return true
+    if b == 33 or b == 36 or b == 38 or b == 39 or b == 40 or b == 41 or b == 42 or b == 43 or b == 44 or b == 59 or b == 61
+        return true
+    false
+
+// _ut_hex_char: encode a nibble 0..15 as an uppercase hex character string.
+fn _ut_hex_char(v: int) -> string
+    if v < 10
+        return chr(48 + v)
+    chr(55 + v)
+
+// _ut_encode: percent-encode one variable's value. Unreserved characters
+// always pass through; reserved characters pass through only when
+// allow_reserved is true (the "+"/"#" operators); every other byte
+// (including each byte of a multi-byte UTF-8 sequence) becomes "%XX".
+fn _ut_encode(s: string, allow_reserved: bool) -> string
+    let data = bytes_append_str(bytes(0), s)
+    let n = bytes_len(data)
+    let result = ""
+    let i = 0
+    while i < n
+        let b = bytes_get(data, i) & 0xFF
+        if _ut_is_unreserved(b)
+            result = result + chr(b)
+        else if allow_reserved and _ut_is_reserved(b)
+            result = result + chr(b)
+        else
+            let hi = b / 16
+            let lo = b - hi * 16
+            result = result + "%" + _ut_hex_char(hi) + _ut_hex_char(lo)
+        i = i + 1
+    result
+
+// ── Private: byte-indexed scanning (see module doc note) ──────────────────
+
+// _ut_index_of: first BYTE index of a single-char ASCII needle at/after
+// from_pos in s, or -1.
+fn _ut_index_of(s: string, needle: string, from_pos: int) -> int
+    let data = bytes_append_str(bytes(0), s)
+    let n = bytes_len(data)
+    let target = ord(needle)
+    let i = from_pos
+    while i < n
+        if (bytes_get(data, i) & 0xFF) == target
+            return i
+        i = i + 1
+    -1
+
+// ── Private: operator table (RFC 6570 Table 1) ─────────────────────────────
+
+// _ut_is_op_char: true for the 7 RFC 6570 operator characters that may open
+// an expression ("+","#",".","/",";","?","&"). Absence means Level 1
+// (default / simple) expansion.
+fn _ut_is_op_char(c: string) -> bool
+    if c == "+" or c == "#" or c == "." or c == "/"
+        return true
+    if c == ";" or c == "?" or c == "&"
+        return true
+    false
+
+// _ut_op_config: RFC 6570 Table 1 for one operator character (or "" for the
+// default/Level-1 operator). Returns a 5-element list of strings:
+//   [0] prefix        — emitted once, only if >=1 variable is defined
+//   [1] sep           — joiner placed between multiple defined variables
+//   [2] named         — "1" if each piece renders as "name=value"
+//   [3] allow_reserved — "1" if reserved/gen-delims chars pass through raw
+//   [4] omit_eq       — "1" if an empty value renders as bare "name" (no
+//                        "=") instead of "name=" — true only for ";".
+fn _ut_op_config(op: string) -> list
+    let result = []
+    if op == "+"
+        result.push("")
+        result.push(",")
+        result.push("")
+        result.push("1")
+        result.push("")
+    else if op == "#"
+        result.push("#")
+        result.push(",")
+        result.push("")
+        result.push("1")
+        result.push("")
+    else if op == "."
+        result.push(".")
+        result.push(".")
+        result.push("")
+        result.push("")
+        result.push("")
+    else if op == "/"
+        result.push("/")
+        result.push("/")
+        result.push("")
+        result.push("")
+        result.push("")
+    else if op == ";"
+        result.push(";")
+        result.push(";")
+        result.push("1")
+        result.push("")
+        result.push("1")
+    else if op == "?"
+        result.push("?")
+        result.push("&")
+        result.push("1")
+        result.push("")
+        result.push("")
+    else if op == "&"
+        result.push("&")
+        result.push("&")
+        result.push("1")
+        result.push("")
+        result.push("")
+    else
+        // default / Level 1
+        result.push("")
+        result.push(",")
+        result.push("")
+        result.push("")
+        result.push("")
+    result
+
+// _ut_expand_one: core single-variable expander shared by ut_simple,
+// ut_reserved, ut_fragment, ut_label, ut_path, ut_query, ut_form, ut_matrix
+// and _ut_expand_expr's per-token loop.
+fn _ut_expand_one(op: string, name: string, value: string) -> string
+    let cfg = _ut_op_config(op)
+    let prefix = cfg[0]
+    let named = cfg[2] == "1"
+    let allow_reserved = cfg[3] == "1"
+    let omit_eq = cfg[4] == "1"
+    let encoded = _ut_encode(value, allow_reserved)
+    let piece = ""
+    if named
+        if len(value) == 0 and omit_eq
+            piece = name
+        else
+            piece = name + "=" + encoded
+    else
+        piece = encoded
+    prefix + piece
+
+// ── Private: varspec (name[":"N | "*"]) parsing ────────────────────────────
+
+// _ut_varname_only: strip a trailing "*" (explode) or ":"N (prefix-length)
+// modifier, returning the bare variable name. VARCHAR is ASCII-only by RFC
+// 6570 grammar, so codepoint (char_at) and byte (len/slice) indices agree.
+fn _ut_varname_only(token: string) -> string
+    let n = len(token)
+    if n == 0
+        return token
+    let colon = _ut_index_of(token, ":", 0)
+    if colon >= 0
+        return slice(token, 0, colon)
+    if char_at(token, n - 1) == "*"
+        return slice(token, 0, n - 1)
+    token
+
+// _ut_split_varspec: split one varspec token into [name, trunc_digits].
+// trunc_digits is "" unless the token had a ":"N prefix-length modifier
+// (the "*" explode modifier is dropped — it is a no-op on a scalar value).
+fn _ut_split_varspec(token: string) -> list
+    let result = []
+    let n = len(token)
+    if n == 0
+        result.push("")
+        result.push("")
+        return result
+    let colon = _ut_index_of(token, ":", 0)
+    if colon >= 0
+        result.push(slice(token, 0, colon))
+        result.push(slice(token, colon + 1, n))
+        return result
+    if char_at(token, n - 1) == "*"
+        result.push(slice(token, 0, n - 1))
+        result.push("")
+        return result
+    result.push(token)
+    result.push("")
+    result
+
+// _ut_parse_int: decimal-digit-only string -> int. Non-digit bytes are
+// skipped defensively rather than crashing (a malformed ":N" modifier just
+// degrades to truncating at whatever digits precede the first non-digit).
+fn _ut_parse_int(s: string) -> int
+    let n = len(s)
+    let v = 0
+    let i = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        if c >= 48 and c <= 57
+            v = v * 10 + (c - 48)
+        i = i + 1
+    v
+
+// ── Public: template parsing ────────────────────────────────────────────
+
+// ut_parse: split a template into literal and expression segments.
+//
+// Examples:
+//   ut_parse("a" + chr(123) + "b" + chr(125) + "c")
+//     -> Ok({"kinds":["lit","expr","lit"], "texts":["a","b","c"]})
+//   ut_parse("a" + chr(123) + "unterminated")
+//     -> Err("uritemplate: unterminated expression starting at byte 1")
+fn ut_parse(template: string) -> Result
+    let ob = chr(123)
+    let cb = chr(125)
+    let kinds = []
+    let texts = []
+    let n = len(template)
+    let pos = 0
+    while pos < n
+        let open_pos = _ut_index_of(template, ob, pos)
+        if open_pos < 0
+            kinds.push("lit")
+            texts.push(slice(template, pos, n))
+            pos = n
+        else
+            if open_pos > pos
+                kinds.push("lit")
+                texts.push(slice(template, pos, open_pos))
+            let close_pos = _ut_index_of(template, cb, open_pos + 1)
+            if close_pos < 0
+                return err("uritemplate: unterminated expression starting at byte " + str(open_pos))
+            let content = slice(template, open_pos + 1, close_pos)
+            if len(content) == 0
+                return err("uritemplate: empty expression at byte " + str(open_pos))
+            kinds.push("expr")
+            texts.push(content)
+            pos = close_pos + 1
+    let result = {}
+    result["kinds"] = kinds
+    result["texts"] = texts
+    ok(result)
+
+// _ut_split_op: given one expression's raw content (with the '{'/'}'
+// already stripped), split off a leading operator character. Returns
+// [op, rest] where op is "" for the default/Level-1 operator.
+fn _ut_split_op(content: string) -> list
+    let result = []
+    if len(content) > 0 and _ut_is_op_char(char_at(content, 0))
+        result.push(char_at(content, 0))
+        result.push(slice(content, 1, len(content)))
+    else
+        result.push("")
+        result.push(content)
+    result
+
+// ut_vars: every distinct variable name referenced in the template, in
+// first-occurrence order, with ":N"/"*" modifiers stripped. [] if the
+// template fails to parse.
+//
+// Examples:
+//   ut_vars("http://ex.com/~" + chr(123) + "user" + chr(125) + "/") -> ["user"]
+//   ut_vars(chr(123)+"x,y"+chr(125)+chr(123)+"x"+chr(125))          -> ["x","y"]
+fn ut_vars(template: string) -> list
+    let names = []
+    let pr = ut_parse(template)
+    if is_err(pr)
+        return names
+    let parsed = unwrap(pr)
+    let kinds = parsed["kinds"]
+    let texts = parsed["texts"]
+    let seen = {}
+    let i = 0
+    while i < len(kinds)
+        if kinds[i] == "expr"
+            let split_r = _ut_split_op(texts[i])
+            let rest = split_r[1]
+            let tokens = split(rest, ",")
+            let j = 0
+            while j < len(tokens)
+                let nm = _ut_varname_only(tokens[j])
+                if len(nm) > 0 and not contains(seen, nm)
+                    seen[nm] = "1"
+                    names.push(nm)
+                j = j + 1
+        i = i + 1
+    names
+
+// _ut_expand_expr: expand one expression's raw content (operator + comma-
+// separated varspecs, '{'/'}' already stripped) against `vars`.
+fn _ut_expand_expr(content: string, vars: dict) -> string
+    let split_r = _ut_split_op(content)
+    let op = split_r[0]
+    let rest = split_r[1]
+    let cfg = _ut_op_config(op)
+    let prefix = cfg[0]
+    let sep = cfg[1]
+    let named = cfg[2] == "1"
+    let allow_reserved = cfg[3] == "1"
+    let omit_eq = cfg[4] == "1"
+    let tokens = split(rest, ",")
+    let pieces = []
+    let j = 0
+    while j < len(tokens)
+        let spec = _ut_split_varspec(tokens[j])
+        let name = spec[0]
+        let trunc_s = spec[1]
+        if len(name) > 0 and contains(vars, name)
+            let value = vars[name]
+            if len(trunc_s) > 0
+                let tn = _ut_parse_int(trunc_s)
+                if tn < len(value)
+                    value = slice(value, 0, tn)
+            let encoded = _ut_encode(value, allow_reserved)
+            let piece = ""
+            if named
+                if len(value) == 0 and omit_eq
+                    piece = name
+                else
+                    piece = name + "=" + encoded
+            else
+                piece = encoded
+            pieces.push(piece)
+        j = j + 1
+    if len(pieces) == 0
+        return ""
+    prefix + join(pieces, sep)
+
+// ut_expand: expand every expression in `template` against `vars` (a dict
+// of string variable name -> string value). A name absent from `vars` is
+// "undefined" and contributes nothing; if EVERY variable in one expression
+// is undefined, that whole expression (including its operator prefix)
+// contributes nothing. "" if the template fails to parse.
+//
+// Examples:
+//   ut_expand(chr(123)+"var"+chr(125), {"var":"value"})       -> "value"
+//   ut_expand(chr(123)+"+path"+chr(125)+"/here", {"path":"/foo/bar"})
+//     -> "/foo/bar/here"
+//   ut_expand(chr(123)+"?x,y"+chr(125), {"x":"1024","y":"768"}) -> "?x=1024&y=768"
+//   ut_expand(chr(123)+"/who"+chr(125), {})                     -> ""
+fn ut_expand(template: string, vars: dict) -> string
+    let pr = ut_parse(template)
+    if is_err(pr)
+        return ""
+    let parsed = unwrap(pr)
+    let kinds = parsed["kinds"]
+    let texts = parsed["texts"]
+    let out = ""
+    let i = 0
+    while i < len(kinds)
+        if kinds[i] == "lit"
+            out = out + texts[i]
+        else
+            out = out + _ut_expand_expr(texts[i], vars)
+        i = i + 1
+    out
+
+// ── Public: single-variable operator expanders ─────────────────────────────
+
+// ut_simple: Level 1 default expansion {name} -> percent-encoded value
+// (unreserved characters pass through, everything else -> %XX).
+//   ut_simple("var", "value")        -> "value"
+//   ut_simple("hello", "Hello World!") -> "Hello%20World%21"
+fn ut_simple(name: string, value: string) -> string
+    _ut_expand_one("", name, value)
+
+// ut_reserved: Level 2 reserved expansion {+name} -> value with RFC 3986
+// reserved characters (gen-delims/sub-delims) left unescaped.
+//   ut_reserved("hello", "Hello World!") -> "Hello%20World!"
+fn ut_reserved(name: string, value: string) -> string
+    _ut_expand_one("+", name, value)
+
+// ut_fragment: Level 2 fragment expansion {#name} -> "#" + reserved-safe
+// encoded value (empty only when value is "").
+//   ut_fragment("hello", "Hello World!") -> "#Hello%20World!"
+fn ut_fragment(name: string, value: string) -> string
+    _ut_expand_one("#", name, value)
+
+// ut_label: Level 3 label expansion {.name} -> "." + encoded value.
+//   ut_label("who", "fred") -> ".fred"
+fn ut_label(name: string, value: string) -> string
+    _ut_expand_one(".", name, value)
+
+// ut_path: Level 3 path-segment expansion {/name} -> "/" + encoded value.
+//   ut_path("who", "fred") -> "/fred"
+fn ut_path(name: string, value: string) -> string
+    _ut_expand_one("/", name, value)
+
+// ut_query: Level 3 form-style query expansion {?name} -> "?name=value"
+// (empty value still renders "name=", never omits the "=").
+//   ut_query("who", "fred") -> "?who=fred"
+fn ut_query(name: string, value: string) -> string
+    _ut_expand_one("?", name, value)
+
+// ut_form: Level 3 form-style query continuation {&name} -> "&name=value".
+//   ut_form("who", "fred") -> "&who=fred"
+fn ut_form(name: string, value: string) -> string
+    _ut_expand_one("&", name, value)
+
+// ut_matrix: Level 3 path-style parameter expansion {;name} -> ";name=value",
+// or bare ";name" when value is "" (the ";" operator omits "=" on empty).
+//   ut_matrix("who", "fred") -> ";who=fred"
+//   ut_matrix("empty", "")   -> ";empty"
+fn ut_matrix(name: string, value: string) -> string
+    _ut_expand_one(";", name, value)
+
+// ut_explode: Level 4 default-operator explode expansion of an array-valued
+// variable {name*}. Per RFC 6570 the default operator's item separator IS
+// "," (same as the sibling-variable separator), so this equals the
+// non-exploded comma-join of the encoded elements.
+//   ut_explode("list", ["red","green","blue"]) -> "red,green,blue"
+fn ut_explode(name: string, values: list) -> string
+    let n = len(values)
+    let pieces = []
+    let i = 0
+    while i < n
+        pieces.push(_ut_encode(values[i], false))
+        i = i + 1
+    join(pieces, ",")
