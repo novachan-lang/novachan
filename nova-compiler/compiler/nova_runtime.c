@@ -2581,6 +2581,44 @@ int64_t nova_rt_list_flatten_deep(int64_t handle) {
     return out;
 }
 
+int64_t nova_rt_list_compact(int64_t handle) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t v = l->data[i];
+        if (v != 0) nova_rt_list_append(out, v);
+    }
+    return out;
+}
+
+int64_t nova_rt_list_zip_with(int64_t a, int64_t b, int64_t closure) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)a) != NOVA_MEM_LIST) return out;
+    if (nova_mem_find_tag((void*)(uintptr_t)b) != NOVA_MEM_LIST) return out;
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)closure;
+    int64_t min = la->size < lb->size ? la->size : lb->size;
+    for (int64_t i = 0; i < min; i++) nova_rt_list_append(out, fn(la->data[i], lb->data[i]));
+    return out;
+}
+
+int64_t nova_rt_list_scan(int64_t handle, int64_t init, int64_t closure) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)closure;
+    int64_t acc = init;
+    for (int64_t i = 0; i < l->size; i++) {
+        acc = fn(acc, l->data[i]);
+        nova_rt_list_append(out, acc);
+    }
+    return out;
+}
+
 int64_t nova_rt_html_escape(int64_t s) {
     const char* str = nova_str_safe(s);
     size_t slen = strlen(str);
