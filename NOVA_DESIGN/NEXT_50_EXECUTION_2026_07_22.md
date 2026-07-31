@@ -230,4 +230,12 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `d763cd2d` 6 builtins: timestamp_ms, str_hash, dict_count, list_dedup, list_nth, list_zip_longest
 - `258bdb36` 6 builtins: list_take_while, list_drop_while, list_slice_from, dict_zip, str_escape, range_step
 
-**Total builtins: 872.** Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
+- `175c8dca` 5 builtins: list_insert_at, dict_to_list, list_count_val, list_replace_at, list_swap
+- `7397a82f` 5 existing runtime functions wired: list_remove, list_remove_at, to_float, result_and_then, result_or_else
+- `3e2c7ffe` 1 existing runtime function wired: str_char_at
+- `7ed3da8b` 6 stdlib modules (adt/maybe, pipeline/stage_runner, collections/twoq_cache, text/fuzzy_match, data/table, schedule/interval_scheduler) — 104/104 KAT
+- `2aba638b` 11 builtins: str_title_case/camel_case/snake_case/kebab_case, list_interleave, str_indent, path_within, tls_send_bytes/recv_bytes, tls_upgrade, ws_accept_key
+- `c6730615` 7 builtins: str_word_count/words/squeeze/lines, list_zip_with/scan/partition
+- `6a2d1d3d` fix: remove duplicate registrations, add str_center_pad/squeeze/lines
+
+**Total builtins: 896.** Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
