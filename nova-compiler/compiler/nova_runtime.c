@@ -2527,6 +2527,46 @@ int64_t nova_rt_dict_clear(int64_t handle) {
     return 0;
 }
 
+int64_t nova_rt_list_min_by(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->size == 0) return 0;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    int64_t best = l->data[0];
+    int64_t best_key = fn(best);
+    for (int64_t i = 1; i < l->size; i++) {
+        int64_t key = fn(l->data[i]);
+        if (key < best_key) { best = l->data[i]; best_key = key; }
+    }
+    return best;
+}
+
+int64_t nova_rt_list_max_by(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->size == 0) return 0;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    int64_t best = l->data[0];
+    int64_t best_key = fn(best);
+    for (int64_t i = 1; i < l->size; i++) {
+        int64_t key = fn(l->data[i]);
+        if (key > best_key) { best = l->data[i]; best_key = key; }
+    }
+    return best;
+}
+
+int64_t nova_rt_list_sum_by(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    int64_t total = 0;
+    for (int64_t i = 0; i < l->size; i++) total += fn(l->data[i]);
+    return total;
+}
+
 int64_t nova_rt_str_word_count(int64_t s) {
     const char* str = nova_str_safe(s);
     int64_t count = 0;
