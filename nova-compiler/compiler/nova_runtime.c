@@ -28291,3 +28291,131 @@ int64_t nova_rt_list_flatten_once(int64_t handle) {
     }
     return out;
 }
+
+/* nova_rt_list_range_step: generate list from start to end (exclusive) with step */
+int64_t nova_rt_list_range_step(int64_t start, int64_t end, int64_t step) {
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (step == 0) return out;
+    if (step > 0) {
+        for (int64_t i = start; i < end; i += step)
+            nova_rt_list_append(out, i);
+    } else {
+        for (int64_t i = start; i > end; i += step)
+            nova_rt_list_append(out, i);
+    }
+    return out;
+}
+
+/* nova_rt_str_truncate_ellipsis: truncate to max length, add "..." if truncated */
+int64_t nova_rt_str_truncate_ellipsis(int64_t str_handle, int64_t max_len) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    int64_t slen = (int64_t)strlen(s);
+    if (slen <= max_len) return str_handle;
+    if (max_len <= 3) {
+        char* buf = (char*)malloc(4);
+        if (!buf) return str_handle;
+        int64_t dots = max_len < 3 ? max_len : 3;
+        for (int64_t i = 0; i < dots; i++) buf[i] = '.';
+        buf[dots] = 0;
+        int64_t result = nova_rt_create_string(buf);
+        free(buf);
+        return result;
+    }
+    int64_t keep = max_len - 3;
+    char* buf = (char*)malloc((size_t)max_len + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, (size_t)keep);
+    buf[keep] = '.'; buf[keep+1] = '.'; buf[keep+2] = '.';
+    buf[max_len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_update_value: set key to new_val only if key exists, return 1 if updated, 0 if not */
+int64_t nova_rt_dict_update_value(int64_t handle, int64_t key, int64_t new_val) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    const char* k = (const char*)(uintptr_t)key;
+    if (!k) return 0;
+    uint64_t h = 14695981039346656037ULL;
+    for (const char* p = k; *p; p++) {
+        h ^= (uint64_t)(unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    if (h == 0) h = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        int64_t idx = (int64_t)((h + (uint64_t)i) % (uint64_t)d->cap);
+        if (d->hashes[idx] == 0) return 0;
+        if (d->hashes[idx] == (int64_t)h) {
+            const char* ek = (const char*)(uintptr_t)d->keys[idx];
+            if (ek && strcmp(ek, k) == 0) {
+                d->vals[idx] = new_val;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* nova_rt_str_replace_chars: replace each char in 'from' with corresponding char in 'to' */
+int64_t nova_rt_str_replace_chars(int64_t str_handle, int64_t from_handle, int64_t to_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* from = (const char*)(uintptr_t)from_handle;
+    const char* to = (const char*)(uintptr_t)to_handle;
+    if (!s || !from || !to) return str_handle;
+    size_t flen = strlen(from);
+    size_t tlen = strlen(to);
+    size_t map_len = flen < tlen ? flen : tlen;
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return str_handle;
+    for (size_t i = 0; i < slen; i++) {
+        buf[i] = s[i];
+        for (size_t j = 0; j < map_len; j++) {
+            if (s[i] == from[j]) { buf[i] = to[j]; break; }
+        }
+    }
+    buf[slen] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_nth_or: get nth element or default */
+int64_t nova_rt_list_nth_or(int64_t handle, int64_t n, int64_t default_val) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || n < 0 || n >= l->size) return default_val;
+    return l->data[n];
+}
+
+/* nova_rt_list_sliding_max: sliding window maximum of size k */
+int64_t nova_rt_list_sliding_max(int64_t handle, int64_t k) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || k <= 0 || k > l->size) return out;
+    for (int64_t i = 0; i <= l->size - k; i++) {
+        int64_t mx = l->data[i];
+        for (int64_t j = 1; j < k; j++) {
+            if (l->data[i + j] > mx) mx = l->data[i + j];
+        }
+        nova_rt_list_append(out, mx);
+    }
+    return out;
+}
+
+/* nova_rt_list_sliding_min: sliding window minimum of size k */
+int64_t nova_rt_list_sliding_min(int64_t handle, int64_t k) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || k <= 0 || k > l->size) return out;
+    for (int64_t i = 0; i <= l->size - k; i++) {
+        int64_t mn = l->data[i];
+        for (int64_t j = 1; j < k; j++) {
+            if (l->data[i + j] < mn) mn = l->data[i + j];
+        }
+        nova_rt_list_append(out, mn);
+    }
+    return out;
+}
