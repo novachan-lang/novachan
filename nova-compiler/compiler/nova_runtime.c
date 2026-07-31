@@ -2527,6 +2527,104 @@ int64_t nova_rt_dict_clear(int64_t handle) {
     return 0;
 }
 
+int64_t nova_rt_math_sign(int64_t val) {
+    if (val > 0) return 1;
+    if (val < 0) return -1;
+    return 0;
+}
+
+int64_t nova_rt_list_rotate(int64_t handle, int64_t n) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t sz = l->size;
+    if (sz <= 1) {
+        int64_t r = nova_rt_list_create();
+        for (int64_t i = 0; i < sz; i++) nova_rt_list_append(r, l->data[i]);
+        return r;
+    }
+    int64_t k = n % sz;
+    if (k < 0) k += sz;
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = k; i < sz; i++) nova_rt_list_append(result, l->data[i]);
+    for (int64_t i = 0; i < k; i++) nova_rt_list_append(result, l->data[i]);
+    return result;
+}
+
+int64_t nova_rt_list_frequency(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_dict_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t dict = nova_rt_dict_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t key = nova_rt_any_to_str(l->data[i]);
+        NovaDict* dd = (NovaDict*)(uintptr_t)dict;
+        int64_t cur = 0;
+        for (int64_t j = 0; j < dd->size; j++) {
+            if (nova_rt_eq(dd->keys[j], key)) { cur = dd->vals[j]; break; }
+        }
+        nova_rt_dict_set(dict, key, cur + 1);
+    }
+    return dict;
+}
+
+int64_t nova_rt_str_is_numeric(int64_t s) {
+    const char* str = nova_str_safe(s);
+    if (!str[0]) return 0;
+    int64_t i = 0;
+    if (str[0] == '-' || str[0] == '+') { i = 1; if (!str[1]) return 0; }
+    int has_dot = 0;
+    for (; str[i]; i++) {
+        if (str[i] == '.' && !has_dot) { has_dot = 1; continue; }
+        if (str[i] < '0' || str[i] > '9') return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_list_reject(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        if (!fn(closure, l->data[i])) nova_rt_list_append(result, l->data[i]);
+    }
+    return result;
+}
+
+int64_t nova_rt_dict_select_keys(int64_t handle, int64_t key_list) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)key_list) != NOVA_MEM_LIST) return nova_rt_dict_create();
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    NovaList* klist = (NovaList*)(uintptr_t)key_list;
+    int64_t result = nova_rt_dict_create();
+    for (int64_t i = 0; i < klist->size; i++) {
+        for (int64_t j = 0; j < d->size; j++) {
+            if (nova_rt_eq(d->keys[j], klist->data[i])) {
+                nova_rt_dict_set(result, d->keys[j], d->vals[j]);
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+int64_t nova_rt_dict_reject_keys(int64_t handle, int64_t key_list) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)key_list) != NOVA_MEM_LIST) return nova_rt_dict_create();
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    NovaList* klist = (NovaList*)(uintptr_t)key_list;
+    int64_t result = nova_rt_dict_create();
+    for (int64_t j = 0; j < d->size; j++) {
+        int found = 0;
+        for (int64_t i = 0; i < klist->size; i++) {
+            if (nova_rt_eq(d->keys[j], klist->data[i])) { found = 1; break; }
+        }
+        if (!found) nova_rt_dict_set(result, d->keys[j], d->vals[j]);
+    }
+    return result;
+}
+
 int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
