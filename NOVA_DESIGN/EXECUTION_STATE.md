@@ -104,6 +104,16 @@ See memory `[[builtin-needs-type-tag-check]]`, `[[novadict-dense-layout]]`,
   could never fire at all). Full fix needs the call constraint DEFERRED until fn_t resolves
   (the `ti_bound_checks` pattern) — inferrer-deep, tracked with an in-code limitation note.
 
+**OBSERVATION (owner's call, NOT changed unilaterally):** `slice()` is typed string-only
+(`(string,int,int) -> string`), so `slice(myList, 1, 3)` is a type error. List slicing works via
+`xs[1:3]` and `list_slice(xs,1,3)`, so nothing is broken — but Python slices uniformly, and a
+split surface is a wart against the "simpler than Python" bar. Making `slice` polymorphic would be
+additive (no existing code breaks) but it is a public-API design decision, so it is left for the owner.
+
+**DOGFOOD SWEEP (clean):** HOF (map/filter/lambda), dict keys/values/contains, join, string repeat,
+INT64_MAX, shifts, negative int division, nested dicts, list slicing, negative indexing, sort over
+keys, and all list ops over comprehension results — all verified correct.
+
 **NEXT (resume here):** Wave-B #6 RC leak — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
