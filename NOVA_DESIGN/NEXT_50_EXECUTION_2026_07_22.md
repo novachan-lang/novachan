@@ -274,4 +274,16 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `87b2f290` fleet 8: 6 stdlib modules (pancake_sort/cycle_sort/sparse_vector/lucas_theorem/discrete_log/tonelli_shanks) — 75/75 KAT + 8 builtins (1190: list_group_equal, list_alternate, str_is_vowel, list_majority_element, dict_filter_by_key_prefix, list_count_distinct, str_split_every)
 - `b60b9e7b` 8 builtins (1198) — str_hamming_distance, list_dot_product, dict_symmetric_diff, str_is_consonant, list_mismatch, str_remove_digits, dict_values_sum, list_weighted_sum
 
-**Total builtins: 1198.** 1830+ stdlib modules. Fleet 9 in-flight. Critical path: Block A (#1 RC leak shared root) + LOCK-4 sized numerics (strategic bottleneck).
+**Rapid-dev session 8 (builtins 1198→1273):**
+- `82317ac6` 7 builtins (1201→1205 declared, 1201 grep) — list_mean, str_remove_letters, list_accumulate, str_is_sentence, dict_values_max, list_span_indices, str_squeeze_char
+- `74d8a334` 8 builtins (1209) — list_min_by_abs, dict_invert_unique, list_scan_product, dict_keys_matching, str_mask_middle, list_chunk_by_sum, str_camel_to_snake, list_uniq_adjacent
+- `ecf608ac` 8 builtins (1217) — str_snake_to_camel, dict_values_min, str_is_title_case, str_repeat_each, list_skip_while, str_wrap_at, list_take_every, str_rot13
+- `35271053` 8 builtins (1225) — str_atoi, str_caesar_cipher, list_pairwise_diff, str_slug, dict_group_by_value_len, str_is_anagram, dict_remove_keys, list_sample_indices
+- `c479b972` 8 builtins (1233) — list_prefix_match, dict_zip_lists, str_to_char_list, list_cycle_n, dict_values_sorted_asc, list_dedup_stable, list_indices_where_gt, str_is_pangram
+- `7b99d3b7` 8 builtins (1241) — str_count_upper, str_count_lower, dict_keys_with_value, str_encode_hex, dict_rename_key, list_swap_at, str_decode_hex, list_split_when
+- `2681dbd3` 8 builtins (1249) — dict_values_to_strings, str_is_ipv4, list_nth_last, str_pad_right_with, str_is_numeric_strict, list_chunk_pairs, str_remove_prefix_if, list_count_where_gt
+- `e231743f` 8 builtins (1257) — str_remove_vowels, str_title_to_slug, list_windows_sum, dict_values_unique, dict_has_all_keys, list_is_palindrome, str_to_words, list_replace_all
+- `2346d028` 8 builtins (1265) — dict_merge_left, str_lstrip, list_sum_pairs, dict_flip_kv, list_range_inclusive, str_rstrip, list_sum_by_sign, str_first_word
+- `166a2acf` 8 builtins (1273) — str_last_word, list_find_all_indices, list_count_where_lt, str_is_palindrome_ignore_case, dict_keys_longest, list_remove_at_index, str_delete_at, list_insert_at_index
+
+**Total builtins: 1273.** 1830+ stdlib modules. Critical path: Block A (#1 RC leak shared root) + LOCK-4 sized numerics (strategic bottleneck).
