@@ -24307,6 +24307,219 @@ int64_t nova_rt_list_rotate_right(int64_t handle, int64_t n) {
     return r;
 }
 
+/* nova_rt_dict_keys_sorted: return sorted list of dict keys */
+int64_t nova_rt_dict_keys_sorted(int64_t handle) {
+    int64_t keys = nova_rt_dict_keys(handle);
+    return nova_rt_list_sort(keys);
+}
+
+/* nova_rt_list_scan_left: prefix sums with binary function */
+int64_t nova_rt_list_scan_left(int64_t handle, int64_t init, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    int64_t acc = init;
+    nova_rt_list_append(result, acc);
+    if (l && l->size > 0) {
+        int64_t* rec = (int64_t*)(uintptr_t)closure;
+        typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+        nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+        for (int64_t i = 0; i < l->size; i++) {
+            acc = fn(closure, acc, l->data[i]);
+            nova_rt_list_append(result, acc);
+        }
+    }
+    return result;
+}
+
+/* nova_rt_str_wrap: word-wrap text at given width */
+int64_t nova_rt_str_wrap(int64_t val, int64_t width) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0] || width <= 0) return val;
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen * 2 + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    int64_t col = 0;
+    int64_t last_space = -1;
+    int64_t last_space_j = -1;
+    for (size_t i = 0; i < slen; i++) {
+        if (s[i] == '\n') {
+            buf[j++] = '\n';
+            col = 0;
+            last_space = -1;
+            continue;
+        }
+        if (s[i] == ' ') {
+            last_space = (int64_t)i;
+            last_space_j = (int64_t)j;
+        }
+        buf[j++] = s[i];
+        col++;
+        if (col >= width && last_space_j >= 0) {
+            buf[last_space_j] = '\n';
+            col = (int64_t)j - last_space_j - 1;
+            last_space = -1;
+            last_space_j = -1;
+        }
+    }
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_sliding_window: list of windows of size n */
+int64_t nova_rt_list_sliding_window(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!l || n <= 0 || n > l->size) return result;
+    for (int64_t i = 0; i <= l->size - n; i++) {
+        int64_t window = nova_rt_list_create();
+        for (int64_t j = 0; j < n; j++) {
+            nova_rt_list_append(window, l->data[i + j]);
+        }
+        nova_rt_list_append(result, window);
+    }
+    return result;
+}
+
+/* nova_rt_dict_filter_keys: keep only keys satisfying predicate */
+int64_t nova_rt_dict_filter_keys(int64_t handle, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t result = nova_rt_dict_create();
+    if (!d) return result;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            if (fn(closure, d->keys[i])) {
+                nova_rt_dict_set(result, d->keys[i], d->vals[i]);
+            }
+        }
+    }
+    return result;
+}
+
+/* nova_rt_str_encode_uri: percent-encode a URI component (RFC 3986 unreserved set) */
+int64_t nova_rt_str_encode_uri(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen * 3 + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            buf[j++] = (char)c;
+        } else {
+            buf[j++] = '%';
+            buf[j++] = hex[c >> 4];
+            buf[j++] = hex[c & 0x0f];
+        }
+    }
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_decode_uri: decode percent-encoded URI component */
+int64_t nova_rt_str_decode_uri(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    for (size_t i = 0; i < slen; i++) {
+        if (s[i] == '%' && i + 2 < slen) {
+            unsigned char hi = 0, lo = 0;
+            char ch = s[i+1];
+            if (ch >= '0' && ch <= '9') hi = (unsigned char)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') hi = (unsigned char)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') hi = (unsigned char)(ch - 'A' + 10);
+            else { buf[j++] = s[i]; continue; }
+            char cl = s[i+2];
+            if (cl >= '0' && cl <= '9') lo = (unsigned char)(cl - '0');
+            else if (cl >= 'a' && cl <= 'f') lo = (unsigned char)(cl - 'a' + 10);
+            else if (cl >= 'A' && cl <= 'F') lo = (unsigned char)(cl - 'A' + 10);
+            else { buf[j++] = s[i]; continue; }
+            buf[j++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            buf[j++] = s[i];
+        }
+    }
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_intersperse: insert separator between all elements */
+int64_t nova_rt_list_intersperse(int64_t handle, int64_t sep) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!l || l->size == 0) return result;
+    nova_rt_list_append(result, l->data[0]);
+    for (int64_t i = 1; i < l->size; i++) {
+        nova_rt_list_append(result, sep);
+        nova_rt_list_append(result, l->data[i]);
+    }
+    return result;
+}
+
+/* nova_rt_str_to_char_codes: string -> list of integer char codes */
+int64_t nova_rt_str_to_char_codes(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    int64_t result = nova_rt_list_create();
+    if (!s) return result;
+    for (size_t i = 0; s[i]; i++) {
+        nova_rt_list_append(result, (int64_t)(unsigned char)s[i]);
+    }
+    return result;
+}
+
+/* nova_rt_str_common_prefix: longest common prefix of two strings */
+int64_t nova_rt_str_common_prefix(int64_t a_val, int64_t b_val) {
+    const char* a = (const char*)(uintptr_t)a_val;
+    const char* b = (const char*)(uintptr_t)b_val;
+    if (!a || !b) return nova_rt_create_string((void*)"");
+    size_t i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    if (i == 0) return nova_rt_create_string((void*)"");
+    char* buf = (char*)malloc(i + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    memcpy(buf, a, i);
+    buf[i] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_common_suffix: longest common suffix of two strings */
+int64_t nova_rt_str_common_suffix(int64_t a_val, int64_t b_val) {
+    const char* a = (const char*)(uintptr_t)a_val;
+    const char* b = (const char*)(uintptr_t)b_val;
+    if (!a || !b) return nova_rt_create_string((void*)"");
+    size_t alen = strlen(a);
+    size_t blen = strlen(b);
+    size_t i = 0;
+    while (i < alen && i < blen && a[alen - 1 - i] == b[blen - 1 - i]) i++;
+    if (i == 0) return nova_rt_create_string((void*)"");
+    char* buf = (char*)malloc(i + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    memcpy(buf, a + alen - i, i);
+    buf[i] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
 /* nova_rt_list_all_equal: true if all elements are equal */
 int64_t nova_rt_list_all_equal(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
