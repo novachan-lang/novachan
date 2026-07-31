@@ -29226,3 +29226,119 @@ int64_t nova_rt_str_is_pangram(int64_t str_handle) {
     for (int i = 0; i < 26; i++) if (!seen[i]) return 0;
     return 1;
 }
+
+/* nova_rt_str_count_upper: count uppercase letters */
+int64_t nova_rt_str_count_upper(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int64_t count = 0;
+    for (size_t i = 0; s[i]; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') count++;
+    return count;
+}
+
+/* nova_rt_str_count_lower: count lowercase letters */
+int64_t nova_rt_str_count_lower(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int64_t count = 0;
+    for (size_t i = 0; s[i]; i++)
+        if (s[i] >= 'a' && s[i] <= 'z') count++;
+    return count;
+}
+
+/* nova_rt_dict_keys_with_value: list of keys whose value equals target */
+int64_t nova_rt_dict_keys_with_value(int64_t handle, int64_t target) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++)
+        if (d->hashes[i] != 0 && d->vals[i] == target)
+            nova_rt_list_append(out, d->keys[i]);
+    return out;
+}
+
+/* nova_rt_str_encode_hex: encode string bytes as hex */
+int64_t nova_rt_str_encode_hex(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len * 2 + 1);
+    if (!buf) return str_handle;
+    for (size_t i = 0; i < len; i++)
+        snprintf(buf + i * 2, 3, "%02x", (unsigned char)s[i]);
+    buf[len * 2] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_rename_key: rename a key in dict */
+int64_t nova_rt_dict_rename_key(int64_t handle, int64_t old_key, int64_t new_key) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            const char* ok = (const char*)(uintptr_t)old_key;
+            if (k && ok && strcmp(k, ok) == 0)
+                nova_rt_dict_set(out, new_key, d->vals[i]);
+            else
+                nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_swap_at: swap elements at indices i and j, return new list */
+int64_t nova_rt_list_swap_at(int64_t handle, int64_t i, int64_t j) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t k = 0; k < l->size; k++) nova_rt_list_append(out, l->data[k]);
+    NovaList* ol = (NovaList*)(uintptr_t)out;
+    if (i >= 0 && i < ol->size && j >= 0 && j < ol->size) {
+        int64_t tmp = ol->data[i];
+        ol->data[i] = ol->data[j];
+        ol->data[j] = tmp;
+    }
+    return out;
+}
+
+/* nova_rt_str_decode_hex: decode hex string back to ascii */
+int64_t nova_rt_str_decode_hex(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    if (len % 2 != 0) return str_handle;
+    char* buf = (char*)malloc(len / 2 + 1);
+    if (!buf) return str_handle;
+    for (size_t i = 0; i < len; i += 2) {
+        unsigned int val = 0;
+        if (sscanf(s + i, "%2x", &val) != 1) { free(buf); return str_handle; }
+        buf[i / 2] = (char)val;
+    }
+    buf[len / 2] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_split_when: split list at first element that equals value */
+int64_t nova_rt_list_split_when(int64_t handle, int64_t value) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    int64_t left = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t right = (int64_t)(uintptr_t)nova_rt_list_create();
+    int found = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (!found && l->data[i] == value) { found = 1; continue; }
+        if (!found) nova_rt_list_append(left, l->data[i]);
+        else nova_rt_list_append(right, l->data[i]);
+    }
+    nova_rt_list_append(out, left);
+    nova_rt_list_append(out, right);
+    return out;
+}
