@@ -2527,6 +2527,60 @@ int64_t nova_rt_dict_clear(int64_t handle) {
     return 0;
 }
 
+int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
+    const char* str = nova_str_safe(s);
+    const char* d = nova_str_safe(delim);
+    size_t dlen = strlen(d);
+    int64_t list = nova_rt_list_create();
+    if (dlen == 0 || max_count <= 0) {
+        char* dup = (char*)nova_heap_alloc(strlen(str) + 1, NOVA_MEM_RAW);
+        if (dup) strcpy(dup, str);
+        nova_rt_list_append(list, (int64_t)(uintptr_t)dup);
+        return list;
+    }
+    int64_t count = 0;
+    const char* pos = str;
+    while (count < max_count - 1) {
+        const char* found = strstr(pos, d);
+        if (!found) break;
+        size_t plen = found - pos;
+        char* part = (char*)nova_heap_alloc(plen + 1, NOVA_MEM_RAW);
+        if (part) { memcpy(part, pos, plen); part[plen] = '\0'; }
+        nova_rt_list_append(list, (int64_t)(uintptr_t)part);
+        pos = found + dlen;
+        count++;
+    }
+    size_t rem = strlen(pos);
+    char* last = (char*)nova_heap_alloc(rem + 1, NOVA_MEM_RAW);
+    if (last) memcpy(last, pos, rem + 1);
+    nova_rt_list_append(list, (int64_t)(uintptr_t)last);
+    return list;
+}
+
+int64_t nova_rt_dict_invert(int64_t handle) {
+    int64_t out = nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return out;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    for (int64_t i = 0; i < d->size; i++) nova_rt_dict_set(out, d->vals[i], d->keys[i]);
+    return out;
+}
+
+int64_t nova_rt_list_flatten_deep(int64_t handle) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_mem_find_tag((void*)(uintptr_t)l->data[i]) == NOVA_MEM_LIST) {
+            int64_t sub = nova_rt_list_flatten_deep(l->data[i]);
+            NovaList* sl = (NovaList*)(uintptr_t)sub;
+            for (int64_t j = 0; j < sl->size; j++) nova_rt_list_append(out, sl->data[j]);
+        } else {
+            nova_rt_list_append(out, l->data[i]);
+        }
+    }
+    return out;
+}
+
 int64_t nova_rt_html_escape(int64_t s) {
     const char* str = nova_str_safe(s);
     size_t slen = strlen(str);
