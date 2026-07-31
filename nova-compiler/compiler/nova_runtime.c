@@ -21655,7 +21655,14 @@ int64_t nova_rt_tls_alpn(int64_t handle) {
    AcceptSecurityContext handshake (inbound mirror of the client's InitializeSecurityContext loop).
    cert_path = a .pfx file, key_path = its password ("" if none). crypt32 is kept loaded so the
    duplicated cert context stays valid for the program lifetime. */
-typedef struct { NOVA_SOCKET lsock; CredHandle cred; PCCERT_CONTEXT cert; } NovaTlsServer;
+typedef struct {
+    NOVA_SOCKET lsock; CredHandle cred; PCCERT_CONTEXT cert;
+    /* Server-side ALPN: the protocol list this listener supports, pre-built as a
+       SEC_APPLICATION_PROTOCOLS blob (empty => no ALPN). SChannel intersects it with the
+       client's offer during AcceptSecurityContext and picks the SERVER's preference order. */
+    unsigned char alpn_offer[128];
+    int alpn_offer_len;
+} NovaTlsServer;
 
 typedef HCERTSTORE (WINAPI *nova_PFXImportCertStore)(CRYPT_DATA_BLOB*, LPCWSTR, DWORD);
 typedef PCCERT_CONTEXT (WINAPI *nova_CertEnumCertificatesInStore)(HCERTSTORE, PCCERT_CONTEXT);
@@ -21728,8 +21735,28 @@ int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_
     return (int64_t)(uintptr_t)srv;
 }
 
+/* nova_rt_tls_listen_alpn: declare the ALPN protocols this TLS listener supports, as a
+   comma-separated list in SERVER PREFERENCE ORDER (e.g. "h2,http/1.1"). SChannel intersects it
+   with each client's offer at AcceptSecurityContext time and picks the server's first match;
+   nova_rt_tls_alpn() on the accepted connection then reports what was negotiated.
+
+   Call it on the handle returned by tls_listen, BEFORE accepting. Returns 1 on success, 0 if the
+   list is malformed or too long (in which case ALPN stays off and connections still serve — a bad
+   ALPN string must not take the listener down). Mirrors the client-side offer API. */
+int64_t nova_rt_tls_listen_alpn(int64_t listen_handle, int64_t protos_val) {
+    NovaTlsServer* srv = (NovaTlsServer*)(uintptr_t)listen_handle;
+    if (!srv) return 0;
+    const char* csv = nova_str_safe(protos_val);
+    if (!csv || !*csv) { srv->alpn_offer_len = 0; return 1; }   /* explicit "" disables ALPN */
+    int n = nova_tls_build_alpn(csv, srv->alpn_offer, (int)sizeof(srv->alpn_offer));
+    if (n <= 0) { srv->alpn_offer_len = 0; nova_set_error("tls_listen_alpn: malformed or oversized protocol list"); return 0; }
+    srv->alpn_offer_len = n;
+    return 1;
+}
+
 /* Server handshake loop (inbound AcceptSecurityContext) — mirror of nova_tls_handshake. */
-static int nova_tls_server_handshake(NovaTlsConn* c, CredHandle* cred) {
+static int nova_tls_server_handshake(NovaTlsConn* c, CredHandle* cred,
+                                     const unsigned char* alpn_offer, int alpn_offer_len) {
     SECURITY_STATUS ss;
     DWORD flags = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT |
                   ASC_REQ_CONFIDENTIALITY | ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM;
@@ -21739,10 +21766,22 @@ static int nova_tls_server_handshake(NovaTlsConn* c, CredHandle* cred) {
         int n = recv(c->sock, c->enc + c->enc_len, (int)(sizeof(c->enc) - c->enc_len), 0);
         if (n <= 0) return 0;
         c->enc_len += n;
-        SecBuffer inBuf[2];
+        /* ALPN (server): the SEC_APPLICATION_PROTOCOLS blob rides as an EXTRA input buffer
+           alongside the ClientHello token. SChannel intersects it with the client's offer and
+           embeds the chosen protocol in the ServerHello. It is only meaningful on the FIRST call
+           (the one carrying the ClientHello); passing it later is harmless but pointless, so the
+           buffer count drops back to 2 afterwards. */
+        SecBuffer inBuf[3];
         inBuf[0].pvBuffer = c->enc; inBuf[0].cbBuffer = (DWORD)c->enc_len; inBuf[0].BufferType = SECBUFFER_TOKEN;
         inBuf[1].pvBuffer = NULL;   inBuf[1].cbBuffer = 0;                 inBuf[1].BufferType = SECBUFFER_EMPTY;
-        SecBufferDesc inDesc; inDesc.ulVersion = SECBUFFER_VERSION; inDesc.cBuffers = 2; inDesc.pBuffers = inBuf;
+        ULONG in_count = 2;
+        if (first && alpn_offer_len > 0) {
+            inBuf[2].pvBuffer = (void*)(uintptr_t)alpn_offer;
+            inBuf[2].cbBuffer = (DWORD)alpn_offer_len;
+            inBuf[2].BufferType = SECBUFFER_APPLICATION_PROTOCOLS;
+            in_count = 3;
+        }
+        SecBufferDesc inDesc; inDesc.ulVersion = SECBUFFER_VERSION; inDesc.cBuffers = in_count; inDesc.pBuffers = inBuf;
         SecBuffer outBuf; outBuf.pvBuffer = NULL; outBuf.BufferType = SECBUFFER_TOKEN; outBuf.cbBuffer = 0;
         SecBufferDesc outDesc; outDesc.ulVersion = SECBUFFER_VERSION; outDesc.cBuffers = 1; outDesc.pBuffers = &outBuf;
         ss = AcceptSecurityContext(cred, first ? NULL : &c->ctxt, &inDesc, flags, 0,
@@ -21762,6 +21801,21 @@ static int nova_tls_server_handshake(NovaTlsConn* c, CredHandle* cred) {
         if (FAILED(ss)) return 0;
     }
     if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_STREAM_SIZES, &c->sizes) != SEC_E_OK) return 0;
+    /* Record the negotiated ALPN protocol so nova_rt_tls_alpn() reports it on the SERVER side too
+       (the client path already did this). Absent/failed negotiation leaves c->alpn as "" — a
+       server that offered ALPN and got no match must still serve the connection, so this is never
+       treated as a handshake failure. */
+    c->alpn[0] = '\0'; c->alpn_len = 0;
+    if (alpn_offer_len > 0) {
+        NovaAlpnResult ar; memset(&ar, 0, sizeof(ar));
+        if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_APPLICATION_PROTOCOL, &ar) == SEC_E_OK &&
+            ar.ProtoNegoStatus == NOVA_ALPN_STATUS_SUCCESS &&
+            ar.ProtocolIdSize > 0 && ar.ProtocolIdSize < sizeof(c->alpn)) {
+            memcpy(c->alpn, ar.ProtocolId, ar.ProtocolIdSize);
+            c->alpn[ar.ProtocolIdSize] = '\0';
+            c->alpn_len = (int)ar.ProtocolIdSize;
+        }
+    }
     c->handshook = 1;
     return 1;
 }
@@ -21774,7 +21828,7 @@ int64_t nova_rt_tls_accept(int64_t listen_handle) {
     NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));   /* c->cred stays zeroed; srv owns the cred */
     if (!c) { NOVA_CLOSE_SOCKET(cs); return 0; }
     c->sock = cs;
-    if (!nova_tls_server_handshake(c, &srv->cred)) {
+    if (!nova_tls_server_handshake(c, &srv->cred, srv->alpn_offer, srv->alpn_offer_len)) {
         NOVA_CLOSE_SOCKET(cs); free(c); nova_set_error("tls_accept: TLS handshake failed"); return 0;
     }
     return (int64_t)(uintptr_t)c;
@@ -22005,7 +22059,31 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_v
    (tls_connect), plus send/recv/close. Built only with -DNOVA_HAVE_OPENSSL -lssl
    -lcrypto. Reuses the existing Berkeley-socket tcp_listen/accept/connect helpers and
    layers TLS on top. A handle with ssl==NULL is a listener (fd + server CTX). */
-typedef struct { int fd; SSL* ssl; SSL_CTX* ctx; int own_ctx; } NovaTls;
+typedef struct {
+    int fd; SSL* ssl; SSL_CTX* ctx; int own_ctx;
+    /* Server-side ALPN: bare OpenSSL wire list ([len][bytes]...) of the protocols this
+       listener supports, in SERVER preference order. Empty => no ALPN. Consulted by the
+       alpn_select callback below during SSL_accept. */
+    unsigned char alpn_wire[110];
+    int alpn_wire_len;
+} NovaTls;
+
+/* SSL_CTX_set_alpn_select_cb callback: pick the first SERVER protocol the client also offered.
+   SSL_select_next_proto's argument order is (server_list, client_list) from the SERVER's point of
+   view -- passing ours first is what makes the SERVER's preference win, which is what an h2
+   endpoint needs (h2 ahead of http/1.1). Returning NOACK on no-match leaves ALPN unnegotiated and
+   the connection still serves, rather than failing the handshake. */
+static int nova_alpn_select_cb(SSL* ssl, const unsigned char** out, unsigned char* outlen,
+                               const unsigned char* in, unsigned int inlen, void* arg) {
+    NovaTls* L = (NovaTls*)arg;
+    (void)ssl;
+    if (!L || L->alpn_wire_len <= 0) return SSL_TLSEXT_ERR_NOACK;
+    if (SSL_select_next_proto((unsigned char**)out, outlen,
+                              L->alpn_wire, (unsigned int)L->alpn_wire_len,
+                              in, inlen) != OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_NOACK;
+    return SSL_TLSEXT_ERR_OK;
+}
 
 static void nova_ssl_init_once(void) {
     static int done = 0;
@@ -22026,6 +22104,32 @@ int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_
     if (!L) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)lfd); return 0; }
     L->fd = (int)lfd; L->ssl = NULL; L->ctx = ctx; L->own_ctx = 1;
     return (int64_t)(uintptr_t)L;
+}
+
+/* nova_rt_tls_listen_alpn (OpenSSL): see the SChannel twin for the contract. Stores the wire
+   list on the listener and installs the select callback on its CTX. */
+int64_t nova_rt_tls_listen_alpn(int64_t listen_handle, int64_t protos_val) {
+    NovaTls* L = (NovaTls*)(uintptr_t)listen_handle;
+    if (!L || !L->ctx) return 0;
+    const char* csv = nova_str_safe(protos_val);
+    if (!csv || !*csv) { L->alpn_wire_len = 0; return 1; }   /* explicit "" disables ALPN */
+    int wl = 0; const char* p = csv;
+    while (*p) {
+        const char* comma = strchr(p, ',');
+        int seg = comma ? (int)(comma - p) : (int)strlen(p);
+        if (seg <= 0 || seg > 255 || wl + 1 + seg > (int)sizeof(L->alpn_wire)) {
+            L->alpn_wire_len = 0;
+            nova_set_error("tls_listen_alpn: malformed or oversized protocol list");
+            return 0;
+        }
+        L->alpn_wire[wl++] = (unsigned char)seg;
+        memcpy(L->alpn_wire + wl, p, (size_t)seg); wl += seg;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    L->alpn_wire_len = wl;
+    SSL_CTX_set_alpn_select_cb(L->ctx, nova_alpn_select_cb, L);
+    return 1;
 }
 
 int64_t nova_rt_tls_accept(int64_t listen_handle) {
@@ -22206,6 +22310,7 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) { (void)host_val
 int64_t nova_rt_tls_connect_alpn(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
 int64_t nova_rt_tls_alpn(int64_t a) { (void)a; return nova_rt_create_string((void*)""); }
 int64_t nova_rt_tls_listen(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
+int64_t nova_rt_tls_listen_alpn(int64_t a, int64_t b) { (void)a;(void)b; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
 int64_t nova_rt_tls_accept(int64_t a) { (void)a; return 0; }
 int64_t nova_rt_tls_send(int64_t a, int64_t b) { (void)a;(void)b; return 0; }
 int64_t nova_rt_tls_recv(int64_t a, int64_t b) { (void)a;(void)b; return nova_rt_create_string((void*)""); }
