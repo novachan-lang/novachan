@@ -26664,6 +26664,117 @@ int64_t nova_rt_list_min_max(int64_t handle) {
     return out;
 }
 
+/* --- Batch 5: numeric/conversion, list ops, string matching --- */
+
+int64_t nova_rt_int_to_binary(int64_t val) {
+    if (val == 0) return nova_rt_create_string("0");
+    char buf[66]; int pos = 65; buf[65] = '\0';
+    uint64_t uv = (uint64_t)val;
+    while (uv > 0) { buf[--pos] = (uv & 1) ? '1' : '0'; uv >>= 1; }
+    return nova_rt_create_string(&buf[pos]);
+}
+
+int64_t nova_rt_int_to_octal(int64_t val) {
+    if (val == 0) return nova_rt_create_string("0");
+    char buf[24]; int pos = 23; buf[23] = '\0';
+    uint64_t uv = (uint64_t)val;
+    while (uv > 0) { buf[--pos] = '0' + (char)(uv & 7); uv >>= 3; }
+    return nova_rt_create_string(&buf[pos]);
+}
+
+int64_t nova_rt_str_match_count(int64_t val, int64_t pattern) {
+    const char* s = nova_str(val);
+    const char* p = nova_str(pattern);
+    if (!*p) return 0;
+    size_t plen = strlen(p);
+    int64_t count = 0;
+    const char* pos = s;
+    while ((pos = strstr(pos, p)) != NULL) { count++; pos += plen; }
+    return count;
+}
+
+int64_t nova_rt_list_sum_by(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t sum = 0;
+    for (int64_t i = 0; i < l->size; i++) sum += fn(closure, l->data[i]);
+    return sum;
+}
+
+int64_t nova_rt_list_count_by(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++) { if (fn(closure, l->data[i])) count++; }
+    return count;
+}
+
+int64_t nova_rt_str_is_ascii(int64_t val) {
+    const char* s = nova_str(val);
+    while (*s) { if ((unsigned char)*s > 127) return 0; s++; }
+    return 1;
+}
+
+int64_t nova_rt_str_is_identifier(int64_t val) {
+    const char* s = nova_str(val);
+    if (!*s) return 0;
+    if (!isalpha((unsigned char)*s) && *s != '_') return 0;
+    s++;
+    while (*s) { if (!isalnum((unsigned char)*s) && *s != '_') return 0; s++; }
+    return 1;
+}
+
+int64_t nova_rt_list_interleave_all(int64_t handle) {
+    NovaList* lists = (NovaList*)(uintptr_t)handle;
+    if (!lists || lists->size == 0) return nova_rt_list_create(0);
+    int64_t max_len = 0;
+    for (int64_t i = 0; i < lists->size; i++) {
+        NovaList* sub = (NovaList*)(uintptr_t)lists->data[i];
+        if (sub && sub->size > max_len) max_len = sub->size;
+    }
+    int64_t out = nova_rt_list_create(max_len * lists->size);
+    for (int64_t j = 0; j < max_len; j++) {
+        for (int64_t i = 0; i < lists->size; i++) {
+            NovaList* sub = (NovaList*)(uintptr_t)lists->data[i];
+            if (sub && j < sub->size) nova_rt_list_append(out, sub->data[j]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_dict_invert_multi(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_dict_create();
+    int64_t out = nova_rt_dict_create();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t existing = nova_rt_dict_get(out, d->vals[i]);
+            if (existing == 0) {
+                int64_t lst = nova_rt_list_create(2);
+                nova_rt_list_append(lst, d->keys[i]);
+                nova_rt_dict_set(out, d->vals[i], lst);
+            } else {
+                nova_rt_list_append(existing, d->keys[i]);
+            }
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_product_int(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 1;
+    int64_t p = 1;
+    for (int64_t i = 0; i < l->size; i++) p *= l->data[i];
+    return p;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
