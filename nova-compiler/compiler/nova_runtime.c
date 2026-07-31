@@ -28155,3 +28155,139 @@ int64_t nova_rt_list_argmax(int64_t handle) {
     }
     return max_idx;
 }
+
+/* nova_rt_list_diff: elements in a but not in b */
+int64_t nova_rt_list_diff(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!a) return out;
+    for (int64_t i = 0; i < a->size; i++) {
+        int found = 0;
+        if (b) {
+            for (int64_t j = 0; j < b->size; j++) {
+                if (b->data[j] == a->data[i]) { found = 1; break; }
+            }
+        }
+        if (!found) nova_rt_list_append(out, a->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_str_lines_count: count lines in string */
+int64_t nova_rt_str_lines_count(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    int64_t count = 1;
+    for (const char* p = s; *p; p++) {
+        if (*p == '\n') count++;
+    }
+    return count;
+}
+
+/* nova_rt_str_between_last: extract text between last occurrence of start and end markers */
+int64_t nova_rt_str_between_last(int64_t str_handle, int64_t start_handle, int64_t end_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* start = (const char*)(uintptr_t)start_handle;
+    const char* end_str = (const char*)(uintptr_t)end_handle;
+    if (!s || !start || !end_str) return nova_rt_create_string("");
+    size_t slen = strlen(start);
+    const char* last_start = NULL;
+    const char* p = s;
+    while ((p = strstr(p, start)) != NULL) {
+        last_start = p + slen;
+        p += slen;
+    }
+    if (!last_start) return nova_rt_create_string("");
+    const char* end_pos = strstr(last_start, end_str);
+    if (!end_pos) return nova_rt_create_string("");
+    size_t len = (size_t)(end_pos - last_start);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return nova_rt_create_string("");
+    memcpy(buf, last_start, len);
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_cartesian: cartesian product of two lists → list of [a, b] pairs */
+int64_t nova_rt_list_cartesian(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!a || !b) return out;
+    for (int64_t i = 0; i < a->size; i++) {
+        for (int64_t j = 0; j < b->size; j++) {
+            int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+            nova_rt_list_append(pair, a->data[i]);
+            nova_rt_list_append(pair, b->data[j]);
+            nova_rt_list_append(out, pair);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_count_occurrences: count non-overlapping occurrences of substring */
+int64_t nova_rt_str_count_occurrences(int64_t str_handle, int64_t sub_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* sub = (const char*)(uintptr_t)sub_handle;
+    if (!s || !sub || !*sub) return 0;
+    size_t sublen = strlen(sub);
+    int64_t count = 0;
+    const char* p = s;
+    while ((p = strstr(p, sub)) != NULL) {
+        count++;
+        p += sublen;
+    }
+    return count;
+}
+
+/* nova_rt_list_cumulative_min: cumulative minimum */
+int64_t nova_rt_list_cumulative_min(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    int64_t cur_min = l->data[0];
+    nova_rt_list_append(out, cur_min);
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < cur_min) cur_min = l->data[i];
+        nova_rt_list_append(out, cur_min);
+    }
+    return out;
+}
+
+/* nova_rt_dict_filter_values: keep entries where value matches target */
+int64_t nova_rt_dict_filter_values(int64_t handle, int64_t target) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0 && d->vals[i] == target) {
+            nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_flatten_once: flatten one level of nesting */
+int64_t nova_rt_list_flatten_once(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t val = l->data[i];
+        int tag = (int)(val & 7);
+        if (tag == 3) {
+            NovaList* sub = (NovaList*)(uintptr_t)val;
+            if (sub) {
+                for (int64_t j = 0; j < sub->size; j++) {
+                    nova_rt_list_append(out, sub->data[j]);
+                }
+            }
+        } else {
+            nova_rt_list_append(out, val);
+        }
+    }
+    return out;
+}
