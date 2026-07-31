@@ -10613,6 +10613,16 @@ fn ir_type_int() -> IrType
 fn ir_type_int_w(w: string) -> IrType
     IrType("int", w, [], 0)
 
+// LOCK-4 inc3c-part2: is this let-annotation a sized-int type name? Returns the width
+// name (so `let x: u8 = f()` can seed the slot width) or "" for anything else — struct
+// names, generics, f32 and usize/isize all fall through to the default i64/any path.
+fn _lock4_ann_width(t: string) -> string
+    if t == "u8" or t == "i8" or t == "u16" or t == "i16"
+        return t
+    if t == "u32" or t == "i32" or t == "u64" or t == "i64"
+        return t
+    ""
+
 // Width (in bits) of a sized-int name; 64 for u64/i64/usize/isize/unknown (no masking needed).
 fn _width_bits(w: string) -> int
     if w == "u8" or w == "i8"
@@ -12510,7 +12520,23 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                             else if la_et == "call" and (la_ev == "db_all" or la_ev == "orm_all" or la_ev == "orm_where")
                                                 eff_expr = Expr("call", fj_le + "__from_dict_list", 0, [expr], [], la_el)
                                                 fj_list_elem = fj_le
-                let val = ir_lower_expr(b, eff_expr)
+                let val0 = ir_lower_expr(b, eff_expr)
+                // LOCK-4 inc3c-part2 — ANNOTATION BRIDGE. `let x: u8 = <expr>` seeds the width
+                // onto the stored value, so a RUNTIME-valued sized var wraps exactly like a
+                // suffixed literal does. Without this the developer must suffix every literal
+                // (`255u8`), which is what kept sized numerics unusable in practice. Emitted as
+                // a width-typed copy so the existing register-width machinery (@w@) picks it up
+                // and the slot_store hook below records it on the slot.
+                let _annw = ""
+                if len(params) > 0
+                    match params[0]
+                        Param(_aw_n, _aw_t, _aw_d) =>
+                            _annw = _lock4_ann_width(_aw_t)
+                let val = val0
+                if _annw != ""
+                    let _awreg = ir_fresh_reg(b)
+                    ir_emit_inst(b, "copy", _awreg, ir_type_int_w(_annw), [val0], "", 0)
+                    val = _awreg
                 if name != ""
                     // `let x = ...` is always a fresh LOCAL declaration (shadows a same-named
                     // module var). Top-level baked lets never reach here (removed from top_stmts).
@@ -19288,6 +19314,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 rt["@slot@" + dest] = value
                 if contains(st, "@nn@" + value) and st["@nn@" + value] == 1
                     rt["@nn@" + dest] = 1
+                // LOCK-4 inc3c-part2 — SLOT WIDTH FLOW (the core of inc3c-part2). A sized value
+                // that went through a slot comes back out sized, so a RUNTIME-valued sized var
+                // wraps. const-fold only covers slots it can forward a constant through; this
+                // covers the general case (loop accumulators, fn results, reassignment).
+                if stype == "int"
+                    let _slw = "@sw@" + value
+                    if contains(st, _slw)
+                        let _lw = st[_slw]
+                        if _lw != ""
+                            rt["@w@" + dest] = _lw
+                            return IrInst(op, dest, ir_type_int_w(_lw), args, value, num, effect, line)
                 return IrInst(op, dest, IrType(stype, "", [], 0), args, value, num, effect, line)
             else if op == "slot_store"
                 let val_type = ir_reg_type(rt, args[0])
@@ -19302,6 +19339,20 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                             st[value] = "any"
                 else
                     st[value] = val_type
+                // LOCK-4 inc3c-part2 — record the stored value's width on the SLOT, as a
+                // MONOTONIC lattice: absent (unknown) -> "<width>" -> "" (conflicted, absorbing).
+                // Monotonicity is what makes this terminate. ir_infer_types iterates to a fixpoint
+                // (capped at 3 passes), and a slot written with two different widths would
+                // otherwise flip-flop forever; sinking to "" on ANY disagreement means each slot
+                // changes state at most twice and the fixpoint is always reached. "" also means
+                // "unsized" downstream, i.e. plain i64 — the safe direction to fail.
+                let _stw = ir_reg_width(rt, args[0])
+                let _stwk = "@sw@" + value
+                if contains(st, _stwk)
+                    if st[_stwk] != _stw
+                        st[_stwk] = ""
+                else
+                    st[_stwk] = _stw
                 let store_nn = ir_reg_nn(rt, args[0])
                 if contains(st, "@nn@" + value)
                     if store_nn == 0
@@ -19824,7 +19875,13 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     copy_itype = ir_type_int()
                     // LOCK-4 inc3c: carry a sized width across the copy (const-fold turns a slot_load
                     // of a sized value into a copy) so `let x = 255u8; x + 1` wraps at width.
-                    let _cpw = ir_reg_width(rt, args[0])
+                    let _cpw0 = ir_reg_width(rt, args[0])
+                    let _cpw = _cpw0
+                    // inc3c-part2: a copy the BUILDER already width-typed is the annotation bridge
+                    // (`let x: u8 = f()`), whose source register carries no width of its own —
+                    // honour the instruction's declared width in that case.
+                    if _cpw == ""
+                        _cpw = typ.name
                     if _cpw != "" and dest != ""
                         rt["@w@" + dest] = _cpw
                         copy_itype = ir_type_int_w(_cpw)
