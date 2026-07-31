@@ -117,7 +117,7 @@ but not the strategic bottleneck.
 | **DOGFOOD R2 #3: `T?` optional sugar rejected in struct-field / `let` annotation** | 0-A | C | ✅ DONE (batch 4; KAT `_kat_opt_sugar`) — only param/return positions handled `?`; `x: int?` / `let x: int? = some(5)` gave spurious 'missing closing )'. Fix: capture the `?` suffix in the field-type (2 branches) + let-type parsers (mirrors param ~2594; `ti_ann_to_type_g`→Option). The `T?` path works e2e (does NOT hit the separate explicit-`Option<int>` unify bug, R2 #4). | (batch 4) |
 | module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ✅ DONE `ccb70ba6` (GAP 5) — self-contained top-level `let cache={}`/`[]`/`channel()` baked into the const-store (const_set prologue, const_get at every use — named fns/lambdas/nova_main); capture-exclusion fixed the green_scale_test N>1 race. Reconverged, both-mode 0-FAIL, N>1 clean. | ccb70ba6 |
 | ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
-| multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
+| multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ✅ FIXED `a44b8303` (sync_to_stmt bracket-depth tracking prevents error recovery from skipping closing brackets) | a44b8303 |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | **enum float-payload unbox** (codegen) | 0-A | A | ✅ FIXED + CERTIFIED (gen5==gen6, 1155/0 both modes) | (task 5) |
@@ -151,8 +151,8 @@ but not the strategic bottleneck.
 | explicit SIMD path | ceil | A | ⬜ | |
 | runtime builtins: math (D11) | rt | C | ✅ DONE (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf; reconverge pending) | (batch 2) |
 | runtime builtins: PRNG (D8) | rt | C | ✅ DONE (xoshiro256** seedable: rng_new/next/int/float; reconverge pending) | (batch 2) |
-| runtime builtins: signals/sockets/glob/sync/pack | rt | B/C | ⬜ | |
-| regex capture-group engine | rt | B | ⬜ | |
+| runtime builtins: signals/sockets/glob/sync/pack | rt | B/C | ✅ MOSTLY DONE (signals=builtins; sync=std/sync/; pack=std/encoding/pack; glob=std/os/glob; sockets=TCP builtins) | |
+| regex capture-group engine (D3) | rt | B | ✅ DONE (regex_captures + regex_named_captures + regex_find_all + regex_replace_all — all wired) | (pre-existing) |
 | GPU lowering (SPIR-V/PTX) · MCU triples | backend | A(XL) | ⬜ | |
 
 ## Stream 2 — std/ stdlib (Sonnet fleet) — status
@@ -173,10 +173,10 @@ but not the strategic bottleneck.
 |   ↳ math | numtheory·geometry2d·combinatorics·bits·quaternion·easing·polynomial·regression·angle·primesieve | — | ✅ | |
 |   ↳ encoding/data | inifmt·properties·jsonpointer·ascii85·quotedprintable·ndjson·tsv | — | ✅ | |
 |   ↳ util/net/time/other | itertools·func·hash/noncrypto·cli/args·random/dist·querystring·mac·cookie·stopwatch·humanize·calendar·retry·nanoid·humansize·ulid·validate·dotenv | — | ✅ | |
-| forge_decimal (D2 BigDecimal) | numeric | signum | ⬜ Wave-2 | |
-| forge_argon2id (KDF) | crypto | blake2b | ⬜ Wave-2 | |
-| forge_unicode (D6 casefold/graphemes) | text | — | ⬜ Wave-2 | |
-| S2 HTTP-client redirects/cookies | net | — | ⬜ Wave-2 | |
+| forge_decimal (D2 BigDecimal) | numeric | signum | ✅ DONE `4ae0d3cf` + std/numeric/decimal | |
+| forge_argon2id (KDF) | crypto | blake2b | ✅ DONE (std/crypto/argon2id) | |
+| forge_unicode (D6 casefold/graphemes) | text | — | ✅ DONE `ee5dafbf` (std/text/casefold + grapheme) | |
+| S2 HTTP-client redirects/cookies | net | — | ✅ DONE `e11935a3` (redirects + cookie jar + relative-resolve `94d566e4`) | |
 
 *(Wave-1 = 4/4 landed, each KAT-gated + adversarially verified; the verify pass forced fixes to hamt/signum/blake2b before accept.)*
 
