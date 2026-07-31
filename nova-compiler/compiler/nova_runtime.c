@@ -29930,3 +29930,119 @@ int64_t nova_rt_list_max_n(int64_t handle, int64_t n) {
         nova_rt_list_append(out, sl->data[i]);
     return out;
 }
+
+/* nova_rt_list_min_n: get N smallest elements */
+int64_t nova_rt_list_min_n(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t sorted = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return sorted;
+    for (int64_t i = 0; i < l->size; i++) nova_rt_list_append(sorted, l->data[i]);
+    nova_rt_list_sort(sorted);
+    NovaList* sl = (NovaList*)(uintptr_t)sorted;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t lim = n < sl->size ? n : sl->size;
+    for (int64_t i = 0; i < lim; i++)
+        nova_rt_list_append(out, sl->data[i]);
+    return out;
+}
+
+/* nova_rt_str_is_lower_only: true if all chars are lowercase letters */
+int64_t nova_rt_str_is_lower_only(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    for (size_t i = 0; s[i]; i++)
+        if (s[i] < 'a' || s[i] > 'z') return 0;
+    return 1;
+}
+
+/* nova_rt_list_consecutive_pairs: [[a,b],[b,c],[c,d]] */
+int64_t nova_rt_list_consecutive_pairs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size < 2) return out;
+    for (int64_t i = 0; i < l->size - 1; i++) {
+        int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(pair, l->data[i + 1]);
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
+/* nova_rt_dict_size_of: number of entries */
+int64_t nova_rt_dict_size_of(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < d->cap; i++)
+        if (d->hashes[i] != 0) count++;
+    return count;
+}
+
+/* nova_rt_str_to_upper_first: uppercase only the first character */
+int64_t nova_rt_str_to_upper_first(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, len + 1);
+    if (buf[0] >= 'a' && buf[0] <= 'z') buf[0] = (char)(buf[0] - 32);
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_flatten_map: flatten one level and collect results */
+int64_t nova_rt_list_flatten_map(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        NovaList* sub = (NovaList*)(uintptr_t)l->data[i];
+        if (sub && sub->size >= 0 && sub->cap > 0) {
+            for (int64_t j = 0; j < sub->size; j++)
+                nova_rt_list_append(out, sub->data[j]);
+        } else {
+            nova_rt_list_append(out, l->data[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_every_pair: check if all adjacent pairs satisfy a[i] <= a[i+1] */
+int64_t nova_rt_list_every_pair(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return 1;
+    for (int64_t i = 0; i < l->size - 1; i++)
+        if (l->data[i] > l->data[i + 1]) return 0;
+    return 1;
+}
+
+/* nova_rt_dict_to_query_string: convert dict to URL query string */
+int64_t nova_rt_dict_to_query_string(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_create_string("");
+    char* buf = (char*)malloc(4096);
+    if (!buf) return nova_rt_create_string("");
+    size_t pos = 0;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap && pos < 4000; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            if (!k) continue;
+            char vbuf[32];
+            snprintf(vbuf, sizeof(vbuf), "%lld", (long long)d->vals[i]);
+            if (!first) buf[pos++] = '&';
+            size_t klen = strlen(k), vlen = strlen(vbuf);
+            memcpy(buf + pos, k, klen); pos += klen;
+            buf[pos++] = '=';
+            memcpy(buf + pos, vbuf, vlen); pos += vlen;
+            first = 0;
+        }
+    }
+    buf[pos] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
