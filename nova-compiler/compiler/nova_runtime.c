@@ -18641,6 +18641,76 @@ int64_t nova_rt_str_insert(int64_t str_val, int64_t pos, int64_t insert_val) {
     return (int64_t)(uintptr_t)r;
 }
 
+/* nova_rt_str_reverse: Reverse a string (byte-level reverse; correct for ASCII,
+   visually wrong for multi-byte UTF-8 but consistent with slice/indexing semantics). */
+int64_t nova_rt_str_reverse(int64_t str_val) {
+    if (!str_val) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    const char* s = (const char*)(uintptr_t)str_val;
+    size_t len = strlen(s);
+    if (len == 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = s[len - 1 - i];
+    }
+    buf[len] = '\0';
+    char* r = nova_fat_str_create(buf, len);
+    free(buf);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+/* nova_rt_str_chars: Split a string into a list of single-character strings. */
+int64_t nova_rt_str_chars(int64_t str_val) {
+    int64_t out = nova_rt_list_create();
+    if (!str_val) return out;
+    const char* s = (const char*)(uintptr_t)str_val;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++) {
+        char c[2] = { s[i], '\0' };
+        int64_t ch = (int64_t)(uintptr_t)nova_fat_str_create(c, 1);
+        nova_rt_list_append(out, ch);
+    }
+    return out;
+}
+
+/* nova_rt_str_count_char: Count occurrences of a single character in a string. */
+int64_t nova_rt_str_count_char(int64_t str_val, int64_t ch) {
+    if (!str_val) return 0;
+    const char* s = (const char*)(uintptr_t)str_val;
+    char target = (char)(ch & 0xFF);
+    int64_t count = 0;
+    while (*s) {
+        if (*s == target) count++;
+        s++;
+    }
+    return count;
+}
+
+/* nova_rt_str_replace_first: Replace only the first occurrence of a substring. */
+int64_t nova_rt_str_replace_first(int64_t str_val, int64_t old_val, int64_t new_val) {
+    if (!str_val) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* old_s = old_val ? (const char*)(uintptr_t)old_val : "";
+    const char* new_s = new_val ? (const char*)(uintptr_t)new_val : "";
+    size_t slen = strlen(s);
+    size_t olen = strlen(old_s);
+    size_t nlen = strlen(new_s);
+    if (olen == 0) return str_val;
+    const char* found = strstr(s, old_s);
+    if (!found) return str_val;
+    size_t rlen = slen - olen + nlen;
+    char* buf = (char*)malloc(rlen + 1);
+    if (!buf) return str_val;
+    size_t prefix = (size_t)(found - s);
+    memcpy(buf, s, prefix);
+    memcpy(buf + prefix, new_s, nlen);
+    memcpy(buf + prefix + nlen, found + olen, slen - prefix - olen);
+    buf[rlen] = '\0';
+    char* r = nova_fat_str_create(buf, rlen);
+    free(buf);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
 /* ── Phase 7.5: FFI Helpers ───────────────────────────────────────────────── */
 
 /* nova_rt_create_string: Create a NOVA fat string from a null-terminated C string.
