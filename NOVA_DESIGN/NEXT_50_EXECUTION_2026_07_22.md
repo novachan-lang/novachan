@@ -285,5 +285,20 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `e231743f` 8 builtins (1257) — str_remove_vowels, str_title_to_slug, list_windows_sum, dict_values_unique, dict_has_all_keys, list_is_palindrome, str_to_words, list_replace_all
 - `2346d028` 8 builtins (1265) — dict_merge_left, str_lstrip, list_sum_pairs, dict_flip_kv, list_range_inclusive, str_rstrip, list_sum_by_sign, str_first_word
 - `166a2acf` 8 builtins (1273) — str_last_word, list_find_all_indices, list_count_where_lt, str_is_palindrome_ignore_case, dict_keys_longest, list_remove_at_index, str_delete_at, list_insert_at_index
+- `e958edc6` 8 builtins (1281)
+- `16920f18` 8 builtins (1289)
+- `92e91cd5` 8 builtins (1297) — str_remove_suffix_if, list_group_by_mod, dict_keys_shortest, str_is_upper_only, list_running_avg, dict_values_flat, str_byte_count, list_zip_map
+- `541ac463` 8 builtins (1305) — list_second_max, list_second_min, str_count_vowels, str_count_consonants, dict_min_key, dict_max_key, str_swap_case, list_partition_even_odd
 
-**Total builtins: 1273.** 1830+ stdlib modules. Critical path: Block A (#1 RC leak shared root) + LOCK-4 sized numerics (strategic bottleneck).
+**SOUNDNESS FIX (this session):**
+- `08b03d37` **dense-dict iteration — 59 dict builtins read uninitialized heap.** NovaDict is DENSE
+  (`keys/vals/hashes[0..size-1]` live, compacted, no holes; `[size..cap)` uninitialized). 59 builtins
+  iterated `i < d->cap` using `hashes[i] != 0` as an occupancy sentinel. Two defects: (1) reads
+  uninitialized memory and processes nonzero garbage as a live entry → phantom keys + wild `char*`
+  deref; (2) `hashes[i] != 0` is not a valid occupancy test anyway — FNV-1a and `nova_rt_hash` can
+  return 0, silently dropping a live entry. Fixed all 59 to bound by `d->size` with the sentinel
+  removed. Found by verifying a runtime assumption against the actual struct definition rather than
+  copying the surrounding idiom — the idiom itself was the bug, propagated across ~28 batches.
+  List side audited and clean (0 `cap`-bounded iterations).
+
+**Total builtins: 1305.** 1830+ stdlib modules. Critical path: Block A (#1 RC leak shared root) + LOCK-4 sized numerics (strategic bottleneck).
