@@ -12929,6 +12929,49 @@ int64_t nova_rt_dict_merge(int64_t handle_a, int64_t handle_b) {
     return result;
 }
 
+/* dict_delete: remove a key from a dict. Returns 1 if removed, 0 if not found. */
+int64_t nova_rt_dict_delete(int64_t handle, int64_t key) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
+    int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
+    int64_t found_ei = -1;
+    while (d->idx[slot] != DICT_IDX_EMPTY) {
+        int64_t ei = d->idx[slot];
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
+            found_ei = ei;
+            break;
+        }
+        slot = (slot + 1) & (d->idx_cap - 1);
+    }
+    if (found_ei < 0) return 0;
+    nova_rc_dec(d->keys[found_ei]);
+    nova_rc_dec(d->vals[found_ei]);
+    for (int64_t i = found_ei; i < d->size - 1; i++) {
+        d->keys[i] = d->keys[i + 1];
+        d->vals[i] = d->vals[i + 1];
+        d->hashes[i] = d->hashes[i + 1];
+    }
+    d->size--;
+    for (int64_t i = 0; i < d->idx_cap; i++)
+        d->idx[i] = DICT_IDX_EMPTY;
+    for (int64_t i = 0; i < d->size; i++) {
+        int64_t s2 = (int64_t)(d->hashes[i] & (uint64_t)(d->idx_cap - 1));
+        while (d->idx[s2] != DICT_IDX_EMPTY)
+            s2 = (s2 + 1) & (d->idx_cap - 1);
+        d->idx[s2] = i;
+    }
+    return 1;
+}
+
+/* dict_size: return number of key-value pairs. */
+int64_t nova_rt_dict_size(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    return d->size;
+}
+
 int64_t nova_rt_str_count(int64_t s, int64_t sub) {
     const char* str = nova_str_safe(s);
     const char* pat = nova_str_safe(sub);
