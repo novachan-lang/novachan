@@ -27554,3 +27554,90 @@ int64_t nova_rt_list_count_eq(int64_t handle, int64_t val) {
     return count;
 }
 
+/* nova_rt_list_windowed: sliding windows of size n */
+int64_t nova_rt_list_windowed(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0 || n > l->size) return out;
+    for (int64_t i = 0; i <= l->size - n; i++) {
+        int64_t win = (int64_t)(uintptr_t)nova_rt_list_create();
+        for (int64_t j = 0; j < n; j++) {
+            nova_rt_list_append(win, l->data[i + j]);
+        }
+        nova_rt_list_append(out, win);
+    }
+    return out;
+}
+
+/* nova_rt_str_center_with: center string to width using pad char */
+int64_t nova_rt_str_center_with(int64_t str_handle, int64_t width, int64_t pad_char) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) s = "";
+    int64_t slen = (int64_t)strlen(s);
+    if (slen >= width) return str_handle;
+    char pc = (char)(pad_char & 0x7f);
+    if (pc == 0) pc = ' ';
+    int64_t total_pad = width - slen;
+    int64_t left_pad = total_pad / 2;
+    int64_t right_pad = total_pad - left_pad;
+    char* buf = (char*)malloc((size_t)width + 1);
+    if (!buf) return str_handle;
+    memset(buf, pc, (size_t)left_pad);
+    memcpy(buf + left_pad, s, (size_t)slen);
+    memset(buf + left_pad + slen, pc, (size_t)right_pad);
+    buf[width] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_keys_list: return all keys as a list */
+int64_t nova_rt_dict_keys_list(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            nova_rt_list_append(out, d->keys[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_extract_between: extract text between first occurrence of start and end markers */
+int64_t nova_rt_str_extract_between(int64_t str_handle, int64_t start_handle, int64_t end_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* start = (const char*)(uintptr_t)start_handle;
+    const char* end_str = (const char*)(uintptr_t)end_handle;
+    if (!s || !start || !end_str) return nova_rt_create_string("");
+    const char* p1 = strstr(s, start);
+    if (!p1) return nova_rt_create_string("");
+    p1 += strlen(start);
+    const char* p2 = strstr(p1, end_str);
+    if (!p2) return nova_rt_create_string("");
+    size_t len = (size_t)(p2 - p1);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return nova_rt_create_string("");
+    memcpy(buf, p1, len);
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_to_set_list: deduplicate list, preserving first-occurrence order */
+int64_t nova_rt_list_to_set_list(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size == 0) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int found = 0;
+        NovaList* ol = (NovaList*)(uintptr_t)out;
+        for (int64_t j = 0; j < ol->size; j++) {
+            if (ol->data[j] == l->data[i]) { found = 1; break; }
+        }
+        if (!found) nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
