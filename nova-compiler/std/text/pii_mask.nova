@@ -1,0 +1,257 @@
+// std/text/pii_mask.nova — mask common PII (emails, phone numbers,
+// credit-card-like digit runs) inside free-form text.
+// KAT: test_programs/_kat_fleet6.nova
+//
+// std/text/censor.nova already covers word-list profanity redaction; this
+// module is a different concern — pattern-based PII detection/masking, hand
+// scanned char-by-char (no regex engine dependency, LEAF module).
+//
+// Detection heuristics (documented, not silent — this is a text utility, not
+// a validator):
+//   • Email: expand left/right from an '@' over local/domain charsets; the
+//     domain must contain a '.' with at least one char on each side.
+//   • Phone: a maximal run of {digit,-,.,(,),+} (NOT space, to avoid
+//     accidentally bridging two unrelated numbers separated by whitespace)
+//     whose digit COUNT is in [7,15].
+//   • Credit-card: a maximal run of {digit,-,space} (space IS included here
+//     since card numbers are conventionally grouped "4111 1111 1111 1234")
+//     whose digit count is in [13,19]. Because CC runs are masked before
+//     phone runs in pii_mask_all, a real CC number's digits are already
+//     turned into '*' by the time the phone scan runs, so the two heuristics
+//     do not double-match a single card number.
+//   • KNOWN LIMITATION: these are heuristics over plain digit/punctuation
+//     runs, not a full grammar — a sentence with a long, comma/space-free
+//     numeric range can false-positive. Callers with adversarial input
+//     should validate matches before trusting the mask.
+//
+// Public API:
+//   pii_find_emails(text) -> list     every matched email substring, in order
+//   pii_find_phones(text) -> list     every matched phone-like run
+//   pii_find_ccs(text)    -> list     every matched credit-card-like run
+//   pii_mask_email(text)  -> string   emails masked to "f***@domain"
+//   pii_mask_phone(text)  -> string   phone runs masked, last 4 digits kept
+//   pii_mask_cc(text)     -> string   CC runs masked, last 4 digits kept
+//   pii_mask_all(text)    -> string   email, then CC, then phone masking
+//
+// LEAF — imports nothing.
+
+// ── shared helpers ───────────────────────────────────────────────────────
+
+fn _pii_digit_count(s: string) -> int
+    let n = len(s)
+    let cnt = 0
+    let i = 0
+    while i < n
+        if is_digit(char_at(s, i))
+            cnt = cnt + 1
+        i = i + 1
+    return cnt
+
+// _pii_replace_first: replace the FIRST occurrence of `old` in `text` with `new`.
+fn _pii_replace_first(text: string, old: string, new: string) -> string
+    let idx = find(text, old)
+    if idx < 0
+        return text
+    let before = slice(text, 0, idx)
+    let after = slice(text, idx + len(old), len(text))
+    return before + new + after
+
+// _pii_mask_run_keep_last4: mask every digit in `run` with '*' except the
+// last 4 digits (in reading order); non-digit characters pass through as-is.
+fn _pii_mask_run_keep_last4(run: string) -> string
+    let n = len(run)
+    let total = _pii_digit_count(run)
+    let keep_from = total - 4
+    if keep_from < 0
+        keep_from = 0
+    let out = ""
+    let seen = 0
+    let i = 0
+    while i < n
+        let c = char_at(run, i)
+        if is_digit(c)
+            if seen < keep_from
+                out = out + "*"
+            else
+                out = out + c
+            seen = seen + 1
+        else
+            out = out + c
+        i = i + 1
+    return out
+
+// ── email ─────────────────────────────────────────────────────────────────
+
+fn _pii_is_email_local_char(c: string) -> bool
+    if is_alpha(c) or is_digit(c)
+        return true
+    if c == "." or c == "_" or c == "%" or c == "+" or c == "-"
+        return true
+    return false
+
+fn _pii_is_email_domain_char(c: string) -> bool
+    if is_alpha(c) or is_digit(c)
+        return true
+    if c == "." or c == "-"
+        return true
+    return false
+
+// pii_find_emails: every email-shaped substring of text, left to right.
+fn pii_find_emails(text: string) -> list
+    let n = len(text)
+    let result = []
+    let i = 0
+    while i < n
+        let c = char_at(text, i)
+        let matched = false
+        if c == "@"
+            let start = i
+            while start > 0 and _pii_is_email_local_char(char_at(text, start - 1))
+                start = start - 1
+            let dend = i + 1
+            while dend < n and _pii_is_email_domain_char(char_at(text, dend))
+                dend = dend + 1
+            let local_len = i - start
+            let domain_len = dend - (i + 1)
+            if local_len > 0 and domain_len > 0
+                let domain = slice(text, i + 1, dend)
+                let dot_idx = find(domain, ".")
+                if dot_idx > 0 and dot_idx < len(domain) - 1
+                    let email = slice(text, start, dend)
+                    push(result, email)
+                    i = dend
+                    matched = true
+        if not matched
+            i = i + 1
+    return result
+
+// _pii_mask_one_email: "local@domain" -> "f***@domain" (first local char kept).
+fn _pii_mask_one_email(email: string) -> string
+    let at_idx = find(email, "@")
+    if at_idx <= 0
+        return email
+    let local = slice(email, 0, at_idx)
+    let domain = slice(email, at_idx, len(email))
+    let masked_local = slice(local, 0, 1)
+    let ll = len(local)
+    let k = 1
+    while k < ll
+        masked_local = masked_local + "*"
+        k = k + 1
+    return masked_local + domain
+
+// pii_mask_email: mask every email address found in text.
+fn pii_mask_email(text: string) -> string
+    let emails = pii_find_emails(text)
+    let out = text
+    let elen = len(emails)
+    let idx = 0
+    while idx < elen
+        let e = emails[idx]
+        let masked = _pii_mask_one_email(e)
+        out = _pii_replace_first(out, e, masked)
+        idx = idx + 1
+    return out
+
+// ── phone ─────────────────────────────────────────────────────────────────
+
+fn _pii_is_phone_char(c: string) -> bool
+    if is_digit(c)
+        return true
+    if c == "-" or c == "." or c == "(" or c == ")" or c == "+"
+        return true
+    return false
+
+// pii_find_phones: every maximal {digit,-,.,(,),+} run with 7..15 digits.
+fn pii_find_phones(text: string) -> list
+    let n = len(text)
+    let result = []
+    let i = 0
+    while i < n
+        let c = char_at(text, i)
+        let advanced = false
+        if is_digit(c)
+            let start = i
+            while start > 0 and _pii_is_phone_char(char_at(text, start - 1))
+                start = start - 1
+            let end = i
+            while end < n and _pii_is_phone_char(char_at(text, end))
+                end = end + 1
+            let run = slice(text, start, end)
+            let dcount = _pii_digit_count(run)
+            if dcount >= 7 and dcount <= 15
+                push(result, run)
+                i = end
+                advanced = true
+        if not advanced
+            i = i + 1
+    return result
+
+// pii_mask_phone: mask every phone-like run found in text, keeping last 4 digits.
+fn pii_mask_phone(text: string) -> string
+    let runs = pii_find_phones(text)
+    let out = text
+    let rl = len(runs)
+    let idx = 0
+    while idx < rl
+        let r = runs[idx]
+        let masked = _pii_mask_run_keep_last4(r)
+        out = _pii_replace_first(out, r, masked)
+        idx = idx + 1
+    return out
+
+// ── credit card ──────────────────────────────────────────────────────────
+
+fn _pii_is_cc_char(c: string) -> bool
+    if is_digit(c)
+        return true
+    if c == "-" or c == " "
+        return true
+    return false
+
+// pii_find_ccs: every maximal {digit,-,space} run with 13..19 digits.
+fn pii_find_ccs(text: string) -> list
+    let n = len(text)
+    let result = []
+    let i = 0
+    while i < n
+        let c = char_at(text, i)
+        let advanced = false
+        if is_digit(c)
+            let start = i
+            while start > 0 and _pii_is_cc_char(char_at(text, start - 1))
+                start = start - 1
+            let end = i
+            while end < n and _pii_is_cc_char(char_at(text, end))
+                end = end + 1
+            let run = slice(text, start, end)
+            let dcount = _pii_digit_count(run)
+            if dcount >= 13 and dcount <= 19
+                push(result, run)
+                i = end
+                advanced = true
+        if not advanced
+            i = i + 1
+    return result
+
+// pii_mask_cc: mask every credit-card-like run found in text, keeping last 4 digits.
+fn pii_mask_cc(text: string) -> string
+    let runs = pii_find_ccs(text)
+    let out = text
+    let rl = len(runs)
+    let idx = 0
+    while idx < rl
+        let r = runs[idx]
+        let masked = _pii_mask_run_keep_last4(r)
+        out = _pii_replace_first(out, r, masked)
+        idx = idx + 1
+    return out
+
+// pii_mask_all: apply email, then credit-card, then phone masking in sequence
+// (CC before phone so a masked CC run's remaining digits can never be
+// mistaken for a phone number afterward).
+fn pii_mask_all(text: string) -> string
+    let t1 = pii_mask_email(text)
+    let t2 = pii_mask_cc(t1)
+    let t3 = pii_mask_phone(t2)
+    return t3

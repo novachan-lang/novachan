@@ -1,0 +1,183 @@
+// std/math/fft.nova — Cooley-Tukey radix-2 FFT/IFFT over complex sequences.
+// KAT: test_programs/_kat_fleet6.nova
+//
+// Complex arrays are represented as a pair of parallel float lists (re, im) —
+// the SAME convention as std/dsp/dft.nova — so results are directly
+// comparable. Unlike std/dsp/dft.nova (naive O(N^2) direct summation, real
+// input only), this module is a genuinely different algorithm: recursive
+// divide-and-conquer decimation-in-time, O(N log N), over full complex
+// input/output. For N a power of two it recurses on even/odd sub-sequences;
+// for any other N (including N<=1) it falls back to a private O(N^2) direct
+// DFT so every function is TOTAL — no crash, no unsupported-size error, for
+// any non-negative-length input.
+//
+// FLOAT HAZARDS (NOVA memory):
+//   • Every sub-expression is bound to a named `let` before use/return —
+//     never a bare multi-term float expression.
+//   • Float vs int compare is UNSOUND — indices stay int, only magnitudes are
+//     float; comparisons among floats use plain `<`/`>` on already-float lets.
+//
+// Public API:
+//   fft_is_pow2(n)          -> bool   true iff n is a positive power of two
+//   fft_forward(re, im)     -> list   [reOut, imOut], forward DFT (X[k] = sum x[n] e^{-i2πkn/N})
+//   fft_inverse(re, im)     -> list   [reOut, imOut], inverse DFT (normalized by 1/N)
+//   fft_magnitude(re, im)   -> list   |X[k]| per bin, as a float list
+//
+// LEAF — imports nothing.
+
+// fft_is_pow2: true iff n is a strictly positive power of two.
+fn fft_is_pow2(n: int) -> bool
+    if n <= 0
+        return false
+    let m = n
+    while m > 1
+        if m % 2 != 0
+            return false
+        m = m / 2
+    return true
+
+// _fft_copy_pair: fresh copies of (re, im) — never alias the caller's lists.
+fn _fft_copy_pair(re: list, im: list) -> list
+    let ro = []
+    let io = []
+    let n = len(re)
+    let i = 0
+    while i < n
+        push(ro, re[i])
+        push(io, im[i])
+        i = i + 1
+    let out = [ro, io]
+    return out
+
+// _fft_naive_dft: direct O(N^2) complex DFT, correct for ANY N (the fallback
+// path used whenever N is not a power of two).
+fn _fft_naive_dft(re: list, im: list) -> list
+    let n = len(re)
+    let out_re = []
+    let out_im = []
+    let k = 0
+    while k < n
+        let sre = 0.0
+        let sim = 0.0
+        let nn = 0
+        while nn < n
+            let angle = 0.0 - (2.0 * pi() * (k * 1.0) * (nn * 1.0) / (n * 1.0))
+            let c = cos(angle)
+            let s = sin(angle)
+            let rn = re[nn] * 1.0
+            let inn = im[nn] * 1.0
+            let tre = rn * c - inn * s
+            let tim = rn * s + inn * c
+            sre = sre + tre
+            sim = sim + tim
+            nn = nn + 1
+        push(out_re, sre)
+        push(out_im, sim)
+        k = k + 1
+    let out = [out_re, out_im]
+    return out
+
+// _fft_rec: recursive radix-2 decimation-in-time FFT. Requires len(re) to be
+// a power of two (callers gate on fft_is_pow2 first).
+fn _fft_rec(re: list, im: list) -> list
+    let n = len(re)
+    if n <= 1
+        return _fft_copy_pair(re, im)
+    let half = n / 2
+    let re_e = []
+    let im_e = []
+    let re_o = []
+    let im_o = []
+    let idx = 0
+    while idx < n
+        if idx % 2 == 0
+            push(re_e, re[idx])
+            push(im_e, im[idx])
+        else
+            push(re_o, re[idx])
+            push(im_o, im[idx])
+        idx = idx + 1
+    let fe = _fft_rec(re_e, im_e)
+    let fo = _fft_rec(re_o, im_o)
+    let fe_re = fe[0]
+    let fe_im = fe[1]
+    let fo_re = fo[0]
+    let fo_im = fo[1]
+    let re_out = []
+    let im_out = []
+    let fillc = 0
+    while fillc < n
+        push(re_out, 0.0)
+        push(im_out, 0.0)
+        fillc = fillc + 1
+    let k = 0
+    while k < half
+        let angle = 0.0 - (2.0 * pi() * (k * 1.0) / (n * 1.0))
+        let wr = cos(angle)
+        let wi = sin(angle)
+        let for_ = fo_re[k]
+        let foi_ = fo_im[k]
+        let tre = wr * for_ - wi * foi_
+        let tim = wr * foi_ + wi * for_
+        let ere = fe_re[k]
+        let eim = fe_im[k]
+        re_out[k] = ere + tre
+        im_out[k] = eim + tim
+        re_out[k + half] = ere - tre
+        im_out[k + half] = eim - tim
+        k = k + 1
+    let out = [re_out, im_out]
+    return out
+
+// fft_forward: forward DFT X[k] = sum_n x[n] * e^{-i 2π k n / N}.
+// Fast O(N log N) path when N is a power of two; exact O(N^2) fallback otherwise.
+fn fft_forward(re: list, im: list) -> list
+    let n = len(re)
+    if n <= 1
+        return _fft_copy_pair(re, im)
+    if fft_is_pow2(n)
+        return _fft_rec(re, im)
+    return _fft_naive_dft(re, im)
+
+// fft_inverse: inverse DFT via the conjugate trick — conjugate the input,
+// run fft_forward, conjugate the output, and normalize by 1/N.
+fn fft_inverse(re: list, im: list) -> list
+    let n = len(re)
+    if n == 0
+        let empty_re = []
+        let empty_im = []
+        let out0 = [empty_re, empty_im]
+        return out0
+    let cim = []
+    let i = 0
+    while i < n
+        push(cim, 0.0 - (im[i] * 1.0))
+        i = i + 1
+    let f = fft_forward(re, cim)
+    let fre = f[0]
+    let fim = f[1]
+    let nf = n * 1.0
+    let out_re = []
+    let out_im = []
+    let k = 0
+    while k < n
+        let rk = fre[k] / nf
+        let ik = (0.0 - fim[k]) / nf
+        push(out_re, rk)
+        push(out_im, ik)
+        k = k + 1
+    let out = [out_re, out_im]
+    return out
+
+// fft_magnitude: |X[k]| = sqrt(re[k]^2 + im[k]^2) per bin.
+fn fft_magnitude(re: list, im: list) -> list
+    let n = len(re)
+    let out = []
+    let i = 0
+    while i < n
+        let rr = re[i] * re[i]
+        let ii = im[i] * im[i]
+        let m = sqrt(rr + ii)
+        push(out, m)
+        i = i + 1
+    return out

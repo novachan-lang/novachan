@@ -27208,3 +27208,124 @@ int64_t nova_rt_list_group_consecutive(int64_t handle) {
     return out;
 }
 
+/* nova_rt_dict_min_by_value: key with minimum value */
+int64_t nova_rt_dict_min_by_value(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return 0;
+    int64_t min_key = 0, min_val = INT64_MAX;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            if (first || d->vals[i] < min_val) {
+                min_val = d->vals[i]; min_key = d->keys[i]; first = 0;
+            }
+        }
+    }
+    return min_key;
+}
+
+/* nova_rt_dict_max_by_value: key with maximum value */
+int64_t nova_rt_dict_max_by_value(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return 0;
+    int64_t max_key = 0, max_val = INT64_MIN;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            if (first || d->vals[i] > max_val) {
+                max_val = d->vals[i]; max_key = d->keys[i]; first = 0;
+            }
+        }
+    }
+    return max_key;
+}
+
+/* nova_rt_str_pad_left_char: pad left with custom char */
+int64_t nova_rt_str_pad_left_char(int64_t str_val, int64_t target_len, int64_t ch) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    if (!s) s = "";
+    int64_t slen = (int64_t)strlen(s);
+    if (slen >= target_len) return str_val;
+    int64_t pad = target_len - slen;
+    char* buf = (char*)malloc(target_len + 1);
+    if (!buf) return str_val;
+    char c = (char)(ch & 0xFF);
+    memset(buf, c, pad);
+    memcpy(buf + pad, s, slen);
+    buf[target_len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_str_pad_right_char: pad right with custom char */
+int64_t nova_rt_str_pad_right_char(int64_t str_val, int64_t target_len, int64_t ch) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    if (!s) s = "";
+    int64_t slen = (int64_t)strlen(s);
+    if (slen >= target_len) return str_val;
+    int64_t pad = target_len - slen;
+    char* buf = (char*)malloc(target_len + 1);
+    if (!buf) return str_val;
+    char c = (char)(ch & 0xFF);
+    memcpy(buf, s, slen);
+    memset(buf + slen, c, pad);
+    buf[target_len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_math_fib: nth fibonacci number (iterative) */
+int64_t nova_rt_math_fib(int64_t n) {
+    if (n <= 0) return 0;
+    if (n == 1) return 1;
+    int64_t a = 0, b = 1;
+    for (int64_t i = 2; i <= n; i++) {
+        int64_t t = a + b; a = b; b = t;
+    }
+    return b;
+}
+
+/* nova_rt_list_index_of_max: index of maximum element */
+int64_t nova_rt_list_index_of_max(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return -1;
+    int64_t max_idx = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] > l->data[max_idx]) max_idx = i;
+    }
+    return max_idx;
+}
+
+/* nova_rt_list_index_of_min: index of minimum element */
+int64_t nova_rt_list_index_of_min(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return -1;
+    int64_t min_idx = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < l->data[min_idx]) min_idx = i;
+    }
+    return min_idx;
+}
+
+/* nova_rt_list_is_sorted_desc: check if list is sorted descending */
+int64_t nova_rt_list_is_sorted_desc(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return 1;
+    for (int64_t i = 0; i < l->size - 1; i++) {
+        if (l->data[i] < l->data[i + 1]) return 0;
+    }
+    return 1;
+}
+
+/* nova_rt_dict_key_of_value: find first key with given value */
+int64_t nova_rt_dict_key_of_value(int64_t handle, int64_t val) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0 && d->vals[i] == val) return d->keys[i];
+    }
+    return 0;
+}
+
