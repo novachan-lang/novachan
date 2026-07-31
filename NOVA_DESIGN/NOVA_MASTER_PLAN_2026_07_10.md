@@ -3241,108 +3241,79 @@ and boolean-expr results stringify `"1"/"0"`.
 
 The cheapest high-value breadth, each a bounded library/runtime task with immediate daily payoff:
 
-1. **`BigDecimal` / arbitrary-precision decimal** with rounding modes — **[stdlib/lib]**, L. *(Forge covers
-   integer-cents money only.)* THE money/data blocker.
-2. **Signed bignum** — **[lib]**, M. Extend `forge_bignum` to negatives (sign + `big_sub` below zero).
-3. **Regex capture-group extraction** (numbered + named) — **[stdlib]**, M. Extend the PCRE engine to
-   return submatches. *(Forge covers whole-match only.)*
-4. **IANA timezone + DST engine** — **[stdlib/lib]**, XL (bundle tzdata + transition rules). *(Forge covers
-   fixed-offset only.)* The scheduling/logging blocker.
-5. **XML parser** — **[lib]**, L. *(Forge covers emit only.)*
-6. **Seedable/deterministic PRNG** — **[stdlib]**, S. Reproducible stream object from a seed.
-7. **Argon2id / scrypt / bcrypt** memory-hard KDF — **[lib]**, M. *(Forge covers PBKDF2/HKDF; not memory-
-   hard.)* Password-storage best practice; independent of the Sentinel framework.
-8. **Extended math builtins** (`isnan`/`isinf`/`fma`/`copysign`/`gcd`/`lcm`/`clamp`) — **[stdlib]**, S.
-9. **Binary pack/unpack + endianness codec** — **[stdlib]**, M. Removes per-driver hand-rolling; enables
-   file-format work.
+1. ✅ **`BigDecimal` / arbitrary-precision decimal** — **DONE** `4ae0d3cf` (7 rounding modes, Result-based, adversary-CONFIRMED).
+2. ✅ **Signed bignum** — **DONE** `4ae0d3cf` (signs correct, div/mod on zero → Result err).
+3. ✅ **Regex capture-group extraction** (numbered + named) — **DONE** (runtime `nova_rt_regex_captures` + `nova_rt_regex_named_captures`; up to 9 groups; `(?<name>...)` named groups → dict).
+4. 🔄 **IANA timezone + DST engine** — **PARTIAL** (`std/time/tz.nova`: 17 major zones, modern era ~2007+; KAT gated). REMAINING: full historical IANA tzdb (pre-2007, ~350 zones).
+5. ✅ **XML parser** — **DONE** (`std/text/xml` + `_xmlparse_test` + `_xml_test` gated).
+6. ✅ **Seedable/deterministic PRNG** — **DONE** (xoshiro256** runtime builtin, `_prng_test` gated).
+7. ✅ **Argon2id** — **DONE** (`std/crypto/argon2id` + `_argon2id_test` gated).
+8. ✅ **Extended math builtins** — **DONE** (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf runtime builtins).
+9. ✅ **Binary pack/unpack + endianness codec** — **DONE** (`std/encoding/pack` + `_pack_test` gated).
 
 ### Phase 2 — I/O / OS / networking last-mile (must-have deploy story + high-value app surface)
 
 Mostly small mechanical builtins over syscalls the runtime *already links* (pthread, setsockopt, signal):
 
-10. **OS signal handling** (`on_signal`, graceful shutdown) — **[stdlib]**, M. **Must-have** for any
-    deployed server/CLI/container.
-11. **HTTP-client redirects + cookie jar + proxy** — **[lib]**, M. *(Forge covers verbs/chunked/SSE.)* The
-    most-used app-dev networking surface.
-12. **Filesystem glob** — **[stdlib]**, S. Needed by NOVA's own toolchain too.
-13. **File permissions + symlinks** (`+x`, 0600) — **[stdlib]**, M. Security-relevant (private-key perms).
-14. **Thread sync primitives** (mutex/rwlock/semaphore/barrier) — **[stdlib]**, M.
-15. **Unix domain sockets**, **socket options** (`TCP_NODELAY`/`SO_REUSEPORT`), **UDP peer address** —
-    **[stdlib]**, S–M. Unblocks sidecars, latency tuning, and UDP servers respectively.
+10. ✅ **OS signal handling** — **DONE** (SIGINT/SIGTERM graceful shutdown + SIGHUP reload channel; `_kat_signals` gated).
+11. 🔄 **HTTP-client redirects + cookie jar + proxy** — **REDIRECTS+COOKIES DONE** `e11935a3` `94d566e4` (follows 301-308, full RFC-3986 resolve, cookie jar). REMAINING: proxy/CONNECT tunnel.
+12. ✅ **Filesystem glob** — **DONE** (`std/os/glob.nova`: recursive `**` glob, `*`/`?` wildcards; `std/os/fnmatch.nova`; `_glob_test` gated).
+13. ✅ **File permissions + symlinks** — **DONE** (chmod/umask/symlink/readlink builtins; `_kat_perms` gated).
+14. ✅ **Thread sync primitives** — **DONE** (`std/sync/mutex`+`semaphore`; `_sync_test`+`_syncmutex_test` gated).
+15. 🔄 **Unix domain sockets + socket options + UDP** — **SOCKET OPTIONS DONE** (TCP_NODELAY/SO_REUSEPORT/SO_KEEPALIVE builtins; UDP recvfrom). Unix sockets DEFERRED (AF_UNIX+netpoller segfault on Win).
 
 ### Phase 3 — Ecosystem connective tissue (must-have for "share code"; unblocks everything downstream)
 
-16. **Wire the transitive dependency resolver into the CLI** (+ `nova.lock`) — **[tool]**, L. *(Prior audit
-    Toolchain #10 — the resolver EXISTS, just unwired.)* Do this first; it's cheap and unblocks multi-package.
-17. **Docs generator** (`nova doc`, `///` extraction → HTML) — **[tool]**, L. Table stakes for a library
-    ecosystem.
-18. **Live package registry + publish flow** (Vault) — **[tool/infra]**, XL. External infra; the "build
-    ON, not just IN" enabler. Needs the ABI-version load-time check (audit §3.9) first.
-19. **Signed one-command installer** (`curl\|sh`/msi/brew/apt) — **[tool]**, M. First-run friction on the
-    full-stack identity.
+16. 🔄 **Wire the transitive dependency resolver** — **LOCKFILE DONE** `dcd8fae8` (`nova.lock` reproducible installs). REMAINING: full transitive-resolver CLI wiring.
+17. ✅ **Docs generator** — **DONE** `722d48d2` (`forge_doc_gen`: parse/extract/render; KAT gated).
+18. **Live package registry + publish flow** (Vault) — **[tool/infra]**, XL. NOT STARTED.
+19. **Signed one-command installer** — **[tool]**, M. NOT STARTED (needs signing cert).
 
 ### Phase 4 — Quality & observability tooling (the "robust"/"fast" promises, verifiable by the user)
 
-20. **Property-based testing + mocks + DB-rollback fixtures** — **[tool/lib]**, M. Finds NOVA's own bug
-    class; composes on `nova test` + `forge_test`.
-21. **Per-`fn` test ergonomics** (discovery/reporting/filter/parallel/diff) — **[tool]**, M.
-22. **Profiler** (sampling CPU + flamegraph) — **[tool]**, L. Makes the "fast" promise self-verifiable.
-23. **LSP inferer-backed hover/completion + refs/rename** — **[tool]**, L. *(Prior audit §3.6 — the
-    inferer's answers already exist on the diagnostics path; wiring job.)*
+20. ✅ **Property-based testing** — **DONE** `722d48d2` (`forge_test_prop`: seeded LCG, tp_check/tp_int_range/tp_bool/tp_string; KAT gated).
+21. 🔄 **Per-`fn` test ergonomics** — PARTIAL (`@test` annotation + `inject_tests` codegen + `nova test`; filter/parallel/diff NOT YET).
+22. ✅ **Profiler** — **DONE** `44d0967d` (`forge_profiler`: enter/exit/calls/total_time/hotspot/report; KAT gated).
+23. ✅ **LSP** — **DONE** v0.4.0 (ALL 14 features: hover/goto/sig-help/inlay/completions/refs/rename/tokens/actions/symbols). Quality improvement (inferer-backed) = follow-on.
 
 ### Phase 5 — Language ceilings (unlock declarative frameworks; the multiplier for all future libraries)
 
 Sequenced because L1/L2 are the *multiplier* that lets Forge and the sibling frameworks stop hand-
 registering and become declarative:
 
-24. **Module-symbol namespacing** (`@mod__fn` mangling + call qualification) — **[lang]**, M. Do early:
-    it's a **hard cap on stdlib/ecosystem scale** (L11) and cheap relative to its blast radius.
-25. **User-extensible annotations → codegen hook** — **[lang]**, XL. The #1 lever (L1); unblocks the
-    type-driven `service` marquee (audit Forge #6), declarative ORM/DI/routing/validation/test-discovery.
-26. **Macros / general comptime** (quasi-quote AST) — **[lang]**, XL (L2). Pairs with #25; would also
-    erase the compiler's own ~700 hand-built AST sites.
-27. **Sized numeric types + `f32` + unsigned** — **[lang]**, M (L7). Unblocks embedded/Edge, wire codecs,
-    GPU/graphics interop.
-28. **Const generics** (L5, L) + **variance** (L3, L) + **associated types** (L4, XL) — **[lang]**. The
-    abstraction ceiling; raises how generic the stdlib/frameworks can be. Const generics also unblock
-    fixed-size stack arrays + shape-checked tensors.
-29. **Enforced immutability distinction** (L6, M) + **custom index/iterator operators** (L8, M) + **weak-
-    ref/Drop language surface** (L10, M) — **[lang]**. Correctness + battery-author ergonomics.
+24. 🔄 **Module-symbol namespacing** (L11) — **Phase 1 DONE** (collision DETECTED as compile error; `fn_src_path`/`fn_src_mod`). Phase 2 `@mod__fn` mangling DEFERRED (XL, ergonomic-only).
+25. ✅ **User-extensible annotations → codegen hook** (L1a) — **Phase 1 DONE** `1a65d7c0`→`e099c1ac` (15 annotation types: @entity/@service/@middleware/@inject/@deprecated/@validate/@builder/@log/@retry/@timeout/@singleton/@observable/@async/@cache/@event; AST-inject codegen). Phase 2 user-extensible = L1b (XL).
+26. ✅ **Comptime** (L2a) — **Phase 1+2 DONE** `55d3fb7e`+`b7a5e1ca` (compile-time fn evaluation + value propagation + `\\u{XXXX}` unicode escapes). Phase 3 general quasi-quote AST = L2b (XL).
+27. 🔄 **Sized numeric types + `f32` + unsigned** (L7) — **inc1-inc3b DONE** (width types + width-mismatch + wrapping arithmetic). inc3c/inc3d OPEN.
+28. **Const generics** (L5) + **variance** (L3) + **associated types** (L4) — NOT STARTED.
+29. ✅/🔄 **L6 `let mut`** ✅ DONE `1a65d7c0` + **L8 custom index/iter** ✅ DONE `49f28f4f` + **L10 weak-ref/Drop** NOT STARTED.
 
 ### Phase 6 — Domain libraries: presentation layer (the frontend half of NOVA's own identity)
 
 The highest-leverage breadth hole, but XL and dependent on FFI-callback + WASM-DOM foundations:
 
-30. **Browser DOM/reactive UI runtime (Prism-web / LiveView-in-wasm)** — **[lib]**, XL (G2). Depends on
-    WASM productization (audit 5.3). The "one language, real frontend" killer app.
-31. **Native GUI toolkit (Prism desktop)** — **[lib/framework]**, XL (G1). Depends on FFI callbacks
-    (`@cdecl`, struct-by-value) + a wgpu/window binding. The biggest domain hole.
-32. **Image codecs (PNG/JPEG) + 2D canvas** — **[lib]**, L (G3). Self-contained on `deflatex` + `bytes`;
-    unblocks avatars/thumbnails/charts/QR and PNG plotting (G10).
+30. **Browser DOM/reactive UI runtime (Prism-web)** — NOT STARTED (depends on WASM productization).
+31. **Native GUI toolkit (Prism desktop)** — NOT STARTED (depends on FFI callbacks + wgpu).
+32. ✅ **Image codecs (PNG/JPEG) + 2D canvas** — **DONE** (PNG decode `1ae4bec7`, JPEG decode `36b5e287`, 2D canvas `7e1adc15`; all adversary-verified).
 
 ### Phase 7 — Domain libraries: wire-protocol clients & documents (cheap high-value; pattern-repeats)
 
 NOVA's proven raw-TCP driver ability (PG/MySQL/Redis/TLS) makes these **pattern-repeats, not new
 capability** — the cheapest way to broaden "integrates with everything":
 
-33. **Message-broker clients** (Kafka, NATS, MQTT, AMQP) — **[lib]**, L each (G6).
-34. **GCP + Azure cloud SDKs + broader AWS** (SQS/SNS/Lambda/KMS) — **[lib]**, L each (G8).
-35. **OpenTelemetry tracing** (spans + `traceparent` + OTLP) — **[lib]**, M (G9). Reuses existing JSON/
-    protobuf codecs + Forge middleware.
-36. **PDF / office generation** (PDF, XLSX) — **[lib]**, L (G7). PDF self-contained; XLSX = zip + XML.
+33. ✅ **Message-broker clients** — **ALL DONE** (Kafka `forge_kafka.nova` 433L, NATS `forge_nats.nova` 376L, MQTT `forge_mqtt.nova`+`forge_mqtt_client.nova`, AMQP `forge_amqp.nova` 471L; all adversarially verified).
+34. ✅ **GCP + Azure + broader AWS SDKs** — **DONE** (`forge_gcp.nova` JWT+Storage/PubSub/BigQuery, `forge_azure.nova` AD+Blob/KeyVault/SQL/Cosmos, `forge_aws.nova`+`forge_awssigv4.nova` SigV4+S3/SQS/SNS/Lambda/DynamoDB).
+35. ✅ **OpenTelemetry tracing** — **DONE** (`forge_otel.nova` 369L: span lifecycle, W3C traceparent inject/extract, OTLP export).
+36. ✅ **PDF / XLSX generation** — **DONE** (`forge_pdf.nova` page/text/line/rect, `forge_xlsx.nova` 221L).
 
 ### Phase 8 — Numeric-at-scale frontier (owns "AI/data"; XL, hardware-gated, interlocking)
 
 Do last — these interlock (train → GPU → dataframe) and each waits on its dependency:
 
-37. **Dataframe / columnar analytics engine (Pulse)** — **[lib]**, L (G5). Viable now that typed float-
-    array perf landed.
-38. **Autodiff / training (Cortex)** — **[lib+lang]**, XL (G4). Needs a `grad`/backward pass; benefits
-    from a `grad` compiler pass. Depends on GPU (audit 5.4) for real training speed.
-39. **GPU kernel lowering** (NOVA → SPIR-V/PTX) — **[lang/tool]**, XL. *(Prior audit 5.4.)* The compute
-    frontier under G4/G5/Reactor; hardware-gated.
-40. **ONNX/GGUF/SafeTensors model loaders** — **[lib]**, L. Lets NOVA *serve* any pre-trained model even
-    before training (G4) lands.
+37. ✅ **Dataframe / columnar analytics engine (Pulse)** — **DONE** (`forge_pulse.nova`: df_col, pulse_describe, pulse_agg/group-by, pulse_rolling, pulse_crosstab, pulse_corr, pulse_from_csv; + `std/data/dataframe.nova` with L8 index operator).
+38. **Autodiff / training (Cortex)** — NOT STARTED (needs `grad`/backward-pass compiler transform; depends on GPU).
+39. **GPU kernel lowering** (NOVA → SPIR-V/PTX) — NOT STARTED (hardware-gated).
+40. 🔄 **ONNX/GGUF/SafeTensors model loaders** — **IN PROGRESS** (fleet building pure NOVA binary parsers).
 
 **The governing rule** (inherited from the prior audit): *do not start a framework whose blocking core
 gap is still open, and do not pour frontier code onto an unclosed soundness hole.* Wave A (soundness) →

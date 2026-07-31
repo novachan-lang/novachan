@@ -179,10 +179,14 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 
 ---
 
-**Beyond 50** (Phase 5–6, gated on the above): F6 broker clients (Kafka/NATS/MQTT), F8 cloud SDKs,
-F10 OpenTelemetry, F9 PDF/XLSX, F4 Pulse dataframe, Sentinel/Mesh/Ops frameworks; then the numeric
-frontier — F7 GPU lowering (SPIR-V/PTX), F3 Cortex autodiff, Reactor game engine, Edge/MCU.
+**Beyond 50 — STATUS (2026-07-31 audit):**
+- ✅ F6 broker clients — ALL DONE (Kafka/NATS/MQTT/AMQP, adversarially verified)
+- ✅ F8 cloud SDKs — DONE (AWS+SigV4, GCP, Azure)
+- ✅ F10 OpenTelemetry — DONE (forge_otel: spans, traceparent, OTLP export)
+- ✅ F9 PDF/XLSX — DONE (forge_pdf, forge_xlsx)
+- ✅ F4 Pulse dataframe — DONE (forge_pulse: columnar ops, group-by, rolling, crosstab, corr, csv-import)
+- 🔄 F7 GPU lowering (SPIR-V/PTX) — NOT STARTED (hardware-gated)
+- F3 Cortex autodiff — NOT STARTED (needs grad compiler pass)
+- Sentinel/Mesh/Ops/Reactor/Edge — framework-level, gated on LOCKs
 
-**Recommended immediate start:** Block A (#1 push-of-fresh-temp leak — the shared RC root) + Block E
-#32 (L11 namespacing — the prerequisite wall for the whole declarative multiplier). Both are compiler/
-runtime and both unblock the widest downstream set.
+**Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
