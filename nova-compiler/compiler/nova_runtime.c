@@ -2413,6 +2413,75 @@ int64_t nova_rt_list_filter(int64_t handle, int64_t closure) {
     return new_list;
 }
 
+/* list_flatten: flatten one level of nesting (list of lists -> single list). */
+int64_t nova_rt_list_flatten(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    nova_list_deopt(handle);
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t new_list = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t elem = l->data[i];
+        if (nova_mem_find_tag((void*)(uintptr_t)elem) == NOVA_MEM_LIST) {
+            nova_list_deopt(elem);
+            NovaList* inner = (NovaList*)(uintptr_t)elem;
+            for (int64_t j = 0; j < inner->size; j++)
+                nova_rt_list_append(new_list, inner->data[j]);
+        } else {
+            nova_rt_list_append(new_list, elem);
+        }
+    }
+    return new_list;
+}
+
+/* list_any: true if any element satisfies the predicate closure. */
+int64_t nova_rt_list_any(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(closure, l->data[i])) return 1;
+    }
+    return 0;
+}
+
+/* list_all: true if all elements satisfy the predicate closure. */
+int64_t nova_rt_list_all(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < l->size; i++) {
+        if (!fn(closure, l->data[i])) return 0;
+    }
+    return 1;
+}
+
+/* list_find: first element satisfying predicate, or 0 (null) if none. */
+int64_t nova_rt_list_find(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(closure, l->data[i])) return l->data[i];
+    }
+    return 0;
+}
+
+/* list_count: count elements satisfying predicate. */
+int64_t nova_rt_list_count(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(closure, l->data[i])) count++;
+    }
+    return count;
+}
+
 int64_t nova_rt_list_slice(int64_t handle, int64_t start, int64_t end) {
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
