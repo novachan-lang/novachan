@@ -2527,6 +2527,50 @@ int64_t nova_rt_dict_clear(int64_t handle) {
     return 0;
 }
 
+int64_t nova_rt_html_escape(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    size_t cap = slen * 6 + 1;
+    char* out = (char*)nova_heap_alloc(cap, NOVA_MEM_RAW);
+    if (!out) return s;
+    size_t pos = 0;
+    for (size_t i = 0; i < slen; i++) {
+        switch (str[i]) {
+            case '&':  memcpy(out+pos, "&amp;", 5);  pos += 5; break;
+            case '<':  memcpy(out+pos, "&lt;", 4);   pos += 4; break;
+            case '>':  memcpy(out+pos, "&gt;", 4);   pos += 4; break;
+            case '"':  memcpy(out+pos, "&quot;", 6);  pos += 6; break;
+            case '\'': memcpy(out+pos, "&#x27;", 6);  pos += 6; break;
+            default:   out[pos++] = str[i]; break;
+        }
+    }
+    out[pos] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_html_unescape(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    char* out = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    size_t pos = 0;
+    for (size_t i = 0; i < slen; i++) {
+        if (str[i] == '&') {
+            if (strncmp(str+i, "&amp;", 5) == 0) { out[pos++] = '&'; i += 4; }
+            else if (strncmp(str+i, "&lt;", 4) == 0) { out[pos++] = '<'; i += 3; }
+            else if (strncmp(str+i, "&gt;", 4) == 0) { out[pos++] = '>'; i += 3; }
+            else if (strncmp(str+i, "&quot;", 6) == 0) { out[pos++] = '"'; i += 5; }
+            else if (strncmp(str+i, "&#x27;", 6) == 0) { out[pos++] = '\''; i += 5; }
+            else if (strncmp(str+i, "&#39;", 5) == 0) { out[pos++] = '\''; i += 4; }
+            else out[pos++] = str[i];
+        } else {
+            out[pos++] = str[i];
+        }
+    }
+    out[pos] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
 int64_t nova_rt_list_min_by(int64_t handle, int64_t closure) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
     NovaList* l = (NovaList*)(uintptr_t)handle;
