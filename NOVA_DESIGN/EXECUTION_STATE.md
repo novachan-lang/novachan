@@ -162,7 +162,14 @@ param #11). **STRATEGIC (owner's call): LOCK-4 sized/unsigned + f32/f16** — st
   lost), so the return analyzes "any". REAL FIX (scoped, invasive): type the HOF lambda param to the list element
   struct type. KAT `_kat_hof_float.nova` written+kept (unregistered). NOT rushed overnight — needs a focused session.
 - ⬜ CYCLE 3-G: `sum([..for..])` over a comprehension returns a float / garbage-int (separate root, sum() typing).
-- 🔄 CLUSTER C: catch parser. INLINE `EXPR catch e => handler` FIXED (batch 3) — the parser never consumed the
+- ✅ CLUSTER C **CLOSED** `793bf3c8` — the remaining "bare multi-line catch as a fn's final statement
+  swallows the next fn" is fixed. Root (measured): the catch handler loop skips newlines while scanning
+  for its next handler statement, so on exit the cursor sits DIRECTLY on the following token instead of
+  on a NEWLINE like every other statement — and that adjacent `fn` was handed to NOVA's trailing-lambda
+  parser (`process(xs) fn(x) ...`), which ate the next DECLARATION. fn-specific (a following `type`/`let`
+  parsed fine). Fix: `_tf_is_trailing` — a trailing fn must be indented PAST the statement column.
+  Trailing-fn verified unaffected (byte-identical IR). KAT `_kat_catch_bare_final`.
+- (historical) CLUSTER C: catch parser. INLINE `EXPR catch e => handler` FIXED (batch 3) — the parser never consumed the
   `=>` ("unexpected FAT_ARROW"); now consumes the optional FAT_ARROW in the inline handler path. KAT `_kat_catch`
   (inline / multi-line / return+inline). REMAINS: bare multi-line catch as a function's implicit-return final
   statement swallows the next fn (subtle fn-body/indent-block interaction) — narrow, deferred (use let/return).
