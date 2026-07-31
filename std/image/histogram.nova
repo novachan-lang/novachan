@@ -1,0 +1,184 @@
+// std/image/histogram.nova — RGB image histogram computation and equalization.
+//
+// IMAGE MODEL:
+//   RGB image = flat list of ints 0..255, 3 consecutive values per pixel (r,g,b),
+//   row-major order.  pixel i is at px[i*3], px[i*3+1], px[i*3+2].
+//   A derived "gray" channel (luminance, ITU-R BT.601: 0.299r+0.587g+0.114b,
+//   rounded to nearest int) is also tracked so grayscale-style equalization
+//   works without a separate grayscale-conversion pass.
+//
+// HISTOGRAM MODEL:
+//   ih_from_pixels returns a dict:
+//     { "width": w, "height": h, "count": n,
+//       "r": [256 ints], "g": [256 ints], "b": [256 ints], "gray": [256 ints] }
+//   where hist["r"][v] = number of pixels whose red channel equals v, etc.
+//   "count" is the number of whole pixels actually consumed (min(width*height,
+//   floor(len(pixels)/3)) — under-sized pixel lists are handled safely, never
+//   read out of bounds).
+//
+// PREFIX: ih_  (private helpers: _ih_)
+//
+// FLOAT HAZARDS obeyed throughout (see std/color/rgb.nova, std/color/lab.nova):
+//   * every intermediate float expression bound to a named let.
+//   * float-returning private helper uses single-exit (no early `return`).
+//
+// API:
+//   ih_from_pixels(pixels, width, height) -> any    build histogram dict
+//   ih_channel(hist, channel)             -> list   256-element freq list for
+//                                                     "r" / "g" / "b" / "gray"
+//                                                     (all-zero list for an
+//                                                     unrecognized channel name)
+//   ih_mean(hist, channel)                -> int    floor(sum(v*count[v]) / total)
+//   ih_equalize(hist)                     -> list   256-element LUT equalizing
+//                                                     the "gray" channel
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+fn _ih_clamp255(v: int) -> int
+    let r = v
+    if v < 0
+        r = 0
+    if v > 255
+        r = 255
+    r
+
+// Luminance (ITU-R BT.601), rounded to nearest int, clamped to [0,255].
+fn _ih_gray(r: int, g: int, b: int) -> int
+    let rf = r * 1.0
+    let gf = g * 1.0
+    let bf = b * 1.0
+    let lr = rf * 0.299
+    let lg = gf * 0.587
+    let lb = bf * 0.114
+    let sum1 = lr + lg
+    let sum2 = sum1 + lb
+    let rounded = sum2 + 0.5
+    let gi = float_to_int(rounded)
+    _ih_clamp255(gi)
+
+fn _ih_new_bins() -> list
+    let bins = []
+    let i = 0
+    while i < 256
+        bins.push(0)
+        i = i + 1
+    bins
+
+// ── construction ─────────────────────────────────────────────────────────────
+
+// ih_from_pixels: build per-channel + luminance histograms from an RGB pixel
+// list. Bounds-safe: only whole (r,g,b) triples that exist in `pixels` and
+// fall within width*height are counted.
+fn ih_from_pixels(pixels: list, width: int, height: int) -> any
+    let rbins = _ih_new_bins()
+    let gbins = _ih_new_bins()
+    let bbins = _ih_new_bins()
+    let graybins = _ih_new_bins()
+    let n = len(pixels)
+    let max_pixels = n / 3
+    let total = width * height
+    let count = total
+    if max_pixels < count
+        count = max_pixels
+    if count < 0
+        count = 0
+    let i = 0
+    while i < count
+        let base = i * 3
+        let r = pixels[base]
+        let g = pixels[base + 1]
+        let b = pixels[base + 2]
+        let rc = _ih_clamp255(r)
+        let gc = _ih_clamp255(g)
+        let bc = _ih_clamp255(b)
+        rbins[rc] = rbins[rc] + 1
+        gbins[gc] = gbins[gc] + 1
+        bbins[bc] = bbins[bc] + 1
+        let gray = _ih_gray(rc, gc, bc)
+        graybins[gray] = graybins[gray] + 1
+        i = i + 1
+    let hist = {}
+    hist["width"] = width
+    hist["height"] = height
+    hist["count"] = count
+    hist["r"] = rbins
+    hist["g"] = gbins
+    hist["b"] = bbins
+    hist["gray"] = graybins
+    hist
+
+// ── queries ───────────────────────────────────────────────────────────────────
+
+// ih_channel: return the 256-element frequency list for the named channel.
+// Unrecognized channel names return an all-zero 256-element list (never crashes).
+fn ih_channel(hist: any, channel: str) -> list
+    let out = _ih_new_bins()
+    if channel == "r"
+        out = hist["r"]
+    if channel == "g"
+        out = hist["g"]
+    if channel == "b"
+        out = hist["b"]
+    if channel == "gray"
+        out = hist["gray"]
+    out
+
+// ih_mean: integer mean of the named channel (floor(sum(v*count[v]) / total)).
+// Returns 0 if the histogram has no pixels.
+fn ih_mean(hist: any, channel: str) -> int
+    let bins = ih_channel(hist, channel)
+    let total = hist["count"]
+    let result = 0
+    if total > 0
+        let sum = 0
+        let v = 0
+        while v < 256
+            sum = sum + v * bins[v]
+            v = v + 1
+        result = sum / total
+    result
+
+// ih_equalize: classic histogram equalization LUT for the "gray" channel.
+//   1. CDF (cumulative distribution) of the gray histogram.
+//   2. cdf_min = smallest non-zero CDF value.
+//   3. eq(v) = round((cdf(v) - cdf_min) / (n - cdf_min) * 255), clamped.
+// Degenerate case (n - cdf_min == 0, i.e. a single distinct gray value across
+// every pixel) returns the identity LUT (lut[v] = v for all v), which is a
+// safe, well-defined fallback: the one populated bin trivially maps to itself.
+fn ih_equalize(hist: any) -> list
+    let bins = ih_channel(hist, "gray")
+    let n = hist["count"]
+    let lut = _ih_new_bins()
+    if n > 0
+        let cdf = []
+        let running = 0
+        let k = 0
+        while k < 256
+            running = running + bins[k]
+            cdf.push(running)
+            k = k + 1
+        let cdf_min = n
+        let m = 0
+        while m < 256
+            let cv = cdf[m]
+            if cv > 0
+                if cv < cdf_min
+                    cdf_min = cv
+            m = m + 1
+        let denom = n - cdf_min
+        if denom == 0
+            let ii = 0
+            while ii < 256
+                lut[ii] = ii
+                ii = ii + 1
+        if denom > 0
+            let p = 0
+            while p < 256
+                let cv = cdf[p]
+                let num = (cv - cdf_min) * 255
+                let half = denom / 2
+                let eq = (num + half) / denom
+                let eqc = _ih_clamp255(eq)
+                lut[p] = eqc
+                p = p + 1
+    lut

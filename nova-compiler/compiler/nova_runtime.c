@@ -18525,6 +18525,122 @@ int64_t nova_rt_str_repeat(int64_t str_val, int64_t count) {
     return (int64_t)(uintptr_t)result;
 }
 
+int64_t nova_rt_str_pad_left(int64_t str_val, int64_t width, int64_t pad_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* pad = pad_val ? (const char*)(uintptr_t)pad_val : " ";
+    size_t slen = strlen(s);
+    if ((int64_t)slen >= width) {
+        char* r = nova_fat_str_create(s, slen);
+        return (int64_t)(uintptr_t)r;
+    }
+    size_t padlen = strlen(pad);
+    if (padlen == 0) padlen = 1;
+    size_t total = (size_t)width;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return str_val;
+    size_t fill = total - slen;
+    for (size_t i = 0; i < fill; i++) buf[i] = pad[i % padlen];
+    memcpy(buf + fill, s, slen);
+    buf[total] = '\0';
+    char* r = nova_fat_str_create(buf, total);
+    free(buf);
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_str_pad_right(int64_t str_val, int64_t width, int64_t pad_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* pad = pad_val ? (const char*)(uintptr_t)pad_val : " ";
+    size_t slen = strlen(s);
+    if ((int64_t)slen >= width) {
+        char* r = nova_fat_str_create(s, slen);
+        return (int64_t)(uintptr_t)r;
+    }
+    size_t padlen = strlen(pad);
+    if (padlen == 0) padlen = 1;
+    size_t total = (size_t)width;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return str_val;
+    memcpy(buf, s, slen);
+    size_t fill = total - slen;
+    for (size_t i = 0; i < fill; i++) buf[slen + i] = pad[i % padlen];
+    buf[total] = '\0';
+    char* r = nova_fat_str_create(buf, total);
+    free(buf);
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_str_center(int64_t str_val, int64_t width, int64_t pad_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* pad = pad_val ? (const char*)(uintptr_t)pad_val : " ";
+    size_t slen = strlen(s);
+    if ((int64_t)slen >= width) {
+        char* r = nova_fat_str_create(s, slen);
+        return (int64_t)(uintptr_t)r;
+    }
+    size_t padlen = strlen(pad);
+    if (padlen == 0) padlen = 1;
+    size_t total = (size_t)width;
+    size_t fill = total - slen;
+    size_t left = fill / 2;
+    size_t right = fill - left;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return str_val;
+    for (size_t i = 0; i < left; i++) buf[i] = pad[i % padlen];
+    memcpy(buf + left, s, slen);
+    for (size_t i = 0; i < right; i++) buf[left + slen + i] = pad[i % padlen];
+    buf[total] = '\0';
+    char* r = nova_fat_str_create(buf, total);
+    free(buf);
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_str_remove_prefix(int64_t str_val, int64_t prefix_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* pfx = prefix_val ? (const char*)(uintptr_t)prefix_val : "";
+    size_t slen = strlen(s);
+    size_t plen = strlen(pfx);
+    if (plen <= slen && memcmp(s, pfx, plen) == 0) {
+        size_t rlen = slen - plen;
+        char* r = nova_fat_str_create(s + plen, rlen);
+        return (int64_t)(uintptr_t)r;
+    }
+    char* r = nova_fat_str_create(s, slen);
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_str_remove_suffix(int64_t str_val, int64_t suffix_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* sfx = suffix_val ? (const char*)(uintptr_t)suffix_val : "";
+    size_t slen = strlen(s);
+    size_t xlen = strlen(sfx);
+    if (xlen <= slen && memcmp(s + slen - xlen, sfx, xlen) == 0) {
+        size_t rlen = slen - xlen;
+        char* r = nova_fat_str_create(s, rlen);
+        return (int64_t)(uintptr_t)r;
+    }
+    char* r = nova_fat_str_create(s, slen);
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_str_insert(int64_t str_val, int64_t pos, int64_t insert_val) {
+    const char* s = str_val ? (const char*)(uintptr_t)str_val : "";
+    const char* ins = insert_val ? (const char*)(uintptr_t)insert_val : "";
+    size_t slen = strlen(s);
+    size_t ilen = strlen(ins);
+    size_t p = (size_t)pos;
+    if (p > slen) p = slen;
+    size_t total = slen + ilen;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return str_val;
+    memcpy(buf, s, p);
+    memcpy(buf + p, ins, ilen);
+    memcpy(buf + p + ilen, s + p, slen - p);
+    buf[total] = '\0';
+    char* r = nova_fat_str_create(buf, total);
+    free(buf);
+    return (int64_t)(uintptr_t)r;
+}
+
 /* ── Phase 7.5: FFI Helpers ───────────────────────────────────────────────── */
 
 /* nova_rt_create_string: Create a NOVA fat string from a null-terminated C string.
