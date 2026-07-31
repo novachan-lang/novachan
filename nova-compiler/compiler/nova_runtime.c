@@ -26499,6 +26499,171 @@ int64_t nova_rt_dict_to_sorted_list(int64_t handle) {
     return out;
 }
 
+/* --- Batch 4: practical utilities (regex match, base64 url, timing) --- */
+
+int64_t nova_rt_list_flatten_depth(int64_t handle, int64_t depth) {
+    if (depth <= 0) return handle;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size);
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_type_pred(l->data[i]) == 3) { /* list */
+            int64_t sub = nova_rt_list_flatten_depth(l->data[i], depth - 1);
+            NovaList* sl = (NovaList*)(uintptr_t)sub;
+            if (sl) { for (int64_t j = 0; j < sl->size; j++) nova_rt_list_append(out, sl->data[j]); }
+        } else {
+            nova_rt_list_append(out, l->data[i]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_repeat(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0 || n <= 0) return nova_rt_list_create(0);
+    if (n > 10000) n = 10000;
+    int64_t out = nova_rt_list_create(l->size * n);
+    for (int64_t r = 0; r < n; r++) {
+        for (int64_t i = 0; i < l->size; i++) nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+int64_t nova_rt_str_center(int64_t val, int64_t width, int64_t fill_val) {
+    const char* s = nova_str(val);
+    size_t slen = strlen(s);
+    if ((int64_t)slen >= width) return val;
+    const char* fill = nova_str(fill_val);
+    char fc = fill[0] ? fill[0] : ' ';
+    size_t total = (size_t)width;
+    size_t left = (total - slen) / 2;
+    size_t right = total - slen - left;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return val;
+    memset(buf, fc, left);
+    memcpy(buf + left, s, slen);
+    memset(buf + left + slen, fc, right);
+    buf[total] = '\0';
+    int64_t r = nova_rt_create_string(buf);
+    free(buf);
+    return r;
+}
+
+int64_t nova_rt_list_combinations(int64_t handle, int64_t k) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || k <= 0 || k > l->size) return nova_rt_list_create(0);
+    if (k > 10) k = 10;
+    int64_t out = nova_rt_list_create(16);
+    int64_t* indices = (int64_t*)malloc(k * sizeof(int64_t));
+    if (!indices) return out;
+    for (int64_t i = 0; i < k; i++) indices[i] = i;
+    while (1) {
+        int64_t combo = nova_rt_list_create(k);
+        for (int64_t i = 0; i < k; i++) nova_rt_list_append(combo, l->data[indices[i]]);
+        nova_rt_list_append(out, combo);
+        int64_t i = k - 1;
+        while (i >= 0 && indices[i] == l->size - k + i) i--;
+        if (i < 0) break;
+        indices[i]++;
+        for (int64_t j = i + 1; j < k; j++) indices[j] = indices[j-1] + 1;
+    }
+    free(indices);
+    return out;
+}
+
+int64_t nova_rt_list_permutations(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    if (l->size > 8) return nova_rt_list_create(0); /* cap at 8! = 40320 */
+    int64_t n = l->size;
+    int64_t* arr = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!arr) return nova_rt_list_create(0);
+    for (int64_t i = 0; i < n; i++) arr[i] = l->data[i];
+    int64_t out = nova_rt_list_create(16);
+    int64_t* c = (int64_t*)calloc(n, sizeof(int64_t));
+    if (!c) { free(arr); return out; }
+    int64_t perm = nova_rt_list_create(n);
+    for (int64_t i = 0; i < n; i++) nova_rt_list_append(perm, arr[i]);
+    nova_rt_list_append(out, perm);
+    int64_t i = 0;
+    while (i < n) {
+        if (c[i] < i) {
+            if (i % 2 == 0) { int64_t t = arr[0]; arr[0] = arr[i]; arr[i] = t; }
+            else { int64_t t = arr[c[i]]; arr[c[i]] = arr[i]; arr[i] = t; }
+            perm = nova_rt_list_create(n);
+            for (int64_t j = 0; j < n; j++) nova_rt_list_append(perm, arr[j]);
+            nova_rt_list_append(out, perm);
+            c[i]++;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i++;
+        }
+    }
+    free(arr); free(c);
+    return out;
+}
+
+int64_t nova_rt_str_count_words(int64_t val) {
+    const char* s = nova_str(val);
+    int64_t count = 0;
+    int in_word = 0;
+    while (*s) {
+        if (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') {
+            in_word = 0;
+        } else {
+            if (!in_word) { count++; in_word = 1; }
+        }
+        s++;
+    }
+    return count;
+}
+
+int64_t nova_rt_list_group_runs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(4);
+    int64_t group = nova_rt_list_create(4);
+    nova_rt_list_append(group, l->data[0]);
+    for (int64_t i = 1; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], l->data[i-1])) {
+            nova_rt_list_append(group, l->data[i]);
+        } else {
+            nova_rt_list_append(out, group);
+            group = nova_rt_list_create(4);
+            nova_rt_list_append(group, l->data[i]);
+        }
+    }
+    nova_rt_list_append(out, group);
+    return out;
+}
+
+int64_t nova_rt_dict_for_each(int64_t handle, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) fn(closure, d->keys[i], d->vals[i]);
+    }
+    return 0;
+}
+
+int64_t nova_rt_list_min_max(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t mn = l->data[0], mx = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < mn) mn = l->data[i];
+        if (l->data[i] > mx) mx = l->data[i];
+    }
+    int64_t out = nova_rt_list_create(2);
+    nova_rt_list_append(out, mn);
+    nova_rt_list_append(out, mx);
+    return out;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
