@@ -2150,6 +2150,7 @@ int64_t nova_rt_list_enumerate(int64_t handle) {
 
 int64_t nova_rt_dict_create(void);
 int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val);
+int64_t nova_rt_dict_get(int64_t handle, int64_t key);
 
 int64_t nova_rt_dict_from_list(int64_t handle) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_dict_create();
@@ -2240,6 +2241,61 @@ int64_t nova_rt_str_is_space(int64_t s) {
         str++;
     }
     return 1;
+}
+
+int64_t nova_rt_list_group_by(int64_t handle, int64_t closure) {
+    int64_t out = nova_rt_dict_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t key = fn(l->data[i]);
+        int64_t existing = nova_rt_dict_get(out, key);
+        if (existing == 0 && nova_mem_find_tag((void*)(uintptr_t)existing) != NOVA_MEM_LIST) {
+            int64_t group = nova_rt_list_create();
+            nova_rt_list_append(group, l->data[i]);
+            nova_rt_dict_set(out, key, group);
+        } else {
+            nova_rt_list_append(existing, l->data[i]);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_windows(int64_t handle, int64_t window_size) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    if (window_size <= 0) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    for (int64_t i = 0; i + window_size <= l->size; i++) {
+        int64_t win = nova_rt_list_create();
+        for (int64_t j = 0; j < window_size; j++) nova_rt_list_append(win, l->data[i + j]);
+        nova_rt_list_append(out, win);
+    }
+    return out;
+}
+
+int64_t nova_rt_list_partition(int64_t handle, int64_t closure) {
+    int64_t yes_list = nova_rt_list_create();
+    int64_t no_list = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) {
+        int64_t result = nova_rt_list_create();
+        nova_rt_list_append(result, yes_list);
+        nova_rt_list_append(result, no_list);
+        return result;
+    }
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(l->data[i])) nova_rt_list_append(yes_list, l->data[i]);
+        else nova_rt_list_append(no_list, l->data[i]);
+    }
+    int64_t result = nova_rt_list_create();
+    nova_rt_list_append(result, yes_list);
+    nova_rt_list_append(result, no_list);
+    return result;
 }
 
 int64_t nova_rt_str_is_upper(int64_t s) {
