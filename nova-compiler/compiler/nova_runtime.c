@@ -2897,6 +2897,77 @@ int64_t nova_rt_list_shuffle(int64_t handle) {
     return result;
 }
 
+int64_t nova_rt_timestamp_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)((t - 116444736000000000ULL) / 10000);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
+}
+
+int64_t nova_rt_str_hash(int64_t s) {
+    const char* str = nova_str_safe(s);
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; str[i]; i++) {
+        h ^= (uint64_t)(unsigned char)str[i];
+        h *= 1099511628211ULL;
+    }
+    return (int64_t)h;
+}
+
+int64_t nova_rt_dict_count(int64_t handle, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    int64_t count = 0;
+    for (int64_t j = 0; j < d->size; j++) {
+        if (fn(closure, d->keys[j], d->vals[j])) count++;
+    }
+    return count;
+}
+
+int64_t nova_rt_list_dedup(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        if (i == 0 || !nova_rt_eq(l->data[i], l->data[i-1])) {
+            nova_rt_list_append(result, l->data[i]);
+        }
+    }
+    return result;
+}
+
+int64_t nova_rt_list_nth(int64_t handle, int64_t n, int64_t def) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return def;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (n < 0 || n >= l->size) return def;
+    return l->data[n];
+}
+
+int64_t nova_rt_list_zip_longest(int64_t a, int64_t b, int64_t fill_val) {
+    int64_t result = nova_rt_list_create();
+    NovaList* la = (nova_mem_find_tag((void*)(uintptr_t)a) == NOVA_MEM_LIST) ? (NovaList*)(uintptr_t)a : NULL;
+    NovaList* lb = (nova_mem_find_tag((void*)(uintptr_t)b) == NOVA_MEM_LIST) ? (NovaList*)(uintptr_t)b : NULL;
+    int64_t sa = la ? la->size : 0;
+    int64_t sb = lb ? lb->size : 0;
+    int64_t mx = sa > sb ? sa : sb;
+    for (int64_t i = 0; i < mx; i++) {
+        int64_t pair = nova_rt_list_create();
+        nova_rt_list_append(pair, i < sa ? la->data[i] : fill_val);
+        nova_rt_list_append(pair, i < sb ? lb->data[i] : fill_val);
+        nova_rt_list_append(result, pair);
+    }
+    return result;
+}
+
 int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
