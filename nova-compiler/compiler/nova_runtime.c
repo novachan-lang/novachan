@@ -14214,6 +14214,33 @@ int64_t nova_rt_sum_any(int64_t handle) {
     return acc;
 }
 
+/* CYCLE 3-G (same class as nova_rt_sum_any): min()/max() over a list whose element
+   type the compiler could not determine statically. Returns a raw int for an integer
+   list and a BOXED float for a float list, so the result is self-describing. */
+int64_t nova_rt_list_min_any(int64_t handle) {
+    NovaList* l = nova_as_list(handle);
+    if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_box_float(nova_rt_list_min_f(handle));
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_is_box(l->data[i])) return nova_rt_box_float(nova_rt_list_min_f(handle));
+    }
+    int64_t m = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) if (l->data[i] < m) m = l->data[i];
+    return m;
+}
+
+int64_t nova_rt_list_max_any(int64_t handle) {
+    NovaList* l = nova_as_list(handle);
+    if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_box_float(nova_rt_list_max_f(handle));
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_is_box(l->data[i])) return nova_rt_box_float(nova_rt_list_max_f(handle));
+    }
+    int64_t m = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) if (l->data[i] > m) m = l->data[i];
+    return m;
+}
+
 int64_t nova_rt_index_of(int64_t handle, int64_t item) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return -1;  /* SOUNDNESS: non-list -> not found, no wild deref */
     nova_list_deopt(handle);  /* S4.2 */
