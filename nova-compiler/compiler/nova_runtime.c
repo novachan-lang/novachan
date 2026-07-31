@@ -2450,6 +2450,32 @@ int64_t nova_rt_list_contains(int64_t handle, int64_t val) {
     return 0;
 }
 
+int64_t nova_rt_list_filled(int64_t val, int64_t count) {
+    int64_t out = nova_rt_list_create();
+    if (count <= 0) return out;
+    if (count > 10000000) count = 10000000;
+    for (int64_t i = 0; i < count; i++) nova_rt_list_append(out, val);
+    return out;
+}
+
+int64_t nova_rt_dict_get_or(int64_t handle, int64_t key, int64_t def) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return def;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    for (int64_t i = 0; i < d->size; i++) {
+        if (nova_rt_eq(d->keys[i], key)) return d->vals[i];
+    }
+    return def;
+}
+
+int64_t nova_rt_dict_has_key(int64_t handle, int64_t key) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    for (int64_t i = 0; i < d->size; i++) {
+        if (nova_rt_eq(d->keys[i], key)) return 1;
+    }
+    return 0;
+}
+
 int64_t nova_rt_split(int64_t s, int64_t delim) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
