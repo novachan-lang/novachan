@@ -1,0 +1,331 @@
+// KAT for 6 new pure-NOVA stdlib modules:
+//   std/cache/lru, std/stream/pipeline, std/queue/priority,
+//   std/event/emitter, std/security/sanitize, std/regex/glob
+// All expected values hand-computed. Prints "PASS _kat_cache_stream_queue" iff
+// every check passes; otherwise prints one FAIL line per failing check and
+// a final FAILED count.
+//
+// NOTE ON DESIGN: module-level `let` globals in NOVA are baked as constants
+// at each read site and do NOT reflect mutations made from inside a function
+// (confirmed by isolated probe: a module-level counter incremented only
+// inside functions reads back as its initial value). So this KAT never
+// mutates module-level state from within a function — check* functions
+// RETURN a 0/1 fail flag, every test_* function accumulates its own local
+// total and returns it, and the grand total is summed in top-level script
+// code (top-level mutation of a `let` works fine — only function-body
+// mutation of MODULE-level vars is baked/lost). Per-test side effects (the
+// event-emitter handlers) use a dict captured by a closure instead: dicts
+// are reference types, so mutating dict CONTENTS from inside a closure/helper
+// persists correctly even though reassigning a scalar module var would not.
+
+import std/cache/lru as ca
+import std/stream/pipeline as sp
+import std/queue/priority as pq
+import std/event/emitter as ev
+import std/security/sanitize as san
+import std/regex/glob as gl
+
+fn check(name: string, cond: bool) -> int
+    if not cond
+        print("FAIL: " + name)
+        return 1
+    return 0
+
+fn check_int(name: string, got: int, want: int) -> int
+    if got != want
+        print("FAIL: " + name + " got=" + str(got) + " want=" + str(want))
+        return 1
+    return 0
+
+fn check_str(name: string, got: string, want: string) -> int
+    if got != want
+        print("FAIL: " + name + " got=[" + got + "] want=[" + want + "]")
+        return 1
+    return 0
+
+// ---------------------------------------------------------------------------
+// std/cache/lru
+// ---------------------------------------------------------------------------
+fn test_lru() -> int
+    let f = 0
+    let c = ca.ca_new(3)
+    f = f + check_int("lru.size.empty", ca.ca_size(c), 0)
+    f = f + check("lru.contains.miss", not ca.ca_contains(c, "a"))
+    f = f + check_int("lru.get.miss", ca.ca_get(c, "a"), 0)
+
+    ca.ca_put(c, "a", 1)
+    ca.ca_put(c, "b", 2)
+    ca.ca_put(c, "c", 3)
+    f = f + check_int("lru.size.3", ca.ca_size(c), 3)
+    f = f + check_int("lru.get.a", ca.ca_get(c, "a"), 1)   // touches a -> MRU; order now b,c,a
+    f = f + check_int("lru.get.b", ca.ca_get(c, "b"), 2)   // touches b -> MRU; order now c,a,b
+
+    // capacity 3 already full (c,a,b); inserting d evicts LRU = c
+    ca.ca_put(c, "d", 4)
+    f = f + check_int("lru.size.after.evict", ca.ca_size(c), 3)
+    f = f + check("lru.evicted.c", not ca.ca_contains(c, "c"))
+    f = f + check("lru.has.a", ca.ca_contains(c, "a"))
+    f = f + check("lru.has.b", ca.ca_contains(c, "b"))
+    f = f + check("lru.has.d", ca.ca_contains(c, "d"))
+
+    // update existing key does not evict, keeps size the same
+    ca.ca_put(c, "a", 99)
+    f = f + check_int("lru.update.value", ca.ca_get(c, "a"), 99)
+    f = f + check_int("lru.update.size", ca.ca_size(c), 3)
+
+    f = f + check("lru.remove.a", ca.ca_remove(c, "a"))
+    f = f + check_int("lru.size.after.remove", ca.ca_size(c), 2)
+    f = f + check("lru.remove.missing", not ca.ca_remove(c, "zzz"))
+
+    let ks = ca.ca_keys(c)
+    f = f + check_int("lru.keys.len", len(ks), 2)
+
+    ca.ca_clear(c)
+    f = f + check_int("lru.size.after.clear", ca.ca_size(c), 0)
+
+    // capacity 0 is a no-op cache
+    let c0 = ca.ca_new(0)
+    ca.ca_put(c0, "x", 1)
+    f = f + check_int("lru.cap0.size", ca.ca_size(c0), 0)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/stream/pipeline
+// ---------------------------------------------------------------------------
+fn _double(x)
+    return x * 2
+
+fn _is_even(x) -> bool
+    return x % 2 == 0
+
+fn _sum2(acc, x)
+    return acc + x
+
+fn test_pipeline() -> int
+    let f = 0
+    let src = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let s1 = sp.sp_from_list(src)
+    let s2 = sp.sp_filter(s1, _is_even)   // 2,4,6,8,10
+    let s3 = sp.sp_map(s2, _double)       // 4,8,12,16,20
+    let s4 = sp.sp_take(s3, 3)            // 4,8,12
+    let out = sp.sp_collect(s4)
+    f = f + check_int("pipeline.collect.len", len(out), 3)
+    f = f + check_int("pipeline.collect.0", out[0], 4)
+    f = f + check_int("pipeline.collect.1", out[1], 8)
+    f = f + check_int("pipeline.collect.2", out[2], 12)
+
+    // branching: s2 (evens) used as base for two different pipelines
+    let branchA = sp.sp_collect(sp.sp_take(s2, 2))
+    f = f + check_int("pipeline.branchA.len", len(branchA), 2)
+    f = f + check_int("pipeline.branchA.0", branchA[0], 2)
+    f = f + check_int("pipeline.branchA.1", branchA[1], 4)
+    let branchB = sp.sp_collect(sp.sp_map(s2, _double))
+    f = f + check_int("pipeline.branchB.len", len(branchB), 5)
+    f = f + check_int("pipeline.branchB.4", branchB[4], 20)
+
+    f = f + check_int("pipeline.count", sp.sp_count(sp.sp_from_list(src)), 10)
+
+    let total = sp.sp_reduce(sp.sp_from_list(src), 0, _sum2)
+    f = f + check_int("pipeline.reduce.sum", total, 55)
+
+    // mutating source after sp_from_list must not affect the stream (private copy)
+    let mutable_src = [1, 2, 3]
+    let sm = sp.sp_from_list(mutable_src)
+    push(mutable_src, 4)
+    f = f + check_int("pipeline.copy.isolated", sp.sp_count(sm), 3)
+
+    // for_each: collect side effects via a local dict box (reference type),
+    // captured by a closure -- module-level scalar globals do NOT persist
+    // mutation from function bodies in NOVA, but dict-content mutation does.
+    let box = {}
+    box["sum"] = 0
+    let adder = fn(v) _pipeline_add_to_box(box, v)
+    sp.sp_for_each(sp.sp_from_list([10, 20, 30]), adder)
+    f = f + check_int("pipeline.for_each.sum", box["sum"], 60)
+    return f
+
+fn _pipeline_add_to_box(box, v)
+    box["sum"] = box["sum"] + v
+
+// ---------------------------------------------------------------------------
+// std/queue/priority
+// ---------------------------------------------------------------------------
+fn test_priority() -> int
+    let f = 0
+    let q = pq.pq_new()
+    f = f + check("pq.empty.is_empty", pq.pq_is_empty(q))
+    f = f + check_int("pq.empty.size", pq.pq_size(q), 0)
+    f = f + check_int("pq.empty.pop", pq.pq_pop(q), 0)
+
+    pq.pq_push(q, 5, 500)
+    pq.pq_push(q, 1, 100)
+    pq.pq_push(q, 3, 300)
+    pq.pq_push(q, 2, 200)
+    pq.pq_push(q, 4, 400)
+    f = f + check_int("pq.size.5", pq.pq_size(q), 5)
+    f = f + check_int("pq.peek.min", pq.pq_peek(q), 100)
+
+    f = f + check_int("pq.pop.1", pq.pq_pop(q), 100)
+    f = f + check_int("pq.pop.2", pq.pq_pop(q), 200)
+    f = f + check_int("pq.pop.3", pq.pq_pop(q), 300)
+    f = f + check_int("pq.pop.4", pq.pq_pop(q), 400)
+    f = f + check_int("pq.pop.5", pq.pq_pop(q), 500)
+    f = f + check("pq.drained.is_empty", pq.pq_is_empty(q))
+    f = f + check_int("pq.drained.pop", pq.pq_pop(q), 0)
+
+    // duplicate priorities: both values must come out, order among ties unspecified
+    let q2 = pq.pq_new()
+    pq.pq_push(q2, 1, 10)
+    pq.pq_push(q2, 1, 20)
+    let firstv = pq.pq_pop(q2)
+    let secondv = pq.pq_pop(q2)
+    f = f + check("pq.ties.sum", firstv + secondv == 30)
+
+    // heap-order stress: push a scrambled sequence, pop must come out sorted
+    let q3 = pq.pq_new()
+    let scrambled = [9, 3, 7, 1, 8, 2, 6, 4, 5, 0]
+    for v in scrambled
+        pq.pq_push(q3, v, v)
+    let prev = 0 - 1
+    let sorted_ok = 1
+    let k = 0
+    while k < 10
+        let got = pq.pq_pop(q3)
+        if got < prev
+            sorted_ok = 0
+        prev = got
+        k = k + 1
+    f = f + check("pq.stress.sorted", sorted_ok == 1)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/event/emitter
+// ---------------------------------------------------------------------------
+fn _emitter_record(box, data)
+    box["hits"] = box["hits"] + 1
+    box["last"] = data
+
+fn _emitter_record_once(box, data)
+    box["hits"] = box["hits"] + 100
+
+fn test_emitter() -> int
+    let f = 0
+    let e = ev.ev_new()
+    f = f + check_int("emitter.count.none", ev.ev_count(e, "ping"), 0)
+
+    let box = {}
+    box["hits"] = 0
+    box["last"] = 0
+    let on_ping = fn(d) _emitter_record(box, d)
+    ev.ev_on(e, "ping", on_ping)
+    f = f + check_int("emitter.count.one", ev.ev_count(e, "ping"), 1)
+
+    let n1 = ev.ev_emit(e, "ping", 42)
+    f = f + check_int("emitter.emit.count", n1, 1)
+    f = f + check_int("emitter.emit.hits", box["hits"], 1)
+    f = f + check_int("emitter.emit.data", box["last"], 42)
+
+    let on_ping_once = fn(d) _emitter_record_once(box, d)
+    ev.ev_once(e, "ping", on_ping_once)
+    f = f + check_int("emitter.count.two", ev.ev_count(e, "ping"), 2)
+    box["hits"] = 0
+    let n2 = ev.ev_emit(e, "ping", 7)
+    f = f + check_int("emitter.emit2.count", n2, 2)
+    f = f + check_int("emitter.emit2.hits", box["hits"], 101)   // 1 (regular) + 100 (once)
+    f = f + check_int("emitter.count.after_once", ev.ev_count(e, "ping"), 1)  // once handler dropped
+
+    box["hits"] = 0
+    let n3 = ev.ev_emit(e, "ping", 1)
+    f = f + check_int("emitter.emit3.count", n3, 1)
+    f = f + check_int("emitter.emit3.hits", box["hits"], 1)   // only the regular handler remains
+
+    ev.ev_off(e, "ping")
+    f = f + check_int("emitter.off.count", ev.ev_count(e, "ping"), 0)
+    let n4 = ev.ev_emit(e, "ping", 1)
+    f = f + check_int("emitter.off.emit", n4, 0)
+
+    f = f + check_int("emitter.emit.unknown_event", ev.ev_emit(e, "nope", 1), 0)
+    return f
+
+// ---------------------------------------------------------------------------
+// std/security/sanitize
+// ---------------------------------------------------------------------------
+fn test_sanitize() -> int
+    let f = 0
+    f = f + check_str("san.html.basic", san.san_html("<b>Tom & \"Jerry\"</b>"), "&lt;b&gt;Tom &amp; &quot;Jerry&quot;&lt;/b&gt;")
+    f = f + check_str("san.html.plain", san.san_html("hello"), "hello")
+
+    f = f + check_str("san.sql.basic", san.san_sql_string("O'Brien"), "O''Brien")
+    f = f + check_str("san.sql.none", san.san_sql_string("plain"), "plain")
+
+    f = f + check_str("san.path.safe", san.san_path("a/b/c.txt"), "a/b/c.txt")
+    f = f + check_str("san.path.traversal", san.san_path("../etc/passwd"), "")
+    f = f + check_str("san.path.traversal.mid", san.san_path("a/../b"), "")
+    f = f + check_str("san.path.traversal.backslash", san.san_path("a\\..\\b"), "")
+    f = f + check_str("san.path.dotfile_ok", san.san_path("a/.hidden"), "a/.hidden")
+
+    f = f + check_str("san.strip_tags.basic", san.san_strip_tags("<b>hi</b> there"), "hi there")
+    f = f + check_str("san.strip_tags.none", san.san_strip_tags("plain text"), "plain text")
+    f = f + check_str("san.strip_tags.dangling", san.san_strip_tags("keep<this dies"), "keep")
+
+    f = f + check_str("san.truncate.short", san.san_truncate("hi", 10), "hi")
+    f = f + check_str("san.truncate.exact", san.san_truncate("hello", 5), "hello")
+    f = f + check_str("san.truncate.long", san.san_truncate("hello world", 5), "hello")
+
+    f = f + check_str("san.alnum.mixed", san.san_alphanumeric("Hello, World! 123"), "HelloWorld123")
+    f = f + check_str("san.alnum.none", san.san_alphanumeric("!!!@@@"), "")
+    return f
+
+// ---------------------------------------------------------------------------
+// std/regex/glob
+// ---------------------------------------------------------------------------
+fn test_glob() -> int
+    let f = 0
+    f = f + check("glob.star.basic", gl.gl_match("*.txt", "readme.txt"))
+    f = f + check("glob.star.no_match", not gl.gl_match("*.txt", "readme.md"))
+    f = f + check("glob.star.empty_ok", gl.gl_match("*", ""))
+    f = f + check("glob.star.all", gl.gl_match("a*b", "aXYZb"))
+    f = f + check("glob.star.exact_needed", not gl.gl_match("a*b", "aXYZ"))
+
+    f = f + check("glob.q.basic", gl.gl_match("h?llo", "hello"))
+    f = f + check("glob.q.no_match_len", not gl.gl_match("h?llo", "hllo"))
+    f = f + check("glob.q.wrong_char_count", not gl.gl_match("h?llo", "heello"))
+
+    f = f + check("glob.class.basic", gl.gl_match("[abc]at", "cat"))
+    f = f + check("glob.class.no_match", not gl.gl_match("[abc]at", "dat"))
+    f = f + check("glob.class.range", gl.gl_match("[a-z]og", "dog"))
+    f = f + check("glob.class.range.no_match", not gl.gl_match("[a-z]og", "5og"))
+    f = f + check("glob.class.negate", gl.gl_match("[!0-9]x", "ax"))
+    f = f + check("glob.class.negate.no_match", not gl.gl_match("[!0-9]x", "5x"))
+    f = f + check("glob.class.unterminated_literal", gl.gl_match("[abc", "[abc"))
+
+    f = f + check("glob.combo", gl.gl_match("*.[ch]", "main.c"))
+    f = f + check("glob.combo2", gl.gl_match("*.[ch]", "main.h"))
+    f = f + check("glob.combo3", not gl.gl_match("*.[ch]", "main.cpp"))
+
+    let names = ["a.txt", "b.md", "c.txt", "readme.txt", "notes.md"]
+    let txts = gl.gl_filter("*.txt", names)
+    f = f + check_int("glob.filter.count", len(txts), 3)
+    f = f + check_str("glob.filter.0", txts[0], "a.txt")
+    f = f + check_str("glob.filter.1", txts[1], "c.txt")
+    f = f + check_str("glob.filter.2", txts[2], "readme.txt")
+
+    f = f + check("glob.is_pattern.star", gl.gl_is_pattern("*.txt"))
+    f = f + check("glob.is_pattern.q", gl.gl_is_pattern("a?c"))
+    f = f + check("glob.is_pattern.class", gl.gl_is_pattern("[abc]"))
+    f = f + check("glob.is_pattern.literal", not gl.gl_is_pattern("plain.txt"))
+    return f
+
+// ---------------------------------------------------------------------------
+let failures = 0
+failures = failures + test_lru()
+failures = failures + test_pipeline()
+failures = failures + test_priority()
+failures = failures + test_emitter()
+failures = failures + test_sanitize()
+failures = failures + test_glob()
+
+if failures == 0
+    print("PASS _kat_cache_stream_queue")
+else
+    print("FAILED " + str(failures) + " checks")

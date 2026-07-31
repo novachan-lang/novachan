@@ -201,4 +201,10 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `a44b8303` parser bracket-depth fix + 6 str builtins (pad_left/right/center + remove_prefix/suffix + insert) + std/core expansion (list 7, dict 6, seq 10 new fns) + image/game/ui fleet (6 modules, KAT-gated)
 - `92917ea4` 4 more string builtins: str_reverse, str_chars, str_count_char, str_replace_first (fully wired)
 
+**2026-07-31 continued (rapid-dev session 3):**
+- `a49d340e` 5 native list builtins: list_flatten, list_any, list_all, list_find, list_count (closure-based)
+- `fd11bd5d` dict_delete + dict_size builtins (fills key removal gap)
+- `b3afbd52` json_stringify_pretty (indented multi-line JSON) + trim_left/trim_right + math_clamp/math_lerp + list_unique + 6 stdlib modules (testing/mock ext, testing/snapshot ext, debug/trace, debug/inspect, web/url_builder, web/form) — all KAT-gated
+- `a5290c6e` 12 new builtins: str_capitalize, str_title, str_is_digit/alpha/alnum/space, list_take/drop/chunk/zip/enumerate, dict_from_list
+
 **Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.

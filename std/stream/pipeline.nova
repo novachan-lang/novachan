@@ -1,0 +1,136 @@
+// std/stream/pipeline — lazy stream pipeline over a list.
+//
+// A stream is a dict:
+//   "data" -> list (the source elements, a private copy)
+//   "ops"  -> list of operation descriptors, each a dict:
+//               {"kind": "map"|"filter"|"take", "fn": closure-or-0, "n": int-or-0}
+//
+// sp_map/sp_filter/sp_take are NON-MUTATING: each returns a NEW stream dict
+// that shares the same source list but has its own ops list with one more
+// entry appended. Nothing is evaluated until a terminal operation
+// (sp_collect / sp_for_each / sp_reduce / sp_count) runs.
+//
+// Laziness that actually matters: sp_collect runs a SINGLE pass over the
+// source, threading each element through every op in sequence, and stops
+// the whole scan as soon as every downstream `take` budget is exhausted —
+// it does not materialize an intermediate list per stage, and it does not
+// keep pulling from the source past the point where the result is already
+// fully determined.
+//
+// Public API:
+//   sp_from_list(list)        -> stream
+//   sp_map(stream, f)         -> stream   (f: value -> value)
+//   sp_filter(stream, pred)   -> stream   (pred: value -> bool)
+//   sp_take(stream, n)        -> stream
+//   sp_collect(stream)        -> list
+//   sp_for_each(stream, f)    -> (calls f(value) for each result value)
+//   sp_reduce(stream, init, f)-> any      (f: (acc, value) -> acc)
+//   sp_count(stream)          -> int
+//
+// LEAF — imports nothing.
+
+// sp_from_list: wrap a list as a fresh stream (source is copied, not aliased,
+// so later mutation of the caller's list can't retroactively change the stream).
+fn sp_from_list(lst) -> dict
+    let s = {}
+    let data = []
+    for v in lst
+        push(data, v)
+    s["data"] = data
+    s["ops"] = []
+    return s
+
+// _sp_with_op: return a new stream = stream + one more op appended.
+// The source list is shared (streams are conceptually views, not copies);
+// the ops list is copied so branching a pipeline (using one stream as the
+// base for two different `sp_map` calls) does not cross-contaminate.
+fn _sp_with_op(stream, kind, fnval, nval) -> dict
+    let s = {}
+    s["data"] = stream["data"]
+    let ops = []
+    for o in stream["ops"]
+        push(ops, o)
+    let op = {}
+    op["kind"] = kind
+    op["fn"] = fnval
+    op["n"] = nval
+    push(ops, op)
+    s["ops"] = ops
+    return s
+
+// sp_map: append a value -> value transform.
+fn sp_map(stream, f) -> dict
+    return _sp_with_op(stream, "map", f, 0)
+
+// sp_filter: append a keep-if-true predicate.
+fn sp_filter(stream, pred) -> dict
+    return _sp_with_op(stream, "filter", pred, 0)
+
+// sp_take: append a "stop after n results reach this point" gate.
+fn sp_take(stream, n) -> dict
+    return _sp_with_op(stream, "take", 0, n)
+
+// sp_collect: run the pipeline to completion and return the resulting list.
+fn sp_collect(stream) -> list
+    let data = stream["data"]
+    let ops = stream["ops"]
+    let nops = len(ops)
+    // Per-op remaining budget for "take" stages; -1 for non-take stages.
+    // Fresh per call so the same stream dict can be collected more than once.
+    let remaining = []
+    for op in ops
+        if op["kind"] == "take"
+            push(remaining, op["n"])
+        else
+            push(remaining, 0 - 1)
+    let out = []
+    let n = len(data)
+    let i = 0
+    let stop = 0
+    while i < n and stop == 0
+        let v = data[i]
+        let keep = 1
+        let oi = 0
+        while oi < nops and keep == 1
+            let op = ops[oi]
+            let kind = op["kind"]
+            if kind == "map"
+                let f = op["fn"]
+                v = f(v)
+            else if kind == "filter"
+                let pred = op["fn"]
+                if not pred(v)
+                    keep = 0
+            else
+                // "take": once this gate's budget hits 0, EVERY later source
+                // element will also be dropped at this exact same gate (the
+                // budget never refills) — so stopping the whole scan here
+                // produces exactly the same final result as continuing.
+                if remaining[oi] <= 0
+                    keep = 0
+                    stop = 1
+                else
+                    remaining[oi] = remaining[oi] - 1
+            oi = oi + 1
+        if keep == 1
+            push(out, v)
+        i = i + 1
+    return out
+
+// sp_for_each: run the pipeline, calling f(value) once per result value, in order.
+fn sp_for_each(stream, f)
+    let items = sp_collect(stream)
+    for v in items
+        f(v)
+
+// sp_reduce: run the pipeline, then left-fold the results with f(acc, value).
+fn sp_reduce(stream, init, f)
+    let items = sp_collect(stream)
+    let acc = init
+    for v in items
+        acc = f(acc, v)
+    return acc
+
+// sp_count: number of elements the pipeline produces.
+fn sp_count(stream) -> int
+    return len(sp_collect(stream))
