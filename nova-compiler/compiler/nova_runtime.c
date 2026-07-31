@@ -28042,3 +28042,116 @@ int64_t nova_rt_str_overlay(int64_t str_handle, int64_t overlay_handle, int64_t 
     return result;
 }
 
+/* nova_rt_str_reverse_chars: reverse a string character by character */
+int64_t nova_rt_str_reverse_chars(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    for (size_t i = 0; i < len; i++) buf[i] = s[len - 1 - i];
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_take_right: take last n elements */
+int64_t nova_rt_list_take_right(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    int64_t start = l->size - n;
+    if (start < 0) start = 0;
+    for (int64_t i = start; i < l->size; i++) {
+        nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_list_drop_right: drop last n elements */
+int64_t nova_rt_list_drop_right(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n >= l->size) return out;
+    int64_t end = l->size - n;
+    if (end < 0) end = 0;
+    for (int64_t i = 0; i < end; i++) {
+        nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_dict_keys_sorted_desc: return keys sorted in descending order */
+int64_t nova_rt_dict_keys_sorted_desc(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    int64_t* karr = NULL;
+    int64_t count = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t* tmp = (int64_t*)realloc(karr, (size_t)(count + 1) * sizeof(int64_t));
+            if (!tmp) { free(karr); return out; }
+            karr = tmp;
+            karr[count++] = d->keys[i];
+        }
+    }
+    for (int64_t i = 0; i < count - 1; i++) {
+        for (int64_t j = i + 1; j < count; j++) {
+            const char* a = (const char*)(uintptr_t)karr[i];
+            const char* b = (const char*)(uintptr_t)karr[j];
+            if (a && b && strcmp(a, b) < 0) {
+                int64_t tmp = karr[i]; karr[i] = karr[j]; karr[j] = tmp;
+            }
+        }
+    }
+    for (int64_t i = 0; i < count; i++) {
+        nova_rt_list_append(out, karr[i]);
+    }
+    free(karr);
+    return out;
+}
+
+/* nova_rt_str_is_balanced: check if parens/brackets/braces are balanced */
+int64_t nova_rt_str_is_balanced(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 1;
+    char stack[4096];
+    int top = 0;
+    for (const char* p = s; *p; p++) {
+        if (*p == '(' || *p == '[' || *p == '{') {
+            if (top >= 4095) return 0;
+            stack[top++] = *p;
+        } else if (*p == ')') {
+            if (top == 0 || stack[--top] != '(') return 0;
+        } else if (*p == ']') {
+            if (top == 0 || stack[--top] != '[') return 0;
+        } else if (*p == '}') {
+            if (top == 0 || stack[--top] != '{') return 0;
+        }
+    }
+    return top == 0 ? 1 : 0;
+}
+
+/* nova_rt_list_argmin: index of minimum value */
+int64_t nova_rt_list_argmin(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return -1;
+    int64_t min_idx = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < l->data[min_idx]) min_idx = i;
+    }
+    return min_idx;
+}
+
+/* nova_rt_list_argmax: index of maximum value */
+int64_t nova_rt_list_argmax(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return -1;
+    int64_t max_idx = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] > l->data[max_idx]) max_idx = i;
+    }
+    return max_idx;
+}
