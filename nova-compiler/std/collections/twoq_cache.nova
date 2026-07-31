@@ -1,0 +1,194 @@
+// ============================================================================
+// std/collections/twoq_cache — the 2Q cache-replacement algorithm
+// ============================================================================
+// std/cache/lru.nova (plain LRU) and std/collections/arc_cache.nova /
+// lfu_cache.nova already cover single-policy eviction. 2Q (Johnson & Shasha,
+// VLDB 1994) is a different, well-known policy that fixes LRU's classic
+// weakness — a single scan through cold, once-only keys (e.g. a batch job
+// walking every row of a table) evicts the entire working set out of a
+// plain LRU. 2Q defends against this with a two-tier design:
+//
+//   A1in  — a small FIFO queue for keys seen exactly once "recently". A
+//           first-time key always lands here, NOT in the main cache, so a
+//           single cold scan can only ever evict up to |A1in| capacity's
+//           worth of hot data, not the whole cache.
+//   A1out — a "ghost" FIFO of KEYS ONLY (no values) recently evicted from
+//           A1in. If a key is put again while its ghost is still present,
+//           that's evidence of real reuse — it gets promoted straight into
+//           the hot main cache instead of cycling through A1in again.
+//   Am    — the main cache, plain LRU-ordered, for keys that have proven
+//           reuse (promoted from a ghost hit, or re-put/re-get while
+//           already resident).
+//
+// Capacity split (standard 2Q defaults): A1in gets 1/4 of capacity (min 1),
+// Am gets the rest (min 1); the A1out ghost list is capped at `capacity`
+// entries (ghosts carry no value, so they're cheap to keep around longer).
+//
+// Representation (dict c):
+//   "tq_cap"        -> int   total resident capacity (A1in + Am)
+//   "tq_kin_cap"    -> int   A1in capacity
+//   "tq_am_cap"     -> int   Am capacity
+//   "tq_kout_cap"   -> int   A1out ghost-list capacity
+//   "tq_a1in"       -> list  FIFO of keys, oldest at index 0
+//   "tq_a1out"      -> list  ghost FIFO of keys (no values), oldest at index 0
+//   "tq_am"         -> list  LRU of keys, oldest at index 0, MRU at the end
+//   "tq_data"       -> dict  str(key) -> value, defined for resident keys only
+//   "tq_evictions"  -> int   count of entries fully evicted (value dropped)
+//
+// Public API:
+//   tq_new(capacity)         -> dict
+//   tq_get(c, key)           -> any    cached value, or 0 on miss; promotes on hit
+//   tq_put(c, key, val)                insert/update; runs the 2Q admission+eviction policy
+//   tq_has(c, key)           -> bool
+//   tq_size(c)               -> int    number of resident (valued) entries
+//   tq_keys(c)               -> list   resident keys (A1in then Am order), a fresh copy
+//   tq_evict_count(c)        -> int    total entries fully evicted so far
+//
+// LEAF — imports nothing.
+// ============================================================================
+
+// tq_new: create an empty 2Q cache with the given total resident capacity.
+fn tq_new(capacity) -> dict
+    let kin = capacity / 4
+    if kin < 1
+        kin = 1
+    let am_cap = capacity - kin
+    if am_cap < 1
+        am_cap = 1
+    let c = {}
+    c["tq_cap"] = capacity
+    c["tq_kin_cap"] = kin
+    c["tq_am_cap"] = am_cap
+    c["tq_kout_cap"] = capacity
+    c["tq_a1in"] = []
+    c["tq_a1out"] = []
+    c["tq_am"] = []
+    c["tq_data"] = {}
+    c["tq_evictions"] = 0
+    return c
+
+// _tq_touch_am: move key to the MRU end of Am (key must already be in Am).
+fn _tq_touch_am(c, key)
+    let am = c["tq_am"]
+    remove(am, key)
+    push(am, key)
+    c["tq_am"] = am
+
+// _tq_evict_am_if_needed: while Am is over capacity, fully evict its oldest
+// (least-recently-used) entry — dropping both the key and its value.
+fn _tq_evict_am_if_needed(c)
+    let am = c["tq_am"]
+    let cap = c["tq_am_cap"]
+    while len(am) > cap
+        let oldest = am[0]
+        remove(am, oldest)
+        let data = c["tq_data"]
+        del(data, str(oldest))
+        c["tq_data"] = data
+        c["tq_evictions"] = c["tq_evictions"] + 1
+        am = c["tq_am"]
+
+// _tq_evict_a1out_if_needed: while the ghost list is over capacity, drop
+// its oldest ghost entry (no value to reclaim — ghosts never carry one).
+fn _tq_evict_a1out_if_needed(c)
+    let a1out = c["tq_a1out"]
+    let cap = c["tq_kout_cap"]
+    while len(a1out) > cap
+        let oldest = a1out[0]
+        remove(a1out, oldest)
+        a1out = c["tq_a1out"]
+
+// _tq_evict_a1in_if_needed: while A1in is over capacity, move its oldest
+// entry to the A1out ghost list (dropping the value — that's the "full"
+// eviction) and trim the ghost list if it in turn overflows.
+fn _tq_evict_a1in_if_needed(c)
+    let a1in = c["tq_a1in"]
+    let cap = c["tq_kin_cap"]
+    while len(a1in) > cap
+        let oldest = a1in[0]
+        remove(a1in, oldest)
+        let data = c["tq_data"]
+        del(data, str(oldest))
+        c["tq_data"] = data
+        c["tq_evictions"] = c["tq_evictions"] + 1
+        let a1out = c["tq_a1out"]
+        push(a1out, oldest)
+        c["tq_a1out"] = a1out
+        _tq_evict_a1out_if_needed(c)
+        a1in = c["tq_a1in"]
+
+// tq_get: return the cached value for key, or 0 on a miss. A hit in Am
+// promotes the key to the MRU end; a hit in A1in leaves FIFO order alone
+// (that is the defining asymmetry of 2Q — A1in residency, not access
+// count, is what matters until a key earns promotion via a ghost hit).
+fn tq_get(c, key)
+    let data = c["tq_data"]
+    let k = str(key)
+    if not contains(data, k)
+        return 0
+    let am = c["tq_am"]
+    if _tq_contains_val(am, key)
+        _tq_touch_am(c, key)
+    return data[k]
+
+// _tq_contains_val: linear membership test for a raw (non-string-keyed)
+// list — private helper since NOVA's `contains` builtin is dict/string
+// oriented.
+fn _tq_contains_val(lst, v)
+    for item in lst
+        if item == v
+            return true
+    return false
+
+// tq_has: true if key is currently resident (does not affect recency).
+fn tq_has(c, key) -> bool
+    return contains(c["tq_data"], str(key))
+
+// tq_put: insert or update key -> val, running the full 2Q policy:
+//   * already resident              -> update value, touch Am if it's there
+//   * key has a live ghost (A1out)  -> promote straight into Am
+//   * otherwise (brand-new key)     -> admit into A1in
+fn tq_put(c, key, val)
+    let data = c["tq_data"]
+    let k = str(key)
+    if contains(data, k)
+        data[k] = val
+        c["tq_data"] = data
+        let am = c["tq_am"]
+        if _tq_contains_val(am, key)
+            _tq_touch_am(c, key)
+        return
+    let a1out = c["tq_a1out"]
+    if _tq_contains_val(a1out, key)
+        remove(a1out, key)
+        c["tq_a1out"] = a1out
+        let am = c["tq_am"]
+        push(am, key)
+        c["tq_am"] = am
+        data[k] = val
+        c["tq_data"] = data
+        _tq_evict_am_if_needed(c)
+        return
+    let a1in = c["tq_a1in"]
+    push(a1in, key)
+    c["tq_a1in"] = a1in
+    data[k] = val
+    c["tq_data"] = data
+    _tq_evict_a1in_if_needed(c)
+
+// tq_size: number of resident (valued) entries across A1in and Am.
+fn tq_size(c) -> int
+    return len(c["tq_a1in"]) + len(c["tq_am"])
+
+// tq_keys: resident keys as a fresh list (A1in entries first, then Am).
+fn tq_keys(c) -> list
+    let out = []
+    for k in c["tq_a1in"]
+        push(out, k)
+    for k in c["tq_am"]
+        push(out, k)
+    return out
+
+// tq_evict_count: total number of entries ever fully evicted (value dropped).
+fn tq_evict_count(c) -> int
+    return c["tq_evictions"]

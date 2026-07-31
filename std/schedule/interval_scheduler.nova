@@ -1,0 +1,156 @@
+// ============================================================================
+// std/schedule/interval_scheduler — recurring fixed-interval job queue
+// ============================================================================
+// std/schedule/cron.nova parses and matches cron EXPRESSION STRINGS
+// ("*/5 * * * *") against calendar field tuples — it has no notion of a
+// running job or "what's due right now". This module is the complementary
+// runtime piece: a live registry of named jobs, each due every N seconds,
+// that you poll with isc_due_jobs(scheduler, now) to get the list of jobs
+// that should fire — the same shape as a game engine's fixed-timestep
+// task list or a health-check / heartbeat scheduler. A job that falls
+// behind (isc_due_jobs wasn't polled for several intervals) is caught up
+// in one call rather than firing a backlog burst: its next-run time is
+// advanced past `now` in interval-sized steps, and it counts as having run
+// exactly once for that poll.
+//
+// Representation — four parallel lists, one entry per job (index i is job i):
+//   {"isc_names":      list<string>,   job names
+//    "isc_intervals":  list<int>,      seconds between runs
+//    "isc_next_run":   list<int>,      timestamp of the job's next due run
+//    "isc_run_counts": list<int>}      total times each job has fired
+//
+// Public API:
+//   isc_new()                              -> scheduler
+//   isc_add_job(s, name, interval_secs, start_time)
+//       register a job (or re-schedule it, if name already exists)
+//   isc_due_jobs(s, now)                   -> list   names of jobs due at/before `now`;
+//                                                     advances each due job's next-run
+//                                                     and increments its run count
+//   isc_run_count(s, name)                 -> int    times name has fired (0 if unknown)
+//   isc_next_run(s, name)                  -> int    name's next due timestamp (-1 if unknown)
+//   isc_job_count(s)                       -> int    number of registered jobs
+//   isc_remove_job(s, name)                -> bool   true if name was present and removed
+//
+// LEAF module — imports nothing.
+// ============================================================================
+
+// isc_new: an empty scheduler with no registered jobs.
+fn isc_new() -> dict
+    let s = {}
+    s["isc_names"] = []
+    s["isc_intervals"] = []
+    s["isc_next_run"] = []
+    s["isc_run_counts"] = []
+    return s
+
+// _isc_index_of: the position of name in the job list, or -1 if absent.
+fn _isc_index_of(s, name) -> int
+    let names = s["isc_names"]
+    let i = 0
+    let n = len(names)
+    while i < n
+        if names[i] == name
+            return i
+        i = i + 1
+    return 0 - 1
+
+// isc_add_job: register a job that first becomes due at start_time and then
+// repeats every interval_secs seconds. If name is already registered, its
+// interval and next-run are simply updated (run count is left untouched).
+fn isc_add_job(s, name, interval_secs, start_time)
+    let idx = _isc_index_of(s, name)
+    if idx >= 0
+        let intervals = s["isc_intervals"]
+        intervals[idx] = interval_secs
+        s["isc_intervals"] = intervals
+        let next_runs = s["isc_next_run"]
+        next_runs[idx] = start_time
+        s["isc_next_run"] = next_runs
+        return
+    let names = s["isc_names"]
+    push(names, name)
+    s["isc_names"] = names
+    let intervals = s["isc_intervals"]
+    push(intervals, interval_secs)
+    s["isc_intervals"] = intervals
+    let next_runs = s["isc_next_run"]
+    push(next_runs, start_time)
+    s["isc_next_run"] = next_runs
+    let counts = s["isc_run_counts"]
+    push(counts, 0)
+    s["isc_run_counts"] = counts
+
+// isc_due_jobs: every job whose next-run is <= now. Each due job's run
+// count is incremented by exactly 1 and its next-run is advanced in
+// interval-sized steps until it is strictly after `now` — so a job that
+// missed several intervals catches up silently instead of firing once per
+// missed interval.
+fn isc_due_jobs(s, now) -> list
+    let names = s["isc_names"]
+    let intervals = s["isc_intervals"]
+    let next_runs = s["isc_next_run"]
+    let counts = s["isc_run_counts"]
+    let due = []
+    let i = 0
+    let n = len(names)
+    while i < n
+        if next_runs[i] <= now
+            push(due, names[i])
+            counts[i] = counts[i] + 1
+            let interval = intervals[i]
+            if interval <= 0
+                interval = 1
+            while next_runs[i] <= now
+                next_runs[i] = next_runs[i] + interval
+        i = i + 1
+    s["isc_next_run"] = next_runs
+    s["isc_run_counts"] = counts
+    return due
+
+// isc_run_count: total times name has fired so far (0 if name is unknown).
+fn isc_run_count(s, name) -> int
+    let idx = _isc_index_of(s, name)
+    if idx < 0
+        return 0
+    let counts = s["isc_run_counts"]
+    return counts[idx]
+
+// isc_next_run: name's next due timestamp, or -1 if name is unknown.
+fn isc_next_run(s, name) -> int
+    let idx = _isc_index_of(s, name)
+    if idx < 0
+        return 0 - 1
+    let next_runs = s["isc_next_run"]
+    return next_runs[idx]
+
+// isc_job_count: number of jobs currently registered.
+fn isc_job_count(s) -> int
+    return len(s["isc_names"])
+
+// isc_remove_job: unregister name. Returns true if it was present.
+fn isc_remove_job(s, name) -> bool
+    let idx = _isc_index_of(s, name)
+    if idx < 0
+        return false
+    let names = s["isc_names"]
+    let intervals = s["isc_intervals"]
+    let next_runs = s["isc_next_run"]
+    let counts = s["isc_run_counts"]
+    let new_names = []
+    let new_intervals = []
+    let new_next_runs = []
+    let new_counts = []
+    let i = 0
+    let n = len(names)
+    while i < n
+        if i != idx
+            push(new_names, names[i])
+            push(new_intervals, intervals[i])
+            push(new_next_runs, next_runs[i])
+            push(new_counts, counts[i])
+        i = i + 1
+    s["isc_names"] = new_names
+    s["isc_intervals"] = new_intervals
+    s["isc_next_run"] = new_next_runs
+    s["isc_run_counts"] = new_counts
+    return true
