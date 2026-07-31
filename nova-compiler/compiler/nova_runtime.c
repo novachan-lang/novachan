@@ -29342,3 +29342,112 @@ int64_t nova_rt_list_split_when(int64_t handle, int64_t value) {
     nova_rt_list_append(out, right);
     return out;
 }
+
+/* nova_rt_dict_values_to_strings: convert all values to their string repr */
+int64_t nova_rt_dict_values_to_strings(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld", (long long)d->vals[i]);
+            nova_rt_dict_set(out, d->keys[i], nova_rt_create_string(buf));
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_is_ipv4: check if string is valid IPv4 address */
+int64_t nova_rt_str_is_ipv4(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int parts = 0;
+    int val = 0, digits = 0;
+    for (size_t i = 0; ; i++) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + (s[i] - '0');
+            digits++;
+            if (digits > 3 || val > 255) return 0;
+        } else if (s[i] == '.' || s[i] == 0) {
+            if (digits == 0) return 0;
+            parts++;
+            if (s[i] == 0) break;
+            if (parts >= 4) return 0;
+            val = 0; digits = 0;
+        } else return 0;
+    }
+    return parts == 4 ? 1 : 0;
+}
+
+/* nova_rt_list_nth_last: get Nth element from end (1-based) */
+int64_t nova_rt_list_nth_last(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || n <= 0 || n > l->size) return 0;
+    return l->data[l->size - n];
+}
+
+/* nova_rt_str_pad_right_with: pad string on right with given char to width */
+int64_t nova_rt_str_pad_right_with(int64_t str_handle, int64_t width, int64_t pad_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* pad = (const char*)(uintptr_t)pad_handle;
+    if (!s || !pad || !*pad) return str_handle;
+    size_t len = strlen(s);
+    if ((int64_t)len >= width) return str_handle;
+    char* buf = (char*)malloc((size_t)width + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, len);
+    for (size_t i = len; i < (size_t)width; i++) buf[i] = pad[0];
+    buf[width] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_str_is_numeric_strict: true only if string is all digits */
+int64_t nova_rt_str_is_numeric_strict(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    for (size_t i = 0; s[i]; i++)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
+
+/* nova_rt_list_chunk_pairs: split list into pairs [[a,b],[c,d],...] */
+int64_t nova_rt_list_chunk_pairs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i + 1 < l->size; i += 2) {
+        int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(pair, l->data[i + 1]);
+        nova_rt_list_append(out, pair);
+    }
+    if (l->size % 2 == 1) {
+        int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+        nova_rt_list_append(pair, l->data[l->size - 1]);
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
+/* nova_rt_str_remove_prefix_if: remove prefix only if string starts with it */
+int64_t nova_rt_str_remove_prefix_if(int64_t str_handle, int64_t prefix_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* p = (const char*)(uintptr_t)prefix_handle;
+    if (!s || !p) return str_handle;
+    size_t plen = strlen(p);
+    if (strncmp(s, p, plen) != 0) return str_handle;
+    return nova_rt_create_string(s + plen);
+}
+
+/* nova_rt_list_count_where_gt: count elements greater than threshold */
+int64_t nova_rt_list_count_where_gt(int64_t handle, int64_t threshold) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++)
+        if (l->data[i] > threshold) count++;
+    return count;
+}
