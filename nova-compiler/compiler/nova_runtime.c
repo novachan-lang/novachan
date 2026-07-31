@@ -2416,6 +2416,82 @@ int64_t nova_rt_str_zfill(int64_t s, int64_t width) {
     return (int64_t)(uintptr_t)out;
 }
 
+int64_t nova_rt_str_ljust(int64_t s, int64_t width) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    if (width <= 0 || (size_t)width <= slen) return s;
+    char* out = (char*)nova_heap_alloc((size_t)width + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    memcpy(out, str, slen);
+    memset(out + slen, ' ', (size_t)width - slen);
+    out[width] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_str_rjust(int64_t s, int64_t width) {
+    const char* str = nova_str_safe(s);
+    size_t slen = strlen(str);
+    if (width <= 0 || (size_t)width <= slen) return s;
+    size_t pad = (size_t)width - slen;
+    char* out = (char*)nova_heap_alloc((size_t)width + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    memset(out, ' ', pad);
+    memcpy(out + pad, str, slen + 1);
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_str_swapcase(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t len = strlen(str);
+    char* out = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!out) return s;
+    for (size_t i = 0; i <= len; i++) {
+        char c = str[i];
+        if (c >= 'a' && c <= 'z') out[i] = c - 32;
+        else if (c >= 'A' && c <= 'Z') out[i] = c + 32;
+        else out[i] = c;
+    }
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_str_word_count(int64_t s) {
+    const char* str = nova_str_safe(s);
+    int64_t count = 0;
+    int in_word = 0;
+    while (*str) {
+        if (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') {
+            in_word = 0;
+        } else if (!in_word) {
+            in_word = 1;
+            count++;
+        }
+        str++;
+    }
+    return count;
+}
+
+int64_t nova_rt_str_words(int64_t s) {
+    const char* str = nova_str_safe(s);
+    int64_t list = nova_rt_list_create();
+    const char* start = NULL;
+    while (1) {
+        if (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r' || *str == '\0') {
+            if (start) {
+                size_t wlen = str - start;
+                char* word = (char*)nova_heap_alloc(wlen + 1, NOVA_MEM_RAW);
+                if (word) { memcpy(word, start, wlen); word[wlen] = '\0'; }
+                nova_rt_list_append(list, (int64_t)(uintptr_t)word);
+                start = NULL;
+            }
+            if (*str == '\0') break;
+        } else if (!start) {
+            start = str;
+        }
+        str++;
+    }
+    return list;
+}
+
 int64_t nova_rt_list_index_where(int64_t handle, int64_t closure) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return -1;
     NovaList* l = (NovaList*)(uintptr_t)handle;
