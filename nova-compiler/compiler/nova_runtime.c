@@ -2505,6 +2505,28 @@ int64_t nova_rt_str_swapcase(int64_t s) {
     return (int64_t)(uintptr_t)out;
 }
 
+int64_t nova_rt_list_clear(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    l->size = 0;
+    return 0;
+}
+
+int64_t nova_rt_list_extend(int64_t dst, int64_t src) {
+    if (nova_mem_find_tag((void*)(uintptr_t)dst) != NOVA_MEM_LIST) return dst;
+    if (nova_mem_find_tag((void*)(uintptr_t)src) != NOVA_MEM_LIST) return dst;
+    NovaList* sl = (NovaList*)(uintptr_t)src;
+    for (int64_t i = 0; i < sl->size; i++) nova_rt_list_append(dst, sl->data[i]);
+    return dst;
+}
+
+int64_t nova_rt_dict_clear(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    d->size = 0;
+    return 0;
+}
+
 int64_t nova_rt_str_word_count(int64_t s) {
     const char* str = nova_str_safe(s);
     int64_t count = 0;
