@@ -29681,3 +29681,103 @@ int64_t nova_rt_str_first_word(int64_t str_handle) {
     free(buf);
     return result;
 }
+
+/* nova_rt_str_last_word: get last word after last space */
+int64_t nova_rt_str_last_word(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return str_handle;
+    size_t len = strlen(s);
+    size_t i = len;
+    while (i > 0 && s[i - 1] != ' ') i--;
+    return nova_rt_create_string(s + i);
+}
+
+/* nova_rt_list_find_all_indices: all indices where element equals target */
+int64_t nova_rt_list_find_all_indices(int64_t handle, int64_t target) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++)
+        if (l->data[i] == target) nova_rt_list_append(out, i);
+    return out;
+}
+
+/* nova_rt_list_count_where_lt: count elements less than threshold */
+int64_t nova_rt_list_count_where_lt(int64_t handle, int64_t threshold) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++)
+        if (l->data[i] < threshold) count++;
+    return count;
+}
+
+/* nova_rt_str_is_palindrome_ignore_case: check palindrome ignoring case */
+int64_t nova_rt_str_is_palindrome_ignore_case(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 1;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len / 2; i++) {
+        char a = s[i], b = s[len - 1 - i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* nova_rt_dict_keys_longest: key with longest string length */
+int64_t nova_rt_dict_keys_longest(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_create_string("");
+    int64_t best = 0;
+    size_t best_len = 0;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            size_t klen = k ? strlen(k) : 0;
+            if (first || klen > best_len) { best = d->keys[i]; best_len = klen; first = 0; }
+        }
+    }
+    return best ? best : nova_rt_create_string("");
+}
+
+/* nova_rt_list_remove_at_index: remove element at index, return new list */
+int64_t nova_rt_list_remove_at_index(int64_t handle, int64_t idx) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++)
+        if (i != idx) nova_rt_list_append(out, l->data[i]);
+    return out;
+}
+
+/* nova_rt_str_delete_at: delete character at index */
+int64_t nova_rt_str_delete_at(int64_t str_handle, int64_t idx) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    if (idx < 0 || (size_t)idx >= len) return str_handle;
+    char* buf = (char*)malloc(len);
+    if (!buf) return str_handle;
+    memcpy(buf, s, (size_t)idx);
+    memcpy(buf + (size_t)idx, s + (size_t)idx + 1, len - (size_t)idx - 1);
+    buf[len - 1] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_insert_at_index: insert element at index, return new list */
+int64_t nova_rt_list_insert_at_index(int64_t handle, int64_t idx, int64_t value) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) { nova_rt_list_append(out, value); return out; }
+    if (idx < 0) idx = 0;
+    if (idx > l->size) idx = l->size;
+    for (int64_t i = 0; i < idx; i++) nova_rt_list_append(out, l->data[i]);
+    nova_rt_list_append(out, value);
+    for (int64_t i = idx; i < l->size; i++) nova_rt_list_append(out, l->data[i]);
+    return out;
+}
