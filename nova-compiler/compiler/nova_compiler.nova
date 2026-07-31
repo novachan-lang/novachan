@@ -2156,6 +2156,16 @@ fn _maybe_where(tokens: list, spr: StmtParseResult, pe: list) -> StmtParseResult
     else
         spr
 
+// Loop dispatch for a LABELED loop: picks the right parser by keyword and hands it
+// the label's column as the body-indent reference. Kept as its own function so only
+// the matching parser runs (calling the wrong one would push spurious syntax errors).
+fn _ll_parse_loop(tokens: list, pos: int, pe: list, ref_col: int, kw: string) -> StmtParseResult
+    if kw == "for"
+        return parse_for_stmt(tokens, pos, pe, ref_col)
+    if kw == "loop"
+        return parse_loop_stmt(tokens, pos, pe, ref_col)
+    parse_while_stmt(tokens, pos, pe, ref_col)
+
 fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let kind = tk(tokens, pos)
@@ -2165,7 +2175,12 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         let _ll_kw = tv(tokens, pos + 2)
         if _ll_kw == "while" or _ll_kw == "for" or _ll_kw == "loop"
             let _ll_label = val
-            let _ll_inner = parse_stmt(tokens, pos + 2, pe)
+            // Dispatch to the loop parsers DIRECTLY with the LABEL's column as the
+            // body-indent reference. Going through parse_stmt(pos + 2) made them use
+            // the keyword's column, which sits right of the label — so a body indented
+            // past the label (the natural way to write it) was rejected as "empty body".
+            let _ll_col = tok_col(tokens, pos)
+            let _ll_inner = _ll_parse_loop(tokens, pos + 2, pe, _ll_col, _ll_kw)
             match _ll_inner.stmt
                 Stmt(_ll_tag, _ll_name, _ll_expr, _ll_body, _ll_params, _ll_else, _ll_anns, _ll_sl) =>
                     let _ll_new_anns = [Expr("ann_with_arg", "__label", 0, [Expr("str", _ll_label, 0, [], [], ln)], [], ln)]
@@ -2275,16 +2290,9 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                 _un_p2 = skip_nl(tokens, _un_esr.pos)
         StmtParseResult(Stmt("if", "", _un_neg, _un_body, [], _un_else, [], ln), _un_p2)
     else if kind == "KW" and val == "while"
-        parse_while_stmt(tokens, pos, pe)
+        parse_while_stmt(tokens, pos, pe, tok_col(tokens, pos))
     else if kind == "KW" and val == "loop"
-        let _lp_p = skip_nl(tokens, pos + 1)
-        let _lp_body = []
-        let _lp_col = tok_col(tokens, pos)
-        while tk(tokens, _lp_p) != "EOF" and tok_col(tokens, _lp_p) > _lp_col
-            let _lp_sr = parse_stmt(tokens, _lp_p, pe)
-            push(_lp_body, _lp_sr.stmt)
-            _lp_p = skip_nl(tokens, _lp_sr.pos)
-        StmtParseResult(Stmt("while", "", Expr("bool", "true", 1, [], [], ln), _lp_body, [], [], [], ln), _lp_p)
+        parse_loop_stmt(tokens, pos, pe, tok_col(tokens, pos))
     else if kind == "KW" and val == "unsafe" and tk(tokens, pos + 1) == "NEWLINE"
         // #4: `unsafe` BLOCK (a NEWLINE right after `unsafe` => indented region). The same-line
         // `unsafe <expr>` form has its operand on this line (no NEWLINE here), so it is unaffected and
@@ -2312,7 +2320,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             _ut_p2 = skip_nl(tokens, _ut_sr.pos)
         StmtParseResult(Stmt("while", "", _ut_neg, _ut_body, [], [], [], ln), _ut_p2)
     else if kind == "KW" and val == "for"
-        parse_for_stmt(tokens, pos, pe)
+        parse_for_stmt(tokens, pos, pe, tok_col(tokens, pos))
     else if kind == "KW" and val == "return"
         let p = pos + 1
         if tk(tokens, p) == "NEWLINE" or tk(tokens, p) == "EOF"
@@ -3224,9 +3232,25 @@ fn parse_if_chain(tokens: list, pos: int, base_col: int, pe: list) -> StmtParseR
 fn parse_if_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     parse_if_chain(tokens, pos, tok_col(tokens, pos), pe)
 
-fn parse_while_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
+// `loop` = `while true`. Split out of parse_stmt so a labeled `outer: loop` can pass
+// the LABEL's column as the body-indent reference (see parse_while_stmt).
+fn parse_loop_stmt(tokens: list, pos: int, pe: list, ref_col: int) -> StmtParseResult
     let ln = tl(tokens, pos)
-    let kw_col = tok_col(tokens, pos)
+    let _lp_p = skip_nl(tokens, pos + 1)
+    let _lp_body = []
+    while tk(tokens, _lp_p) != "EOF" and tok_col(tokens, _lp_p) > ref_col
+        let _lp_sr = parse_stmt(tokens, _lp_p, pe)
+        push(_lp_body, _lp_sr.stmt)
+        _lp_p = skip_nl(tokens, _lp_sr.pos)
+    StmtParseResult(Stmt("while", "", Expr("bool", "true", 1, [], [], ln), _lp_body, [], [], [], ln), _lp_p)
+
+// `ref_col` is the column the BODY must be indented past. Normally that is the
+// `while` keyword's own column, but for a labeled loop (`outer: while ...`) the
+// label starts the statement and the keyword sits further right — the body is
+// indented past the LABEL, so the caller passes the label's column instead.
+fn parse_while_stmt(tokens: list, pos: int, pe: list, ref_col: int) -> StmtParseResult
+    let ln = tl(tokens, pos)
+    let kw_col = ref_col
     let p = pos + 1
     if tk(tokens, p) == "KW" and tv(tokens, p) == "let"
         p = p + 1
@@ -3267,9 +3291,10 @@ fn parse_while_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             p2 = skip_nl(tokens, _wes.pos)
     StmtParseResult(Stmt("while", "", cond_r.expr, body, [], _we, [], ln), p2)
 
-fn parse_for_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
+// See parse_while_stmt for what `ref_col` means (labeled-loop body indentation).
+fn parse_for_stmt(tokens: list, pos: int, pe: list, ref_col: int) -> StmtParseResult
     let ln = tl(tokens, pos)
-    let kw_col = tok_col(tokens, pos)
+    let kw_col = ref_col
     let p = pos + 1
     let var_name = ""
     let _fd_vars = []
