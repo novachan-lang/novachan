@@ -1,0 +1,202 @@
+// ============================================================================
+// NOVA Standard Library — std/statistics/tdigest
+// ============================================================================
+// T-Digest: a mergeable, bounded-memory sketch for streaming quantile
+// estimation (Dunning & Ertl). Unlike std/statistics's exact stat_quartiles /
+// stat_rank (which require the FULL dataset in memory to sort), a t-digest
+// ingests values one at a time in O(centroids) per insert and answers
+// approximate quantile/CDF queries in O(centroids) — memory stays bounded by
+// the compression parameter regardless of how many values are added.
+//
+// Representation (dict td):
+//   "centroids"   -> list of [mean: float, weight: int], kept SORTED by mean.
+//                     Each centroid represents a cluster of merged samples.
+//   "compression" -> float; higher = more centroids = tighter accuracy
+//                     (typical range 20-500; this module keeps centroid count
+//                     roughly bounded near 2x compression under the merge rule).
+//   "count"       -> int total weight (== total values added) ingested so far.
+//
+// Merge rule (the core t-digest idea): a new point is folded into its
+// nearest centroid only if doing so would not make that centroid's weight
+// exceed a position-dependent SCALE THRESHOLD:
+//     threshold(q) = 4 * n * q * (1 - q) / compression
+// where q is the centroid's approximate quantile position (cumulative
+// weight before it, plus half its own weight, over total weight n). This
+// threshold is small near q=0 and q=1 (tails get many small, precise
+// centroids) and large near q=0.5 (the middle gets fewer, coarser
+// centroids) — exactly the non-uniform precision that makes t-digest useful
+// for accurate p99/p999-style tail quantiles at bounded memory.
+//
+// Public API (prefix td_):
+//   td_new(compression)              -> dict
+//   td_add(td, value)                -> dict   (weight 1)
+//   td_add_weighted(td, value, w)    -> dict
+//   td_quantile(td, q)               -> float  (q in [0,1]; interpolated estimate)
+//   td_cdf(td, value)                -> float  (P(X <= value), centroid-step approx)
+//   td_count(td)                     -> int    (total weight ingested)
+//   td_centroid_count(td)            -> int    (current sketch size)
+//   td_merge(td1, td2)               -> dict   (new digest = union of both)
+//
+// Known approximation: td_cdf uses a coarse step function (full weight
+// credited once a centroid's mean is <= the query value) rather than
+// interpolating within the straddling centroid. This keeps it monotonic and
+// float-precision-safe; td_quantile does interpolate between adjacent
+// centroid means, which is where t-digest's accuracy actually matters.
+// ============================================================================
+
+// td_new: an empty digest. compression controls memory/accuracy trade-off.
+fn td_new(compression) -> dict
+    let td = {}
+    td["centroids"] = []
+    td["compression"] = compression * 1.0
+    td["count"] = 0
+    td
+
+// _td_insert_sorted: insert [mean, weight] into `centroids` (sorted by mean),
+// returning a NEW list (centroids is rebuilt since NOVA lists grow by push,
+// not by in-place splice).
+fn _td_insert_sorted(centroids, mean, weight) -> list
+    let out = []
+    let n = len(centroids)
+    let inserted = 0
+    let i = 0
+    while i < n
+        if inserted == 0 and mean < centroids[i][0]
+            out.push([mean, weight])
+            inserted = 1
+        out.push(centroids[i])
+        i = i + 1
+    if inserted == 0
+        out.push([mean, weight])
+    out
+
+// td_add_weighted: ingest one (value, weight) sample. Merges into the
+// nearest centroid when the scale-function threshold allows it; otherwise
+// inserts a brand-new centroid at the correct sorted position.
+fn td_add_weighted(td, value, weight) -> dict
+    let centroids = td["centroids"]
+    let v = value * 1.0
+    let n = len(centroids)
+    if n == 0
+        centroids.push([v, weight])
+        td["count"] = td["count"] + weight
+        return td
+    let besti = 0
+    let bestd = abs(centroids[0][0] - v)
+    let i = 1
+    while i < n
+        let d = abs(centroids[i][0] - v)
+        if d < bestd
+            bestd = d
+            besti = i
+        i = i + 1
+    let before = 0
+    let j = 0
+    while j < besti
+        before = before + centroids[j][1]
+        j = j + 1
+    let total = td["count"] + weight
+    let totalf = total * 1.0
+    let wf = centroids[besti][1] * 1.0
+    let beforef = before * 1.0
+    let qpos = (beforef + wf / 2.0) / totalf
+    let comp = td["compression"]
+    let threshold = 4.0 * totalf * qpos * (1.0 - qpos) / comp
+    let neww = centroids[besti][1] + weight
+    let newwf = neww * 1.0
+    if newwf <= threshold
+        let oldw = centroids[besti][1]
+        let oldmean = centroids[besti][0]
+        let mergedmean = (oldmean * (oldw * 1.0) + v * (weight * 1.0)) / newwf
+        centroids[besti][0] = mergedmean
+        centroids[besti][1] = neww
+    else
+        td["centroids"] = _td_insert_sorted(centroids, v, weight)
+    td["count"] = total
+    td
+
+// td_add: ingest a single value with weight 1.
+fn td_add(td, value) -> dict
+    td_add_weighted(td, value, 1)
+
+// td_quantile: estimate the value at cumulative quantile q (0.0 <= q <= 1.0)
+// by locating the two centroids whose cumulative-weight midpoints bracket
+// the target rank, and linearly interpolating their means.
+fn td_quantile(td, q) -> float
+    let centroids = td["centroids"]
+    let n = len(centroids)
+    if n == 0
+        return 0.0
+    if n == 1
+        return centroids[0][0]
+    let totalf = td["count"] * 1.0
+    let target = q * totalf
+    let cum = 0.0
+    let prev_mid = 0.0
+    let prev_mean = centroids[0][0]
+    let i = 0
+    while i < n
+        let w = centroids[i][1] * 1.0
+        let mid = cum + w / 2.0
+        if target <= mid
+            if i == 0
+                return centroids[0][0]
+            let this_mean = centroids[i][0]
+            let span = mid - prev_mid
+            if span <= 0.0
+                return this_mean
+            let frac = (target - prev_mid) / span
+            return prev_mean + frac * (this_mean - prev_mean)
+        prev_mid = mid
+        prev_mean = centroids[i][0]
+        cum = cum + w
+        i = i + 1
+    centroids[n - 1][0]
+
+// td_cdf: approximate P(X <= value) as the fraction of total weight held by
+// centroids whose mean is <= value (a monotonic step-function approximation).
+fn td_cdf(td, value) -> float
+    let centroids = td["centroids"]
+    let n = len(centroids)
+    if n == 0
+        return 0.0
+    let v = value * 1.0
+    let acc = 0
+    let i = 0
+    while i < n
+        if centroids[i][0] <= v
+            acc = acc + centroids[i][1]
+        i = i + 1
+    let totalf = td["count"] * 1.0
+    (acc * 1.0) / totalf
+
+// td_count: total weight (sample count) ingested so far.
+fn td_count(td) -> int
+    td["count"]
+
+// td_centroid_count: current number of centroids in the sketch.
+fn td_centroid_count(td) -> int
+    len(td["centroids"])
+
+// td_merge: combine two digests into a brand-new one (re-ingests every
+// centroid of both as a weighted point, so the result respects `td1`'s
+// compression / scale-threshold rule throughout).
+fn td_merge(a, b) -> dict
+    let m = td_new(a["compression"])
+    let ca = a["centroids"]
+    let i = 0
+    let na = len(ca)
+    while i < na
+        m = td_add_weighted(m, ca[i][0], ca[i][1])
+        i = i + 1
+    let cb = b["centroids"]
+    let j = 0
+    let nb = len(cb)
+    while j < nb
+        m = td_add_weighted(m, cb[j][0], cb[j][1])
+        j = j + 1
+    m
+
+// ============================================================================
+fn main()
+    print("std/statistics/tdigest loaded")

@@ -1,0 +1,216 @@
+// ============================================================================
+// NOVA Standard Library — std/collections/cuckoohash
+// ============================================================================
+// Cuckoo hash map: an EXACT key/value hash table (worst-case O(1) lookup,
+// amortized O(1) insert) using two independent hash functions, each key
+// living at exactly one of its two candidate slots. This is a DIFFERENT
+// structure from std/sketch/cuckoofilter.nova, which is a PROBABILISTIC
+// set-membership filter (no stored values, allows false positives, cannot
+// be queried for the original key or an associated value). cuckoohash
+// stores real key/value pairs with exact, collision-free membership.
+//
+// Insert algorithm: try h1(key) and h2(key). If either is empty (or already
+// holds this key), place/update it there. Otherwise "kick" the occupant of
+// h1(key) out, place the new key there, and re-insert the evicted key at
+// ITS other candidate slot — repeating until a slot is free or a max-kicks
+// bound is hit. On max-kicks, the table capacity doubles and every
+// currently-resident entry is rehashed (a standard cuckoo-hashing rehash),
+// then the pending insert is retried.
+//
+// Representation (dict m):
+//   "cap"       -> int table size (number of slots)
+//   "keys"      -> list of string, length cap (garbage when unoccupied)
+//   "vals"      -> list of any, length cap (garbage when unoccupied)
+//   "occupied"  -> list of int (0/1), length cap
+//   "size"      -> int number of resident entries
+//   "max_kicks" -> int eviction-chain bound before a resize is forced
+//
+// Public API (prefix ckh_):
+//   ckh_new(capacity)      -> dict
+//   ckh_put(m, key, val)   -> dict         (insert or update; returns m)
+//   ckh_get(m, key)        -> list         ([1, val] on hit, [0, 0] on miss)
+//   ckh_contains(m, key)   -> bool
+//   ckh_remove(m, key)     -> bool         (true if an entry was removed)
+//   ckh_size(m)            -> int
+//   ckh_capacity(m)        -> int
+//   ckh_keys(m)            -> list         (all resident keys, any order)
+// ============================================================================
+
+// _ckh_make_list: a fresh list of `n` copies of `fillval`.
+fn _ckh_make_list(n, fillval) -> list
+    let out = []
+    let i = 0
+    while i < n
+        out.push(fillval)
+        i = i + 1
+    out
+
+// _ckh_h1: FNV-1a-style hash mod cap.
+fn _ckh_h1(key, cap) -> int
+    let h = 2166136261
+    let i = 0
+    let n = len(key)
+    while i < n
+        h = (h * 16777619 + ord(char_at(key, i))) & 0xFFFFFFFF
+        i = i + 1
+    h % cap
+
+// _ckh_h2: djb2-style hash mod cap (independent seed/mixing from h1).
+fn _ckh_h2(key, cap) -> int
+    let h = 5381
+    let i = 0
+    let n = len(key)
+    while i < n
+        h = ((h * 33) + ord(char_at(key, i))) & 0xFFFFFFFF
+        i = i + 1
+    h % cap
+
+// ckh_new: an empty table with at least 4 slots.
+fn ckh_new(capacity) -> dict
+    let cap = capacity
+    if cap < 4
+        cap = 4
+    let m = {}
+    m["cap"] = cap
+    m["keys"] = _ckh_make_list(cap, "")
+    m["vals"] = _ckh_make_list(cap, 0)
+    m["occupied"] = _ckh_make_list(cap, 0)
+    m["size"] = 0
+    m["max_kicks"] = 32
+    m
+
+// _ckh_resize: double capacity and rehash every resident entry in place.
+fn _ckh_resize(m)
+    let oldkeys = m["keys"]
+    let oldvals = m["vals"]
+    let oldocc = m["occupied"]
+    let oldcap = m["cap"]
+    let newcap = oldcap * 2
+    m["cap"] = newcap
+    m["keys"] = _ckh_make_list(newcap, "")
+    m["vals"] = _ckh_make_list(newcap, 0)
+    m["occupied"] = _ckh_make_list(newcap, 0)
+    m["size"] = 0
+    let i = 0
+    while i < oldcap
+        if oldocc[i] == 1
+            ckh_put(m, oldkeys[i], oldvals[i])
+        i = i + 1
+
+// ckh_put: insert or update key -> val. Returns m.
+fn ckh_put(m, key, val) -> dict
+    let k = str(key)
+    let cap = m["cap"]
+    let keys = m["keys"]
+    let vals = m["vals"]
+    let occ = m["occupied"]
+    let p1 = _ckh_h1(k, cap)
+    if occ[p1] == 1 and keys[p1] == k
+        vals[p1] = val
+        return m
+    let p2 = _ckh_h2(k, cap)
+    if occ[p2] == 1 and keys[p2] == k
+        vals[p2] = val
+        return m
+    let curk = k
+    let curv = val
+    let pos = p1
+    let kicks = 0
+    let maxk = m["max_kicks"]
+    while kicks < maxk
+        if occ[pos] == 0
+            occ[pos] = 1
+            keys[pos] = curk
+            vals[pos] = curv
+            m["size"] = m["size"] + 1
+            return m
+        let evk = keys[pos]
+        let evv = vals[pos]
+        keys[pos] = curk
+        vals[pos] = curv
+        curk = evk
+        curv = evv
+        let a1 = _ckh_h1(curk, cap)
+        let a2 = _ckh_h2(curk, cap)
+        if pos == a1
+            pos = a2
+        else
+            pos = a1
+        kicks = kicks + 1
+    _ckh_resize(m)
+    ckh_put(m, curk, curv)
+
+// ckh_get: [1, val] on hit, [0, 0] on miss (val is then unspecified/garbage
+// slot content — callers should treat the result as "absent" whenever the
+// flag is 0). Deliberately a SINGLE trailing return: a hand-written NOVA
+// function with per-branch `return [1, x]` / `return [0, 0]` hits a real
+// codegen defect where the function's return type locks to whichever
+// branch resolves first, silently corrupting the other branch's
+// pointer-typed value (see the matching note in std/cache/ttlcache.nova).
+// Resolving `found`/`pos` first and building ONE list literal from them
+// avoids it.
+fn ckh_get(m, key) -> list
+    let k = str(key)
+    let cap = m["cap"]
+    let keys = m["keys"]
+    let occ = m["occupied"]
+    let vals = m["vals"]
+    let p1 = _ckh_h1(k, cap)
+    let p2 = _ckh_h2(k, cap)
+    let found = 0
+    let pos = 0
+    if occ[p1] == 1 and keys[p1] == k
+        found = 1
+        pos = p1
+    else
+        if occ[p2] == 1 and keys[p2] == k
+            found = 1
+            pos = p2
+    [found, vals[pos]]
+
+// ckh_contains: true if key is resident.
+fn ckh_contains(m, key) -> bool
+    ckh_get(m, key)[0] == 1
+
+// ckh_remove: remove key if present; returns true iff something was removed.
+fn ckh_remove(m, key) -> bool
+    let k = str(key)
+    let cap = m["cap"]
+    let keys = m["keys"]
+    let occ = m["occupied"]
+    let p1 = _ckh_h1(k, cap)
+    if occ[p1] == 1 and keys[p1] == k
+        occ[p1] = 0
+        m["size"] = m["size"] - 1
+        return true
+    let p2 = _ckh_h2(k, cap)
+    if occ[p2] == 1 and keys[p2] == k
+        occ[p2] = 0
+        m["size"] = m["size"] - 1
+        return true
+    false
+
+// ckh_size: number of resident entries.
+fn ckh_size(m) -> int
+    m["size"]
+
+// ckh_capacity: current number of slots.
+fn ckh_capacity(m) -> int
+    m["cap"]
+
+// ckh_keys: all resident keys (order follows slot index, not insertion).
+fn ckh_keys(m) -> list
+    let out = []
+    let cap = m["cap"]
+    let keys = m["keys"]
+    let occ = m["occupied"]
+    let i = 0
+    while i < cap
+        if occ[i] == 1
+            out.push(keys[i])
+        i = i + 1
+    out
+
+// ============================================================================
+fn main()
+    print("std/collections/cuckoohash loaded")

@@ -1,0 +1,175 @@
+// ============================================================================
+// NOVA Standard Library — std/cache/ttlcache
+// ============================================================================
+// TTL (time-to-live) cache: entries expire a fixed duration after insertion
+// regardless of access pattern. This is a DIFFERENT eviction policy from
+// std/cache/lru.nova (recency-based) and std/collections/lfu_cache.nova /
+// arc_cache.nova / twoq_cache.nova (frequency/recency-hybrid) — none of
+// those support per-entry expiry deadlines. There is no size bound here;
+// entries only ever leave via explicit delete, expiry, or ttlc_clear.
+//
+// Determinism: following the established std/util/ratelimiter.nova
+// convention, ALL time-dependent calls take an explicit `now_ms` argument
+// (compatible with the `time_ms()` builtin) rather than reading a hidden
+// system clock — so the whole module is pure and exactly reproducible in
+// tests.
+//
+// Expiry model: LAZY. An entry past its deadline is only actually removed
+// the next time it is touched by a read (ttlc_get / ttlc_contains /
+// ttlc_ttl_remaining) or by an explicit ttlc_purge_expired sweep. Until
+// then it still occupies storage but is treated as absent by every read.
+//
+// Representation (dict c):
+//   "data"   -> dict str(key) -> value
+//   "expiry" -> dict str(key) -> absolute expiry time in ms, or -1 = never
+//   "count"  -> int resident entry count (includes not-yet-purged expired
+//                entries that haven't been touched by a read yet)
+//
+// Public API (prefix ttlc_):
+//   ttlc_new()                          -> dict
+//   ttlc_set(c, key, val, now_ms, ttl_ms) -> dict  (ttl_ms <= 0 means never expires)
+//   ttlc_get(c, key, now_ms)            -> list    ([1, val] hit, [0, 0] miss/expired)
+//   ttlc_contains(c, key, now_ms)       -> bool
+//   ttlc_delete(c, key)                 -> dict
+//   ttlc_purge_expired(c, now_ms)       -> int     (number of entries swept)
+//   ttlc_size(c, now_ms)                -> int     (live count; does not mutate)
+//   ttlc_ttl_remaining(c, key, now_ms)  -> int     (ms left; -1 = never expires; -2 = absent)
+//   ttlc_clear(c)                       -> dict
+// ============================================================================
+
+// ttlc_new: an empty cache.
+fn ttlc_new() -> dict
+    let c = {}
+    c["data"] = {}
+    c["expiry"] = {}
+    c["count"] = 0
+    c
+
+// ttlc_set: insert or overwrite key -> val. ttl_ms <= 0 means the entry
+// never expires; ttl_ms > 0 sets an absolute deadline of now_ms + ttl_ms.
+fn ttlc_set(c, key, val, now_ms, ttl_ms) -> dict
+    let k = str(key)
+    let data = c["data"]
+    let expiry = c["expiry"]
+    if not contains(data, k)
+        c["count"] = c["count"] + 1
+    data[k] = val
+    if ttl_ms > 0
+        expiry[k] = now_ms + ttl_ms
+    else
+        expiry[k] = -1
+    c
+
+// _ttlc_is_expired: true iff k is resident with a deadline that has passed.
+fn _ttlc_is_expired(c, k, now_ms) -> bool
+    let expiry = c["expiry"]
+    if not contains(expiry, k)
+        return false
+    let e = expiry[k]
+    if e < 0
+        return false
+    now_ms >= e
+
+// ttlc_contains: true iff key is resident and not expired (lazily evicts —
+// this is the ONE place that decides liveness; ttlc_get delegates to it so
+// the two never disagree).
+//
+// NOTE ON IMPLEMENTATION SHAPE: this function is written with early
+// `return false` / `return false` / trailing `true` — that is safe because
+// every branch returns the SAME concrete type (bool). ttlc_get below is
+// deliberately NOT written with per-branch `return [1, x]` / `return [0, 0]`
+// — a hand-written NOVA function with multiple `return` statements whose
+// branches disagree on concrete type (e.g. one branch's list holds an int
+// placeholder, another's holds the dict's actual string/list/dict value)
+// hits a real codegen defect: the function's return type gets fixed by
+// whichever branch resolves first, silently corrupting the other branch's
+// pointer-typed value into raw garbage. Collapsing to a SINGLE trailing
+// expression built from the `get(dict,key,default)` builtin (which performs
+// its own internal any-widening correctly) avoids the defect entirely.
+fn ttlc_contains(c, key, now_ms) -> bool
+    let k = str(key)
+    let data = c["data"]
+    if not contains(data, k)
+        return false
+    if _ttlc_is_expired(c, k, now_ms)
+        del(data, k)
+        del(c["expiry"], k)
+        c["count"] = c["count"] - 1
+        return false
+    true
+
+// ttlc_get: [1, value] on a live hit; lazily evicts (via ttlc_contains) and
+// returns [0, 0] on a miss OR an expired entry. Single trailing return only
+// — see the note on ttlc_contains above for why.
+fn ttlc_get(c, key, now_ms) -> list
+    let k = str(key)
+    let data = c["data"]
+    let live = ttlc_contains(c, key, now_ms)
+    let flag = 0
+    if live
+        flag = 1
+    [flag, get(data, k, 0)]
+
+// ttlc_delete: remove key unconditionally (no-op if absent).
+fn ttlc_delete(c, key) -> dict
+    let k = str(key)
+    let data = c["data"]
+    if contains(data, k)
+        del(data, k)
+        del(c["expiry"], k)
+        c["count"] = c["count"] - 1
+    c
+
+// ttlc_purge_expired: sweep every resident entry and evict expired ones.
+// Returns how many were removed.
+fn ttlc_purge_expired(c, now_ms) -> int
+    let data = c["data"]
+    let ks = keys(data)
+    let n = len(ks)
+    let removed = 0
+    let i = 0
+    while i < n
+        let k = ks[i]
+        if _ttlc_is_expired(c, k, now_ms)
+            del(data, k)
+            del(c["expiry"], k)
+            c["count"] = c["count"] - 1
+            removed = removed + 1
+        i = i + 1
+    removed
+
+// ttlc_size: number of currently-live (non-expired) entries. Read-only —
+// does not purge anything, so a subsequent ttlc_purge_expired may still
+// find work to do even right after this returns 0.
+fn ttlc_size(c, now_ms) -> int
+    let data = c["data"]
+    let ks = keys(data)
+    let n = len(ks)
+    let live = 0
+    let i = 0
+    while i < n
+        if not _ttlc_is_expired(c, ks[i], now_ms)
+            live = live + 1
+        i = i + 1
+    live
+
+// ttlc_ttl_remaining: ms until expiry (-1 = never expires, -2 = absent/expired).
+fn ttlc_ttl_remaining(c, key, now_ms) -> int
+    let k = str(key)
+    if not ttlc_contains(c, key, now_ms)
+        return -2
+    let e = c["expiry"][k]
+    if e < 0
+        return -1
+    e - now_ms
+
+// ttlc_clear: remove everything.
+fn ttlc_clear(c) -> dict
+    c["data"] = {}
+    c["expiry"] = {}
+    c["count"] = 0
+    c
+
+// ============================================================================
+fn main()
+    print("std/cache/ttlcache loaded")
