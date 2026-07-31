@@ -1,0 +1,305 @@
+// KAT for std/net/aws_sns — AWS SNS Query API client.
+//
+// Covers (per the module's public, network-free surface — nothing here
+// touches the actual network; the 5 sns_publish/sns_subscribe/sns_list_topics/
+// sns_list_subscriptions/sns_unsubscribe entry points DO call http_get and are
+// intentionally NOT exercised live from a KAT):
+//   1. URL construction (sns_endpoint_url, sns_presigned_url) — including an
+//      END-TO-END cross-check of the full SigV4 query-signing pipeline
+//      (percent-encoding + self-contained SHA-256/HMAC-SHA-256 + canonical
+//      request/string-to-sign/signing-key chain) against values independently
+//      recomputed in Python's hashlib/hmac (NOT re-derived from NOVA — a real
+//      external oracle), plus a self-contained epoch->UTC-calendar check
+//      against the well-known AWS SigV4 worked-example timestamp.
+//   2. XML response parsing (sns_parse_*_response) against constructed XML
+//      strings covering success, AWS <ErrorResponse>, list/member repetition,
+//      entity-unescaping, and malformed/missing-field inputs.
+//   3. Parameter encoding (sns_url_encode + the sns_*_params builders).
+import std/net/aws_sns
+
+fn main()
+    // ── 1a. sns_url_encode — RFC 3986 percent-encoding ─────────────────────
+    if sns_url_encode("hi there") != "hi%20there"
+        print("FAIL sns_url_encode space: " + sns_url_encode("hi there"))
+        exit(1)
+    if sns_url_encode("arn:aws:sns:us-east-1:123456789012:MyTopic") != "arn%3Aaws%3Asns%3Aus-east-1%3A123456789012%3AMyTopic"
+        print("FAIL sns_url_encode arn: " + sns_url_encode("arn:aws:sns:us-east-1:123456789012:MyTopic"))
+        exit(1)
+    if sns_url_encode("") != ""
+        print("FAIL sns_url_encode empty")
+        exit(1)
+    if sns_url_encode("abc-DEF_123.~") != "abc-DEF_123.~"
+        print("FAIL sns_url_encode unreserved passthrough: " + sns_url_encode("abc-DEF_123.~"))
+        exit(1)
+    if sns_url_encode("a/b?c=d&e") != "a%2Fb%3Fc%3Dd%26e"
+        print("FAIL sns_url_encode reserved: " + sns_url_encode("a/b?c=d&e"))
+        exit(1)
+
+    // ── 1b. sns_endpoint_url ────────────────────────────────────────────────
+    if sns_endpoint_url("us-east-1") != "https://sns.us-east-1.amazonaws.com/"
+        print("FAIL sns_endpoint_url: " + sns_endpoint_url("us-east-1"))
+        exit(1)
+    if sns_endpoint_url("eu-west-2") != "https://sns.eu-west-2.amazonaws.com/"
+        print("FAIL sns_endpoint_url eu-west-2: " + sns_endpoint_url("eu-west-2"))
+        exit(1)
+
+    // ── 1c. sns_epoch_to_stamps — self-contained epoch->UTC-calendar,
+    //        cross-checked against Python datetime for 3 independently
+    //        computed reference epochs (including the AWS SigV4 documented
+    //        worked-example timestamp 2015-08-30T12:36:00Z, and a leap day).
+    let s0 = sns_epoch_to_stamps(0)
+    if s0[0] != "19700101T000000Z" or s0[1] != "19700101"
+        print("FAIL sns_epoch_to_stamps epoch 0: " + s0[0] + " / " + s0[1])
+        exit(1)
+    let s1 = sns_epoch_to_stamps(1440938160)
+    if s1[0] != "20150830T123600Z" or s1[1] != "20150830"
+        print("FAIL sns_epoch_to_stamps AWS worked-example epoch: " + s1[0] + " / " + s1[1])
+        exit(1)
+    let s2 = sns_epoch_to_stamps(1456704000)
+    if s2[0] != "20160229T000000Z" or s2[1] != "20160229"
+        print("FAIL sns_epoch_to_stamps leap day: " + s2[0] + " / " + s2[1])
+        exit(1)
+
+    // ── 3a. Parameter-list builders — ascending key order, exact values ────
+    let pub_p = sns_publish_params("arn:aws:sns:us-east-1:123456789012:MyTopic", "hi there")
+    if len(pub_p) != 4
+        print("FAIL sns_publish_params length: " + str(len(pub_p)))
+        exit(1)
+    if pub_p[0][0] != "Action" or pub_p[0][1] != "Publish"
+        print("FAIL sns_publish_params[0]: " + pub_p[0][0] + "=" + pub_p[0][1])
+        exit(1)
+    if pub_p[1][0] != "Message" or pub_p[1][1] != "hi there"
+        print("FAIL sns_publish_params[1]: " + pub_p[1][0] + "=" + pub_p[1][1])
+        exit(1)
+    if pub_p[2][0] != "TopicArn" or pub_p[2][1] != "arn:aws:sns:us-east-1:123456789012:MyTopic"
+        print("FAIL sns_publish_params[2]: " + pub_p[2][0] + "=" + pub_p[2][1])
+        exit(1)
+    if pub_p[3][0] != "Version" or pub_p[3][1] != "2010-03-31"
+        print("FAIL sns_publish_params[3]: " + pub_p[3][0] + "=" + pub_p[3][1])
+        exit(1)
+
+    let sub_p = sns_subscribe_params("arn:aws:sns:us-east-1:123456789012:MyTopic", "email", "user@example.com")
+    if len(sub_p) != 5
+        print("FAIL sns_subscribe_params length: " + str(len(sub_p)))
+        exit(1)
+    if sub_p[0][0] != "Action" or sub_p[0][1] != "Subscribe"
+        print("FAIL sns_subscribe_params[0]")
+        exit(1)
+    if sub_p[1][0] != "Endpoint" or sub_p[1][1] != "user@example.com"
+        print("FAIL sns_subscribe_params[1]")
+        exit(1)
+    if sub_p[2][0] != "Protocol" or sub_p[2][1] != "email"
+        print("FAIL sns_subscribe_params[2]")
+        exit(1)
+    if sub_p[3][0] != "TopicArn" or sub_p[3][1] != "arn:aws:sns:us-east-1:123456789012:MyTopic"
+        print("FAIL sns_subscribe_params[3]")
+        exit(1)
+    if sub_p[4][0] != "Version" or sub_p[4][1] != "2010-03-31"
+        print("FAIL sns_subscribe_params[4]")
+        exit(1)
+
+    let lt_p = sns_list_topics_params()
+    if len(lt_p) != 2
+        print("FAIL sns_list_topics_params length: " + str(len(lt_p)))
+        exit(1)
+    if lt_p[0][0] != "Action" or lt_p[0][1] != "ListTopics"
+        print("FAIL sns_list_topics_params[0]")
+        exit(1)
+    if lt_p[1][0] != "Version" or lt_p[1][1] != "2010-03-31"
+        print("FAIL sns_list_topics_params[1]")
+        exit(1)
+
+    let ls_p = sns_list_subscriptions_params("arn:aws:sns:us-east-1:123456789012:MyTopic")
+    if len(ls_p) != 3
+        print("FAIL sns_list_subscriptions_params length: " + str(len(ls_p)))
+        exit(1)
+    if ls_p[0][0] != "Action" or ls_p[0][1] != "ListSubscriptionsByTopic"
+        print("FAIL sns_list_subscriptions_params[0]")
+        exit(1)
+    if ls_p[1][0] != "TopicArn" or ls_p[1][1] != "arn:aws:sns:us-east-1:123456789012:MyTopic"
+        print("FAIL sns_list_subscriptions_params[1]")
+        exit(1)
+    if ls_p[2][0] != "Version" or ls_p[2][1] != "2010-03-31"
+        print("FAIL sns_list_subscriptions_params[2]")
+        exit(1)
+
+    let un_p = sns_unsubscribe_params("arn:aws:sns:us-east-1:123456789012:MyTopic:8a21d249-4329-4871-acc6-7be709c6ea7f")
+    if len(un_p) != 3
+        print("FAIL sns_unsubscribe_params length: " + str(len(un_p)))
+        exit(1)
+    if un_p[0][0] != "Action" or un_p[0][1] != "Unsubscribe"
+        print("FAIL sns_unsubscribe_params[0]")
+        exit(1)
+    if un_p[1][0] != "SubscriptionArn" or un_p[1][1] != "arn:aws:sns:us-east-1:123456789012:MyTopic:8a21d249-4329-4871-acc6-7be709c6ea7f"
+        print("FAIL sns_unsubscribe_params[1]")
+        exit(1)
+
+    // ── 1d. sns_presigned_url — FULL end-to-end SigV4 query-signing
+    //        cross-check. Fixed AWS example credentials/date (the same
+    //        "AKIAIOSFODNN7EXAMPLE" pair AWS's own SigV4 docs use), fixed
+    //        timestamp 20150830T123600Z. Expected canonical-query and
+    //        signature were independently computed with Python's hashlib +
+    //        hmac (NOT derived from this NOVA code) implementing the same
+    //        documented SigV4 query-parameter-signing algorithm -- a true
+    //        external oracle, not a self-check.
+    let access_key = "AKIAIOSFODNN7EXAMPLE"
+    let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    let region = "us-east-1"
+    let amz_date = "20150830T123600Z"
+    let date_stamp = "20150830"
+
+    let publish_params = sns_publish_params("arn:aws:sns:us-east-1:123456789012:MyTopic", "hi there")
+    let publish_url = sns_presigned_url(region, publish_params, access_key, secret_key, amz_date, date_stamp)
+
+    let expected_publish_query = "Action=Publish&Message=hi%20there&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A123456789012%3AMyTopic&Version=2010-03-31&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20150830%2Fus-east-1%2Fsns%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host"
+    let expected_publish_sig = "e8f5a2513c63ea7f04abc5fed0adaf296953be6fee51778263244065d624565c"
+    let expected_publish_url = "https://sns.us-east-1.amazonaws.com/?" + expected_publish_query + "&X-Amz-Signature=" + expected_publish_sig
+    if publish_url != expected_publish_url
+        print("FAIL sns_presigned_url Publish mismatch")
+        print("  got: " + publish_url)
+        print("  want:" + expected_publish_url)
+        exit(1)
+    if len(expected_publish_sig) != 64
+        print("FAIL expected_publish_sig fixture length (test-vector bug): " + str(len(expected_publish_sig)))
+        exit(1)
+
+    let lt_params2 = sns_list_topics_params()
+    let lt_url = sns_presigned_url(region, lt_params2, access_key, secret_key, amz_date, date_stamp)
+    let expected_lt_sig = "5a2f5252530e65142afd7ea034500d4fb8e391a14cba0d4f5e5da9e87006ce74"
+    let expected_lt_url = "https://sns.us-east-1.amazonaws.com/?Action=ListTopics&Version=2010-03-31&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20150830%2Fus-east-1%2Fsns%2Faws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=" + expected_lt_sig
+    if lt_url != expected_lt_url
+        print("FAIL sns_presigned_url ListTopics mismatch")
+        print("  got: " + lt_url)
+        print("  want:" + expected_lt_url)
+        exit(1)
+
+    // Different action_params or different region/date must change the
+    // signature (a stuck/constant signature would silently break auth).
+    let sub_params2 = sns_subscribe_params("arn:aws:sns:us-east-1:123456789012:MyTopic", "email", "user@example.com")
+    let sub_url = sns_presigned_url(region, sub_params2, access_key, secret_key, amz_date, date_stamp)
+    if sub_url == publish_url or sub_url == lt_url
+        print("FAIL sns_presigned_url: different actions produced the same URL")
+        exit(1)
+    let other_region_url = sns_presigned_url("eu-west-1", lt_params2, access_key, secret_key, amz_date, date_stamp)
+    if other_region_url == lt_url
+        print("FAIL sns_presigned_url: region change did not change the URL")
+        exit(1)
+
+    // ── 2. XML response parsing (constructed in-memory, no network) ────────
+
+    // -- Publish: success --
+    let publish_xml_ok = "<PublishResponse><PublishResult><MessageId>567910cd-659e-55d4-8ccb-5aaf14679dc0</MessageId></PublishResult><ResponseMetadata><RequestId>d74b8436-ae13-5ab4-a9ff-ce54dfea72a0</RequestId></ResponseMetadata></PublishResponse>"
+    let r1 = sns_parse_publish_response(publish_xml_ok)
+    if is_err(r1)
+        print("FAIL sns_parse_publish_response: expected ok")
+        exit(1)
+    if unwrap(r1) != "567910cd-659e-55d4-8ccb-5aaf14679dc0"
+        print("FAIL sns_parse_publish_response MessageId: " + unwrap(r1))
+        exit(1)
+
+    // -- Publish: AWS <ErrorResponse> --
+    let publish_xml_err = "<ErrorResponse><Error><Type>Sender</Type><Code>NotFound</Code><Message>Topic does not exist</Message></Error><RequestId>a1b2c3</RequestId></ErrorResponse>"
+    let r2 = sns_parse_publish_response(publish_xml_err)
+    if is_ok(r2)
+        print("FAIL sns_parse_publish_response: expected err on ErrorResponse")
+        exit(1)
+    if unwrap_err(r2) != "NotFound: Topic does not exist"
+        print("FAIL sns_parse_publish_response error text: " + unwrap_err(r2))
+        exit(1)
+
+    // -- Publish: empty response / missing MessageId --
+    if is_ok(sns_parse_publish_response(""))
+        print("FAIL sns_parse_publish_response: expected err on empty body")
+        exit(1)
+    if is_ok(sns_parse_publish_response("<PublishResponse><PublishResult></PublishResult></PublishResponse>"))
+        print("FAIL sns_parse_publish_response: expected err on missing MessageId")
+        exit(1)
+
+    // -- Publish: entity-unescaping (amp/lt/gt/quot/apos/decimal-numeric) --
+    let escaped_xml = "<PublishResponse><PublishResult><MessageId>M&amp;M &lt;test&gt; &apos;q&apos; &quot;w&quot; &#65;</MessageId></PublishResult></PublishResponse>"
+    let r3 = sns_parse_publish_response(escaped_xml)
+    if is_err(r3)
+        print("FAIL sns_parse_publish_response: expected ok on escaped-entity xml")
+        exit(1)
+    let expected_unescaped = "M&M " + chr(60) + "test" + chr(62) + " 'q' " + chr(34) + "w" + chr(34) + " A"
+    if unwrap(r3) != expected_unescaped
+        print("FAIL entity unescape: got [" + unwrap(r3) + "] want [" + expected_unescaped + "]")
+        exit(1)
+
+    // -- Subscribe: success ("pending confirmation" — the real AWS shape for
+    //    a protocol that requires endpoint confirmation) --
+    let subscribe_xml = "<SubscribeResponse><SubscribeResult><SubscriptionArn>pending confirmation</SubscriptionArn></SubscribeResult><ResponseMetadata><RequestId>x</RequestId></ResponseMetadata></SubscribeResponse>"
+    let r4 = sns_parse_subscribe_response(subscribe_xml)
+    if is_err(r4) or unwrap(r4) != "pending confirmation"
+        print("FAIL sns_parse_subscribe_response")
+        exit(1)
+
+    // -- ListTopics: 2 members --
+    let list_topics_xml = "<ListTopicsResponse><ListTopicsResult><Topics><member><TopicArn>arn:aws:sns:us-east-1:123456789012:Topic-A</TopicArn></member><member><TopicArn>arn:aws:sns:us-east-1:123456789012:Topic-B</TopicArn></member></Topics></ListTopicsResult><ResponseMetadata><RequestId>x</RequestId></ResponseMetadata></ListTopicsResponse>"
+    let r5 = sns_parse_list_topics_response(list_topics_xml)
+    if is_err(r5)
+        print("FAIL sns_parse_list_topics_response: expected ok")
+        exit(1)
+    let topics = unwrap(r5)
+    if len(topics) != 2
+        print("FAIL sns_parse_list_topics_response count: " + str(len(topics)))
+        exit(1)
+    if topics[0] != "arn:aws:sns:us-east-1:123456789012:Topic-A" or topics[1] != "arn:aws:sns:us-east-1:123456789012:Topic-B"
+        print("FAIL sns_parse_list_topics_response values: " + topics[0] + " / " + topics[1])
+        exit(1)
+
+    // -- ListTopics: empty (no <member> blocks) --
+    let r5b = sns_parse_list_topics_response("<ListTopicsResponse><ListTopicsResult><Topics></Topics></ListTopicsResult></ListTopicsResponse>")
+    if is_err(r5b) or len(unwrap(r5b)) != 0
+        print("FAIL sns_parse_list_topics_response: expected ok empty list")
+        exit(1)
+
+    // -- ListSubscriptionsByTopic: 1 member, all fields --
+    let list_subs_xml = "<ListSubscriptionsByTopicResponse><ListSubscriptionsByTopicResult><Subscriptions><member><TopicArn>arn:aws:sns:us-east-1:123456789012:MyTopic</TopicArn><Protocol>email</Protocol><SubscriptionArn>arn:aws:sns:us-east-1:123456789012:MyTopic:8a21d249-4329-4871-acc6-7be709c6ea7f</SubscriptionArn><Owner>123456789012</Owner><Endpoint>example@amazon.com</Endpoint></member></Subscriptions></ListSubscriptionsByTopicResult><ResponseMetadata><RequestId>x</RequestId></ResponseMetadata></ListSubscriptionsByTopicResponse>"
+    let r6 = sns_parse_list_subscriptions_response(list_subs_xml)
+    if is_err(r6)
+        print("FAIL sns_parse_list_subscriptions_response: expected ok")
+        exit(1)
+    let subs = unwrap(r6)
+    if len(subs) != 1
+        print("FAIL sns_parse_list_subscriptions_response count: " + str(len(subs)))
+        exit(1)
+    let sub0 = subs[0]
+    if sub0["topic_arn"] != "arn:aws:sns:us-east-1:123456789012:MyTopic"
+        print("FAIL sns_parse_list_subscriptions_response topic_arn: " + sub0["topic_arn"])
+        exit(1)
+    if sub0["protocol"] != "email"
+        print("FAIL sns_parse_list_subscriptions_response protocol: " + sub0["protocol"])
+        exit(1)
+    if sub0["subscription_arn"] != "arn:aws:sns:us-east-1:123456789012:MyTopic:8a21d249-4329-4871-acc6-7be709c6ea7f"
+        print("FAIL sns_parse_list_subscriptions_response subscription_arn: " + sub0["subscription_arn"])
+        exit(1)
+    if sub0["owner"] != "123456789012"
+        print("FAIL sns_parse_list_subscriptions_response owner: " + sub0["owner"])
+        exit(1)
+    if sub0["endpoint"] != "example@amazon.com"
+        print("FAIL sns_parse_list_subscriptions_response endpoint: " + sub0["endpoint"])
+        exit(1)
+
+    // -- ListSubscriptionsByTopic: AWS <ErrorResponse> --
+    let list_subs_err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>InvalidParameter</Code><Message>Invalid parameter: TopicArn</Message></Error><RequestId>z</RequestId></ErrorResponse>"
+    let r6b = sns_parse_list_subscriptions_response(list_subs_err_xml)
+    if is_ok(r6b) or unwrap_err(r6b) != "InvalidParameter: Invalid parameter: TopicArn"
+        print("FAIL sns_parse_list_subscriptions_response: expected err on ErrorResponse")
+        exit(1)
+
+    // -- Unsubscribe: success --
+    let unsubscribe_xml = "<UnsubscribeResponse><ResponseMetadata><RequestId>2e2ac2ad-4ba6-11e4-9ee2-cb4bd8b7bd7f</RequestId></ResponseMetadata></UnsubscribeResponse>"
+    let r7 = sns_parse_unsubscribe_response(unsubscribe_xml)
+    if is_err(r7) or unwrap(r7) != "2e2ac2ad-4ba6-11e4-9ee2-cb4bd8b7bd7f"
+        print("FAIL sns_parse_unsubscribe_response")
+        exit(1)
+
+    // -- Unsubscribe: AWS <ErrorResponse> (e.g. already-unsubscribed / bad ARN) --
+    let unsubscribe_err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>NotFound</Code><Message>Subscription does not exist</Message></Error><RequestId>y</RequestId></ErrorResponse>"
+    let r7b = sns_parse_unsubscribe_response(unsubscribe_err_xml)
+    if is_ok(r7b)
+        print("FAIL sns_parse_unsubscribe_response: expected err")
+        exit(1)
+
+    print("aws_sns KAT PASS")

@@ -1,0 +1,956 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/safetensors_loader
+// ============================================================================
+// Parser for the SafeTensors file format (huggingface/safetensors) — the
+// de-facto format for shipping trained model weights safely (no pickle,
+// no arbitrary code execution on load).
+//
+// WIRE FORMAT
+//   bytes[0..8)   header_size N, uint64 LITTLE-ENDIAN
+//   bytes[8..8+N) header JSON, UTF-8 — a flat JSON object:
+//                   {
+//                     "__metadata__": { <any string->string free-form map>, OPTIONAL },
+//                     "<tensor_name>": {
+//                        "dtype": "F32" | "F16" | "BF16" | "F64" |
+//                                 "I8" | "I16" | "I32" | "I64" | "U8" | "BOOL",
+//                        "shape": [<int>, ...],
+//                        "data_offsets": [<int start>, <int end>]
+//                     },
+//                     ...
+//                   }
+//   bytes[8+N..)  raw tensor data, back to back. A tensor's bytes live at
+//                 [8+N+data_offsets[0], 8+N+data_offsets[1]) — i.e.
+//                 data_offsets are relative to the START OF THE DATA SECTION
+//                 (right after the header), NOT absolute file offsets.
+//                 st_data_start(model) below gives that base so a caller
+//                 can compute the absolute file offset when it needs to.
+//
+// This module parses the HEADER ONLY (tensor names/dtypes/shapes/offsets).
+// It does not read or interpret the raw tensor bytes themselves — that is
+// a separate concern (I/O + numeric decode) callers layer on top using
+// st_tensor_offset()/st_data_start() against the original `data` bytes.
+//
+// PUBLIC API
+//   st_parse(data)              -> Result   Ok(model) | Err(message)
+//   st_tensor_names(model)      -> list     tensor names, in header order
+//                                            (excludes "__metadata__")
+//   st_tensor_count(model)      -> int      number of tensors
+//   st_tensor_dtype(model, name)  -> string   "" if name is unknown
+//   st_tensor_shape(model, name)  -> list     [] if name is unknown
+//   st_tensor_offset(model, name) -> list     [start, end], DATA-SECTION-
+//                                            relative (see WIRE FORMAT above);
+//                                            [-1, -1] if name is unknown
+//   st_header_size(model)       -> int      N, the raw header byte count
+//   st_data_start(model)        -> int      8 + N — absolute file offset
+//                                            where the data section begins
+//                                            (add to st_tensor_offset()'s
+//                                            values to get absolute offsets)
+//
+// EXAMPLES
+//   let r = st_parse(file_bytes)
+//   if is_ok(r)
+//       let model = unwrap(r)
+//       let names = st_tensor_names(model)          -> ["weight", "bias"]
+//       st_tensor_dtype(model, "weight")             -> "F32"
+//       st_tensor_shape(model, "weight")             -> [2, 2]
+//       st_tensor_offset(model, "weight")            -> [0, 16]
+//       let abs_start = st_data_start(model) + st_tensor_offset(model, "weight")[0]
+//
+// VALIDATION (st_parse rejects, does not silently accept, all of the
+// following — a corrupted/adversarial file must never be misread as a
+// smaller-but-valid one):
+//   - fewer than 8 bytes total (no room for the header-size field)
+//   - header_size field top bit set / absurdly large (sanity-capped at
+//     _sft_max_header_size() bytes — matches the reference Rust/Python
+//     safetensors implementations' own header-size guard)
+//   - header_size bytes would run past the end of the file
+//   - header is not well-formed strict JSON (unterminated string/object/
+//     array, bad escape, control character in a string, trailing content
+//     after the top-level object, ...)
+//   - a tensor entry missing "dtype"/"shape"/"data_offsets", or with a
+//     non-string dtype / non-array shape / data_offsets that isn't
+//     exactly 2 elements
+//   - an unrecognized dtype string
+//   - a negative shape dimension, or a shape whose element count would
+//     overflow a sane 64-bit budget (adversarial [huge, huge, ...] shape)
+//   - data_offsets that are negative, decreasing (end < start), or run
+//     past the end of the data section
+//   - a tensor's data_offsets byte span not matching
+//     itemsize(dtype) * product(shape) — catches silently-truncated or
+//     hand-corrupted files, not just malformed JSON
+//   - a duplicate tensor name
+//   - a tensor literally named one of this module's reserved result keys
+//     ("__names__"/"__header_size__"/"__data_start__") — see IMPLEMENTATION
+//     NOTES; this can only happen on an adversarial file since real
+//     safetensors writers never emit such names
+//   - JSON nesting (inside "__metadata__", or an unrecognized extra field
+//     on a tensor entry) deeper than _sft_max_depth() levels — an
+//     unbounded-recursion stack-overflow DoS guard (the same vulnerability
+//     class fixed codebase-wide across std/data/sexpr, jsonpath, toml —
+//     see reference_decoder_soundness_bug_classes)
+//
+// IMPLEMENTATION NOTES
+//   - All private helpers are prefixed _sft_ (module-unique — plain "_st_"
+//     is already used by std/collections/segmenttree and
+//     std/game2d/steering2d; NOVA function symbols are GLOBAL across every
+//     imported module, so a shared prefix would be a hard link error).
+//   - Scanning is entirely BYTE-INDEXED (str_to_bytes/bytes_get style, or
+//     here directly over the `bytes` slice already sliced from `data` —
+//     no intermediate string round-trip at all) — never char_at/ord, which
+//     index by CODEPOINT while len()/slice() index by BYTE OFFSET; mixing
+//     the two silently mis-parses any multi-byte UTF-8 tensor name. This
+//     also sidesteps NOVA string NUL-truncation entirely: the header is
+//     parsed as raw bytes, only individual string VALUES (tensor names,
+//     dtype) are ever materialized as NOVA strings, and a decoded NUL
+//     byte inside one is explicitly rejected rather than silently
+//     truncating the string.
+//   - Position state is threaded as a single-key dict {"pos": int} (NOVA
+//     has no mutable reference semantics — a dict is the idiomatic way to
+//     let recursive/sibling calls advance a shared cursor).
+//   - Every recursive descent function (_sft_skip_value and friends,
+//     _sft_parse_tensor_entry) takes a `depth` budget that is decremented
+//     one level at a time and NEVER recurses once it reaches 0 — bounding
+//     native call-stack usage regardless of how deeply nested a malicious
+//     "__metadata__" value or unrecognized tensor-entry field claims to be.
+//   - Result-oriented throughout: every sub-parser returns Ok/Err directly
+//     (via the `ok`/`err`/`is_ok`/`is_err`/`unwrap`/`unwrap_err` language
+//     builtins) instead of threading a shared error flag; every call site
+//     checks is_err() immediately and stops its own loop right away, so a
+//     failure detected at any depth propagates up cleanly with no further
+//     work done after it.
+//   - NO nested dicts anywhere in the returned model (NOVA dict values are
+//     one flat generic `any`, and this codebase's convention avoids
+//     dict-of-dict entirely). Each tensor's info is stored as a single
+//     flat list `[dtype, shape, offset_start, offset_end]` under
+//     model[tensor_name] — a list nested inside a dict value, never a
+//     dict nested inside a dict. The three whole-model fields
+//     (__names__/__header_size__/__data_start__) live as additional flat
+//     keys in that SAME dict, which is why tensor names colliding with
+//     those three reserved strings are rejected at parse time (see
+//     VALIDATION above) — otherwise a malicious tensor named e.g.
+//     "__names__" would silently overwrite (or be overwritten by) the
+//     model's own bookkeeping entry.
+//   - Single-exit style (let result = ...; ...; return result) throughout,
+//     to avoid the NOVA early-return `return null` + `return <value>`
+//     mistag bug (reference_nova_return_null_mistag).
+//   - LEAF module — imports nothing, pure NOVA, no external dependencies.
+// ============================================================================
+
+// ── constants ────────────────────────────────────────────────────────────────
+
+// _sft_max_header_size: sanity cap on the declared header byte count (100 MB
+// — matches the guard the reference Python/Rust safetensors implementations
+// use). Without this cap, a corrupted or adversarial 8-byte size field
+// (e.g. all 0xFF bytes) would attempt an enormous bytes_slice and either
+// OOM or silently clamp in a way that misleads the caller; capping it here
+// turns that into a clean, immediate Err.
+fn _sft_max_header_size() -> int
+    100000000
+
+// _sft_max_depth: recursion budget for JSON nesting inside "__metadata__"
+// (or any unrecognized extra field on a tensor entry) — bounds native
+// call-stack usage against a crafted deeply-nested value. SafeTensors
+// metadata is normally flat or shallow; 64 levels is generous headroom.
+fn _sft_max_depth() -> int
+    64
+
+// _sft_max_elems: sanity cap on a tensor's total element count (product of
+// its shape dims), used only to bound the multiplication against overflow
+// while validating — 2^48 is many orders of magnitude beyond any real
+// model tensor, but keeps elems * itemsize (itemsize <= 8) comfortably
+// inside i64 range even for an adversarial shape.
+fn _sft_max_elems() -> int
+    1 << 48
+
+// _sft_dtype_size: itemsize in bytes for a SafeTensors dtype string, or 0
+// if `dtype` is not one of the 10 dtypes the format defines.
+fn _sft_dtype_size(dtype) -> int
+    let result = 0
+    if dtype == "F32"
+        result = 4
+    else if dtype == "F64"
+        result = 8
+    else if dtype == "F16"
+        result = 2
+    else if dtype == "BF16"
+        result = 2
+    else if dtype == "I8"
+        result = 1
+    else if dtype == "I16"
+        result = 2
+    else if dtype == "I32"
+        result = 4
+    else if dtype == "I64"
+        result = 8
+    else if dtype == "U8"
+        result = 1
+    else if dtype == "BOOL"
+        result = 1
+    return result
+
+// _sft_quote: wrap a string in double quotes, for error messages.
+fn _sft_quote(k) -> string
+    "\"" + k + "\""
+
+// _sft_is_reserved_key: 1 if `key` collides with one of the three
+// whole-model bookkeeping keys st_parse writes into the returned dict.
+fn _sft_is_reserved_key(key) -> int
+    let result = 0
+    if key == "__names__"
+        result = 1
+    else if key == "__header_size__"
+        result = 1
+    else if key == "__data_start__"
+        result = 1
+    return result
+
+// ── low-level byte scan ─────────────────────────────────────────────────────
+
+// _sft_skip_ws: advance st["pos"] past JSON whitespace (space/tab/CR/LF).
+fn _sft_skip_ws(hb, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let b = bytes_get(hb, p)
+            if b == 32 or b == 9 or b == 10 or b == 13
+                st["pos"] = p + 1
+            else
+                go = 0
+
+// _sft_hex_val: 0-15 for an ASCII hex digit byte, -1 if not a hex digit.
+fn _sft_hex_val(b) -> int
+    let result = -1
+    if b >= 48 and b <= 57
+        result = b - 48
+    else if b >= 65 and b <= 70
+        result = b - 55
+    else if b >= 97 and b <= 102
+        result = b - 87
+    return result
+
+// _sft_read_hex4: read exactly 4 hex-digit bytes at st["pos"], advancing it,
+// and return their value 0..0xFFFF. Err on truncation or a non-hex byte.
+fn _sft_read_hex4(hb, n, st) -> Result
+    let result = null
+    let p = st["pos"]
+    if p + 4 > n
+        result = err("st_parse: truncated \\u escape")
+    else
+        let v = 0
+        let bad = 0
+        let i = 0
+        while i < 4
+            let h = _sft_hex_val(bytes_get(hb, p + i))
+            if h < 0
+                bad = 1
+            else
+                v = v * 16 + h
+            i = i + 1
+        if bad == 1
+            result = err("st_parse: invalid hex digit in \\u escape")
+        else
+            st["pos"] = p + 4
+            result = ok(v)
+    return result
+
+// _sft_parse_unicode_escape: st["pos"] is positioned right after the "u" of
+// a "\u" escape. Reads one \uXXXX (or a valid \uXXXX\uYYYY surrogate pair
+// for astral code points) and returns the combined Unicode code point.
+fn _sft_parse_unicode_escape(hb, n, st) -> Result
+    let result = null
+    let hr = _sft_read_hex4(hb, n, st)
+    if is_err(hr)
+        result = hr
+    else
+        let cp = unwrap(hr)
+        if cp >= 0xD800 and cp <= 0xDBFF
+            // high surrogate: must be immediately followed by a low
+            // surrogate \u escape to form a valid astral code point.
+            let p = st["pos"]
+            if p + 1 < n and bytes_get(hb, p) == 92 and bytes_get(hb, p + 1) == 117
+                st["pos"] = p + 2
+                let lr = _sft_read_hex4(hb, n, st)
+                if is_err(lr)
+                    result = lr
+                else
+                    let lo = unwrap(lr)
+                    if lo >= 0xDC00 and lo <= 0xDFFF
+                        let combined = 0x10000 + ((cp - 0xD800) * 0x400) + (lo - 0xDC00)
+                        result = ok(combined)
+                    else
+                        result = err("st_parse: invalid low surrogate in \\u escape")
+            else
+                result = err("st_parse: unpaired high surrogate in \\u escape")
+        else if cp >= 0xDC00 and cp <= 0xDFFF
+            result = err("st_parse: unpaired low surrogate in \\u escape")
+        else
+            result = ok(cp)
+    return result
+
+// _sft_append_utf8: append the UTF-8 encoding of code point `cp` to buffer
+// `buf`, via the from_codepoint() language builtin (std/text/casefold's
+// _utf8_encode uses the same builtin for the same purpose) — reuses the
+// compiler's own correct 1..4-byte UTF-8 encoder rather than re-deriving
+// the bit-twiddling by hand here.
+fn _sft_append_utf8(buf, cp)
+    buf_append(buf, from_codepoint(cp))
+
+// _sft_parse_string_body: parse a JSON string's content, st["pos"] already
+// positioned right AFTER the opening '"'. Handles \n \t \r \b \f \" \\ \/
+// and \uXXXX (with surrogate-pair support) escapes; rejects raw control
+// bytes (< 0x20, per strict JSON), an unterminated string, and a decoded
+// NUL byte (which would silently truncate the resulting NOVA string).
+fn _sft_parse_string_body(hb, n, st) -> Result
+    let result = null
+    let cur = buffer()
+    let go = 1
+    let failmsg = ""
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            failmsg = "st_parse: unterminated string"
+            go = 0
+        else
+            let b = bytes_get(hb, p)
+            if b == 34
+                st["pos"] = p + 1
+                go = 0
+            else if b == 92
+                st["pos"] = p + 1
+                let q = st["pos"]
+                if q >= n
+                    failmsg = "st_parse: unterminated escape sequence"
+                    go = 0
+                else
+                    let eb = bytes_get(hb, q)
+                    if eb == 110
+                        buf_append_char(cur, 10)
+                        st["pos"] = q + 1
+                    else if eb == 116
+                        buf_append_char(cur, 9)
+                        st["pos"] = q + 1
+                    else if eb == 114
+                        buf_append_char(cur, 13)
+                        st["pos"] = q + 1
+                    else if eb == 98
+                        buf_append_char(cur, 8)
+                        st["pos"] = q + 1
+                    else if eb == 102
+                        buf_append_char(cur, 12)
+                        st["pos"] = q + 1
+                    else if eb == 34 or eb == 92 or eb == 47
+                        buf_append_char(cur, eb)
+                        st["pos"] = q + 1
+                    else if eb == 117
+                        st["pos"] = q + 1
+                        let ur = _sft_parse_unicode_escape(hb, n, st)
+                        if is_err(ur)
+                            failmsg = unwrap_err(ur)
+                            go = 0
+                        else
+                            let cp = unwrap(ur)
+                            if cp == 0
+                                failmsg = "st_parse: NUL (\\u0000) is not supported inside a string value"
+                                go = 0
+                            else
+                                _sft_append_utf8(cur, cp)
+                    else
+                        failmsg = "st_parse: invalid escape sequence in string"
+                        go = 0
+            else if b < 32
+                failmsg = "st_parse: control character in string"
+                go = 0
+            else
+                buf_append_char(cur, b)
+                st["pos"] = p + 1
+    if failmsg != ""
+        result = err(failmsg)
+    else
+        result = ok(buf_to_str(cur))
+    return result
+
+// _sft_parse_int: parse a strict JSON integer (optional leading '-', one or
+// more ASCII digits, no fraction/exponent — shape dims and data_offsets
+// are always plain integers per spec). Caps digit count at 18 to stay
+// safely inside i64 range rather than silently wrapping on an
+// absurdly-long adversarial digit run.
+fn _sft_parse_int(hb, n, st) -> Result
+    let result = null
+    let neg = 0
+    let p = st["pos"]
+    if p < n and bytes_get(hb, p) == 45
+        neg = 1
+        st["pos"] = p + 1
+    let acc = 0
+    let ndigits = 0
+    let go = 1
+    while go == 1
+        let q = st["pos"]
+        if q >= n
+            go = 0
+        else
+            let b = bytes_get(hb, q)
+            if b >= 48 and b <= 57
+                acc = acc * 10 + (b - 48)
+                ndigits = ndigits + 1
+                st["pos"] = q + 1
+            else
+                go = 0
+    if ndigits == 0
+        result = err("st_parse: expected an integer")
+    else if ndigits > 18
+        result = err("st_parse: integer literal too large")
+    else
+        let bad_trailer = 0
+        if st["pos"] < n
+            let o2 = bytes_get(hb, st["pos"])
+            if o2 == 46 or o2 == 101 or o2 == 69
+                bad_trailer = 1
+        if bad_trailer == 1
+            result = err("st_parse: expected an integer, found a decimal/exponent number")
+        else
+            let v = acc
+            if neg == 1
+                v = 0 - acc
+            result = ok(v)
+    return result
+
+// _sft_parse_int_array: parse a JSON array of integers, e.g. "shape" or
+// "data_offsets". st["pos"] must be at the opening '['.
+fn _sft_parse_int_array(hb, n, st, depth) -> Result
+    let result = null
+    if depth <= 0
+        result = err("st_parse: JSON nesting too deep")
+    else if st["pos"] >= n or bytes_get(hb, st["pos"]) != 91
+        result = err("st_parse: expected an array")
+    else
+        st["pos"] = st["pos"] + 1
+        let arr = []
+        let go = 1
+        let failmsg = ""
+        while go == 1
+            _sft_skip_ws(hb, n, st)
+            if st["pos"] >= n
+                failmsg = "st_parse: unterminated array"
+                go = 0
+            else
+                let b = bytes_get(hb, st["pos"])
+                if b == 93
+                    st["pos"] = st["pos"] + 1
+                    go = 0
+                else if b == 44
+                    st["pos"] = st["pos"] + 1
+                else
+                    let vr = _sft_parse_int(hb, n, st)
+                    if is_err(vr)
+                        failmsg = unwrap_err(vr)
+                        go = 0
+                    else
+                        arr.push(unwrap(vr))
+        if failmsg != ""
+            result = err(failmsg)
+        else
+            result = ok(arr)
+    return result
+
+// ── generic JSON value skip (only used for "__metadata__" and unrecognized
+//    extra fields on a tensor entry — this module never exposes their
+//    parsed content, only needs to walk past them correctly and safely) ──
+
+// _sft_skip_value: skip one JSON value of any kind at st["pos"].
+fn _sft_skip_value(hb, n, st, depth) -> Result
+    let result = null
+    _sft_skip_ws(hb, n, st)
+    if st["pos"] >= n
+        result = err("st_parse: unexpected end of input in JSON value")
+    else
+        let b = bytes_get(hb, st["pos"])
+        if b == 123
+            result = _sft_skip_object(hb, n, st, depth)
+        else if b == 91
+            result = _sft_skip_array(hb, n, st, depth)
+        else if b == 34
+            st["pos"] = st["pos"] + 1
+            let sr = _sft_parse_string_body(hb, n, st)
+            if is_err(sr)
+                result = sr
+            else
+                result = ok(1)
+        else if b == 45 or (b >= 48 and b <= 57)
+            result = _sft_skip_number(hb, n, st)
+        else
+            result = _sft_skip_literal(hb, n, st)
+    return result
+
+// _sft_skip_object: skip a whole {...} value, recursing into each field's
+// value via _sft_skip_value with a decremented depth budget.
+fn _sft_skip_object(hb, n, st, depth) -> Result
+    let result = null
+    if depth <= 0
+        result = err("st_parse: JSON nesting too deep")
+    else
+        st["pos"] = st["pos"] + 1
+        let go = 1
+        let failmsg = ""
+        while go == 1
+            _sft_skip_ws(hb, n, st)
+            if st["pos"] >= n
+                failmsg = "st_parse: unterminated object"
+                go = 0
+            else
+                let b = bytes_get(hb, st["pos"])
+                if b == 125
+                    st["pos"] = st["pos"] + 1
+                    go = 0
+                else if b == 44
+                    st["pos"] = st["pos"] + 1
+                else if b != 34
+                    failmsg = "st_parse: expected a string key in object"
+                    go = 0
+                else
+                    st["pos"] = st["pos"] + 1
+                    let kr = _sft_parse_string_body(hb, n, st)
+                    if is_err(kr)
+                        failmsg = unwrap_err(kr)
+                        go = 0
+                    else
+                        _sft_skip_ws(hb, n, st)
+                        if st["pos"] >= n or bytes_get(hb, st["pos"]) != 58
+                            failmsg = "st_parse: expected ':' in object"
+                            go = 0
+                        else
+                            st["pos"] = st["pos"] + 1
+                            let vr = _sft_skip_value(hb, n, st, depth - 1)
+                            if is_err(vr)
+                                failmsg = unwrap_err(vr)
+                                go = 0
+        if failmsg != ""
+            result = err(failmsg)
+        else
+            result = ok(1)
+    return result
+
+// _sft_skip_array: skip a whole [...] value, recursing into each element.
+fn _sft_skip_array(hb, n, st, depth) -> Result
+    let result = null
+    if depth <= 0
+        result = err("st_parse: JSON nesting too deep")
+    else
+        st["pos"] = st["pos"] + 1
+        let go = 1
+        let failmsg = ""
+        while go == 1
+            _sft_skip_ws(hb, n, st)
+            if st["pos"] >= n
+                failmsg = "st_parse: unterminated array"
+                go = 0
+            else
+                let b = bytes_get(hb, st["pos"])
+                if b == 93
+                    st["pos"] = st["pos"] + 1
+                    go = 0
+                else if b == 44
+                    st["pos"] = st["pos"] + 1
+                else
+                    let vr = _sft_skip_value(hb, n, st, depth - 1)
+                    if is_err(vr)
+                        failmsg = unwrap_err(vr)
+                        go = 0
+        if failmsg != ""
+            result = err(failmsg)
+        else
+            result = ok(1)
+    return result
+
+// _sft_skip_number: skip a JSON number (int, decimal, and/or exponent).
+fn _sft_skip_number(hb, n, st) -> Result
+    let result = null
+    let p = st["pos"]
+    if p < n and bytes_get(hb, p) == 45
+        st["pos"] = p + 1
+    let saw_digit = 0
+    let go = 1
+    while go == 1
+        let q = st["pos"]
+        if q >= n
+            go = 0
+        else
+            let b = bytes_get(hb, q)
+            if b >= 48 and b <= 57
+                saw_digit = 1
+                st["pos"] = q + 1
+            else
+                go = 0
+    if saw_digit == 0
+        result = err("st_parse: malformed number")
+    else
+        if st["pos"] < n and bytes_get(hb, st["pos"]) == 46
+            st["pos"] = st["pos"] + 1
+            let go2 = 1
+            while go2 == 1
+                let q2 = st["pos"]
+                if q2 >= n
+                    go2 = 0
+                else
+                    let b2 = bytes_get(hb, q2)
+                    if b2 >= 48 and b2 <= 57
+                        st["pos"] = q2 + 1
+                    else
+                        go2 = 0
+        if st["pos"] < n
+            let oe = bytes_get(hb, st["pos"])
+            if oe == 101 or oe == 69
+                st["pos"] = st["pos"] + 1
+                if st["pos"] < n
+                    let os = bytes_get(hb, st["pos"])
+                    if os == 43 or os == 45
+                        st["pos"] = st["pos"] + 1
+                let go3 = 1
+                while go3 == 1
+                    let q3 = st["pos"]
+                    if q3 >= n
+                        go3 = 0
+                    else
+                        let b3 = bytes_get(hb, q3)
+                        if b3 >= 48 and b3 <= 57
+                            st["pos"] = q3 + 1
+                        else
+                            go3 = 0
+        result = ok(1)
+    return result
+
+// _sft_skip_literal: skip a bare `true`/`false`/`null` literal.
+fn _sft_skip_literal(hb, n, st) -> Result
+    let result = null
+    let p = st["pos"]
+    if p + 4 <= n and bytes_get(hb, p) == 116 and bytes_get(hb, p + 1) == 114 and bytes_get(hb, p + 2) == 117 and bytes_get(hb, p + 3) == 101
+        st["pos"] = p + 4
+        result = ok(1)
+    else if p + 5 <= n and bytes_get(hb, p) == 102 and bytes_get(hb, p + 1) == 97 and bytes_get(hb, p + 2) == 108 and bytes_get(hb, p + 3) == 115 and bytes_get(hb, p + 4) == 101
+        st["pos"] = p + 5
+        result = ok(1)
+    else if p + 4 <= n and bytes_get(hb, p) == 110 and bytes_get(hb, p + 1) == 117 and bytes_get(hb, p + 2) == 108 and bytes_get(hb, p + 3) == 108
+        st["pos"] = p + 4
+        result = ok(1)
+    else
+        result = err("st_parse: unrecognized JSON literal")
+    return result
+
+// ── tensor entry ─────────────────────────────────────────────────────────────
+
+// _sft_parse_tensor_entry: parse one {"dtype":..., "shape":[...],
+// "data_offsets":[...]} object. Fields may appear in any order; any extra,
+// unrecognized field is generically skipped (forward-compatible with a
+// future SafeTensors writer that adds fields this module doesn't know
+// about) via _sft_skip_value. Returns Ok([dtype, shape, offset_start,
+// offset_end]) — a flat list, never a nested dict (see IMPLEMENTATION
+// NOTES at the top of this file).
+fn _sft_parse_tensor_entry(hb, n, st, depth) -> Result
+    let result = null
+    if depth <= 0
+        result = err("st_parse: header nesting too deep")
+    else if st["pos"] >= n or bytes_get(hb, st["pos"]) != 123
+        result = err("st_parse: expected an object for a tensor entry")
+    else
+        st["pos"] = st["pos"] + 1
+        let dtype = ""
+        let shape = []
+        let ostart = -1
+        let oend = -1
+        let have_dtype = 0
+        let have_shape = 0
+        let have_offsets = 0
+        let failmsg = ""
+        let go = 1
+        while go == 1
+            _sft_skip_ws(hb, n, st)
+            if st["pos"] >= n
+                failmsg = "st_parse: unterminated tensor entry object"
+                go = 0
+            else
+                let b = bytes_get(hb, st["pos"])
+                if b == 125
+                    st["pos"] = st["pos"] + 1
+                    go = 0
+                else if b == 44
+                    st["pos"] = st["pos"] + 1
+                else if b != 34
+                    failmsg = "st_parse: expected a string field name in tensor entry"
+                    go = 0
+                else
+                    st["pos"] = st["pos"] + 1
+                    let fkr = _sft_parse_string_body(hb, n, st)
+                    if is_err(fkr)
+                        failmsg = unwrap_err(fkr)
+                        go = 0
+                    else
+                        let fname = unwrap(fkr)
+                        _sft_skip_ws(hb, n, st)
+                        if st["pos"] >= n or bytes_get(hb, st["pos"]) != 58
+                            failmsg = "st_parse: expected ':' after tensor entry field " + _sft_quote(fname)
+                            go = 0
+                        else
+                            st["pos"] = st["pos"] + 1
+                            _sft_skip_ws(hb, n, st)
+                            if fname == "dtype"
+                                if st["pos"] >= n or bytes_get(hb, st["pos"]) != 34
+                                    failmsg = "st_parse: \"dtype\" must be a string"
+                                    go = 0
+                                else
+                                    st["pos"] = st["pos"] + 1
+                                    let dr = _sft_parse_string_body(hb, n, st)
+                                    if is_err(dr)
+                                        failmsg = unwrap_err(dr)
+                                        go = 0
+                                    else
+                                        dtype = unwrap(dr)
+                                        have_dtype = 1
+                            else if fname == "shape"
+                                let shr = _sft_parse_int_array(hb, n, st, depth - 1)
+                                if is_err(shr)
+                                    failmsg = unwrap_err(shr)
+                                    go = 0
+                                else
+                                    shape = unwrap(shr)
+                                    have_shape = 1
+                            else if fname == "data_offsets"
+                                let dor = _sft_parse_int_array(hb, n, st, depth - 1)
+                                if is_err(dor)
+                                    failmsg = unwrap_err(dor)
+                                    go = 0
+                                else
+                                    let offs = unwrap(dor)
+                                    if len(offs) != 2
+                                        failmsg = "st_parse: \"data_offsets\" must have exactly 2 elements"
+                                        go = 0
+                                    else
+                                        ostart = offs[0]
+                                        oend = offs[1]
+                                        have_offsets = 1
+                            else
+                                let skr = _sft_skip_value(hb, n, st, depth - 1)
+                                if is_err(skr)
+                                    failmsg = unwrap_err(skr)
+                                    go = 0
+        if failmsg != ""
+            result = err(failmsg)
+        else if have_dtype == 0
+            result = err("st_parse: tensor entry missing \"dtype\"")
+        else if have_shape == 0
+            result = err("st_parse: tensor entry missing \"shape\"")
+        else if have_offsets == 0
+            result = err("st_parse: tensor entry missing \"data_offsets\"")
+        else
+            result = ok([dtype, shape, ostart, oend])
+    return result
+
+// _sft_validate_tensors: cross-check every parsed tensor entry against the
+// data section it will be read from (see VALIDATION at the top of this
+// file for the full list of checks).
+fn _sft_validate_tensors(model, names, data_len) -> Result
+    let result = ok(1)
+    let cnt = len(names)
+    let i = 0
+    let failmsg = ""
+    while i < cnt and failmsg == ""
+        let name = names[i]
+        let entry = model[name]
+        let dtype = entry[0]
+        let shape = entry[1]
+        let ostart = entry[2]
+        let oend = entry[3]
+        let isz = _sft_dtype_size(dtype)
+        if isz == 0
+            failmsg = "st_parse: tensor " + _sft_quote(name) + " has unknown dtype " + _sft_quote(dtype)
+        else
+            let sn = len(shape)
+            let elems = 1
+            let j = 0
+            let shape_bad = 0
+            while j < sn and shape_bad == 0
+                let d = shape[j]
+                if d < 0
+                    shape_bad = 1
+                    failmsg = "st_parse: tensor " + _sft_quote(name) + " has a negative shape dimension"
+                else if d != 0 and elems > (_sft_max_elems() / d)
+                    shape_bad = 1
+                    failmsg = "st_parse: tensor " + _sft_quote(name) + " shape element count overflows the sanity limit"
+                else
+                    elems = elems * d
+                j = j + 1
+            if shape_bad == 0
+                if ostart < 0 or oend < ostart
+                    failmsg = "st_parse: tensor " + _sft_quote(name) + " has invalid data_offsets"
+                else if oend > data_len
+                    failmsg = "st_parse: tensor " + _sft_quote(name) + " data_offsets extend past the end of the data section"
+                else
+                    let expected = elems * isz
+                    if expected != oend - ostart
+                        failmsg = "st_parse: tensor " + _sft_quote(name) + " byte length " + str(oend - ostart) + " does not match dtype*shape (expected " + str(expected) + ")"
+        i = i + 1
+    if failmsg != ""
+        result = err(failmsg)
+    return result
+
+// _sft_read_u64_le: read an 8-byte little-endian value at `off`. Caller
+// must have already checked off+8 <= bytes_len(data).
+fn _sft_read_u64_le(data, off) -> int
+    let b0 = bytes_get(data, off) & 0xFF
+    let b1 = bytes_get(data, off + 1) & 0xFF
+    let b2 = bytes_get(data, off + 2) & 0xFF
+    let b3 = bytes_get(data, off + 3) & 0xFF
+    let b4 = bytes_get(data, off + 4) & 0xFF
+    let b5 = bytes_get(data, off + 5) & 0xFF
+    let b6 = bytes_get(data, off + 6) & 0xFF
+    let b7 = bytes_get(data, off + 7) & 0xFF
+    (b7 << 56) | (b6 << 48) | (b5 << 40) | (b4 << 32) | (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// st_parse: parse a complete in-memory SafeTensors file (`data`, as
+// returned by e.g. read_file_bytes) into a model value. See the WIRE
+// FORMAT / VALIDATION sections at the top of this file for exactly what
+// is accepted and rejected.
+fn st_parse(data: any) -> Result
+    let result = null
+    let total = bytes_len(data)
+    if total < 8
+        result = err("st_parse: input too short for the 8-byte header-size field")
+    else
+        let hsz = _sft_read_u64_le(data, 0)
+        if hsz < 0
+            result = err("st_parse: header size field is not a valid non-negative value")
+        else if hsz > _sft_max_header_size()
+            result = err("st_parse: header size exceeds the sanity limit of " + str(_sft_max_header_size()) + " bytes")
+        else if hsz > total - 8
+            result = err("st_parse: header extends past the end of the file")
+        else
+            let header_end = 8 + hsz
+            let hb = bytes_slice(data, 8, header_end)
+            let n = bytes_len(hb)
+            let st = {}
+            st["pos"] = 0
+            _sft_skip_ws(hb, n, st)
+            if st["pos"] >= n or bytes_get(hb, st["pos"]) != 123
+                result = err("st_parse: header is not a JSON object")
+            else
+                st["pos"] = st["pos"] + 1
+                let names = []
+                let model = {}
+                let failmsg = ""
+                let go = 1
+                while go == 1
+                    _sft_skip_ws(hb, n, st)
+                    if st["pos"] >= n
+                        failmsg = "st_parse: unterminated header object"
+                        go = 0
+                    else
+                        let b = bytes_get(hb, st["pos"])
+                        if b == 125
+                            st["pos"] = st["pos"] + 1
+                            go = 0
+                        else if b == 44
+                            st["pos"] = st["pos"] + 1
+                        else if b != 34
+                            failmsg = "st_parse: expected a string key in header object"
+                            go = 0
+                        else
+                            st["pos"] = st["pos"] + 1
+                            let kr = _sft_parse_string_body(hb, n, st)
+                            if is_err(kr)
+                                failmsg = unwrap_err(kr)
+                                go = 0
+                            else
+                                let key = unwrap(kr)
+                                _sft_skip_ws(hb, n, st)
+                                if st["pos"] >= n or bytes_get(hb, st["pos"]) != 58
+                                    failmsg = "st_parse: expected ':' after key " + _sft_quote(key)
+                                    go = 0
+                                else
+                                    st["pos"] = st["pos"] + 1
+                                    _sft_skip_ws(hb, n, st)
+                                    if key == "__metadata__"
+                                        let sr = _sft_skip_value(hb, n, st, _sft_max_depth())
+                                        if is_err(sr)
+                                            failmsg = unwrap_err(sr)
+                                            go = 0
+                                    else if _sft_is_reserved_key(key) == 1
+                                        failmsg = "st_parse: tensor name " + _sft_quote(key) + " collides with a reserved model key"
+                                        go = 0
+                                    else
+                                        let er = _sft_parse_tensor_entry(hb, n, st, _sft_max_depth())
+                                        if is_err(er)
+                                            failmsg = unwrap_err(er)
+                                            go = 0
+                                        else if contains(model, key) == 1
+                                            failmsg = "st_parse: duplicate tensor name " + _sft_quote(key)
+                                            go = 0
+                                        else
+                                            model[key] = unwrap(er)
+                                            names.push(key)
+                if failmsg != ""
+                    result = err(failmsg)
+                else
+                    _sft_skip_ws(hb, n, st)
+                    if st["pos"] != n
+                        result = err("st_parse: trailing content after the header JSON object")
+                    else
+                        let data_len = total - header_end
+                        let vr = _sft_validate_tensors(model, names, data_len)
+                        if is_err(vr)
+                            result = vr
+                        else
+                            model["__names__"] = names
+                            model["__header_size__"] = hsz
+                            model["__data_start__"] = header_end
+                            result = ok(model)
+    return result
+
+// st_tensor_names: tensor names in header order (excludes "__metadata__").
+fn st_tensor_names(model) -> list
+    model["__names__"]
+
+// st_tensor_count: number of tensors in the model.
+fn st_tensor_count(model) -> int
+    len(model["__names__"])
+
+// st_header_size: the raw header byte count N (as declared in the file).
+fn st_header_size(model) -> int
+    model["__header_size__"]
+
+// st_data_start: absolute file offset (8 + N) where the tensor data
+// section begins. Add this to an st_tensor_offset() value to get an
+// absolute offset into the original `data` bytes passed to st_parse.
+fn st_data_start(model) -> int
+    model["__data_start__"]
+
+// st_tensor_dtype: dtype string for `name` ("F32", "I64", ...), or "" if
+// `name` is not a tensor in this model.
+fn st_tensor_dtype(model, name) -> string
+    let result = ""
+    if contains(model, name) == 1 and _sft_is_reserved_key(name) == 0
+        let entry = model[name]
+        result = entry[0]
+    return result
+
+// st_tensor_shape: shape (list of dimension sizes) for `name`, or [] if
+// `name` is not a tensor in this model.
+fn st_tensor_shape(model, name) -> list
+    let result = []
+    if contains(model, name) == 1 and _sft_is_reserved_key(name) == 0
+        let entry = model[name]
+        result = entry[1]
+    return result
+
+// st_tensor_offset: [start, end] byte range for `name`, relative to the
+// start of the data section (st_data_start) — see WIRE FORMAT at the top
+// of this file. Returns [-1, -1] if `name` is not a tensor in this model.
+fn st_tensor_offset(model, name) -> list
+    let result = [-1, -1]
+    if contains(model, name) == 1 and _sft_is_reserved_key(name) == 0
+        let entry = model[name]
+        result = [entry[2], entry[3]]
+    return result

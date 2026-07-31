@@ -38,6 +38,11 @@ break/continue [deferred gen3], numeric separators [already existed], unicode es
 - `b7a5e1ca` L2a comptime Phase 2 + `\u{XXXX}` unicode escapes (GAP-4 closed)
 - `9c81807c` for-in-channel iteration (GAP-2 closed: `for val in ch` drains until close)
 - `9aee01e4` labeled break/continue parser+codegen (GAP-1 DEFERRED: gen3 truncation)
+- `a6355d99` docs: tick plan files — L6/L1a/L2a DONE, all 4 appendix gaps CLOSED
+- `c488cace` docs: comprehensive plan audit — tick 25+ items verified against live code
+- (pending) pack module float support: f64/f32 pack/unpack via IEEE 754 bitcast (47-check KAT)
+- (pending) model loaders: ONNX 565L + GGUF 497L + SafeTensors 956L (all KAT-verified GREEN)
+- (pending) AWS SQS 506L + SNS 752L std modules (verifying)
 
 **Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
 `3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic

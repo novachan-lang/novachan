@@ -1,0 +1,297 @@
+// Canonical KAT test for std/ml/safetensors_loader (SafeTensors model-file
+// header parser). Constructs minimal, well-formed SafeTensors buffers
+// entirely in-memory (no real model file needed) — plus a battery of
+// malformed/adversarial buffers — and verifies:
+//   PART A — valid multi-tensor header + "__metadata__" parses correctly,
+//            every accessor returns the right value, and an unknown tensor
+//            name returns the documented safe defaults.
+//   PART B — every VALIDATION rule documented at the top of
+//            safetensors_loader.nova actually rejects (Err), one bug class
+//            at a time: truncated input, header-size overrun, non-object
+//            header, unterminated object, trailing content, missing
+//            required field, unknown dtype, malformed data_offsets,
+//            dtype*shape byte-length mismatch, data_offsets past the data
+//            section, negative shape dimension, duplicate tensor name, and
+//            a tensor name colliding with a reserved model key.
+//   PART C — the JSON-nesting recursion-depth DoS guard: a "__metadata__"
+//            value nested far beyond the depth cap (both unterminated and
+//            fully balanced) is rejected promptly rather than hanging or
+//            crashing, while an ordinary shallow-nested value still parses.
+//   PART D — \uXXXX string-escape handling: a BMP code point decodes to
+//            the correct UTF-8 bytes, and both a NUL-producing escape and
+//            an unpaired surrogate escape are rejected rather than
+//            silently corrupting/truncating the resulting string.
+//   PART E — a zero-rank ("scalar") tensor (shape = []) sizes correctly,
+//            and an unrecognized extra field on a tensor entry is skipped
+//            rather than rejected (forward compatibility).
+import std/ml/safetensors_loader
+
+fn eq_i(name, got, want)
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+fn eq_s(name, got, want)
+    if got != want
+        print("FAIL " + name + ": got [" + got + "] want [" + want + "]")
+        exit(1)
+    print("ok " + name)
+
+fn eq_l(name, got, want)
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+// is_parse_err: 1 iff st_parse(b) is Err, 0 iff it is Ok.
+fn is_parse_err(b) -> int
+    let r = 0
+    if is_err(st_parse(b)) == 1
+        r = 1
+    return r
+
+// _parse_ok: parse-or-fail helper for buffers built to be well-formed. An
+// Err here means the KAT's OWN test data is broken, so it fails loudly
+// rather than silently continuing with a null model.
+fn _parse_ok(b) -> any
+    let r = null
+    let pr = st_parse(b)
+    if is_ok(pr) == 1
+        r = unwrap(pr)
+    else
+        print("FAIL: unexpected parse error building test fixture: " + unwrap_err(pr))
+        exit(1)
+    return r
+
+// ── little-endian byte-writing + buffer-assembly helpers (test-data
+//    construction only — safetensors_loader.nova itself never writes) ──────
+
+fn _w_u64le(v) -> any
+    let out = bytes_create(0)
+    let i = 0
+    while i < 8
+        out = bytes_append(out, (v >> (i * 8)) & 0xFF)
+        i = i + 1
+    out
+
+// _build: assemble a full SafeTensors buffer from a header JSON string and
+// a data-section length (filled with a deterministic, otherwise-irrelevant
+// byte pattern — safetensors_loader.nova never interprets tensor data
+// bytes, only validates the data_offsets span against this length).
+fn _build(header_json, data_len) -> any
+    let hb = str_to_bytes(header_json)
+    let hlen = bytes_len(hb)
+    let buf = bytes_create(0)
+    buf = bytes_concat(buf, _w_u64le(hlen))
+    buf = bytes_concat(buf, hb)
+    let k = 0
+    while k < data_len
+        buf = bytes_append(buf, k - (k / 256) * 256)
+        k = k + 1
+    return buf
+
+// ── PART A: valid multi-tensor header + metadata ────────────────────────────
+fn part_a_valid()
+    let ob = chr(123)
+    let cb = chr(125)
+    // {"__metadata__":{"format":"pt","note":"test model","nested":{"a":1,"b":[1,2,3]}},
+    //  "w1":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},
+    //  "b1":{"dtype":"I64","shape":[3],"data_offsets":[16,40]}}
+    let meta = ob + "\"format\":\"pt\",\"note\":\"test model\",\"nested\":" + ob + "\"a\":1,\"b\":[1,2,3]" + cb + cb
+    let t_w1 = ob + "\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]" + cb
+    let t_b1 = ob + "\"dtype\":\"I64\",\"shape\":[3],\"data_offsets\":[16,40]" + cb
+    let hdr = ob + "\"__metadata__\":" + meta + ",\"w1\":" + t_w1 + ",\"b1\":" + t_b1 + cb
+    let buf = _build(hdr, 40)
+
+    let model = _parse_ok(buf)
+    eq_i("A tensor_count", st_tensor_count(model), 2)
+
+    let names = st_tensor_names(model)
+    eq_i("A names len", len(names), 2)
+    eq_s("A names[0]", names[0], "w1")
+    eq_s("A names[1]", names[1], "b1")
+
+    eq_s("A w1 dtype", st_tensor_dtype(model, "w1"), "F32")
+    eq_l("A w1 shape", st_tensor_shape(model, "w1"), [2, 2])
+    eq_l("A w1 offset", st_tensor_offset(model, "w1"), [0, 16])
+
+    eq_s("A b1 dtype", st_tensor_dtype(model, "b1"), "I64")
+    eq_l("A b1 shape", st_tensor_shape(model, "b1"), [3])
+    eq_l("A b1 offset", st_tensor_offset(model, "b1"), [16, 40])
+
+    let hlen = bytes_len(str_to_bytes(hdr))
+    eq_i("A header_size", st_header_size(model), hlen)
+    eq_i("A data_start", st_data_start(model), 8 + hlen)
+
+    // unknown tensor name -> documented safe defaults, never a crash
+    eq_s("A unknown dtype", st_tensor_dtype(model, "does_not_exist"), "")
+    eq_l("A unknown shape", st_tensor_shape(model, "does_not_exist"), [])
+    eq_l("A unknown offset", st_tensor_offset(model, "does_not_exist"), [-1, -1])
+
+    // "__metadata__" itself is never exposed as a tensor
+    eq_i("A metadata not a tensor", contains(names, "__metadata__"), 0)
+
+    print("PART A (valid multi-tensor + metadata) ok")
+
+// ── PART B: every documented VALIDATION rule actually rejects ──────────────
+fn part_b_malformed()
+    let ob = chr(123)
+    let cb = chr(125)
+
+    // B1: fewer than 8 bytes total.
+    eq_i("B1 too-short input rejected", is_parse_err(bytes_create(4)), 1)
+
+    // B2: header_size claims more bytes than the buffer actually has.
+    let hdr_small = ob + cb
+    let hb_small = str_to_bytes(hdr_small)
+    let buf_b2 = bytes_create(0)
+    buf_b2 = bytes_concat(buf_b2, _w_u64le(bytes_len(hb_small) + 100))
+    buf_b2 = bytes_concat(buf_b2, hb_small)
+    eq_i("B2 header-size overrun rejected", is_parse_err(buf_b2), 1)
+
+    // B3: header is not a JSON object at all.
+    let buf_b3 = _build("not json", 0)
+    eq_i("B3 non-object header rejected", is_parse_err(buf_b3), 1)
+
+    // B4: unterminated header object (missing the final '}').
+    let hdr_b4 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb
+    let buf_b4 = _build(hdr_b4, 4)
+    eq_i("B4 unterminated object rejected", is_parse_err(buf_b4), 1)
+
+    // B5: trailing content after an otherwise-valid header object.
+    let buf_b5 = _build(ob + cb + "garbage", 0)
+    eq_i("B5 trailing content rejected", is_parse_err(buf_b5), 1)
+
+    // B6: tensor entry missing "dtype".
+    let hdr_b6 = ob + "\"w1\":" + ob + "\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B6 missing dtype rejected", is_parse_err(_build(hdr_b6, 4)), 1)
+
+    // B7: tensor entry missing "shape".
+    let hdr_b7 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B7 missing shape rejected", is_parse_err(_build(hdr_b7, 4)), 1)
+
+    // B8: tensor entry missing "data_offsets".
+    let hdr_b8 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1]" + cb + cb
+    eq_i("B8 missing data_offsets rejected", is_parse_err(_build(hdr_b8, 4)), 1)
+
+    // B9: unrecognized dtype string.
+    let hdr_b9 = ob + "\"w1\":" + ob + "\"dtype\":\"WEIRD\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B9 unknown dtype rejected", is_parse_err(_build(hdr_b9, 4)), 1)
+
+    // B10: "data_offsets" with the wrong element count (must be exactly 2).
+    let hdr_b10 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4,8]" + cb + cb
+    eq_i("B10 3-element data_offsets rejected", is_parse_err(_build(hdr_b10, 8)), 1)
+
+    // B11: byte span does not match dtype*shape (F32 x 2 elems = 8 bytes,
+    // but data_offsets claims only 4) -- catches silent corruption, not
+    // just malformed JSON.
+    let hdr_b11 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B11 dtype*shape byte-length mismatch rejected", is_parse_err(_build(hdr_b11, 8)), 1)
+
+    // B12: data_offsets end runs past the actual data section length.
+    let hdr_b12 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B12 data_offsets past data section rejected", is_parse_err(_build(hdr_b12, 2)), 1)
+
+    // B13: negative shape dimension.
+    let hdr_b13 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[-1,2],\"data_offsets\":[0,8]" + cb + cb
+    eq_i("B13 negative shape dim rejected", is_parse_err(_build(hdr_b13, 8)), 1)
+
+    // B14: duplicate tensor name.
+    let hdr_b14 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + ",\"w1\":" + ob + "\"dtype\":\"I64\",\"shape\":[1],\"data_offsets\":[4,12]" + cb + cb
+    eq_i("B14 duplicate tensor name rejected", is_parse_err(_build(hdr_b14, 12)), 1)
+
+    // B15: tensor literally named a reserved model key.
+    let hdr_b15 = ob + "\"__names__\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B15 reserved-key tensor name rejected", is_parse_err(_build(hdr_b15, 4)), 1)
+
+    // B16: a well-formed file (positive control) parses fine, proving B1-B15
+    // are not simply rejecting everything.
+    let hdr_b16 = ob + "\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    eq_i("B16 positive control still accepted", is_parse_err(_build(hdr_b16, 4)), 0)
+
+    print("PART B (VALIDATION rules) ok -- every documented rejection rejects, positive control still passes")
+
+// ── PART C: JSON-nesting recursion-depth DoS guard ──────────────────────────
+fn part_c_depth_dos()
+    let ob = chr(123)
+
+    // C1: ~20000 unmatched '[' inside "__metadata__" -- pre-fix (no depth
+    // cap) this would recurse ~20000 native stack frames deep. Must be
+    // rejected promptly, not hang and not crash (kill-on-timeout would
+    // catch a hang; a fabricated fix would time out here).
+    let deep_open = repeat("[", 20000)
+    let buf_c1 = _build(ob + "\"__metadata__\":" + deep_open, 0)
+    eq_i("C1 20000-deep unterminated metadata rejected", is_parse_err(buf_c1), 1)
+
+    // C2: same idea but FULLY BALANCED (2000 opens + 2000 matching closes,
+    // well beyond the depth cap) -- proves the cap fires going IN, before
+    // ever reaching the matching ']'s; a document that WOULD balance is
+    // still too deep.
+    let deep_balanced = repeat("[", 2000) + repeat("]", 2000)
+    let buf_c2 = _build(ob + "\"__metadata__\":" + deep_balanced, 0)
+    eq_i("C2 2000-deep balanced metadata rejected", is_parse_err(buf_c2), 1)
+
+    // C3: a moderately nested but well-formed metadata value, comfortably
+    // inside the cap, must still parse correctly alongside a real tensor --
+    // the fix must not reject ordinary, merely-nested input.
+    let shallow = repeat("[", 10) + "1" + repeat("]", 10)
+    let cb = chr(125)
+    let hdr_c3 = ob + "\"__metadata__\":" + shallow + ",\"w1\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    let model_c3 = _parse_ok(_build(hdr_c3, 4))
+    eq_i("C3 shallow-nested metadata still parses", st_tensor_count(model_c3), 1)
+
+    print("PART C (recursion-depth DoS guard) ok -- 20000-deep and 2000-deep-balanced rejected without hang, shallow nesting still parses")
+
+// ── PART D: \uXXXX escape handling ───────────────────────────────────────────
+fn part_d_unicode()
+    let ob = chr(123)
+    let cb = chr(125)
+
+    // D1: a tensor name containing é (BMP code point, "e with acute
+    // accent") must decode to the correct UTF-8 bytes. \\u00e9 in this
+    // NOVA source literal is the two-character escape "\\" then "u00e9",
+    // i.e. the runtime JSON text literally contains the 6-byte escape
+    // sequence é for the parser to decode.
+    let hdr_d1 = ob + "\"caf\\u00e9\":" + ob + "\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]" + cb + cb
+    let model_d1 = _parse_ok(_build(hdr_d1, 4))
+    let want_name = "caf" + from_codepoint(0xe9)
+    let names_d1 = st_tensor_names(model_d1)
+    eq_i("D1 decoded name len", len(names_d1), 1)
+    eq_s("D1 \\u00e9 decodes to correct UTF-8", names_d1[0], want_name)
+
+    // D2: a NUL-producing escape inside a string value must
+    // be rejected, not silently truncate the resulting NOVA string.
+    let hdr_d2 = ob + "\"__metadata__\":" + ob + "\"bad\":\"x\\u0000y\"" + cb + cb
+    eq_i("D2 \\u0000 escape rejected", is_parse_err(_build(hdr_d2, 0)), 1)
+
+    // D3: an unpaired high surrogate must be rejected, not silently
+    // produce a garbage/partial code point.
+    let hdr_d3 = ob + "\"__metadata__\":" + ob + "\"bad\":\"x\\ud800y\"" + cb + cb
+    eq_i("D3 unpaired surrogate rejected", is_parse_err(_build(hdr_d3, 0)), 1)
+
+    print("PART D (\\uXXXX escape handling) ok")
+
+// ── PART E: zero-rank tensor + forward-compatible extra field ──────────────
+fn part_e_scalar_and_extra_field()
+    let ob = chr(123)
+    let cb = chr(125)
+    // shape=[] (scalar, 1 element) with an unrecognized extra field
+    // ("extra_field", itself a nested object) that must be generically
+    // skipped rather than rejected.
+    let hdr = ob + "\"scalar\":" + ob + "\"dtype\":\"F32\",\"shape\":[],\"data_offsets\":[0,4],\"extra_field\":" + ob + "\"nested\":[1,2,3]" + cb + cb + cb
+    let model = _parse_ok(_build(hdr, 4))
+    eq_i("E tensor_count", st_tensor_count(model), 1)
+    eq_l("E scalar shape is empty", st_tensor_shape(model, "scalar"), [])
+    eq_l("E scalar offset", st_tensor_offset(model, "scalar"), [0, 4])
+    eq_s("E scalar dtype", st_tensor_dtype(model, "scalar"), "F32")
+
+    print("PART E (zero-rank tensor + forward-compatible extra field) ok")
+
+fn main()
+    part_a_valid()
+    part_b_malformed()
+    part_c_depth_dos()
+    part_d_unicode()
+    part_e_scalar_and_extra_field()
+    print("SAFETENSORS-LOADER KAT PASS")

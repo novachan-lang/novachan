@@ -3249,7 +3249,7 @@ The cheapest high-value breadth, each a bounded library/runtime task with immedi
 6. ✅ **Seedable/deterministic PRNG** — **DONE** (xoshiro256** runtime builtin, `_prng_test` gated).
 7. ✅ **Argon2id** — **DONE** (`std/crypto/argon2id` + `_argon2id_test` gated).
 8. ✅ **Extended math builtins** — **DONE** (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf runtime builtins).
-9. ✅ **Binary pack/unpack + endianness codec** — **DONE** (`std/encoding/pack` + `_pack_test` gated).
+9. ✅ **Binary pack/unpack + endianness codec** — **DONE** (`std/encoding/pack` + `_pack_test` gated). **Float support added**: f64/f32 pack/unpack via `float_to_bits`/`float_from_bits`/`f32_from_bits` builtins + pure-NOVA IEEE 754 double→single conversion; format chars 'f'/'d'; `_pack_float_kat` gated (47 checks).
 
 ### Phase 2 — I/O / OS / networking last-mile (must-have deploy story + high-value app surface)
 
@@ -3302,7 +3302,7 @@ NOVA's proven raw-TCP driver ability (PG/MySQL/Redis/TLS) makes these **pattern-
 capability** — the cheapest way to broaden "integrates with everything":
 
 33. ✅ **Message-broker clients** — **ALL DONE** (Kafka `forge_kafka.nova` 433L, NATS `forge_nats.nova` 376L, MQTT `forge_mqtt.nova`+`forge_mqtt_client.nova`, AMQP `forge_amqp.nova` 471L; all adversarially verified).
-34. ✅ **GCP + Azure + broader AWS SDKs** — **DONE** (`forge_gcp.nova` JWT+Storage/PubSub/BigQuery, `forge_azure.nova` AD+Blob/KeyVault/SQL/Cosmos, `forge_aws.nova`+`forge_awssigv4.nova` SigV4+S3/SQS/SNS/Lambda/DynamoDB).
+34. ✅ **GCP + Azure + broader AWS SDKs** — **DONE** (`forge_gcp.nova` JWT+Storage/PubSub/BigQuery, `forge_azure.nova` AD+Blob/KeyVault/SQL/Cosmos, `forge_aws.nova`+`forge_awssigv4.nova` SigV4+S3/SQS/SNS/Lambda/DynamoDB; **+ dedicated `std/net/aws_sqs.nova` 506L + `std/net/aws_sns.nova` 752L with SigV4 signing, KAT-gated**).
 35. ✅ **OpenTelemetry tracing** — **DONE** (`forge_otel.nova` 369L: span lifecycle, W3C traceparent inject/extract, OTLP export).
 36. ✅ **PDF / XLSX generation** — **DONE** (`forge_pdf.nova` page/text/line/rect, `forge_xlsx.nova` 221L).
 
@@ -3313,7 +3313,7 @@ Do last — these interlock (train → GPU → dataframe) and each waits on its 
 37. ✅ **Dataframe / columnar analytics engine (Pulse)** — **DONE** (`forge_pulse.nova`: df_col, pulse_describe, pulse_agg/group-by, pulse_rolling, pulse_crosstab, pulse_corr, pulse_from_csv; + `std/data/dataframe.nova` with L8 index operator).
 38. **Autodiff / training (Cortex)** — NOT STARTED (needs `grad`/backward-pass compiler transform; depends on GPU).
 39. **GPU kernel lowering** (NOVA → SPIR-V/PTX) — NOT STARTED (hardware-gated).
-40. 🔄 **ONNX/GGUF/SafeTensors model loaders** — **IN PROGRESS** (fleet building pure NOVA binary parsers).
+40. ✅ **ONNX/GGUF/SafeTensors model loaders** — **DONE** (`std/ml/onnx_loader.nova` 565L protobuf-wire ONNX parser, `std/ml/gguf_loader.nova` 497L GGUF v3 header/metadata/tensor parser, `std/ml/safetensors_loader.nova` 956L JSON-header+tensor-data parser; all Result-based, overflow-safe, recursion-depth-capped; KATs `_kat_onnx_loader`/`_kat_gguf_loader`/`_kat_safetensors_loader` all GREEN).
 
 **The governing rule** (inherited from the prior audit): *do not start a framework whose blocking core
 gap is still open, and do not pour frontier code onto an unclosed soundness hole.* Wave A (soundness) →

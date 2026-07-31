@@ -1,0 +1,497 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/gguf_loader (GGUF model-file parser)
+// ============================================================================
+import std/encoding/pack
+// WHAT: GGUF (github.com/ggerganov/ggml, used by llama.cpp) is the on-disk
+// format for quantized/full-precision LLM weight files. This module parses
+// the HEADER + METADATA + TENSOR-INFO sections into a plain NOVA `dict` (the
+// "model" value returned by gguf_parse) — it does NOT read the tensor DATA
+// payload itself (that lives past all tensor-info entries, at each tensor's
+// own recorded byte offset, and is typically gigabytes — a caller that wants
+// raw weight bytes reads them directly from the source `bytes`/file at
+// `gguf_tensor_info(model, name)["offset"]`, exactly as llama.cpp's own
+// gguf_init_from_file() separates header parsing from tensor-data mmap).
+//
+// WIRE LAYOUT (little-endian throughout — GGUF is an x86/ARM-native format):
+//   magic            4 bytes   ASCII "GGUF" (0x47 0x47 0x55 0x46)
+//   version          u32       currently 3 (v1/v2 used a 32-bit tensor/kv
+//                               count instead of 64-bit; NOT accepted here —
+//                               see VERSION SCOPE below)
+//   tensor_count     u64
+//   metadata_kv_count u64
+//   metadata[metadata_kv_count]:
+//     key_len        u64
+//     key            key_len bytes, UTF-8 (no NUL terminator)
+//     value_type     u32       (see VALUE TYPES below)
+//     value          per value_type
+//   tensor_info[tensor_count]:
+//     name_len       u64
+//     name           name_len bytes, UTF-8
+//     n_dims         u32
+//     dims[n_dims]   u64 each
+//     type           u32       (ggml tensor dtype enum — passed through
+//                               as-is, not interpreted by this module)
+//     offset         u64       byte offset of the tensor's data, RELATIVE to
+//                               the start of the (alignment-padded) tensor
+//                               data block, not the file itself
+//
+// VALUE TYPES (metadata value_type / array element_type tag):
+//   0 UINT8   1 INT8   2 UINT16   3 INT16   4 UINT32   5 INT32
+//   6 FLOAT32 7 BOOL    8 STRING   9 ARRAY   10 UINT64  11 INT64  12 FLOAT64
+//   ARRAY payload = element_type:u32, count:u64, then `count` values of
+//   element_type back-to-back (recursively — this module supports nested
+//   arrays too, bounded to 64 levels deep as a hostile-input guard, even
+//   though no real GGUF producer emits array-of-array).
+//
+// VERSION SCOPE. Only GGUF v3 (u64 tensor/kv counts) is implemented — this
+// is the version every current llama.cpp release writes. v1 (u32 counts,
+// no alignment key) and v2 (u64 counts, different metadata value-type
+// numbering for a couple of legacy types) are pre-2023 formats no longer
+// produced in practice; gguf_parse rejects any version other than 3 with a
+// clear err() rather than silently misreading a v1/v2 file with v3 framing
+// (a version-numbering mismatch is exactly the "guessed wrong, corrupted
+// silently" failure class this module refuses to have — see SAFETY below).
+//
+// NOVA int IS 64-bit signed two's complement — a GGUF value that is
+// genuinely unsigned and >= 2^63 (an absurd tensor offset/count in practice)
+// decodes to a negative NOVA int, identically to how std/encoding/pack's own
+// unpack_u64_le documents this same representational limit. Every count/
+// length actually used as a loop bound or size by this module is explicitly
+// checked to be >= 0 first and rejected via err() otherwise — a wrapped-
+// negative "count" can never be misread as a huge positive one.
+//
+// NO NESTED DICTS. The returned "model" value and every dict this module
+// hands back (gguf_metadata, gguf_tensor_info) are single-level: a dict's
+// values are scalars or LISTS, never another dict. Per-tensor shape info
+// (dims/type/offset) is instead stored as four PARALLEL lists on the model,
+// indexed together by tensor position; gguf_tensor_info(model, name)
+// zips them into a fresh single-level dict {dims, type, offset} on demand.
+//
+// SAFETY (adversarial/truncated/hostile input). Every multi-byte read is
+// bounds-checked BEFORE the read (never a runtime clamp-and-guess), using
+// the overflow-safe `need > n - pos` form (not `pos + need > n`, which can
+// wrap for a pathological huge `pos` — the same overflow class documented
+// in std/encoding/ubjson's decoder soundness notes) via `_gg_room`. Every
+// length/count field (string length, array count, n_dims, tensor/kv counts)
+// is rejected via err() if it decodes negative, rather than silently
+// truncated to 0 or treated as a huge unsigned magnitude. Array/metadata
+// nesting is depth-capped (64) against a crafted ARRAY-of-ARRAY chain.
+// Because every loop consumes at least one input byte per iteration, total
+// work is bounded by the buffer size itself — no separate iteration cap is
+// needed to prevent a hostile huge tensor_count/kv_count/n_dims/array-count
+// from spinning: the very first out-of-range read past the real data ends
+// the loop with err() immediately.
+//
+// PUBLIC API
+//   gguf_parse(data: bytes)        -> Result   Ok(model dict) / Err(message)
+//   gguf_version(model)            -> int
+//   gguf_tensor_count(model)       -> int
+//   gguf_metadata(model)           -> dict      key -> value (scalar or list)
+//   gguf_tensor_names(model)       -> list      of string, file order
+//   gguf_tensor_info(model, name)  -> dict      {dims:list, type:int,
+//                                                 offset:int}; {} if name
+//                                                 is not a tensor in model
+//   gguf_arch(model)               -> string    general.architecture value,
+//                                                 "" if absent/not a string
+
+// ── metadata value-type tag constants ──────────────────────────────────────
+fn _gg_vt_uint8() -> int
+    0
+fn _gg_vt_int8() -> int
+    1
+fn _gg_vt_uint16() -> int
+    2
+fn _gg_vt_int16() -> int
+    3
+fn _gg_vt_uint32() -> int
+    4
+fn _gg_vt_int32() -> int
+    5
+fn _gg_vt_float32() -> int
+    6
+fn _gg_vt_bool() -> int
+    7
+fn _gg_vt_string() -> int
+    8
+fn _gg_vt_array() -> int
+    9
+fn _gg_vt_uint64() -> int
+    10
+fn _gg_vt_int64() -> int
+    11
+fn _gg_vt_float64() -> int
+    12
+
+fn _gg_max_depth() -> int
+    64
+
+// ── bounds check: does [pos, pos+need) fit inside a buffer of length n? ────
+// Overflow-safe form: requires pos in [0, n] first (so n - pos cannot
+// underflow), then compares `need` against the remaining room directly
+// rather than computing `pos + need` (which could wrap for a hostile huge
+// pos/need pair) — see SAFETY note in the header.
+fn _gg_room(n, pos, need) -> int
+    let ok_room = 1
+    if pos < 0 or pos > n
+        ok_room = 0
+    else if need < 0
+        ok_room = 0
+    else if need > n - pos
+        ok_room = 0
+    ok_room
+
+// ── fixed-width little-endian readers -> [value, next_pos, err] ────────────
+fn _gg_read_u32(b, pos) -> list
+    let n = bytes_len(b)
+    let val = 0
+    let next = pos
+    let errmsg = ""
+    if _gg_room(n, pos, 4) == 0
+        errmsg = "gguf: truncated u32 at " + str(pos)
+    else
+        val = unpack_u32_le(b, pos)
+        next = pos + 4
+    [val, next, errmsg]
+
+fn _gg_read_u64(b, pos) -> list
+    let n = bytes_len(b)
+    let val = 0
+    let next = pos
+    let errmsg = ""
+    if _gg_room(n, pos, 8) == 0
+        errmsg = "gguf: truncated u64 at " + str(pos)
+    else
+        val = unpack_u64_le(b, pos)
+        next = pos + 8
+    [val, next, errmsg]
+
+// ── length-prefixed UTF-8 string: u64 len + bytes -> [str, next_pos, err] ──
+fn _gg_read_string(b, pos) -> list
+    let n = bytes_len(b)
+    let val = ""
+    let next = pos
+    let errmsg = ""
+    let lr = _gg_read_u64(b, pos)
+    if lr[2] != ""
+        errmsg = lr[2]
+        next = lr[1]
+    else
+        let slen = lr[0]
+        let sp = lr[1]
+        if slen < 0
+            errmsg = "gguf: negative string length at " + str(pos)
+            next = sp
+        else if _gg_room(n, sp, slen) == 0
+            errmsg = "gguf: truncated string data at " + str(sp)
+            next = sp
+        else
+            let sb = bytes_slice(b, sp, sp + slen)
+            val = bytes_to_str(sb)
+            next = sp + slen
+    [val, next, errmsg]
+
+// ── one metadata value of a given type tag -> [value, next_pos, err] ──────
+// `depth` guards against a crafted ARRAY-of-ARRAY chain (see header).
+fn _gg_read_value(b, pos, vtype, depth) -> list
+    let n = bytes_len(b)
+    let val = null
+    let next = pos
+    let errmsg = ""
+    if depth > _gg_max_depth()
+        errmsg = "gguf: metadata array nesting too deep at " + str(pos)
+    else if vtype == _gg_vt_uint8() or vtype == _gg_vt_bool()
+        if _gg_room(n, pos, 1) == 0
+            errmsg = "gguf: truncated uint8/bool value at " + str(pos)
+        else
+            val = unpack_u8(b, pos)
+            next = pos + 1
+    else if vtype == _gg_vt_int8()
+        if _gg_room(n, pos, 1) == 0
+            errmsg = "gguf: truncated int8 value at " + str(pos)
+        else
+            val = unpack_i8(b, pos)
+            next = pos + 1
+    else if vtype == _gg_vt_uint16()
+        if _gg_room(n, pos, 2) == 0
+            errmsg = "gguf: truncated uint16 value at " + str(pos)
+        else
+            val = unpack_u16_le(b, pos)
+            next = pos + 2
+    else if vtype == _gg_vt_int16()
+        if _gg_room(n, pos, 2) == 0
+            errmsg = "gguf: truncated int16 value at " + str(pos)
+        else
+            val = unpack_i16_le(b, pos)
+            next = pos + 2
+    else if vtype == _gg_vt_uint32()
+        if _gg_room(n, pos, 4) == 0
+            errmsg = "gguf: truncated uint32 value at " + str(pos)
+        else
+            val = unpack_u32_le(b, pos)
+            next = pos + 4
+    else if vtype == _gg_vt_int32()
+        if _gg_room(n, pos, 4) == 0
+            errmsg = "gguf: truncated int32 value at " + str(pos)
+        else
+            val = unpack_i32_le(b, pos)
+            next = pos + 4
+    else if vtype == _gg_vt_float32()
+        if _gg_room(n, pos, 4) == 0
+            errmsg = "gguf: truncated float32 value at " + str(pos)
+        else
+            let bits32 = unpack_u32_le(b, pos)
+            val = f32_from_bits(bits32)
+            next = pos + 4
+    else if vtype == _gg_vt_uint64()
+        if _gg_room(n, pos, 8) == 0
+            errmsg = "gguf: truncated uint64 value at " + str(pos)
+        else
+            val = unpack_u64_le(b, pos)
+            next = pos + 8
+    else if vtype == _gg_vt_int64()
+        if _gg_room(n, pos, 8) == 0
+            errmsg = "gguf: truncated int64 value at " + str(pos)
+        else
+            val = unpack_i64_le(b, pos)
+            next = pos + 8
+    else if vtype == _gg_vt_float64()
+        if _gg_room(n, pos, 8) == 0
+            errmsg = "gguf: truncated float64 value at " + str(pos)
+        else
+            let bits64 = unpack_u64_le(b, pos)
+            val = float_from_bits(bits64)
+            next = pos + 8
+    else if vtype == _gg_vt_string()
+        let sr = _gg_read_string(b, pos)
+        val = sr[0]
+        next = sr[1]
+        errmsg = sr[2]
+    else if vtype == _gg_vt_array()
+        let ar = _gg_read_array(b, pos, depth)
+        val = ar[0]
+        next = ar[1]
+        errmsg = ar[2]
+    else
+        errmsg = "gguf: unknown metadata value type " + str(vtype) + " at " + str(pos)
+    [val, next, errmsg]
+
+// ── ARRAY value body: element_type:u32, count:u64, then count elements ────
+// -> [list, next_pos, err]. Bounded by buffer size (see header SAFETY) —
+// no separate cap on `count` is needed beyond that.
+fn _gg_read_array(b, pos, depth) -> list
+    let out = []
+    let next = pos
+    let errmsg = ""
+    let etr = _gg_read_u32(b, pos)
+    if etr[2] != ""
+        errmsg = etr[2]
+        next = etr[1]
+    else
+        let elem_type = etr[0]
+        let cr = _gg_read_u64(b, etr[1])
+        if cr[2] != ""
+            errmsg = cr[2]
+            next = cr[1]
+        else
+            let count = cr[0]
+            let cur = cr[1]
+            if count < 0
+                errmsg = "gguf: negative array element count at " + str(pos)
+                next = cur
+            else
+                let i = 0
+                let done = 0
+                while i < count and done == 0
+                    let vr = _gg_read_value(b, cur, elem_type, depth + 1)
+                    if vr[2] != ""
+                        errmsg = vr[2]
+                        done = 1
+                    else
+                        push(out, vr[0])
+                        cur = vr[1]
+                        i = i + 1
+                next = cur
+    [out, next, errmsg]
+
+// ── top-level entry point ───────────────────────────────────────────────
+// Ok(model) for a well-formed v3 GGUF buffer, Err(message) for anything
+// malformed/truncated/hostile/unsupported-version. Never exits, never
+// crashes, never hangs (see header SAFETY).
+fn gguf_parse(data) -> Result
+    let n = bytes_len(data)
+    if n < 4
+        return err("gguf_parse: buffer too small for magic")
+    let m0 = bytes_get(data, 0) & 0xFF
+    let m1 = bytes_get(data, 1) & 0xFF
+    let m2 = bytes_get(data, 2) & 0xFF
+    let m3 = bytes_get(data, 3) & 0xFF
+    if m0 != 0x47 or m1 != 0x47 or m2 != 0x55 or m3 != 0x46
+        return err("gguf_parse: bad magic (not a GGUF file)")
+
+    let vr = _gg_read_u32(data, 4)
+    if vr[2] != ""
+        return err(vr[2])
+    let version = vr[0]
+    if version != 3
+        return err("gguf_parse: unsupported GGUF version " + str(version) + " (only v3 is implemented)")
+
+    let tcr = _gg_read_u64(data, vr[1])
+    if tcr[2] != ""
+        return err(tcr[2])
+    let tensor_count = tcr[0]
+    if tensor_count < 0
+        return err("gguf_parse: negative tensor count")
+
+    let kvr = _gg_read_u64(data, tcr[1])
+    if kvr[2] != ""
+        return err(kvr[2])
+    let kv_count = kvr[0]
+    if kv_count < 0
+        return err("gguf_parse: negative metadata kv count")
+
+    let pos = kvr[1]
+    let meta_keys = []
+    let meta_vals = []
+    let i = 0
+    while i < kv_count
+        let kr = _gg_read_string(data, pos)
+        if kr[2] != ""
+            return err(kr[2])
+        let key = kr[0]
+        let vtr = _gg_read_u32(data, kr[1])
+        if vtr[2] != ""
+            return err(vtr[2])
+        let vt = vtr[0]
+        let vr2 = _gg_read_value(data, vtr[1], vt, 0)
+        if vr2[2] != ""
+            return err(vr2[2])
+        push(meta_keys, key)
+        push(meta_vals, vr2[0])
+        pos = vr2[1]
+        i = i + 1
+
+    let tensor_names = []
+    let tensor_dims = []
+    let tensor_types = []
+    let tensor_offsets = []
+    let j = 0
+    while j < tensor_count
+        let nr = _gg_read_string(data, pos)
+        if nr[2] != ""
+            return err(nr[2])
+        let tname = nr[0]
+        let ndr = _gg_read_u32(data, nr[1])
+        if ndr[2] != ""
+            return err(ndr[2])
+        let ndims = ndr[0]
+        if ndims < 0
+            return err("gguf_parse: negative n_dims for tensor '" + tname + "'")
+        let dims = []
+        let dp = ndr[1]
+        let d = 0
+        while d < ndims
+            let dr = _gg_read_u64(data, dp)
+            if dr[2] != ""
+                return err(dr[2])
+            push(dims, dr[0])
+            dp = dr[1]
+            d = d + 1
+        let ttr = _gg_read_u32(data, dp)
+        if ttr[2] != ""
+            return err(ttr[2])
+        let ttype = ttr[0]
+        let tor = _gg_read_u64(data, ttr[1])
+        if tor[2] != ""
+            return err(tor[2])
+        let toffset = tor[0]
+        push(tensor_names, tname)
+        push(tensor_dims, dims)
+        push(tensor_types, ttype)
+        push(tensor_offsets, toffset)
+        pos = tor[1]
+        j = j + 1
+
+    let model = {}
+    model["version"] = version
+    model["tensor_count"] = tensor_count
+    model["metadata_count"] = kv_count
+    model["metadata_keys"] = meta_keys
+    model["metadata_values"] = meta_vals
+    model["tensor_names"] = tensor_names
+    model["tensor_dims"] = tensor_dims
+    model["tensor_types"] = tensor_types
+    model["tensor_offsets"] = tensor_offsets
+    return ok(model)
+
+// ── accessors ───────────────────────────────────────────────────────────
+
+fn gguf_version(model) -> int
+    let out = 0
+    if contains(model, "version") == 1
+        out = model["version"]
+    out
+
+fn gguf_tensor_count(model) -> int
+    let out = 0
+    if contains(model, "tensor_count") == 1
+        out = model["tensor_count"]
+    out
+
+// key -> value (scalar, or a list for an ARRAY-typed metadata entry). A
+// single-level dict — see NO NESTED DICTS in the header.
+fn gguf_metadata(model) -> dict
+    let out = {}
+    if contains(model, "metadata_keys") == 1 and contains(model, "metadata_values") == 1
+        let keys_list = model["metadata_keys"]
+        let vals_list = model["metadata_values"]
+        let n = len(keys_list)
+        let i = 0
+        while i < n
+            out[keys_list[i]] = vals_list[i]
+            i = i + 1
+    out
+
+fn gguf_tensor_names(model) -> list
+    let out = []
+    if contains(model, "tensor_names") == 1
+        out = model["tensor_names"]
+    out
+
+// {dims: list<int>, type: int, offset: int} for the named tensor, or an
+// empty dict ({}) if `name` is not a tensor in this model (callers can
+// check len(result) == 0).
+fn gguf_tensor_info(model, name) -> dict
+    let out = {}
+    if contains(model, "tensor_names") == 1 and contains(model, "tensor_dims") == 1 and contains(model, "tensor_types") == 1 and contains(model, "tensor_offsets") == 1
+        let names_list = model["tensor_names"]
+        let dims_list = model["tensor_dims"]
+        let types_list = model["tensor_types"]
+        let offsets_list = model["tensor_offsets"]
+        let n = len(names_list)
+        let i = 0
+        let found = 0
+        while i < n and found == 0
+            if names_list[i] == name
+                out["dims"] = dims_list[i]
+                out["type"] = types_list[i]
+                out["offset"] = offsets_list[i]
+                found = 1
+            i = i + 1
+    out
+
+// general.architecture metadata value, or "" if absent / not a string.
+fn gguf_arch(model) -> string
+    let out = ""
+    if contains(model, "metadata_keys") == 1 and contains(model, "metadata_values") == 1
+        let keys_list = model["metadata_keys"]
+        let vals_list = model["metadata_values"]
+        let n = len(keys_list)
+        let i = 0
+        let found = 0
+        while i < n and found == 0
+            if keys_list[i] == "general.architecture"
+                if type_of(vals_list[i]) == "string"
+                    out = vals_list[i]
+                found = 1
+            i = i + 1
+    out

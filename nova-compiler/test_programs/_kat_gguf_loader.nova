@@ -1,0 +1,251 @@
+// Canonical KAT test for std/ml/gguf_loader (GGUF model-file parser).
+// Constructs a minimal, well-formed GGUF v3 buffer entirely in-memory (no
+// real model file needed) and verifies the header/metadata/tensor-info are
+// parsed correctly, then probes malformed-input rejection paths.
+import std/ml/gguf_loader
+
+fn eq_s(name: string, got: string, want: string)
+    if got != want
+        print("FAIL " + name + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("ok " + name)
+
+fn eq_i(name: string, got: int, want: int)
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+// Approximate float equality (values used below are all exactly
+// representable in IEEE-754 binary32/binary64, so a tight epsilon is fine).
+fn eq_f(name: string, got: float, want: float)
+    let diff = got - want
+    if diff < 0.0
+        diff = 0.0 - diff
+    if diff > 0.0000001
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+// True iff gguf_parse(b) is Err.
+fn is_parse_err(b) -> int
+    let r = 1
+    match gguf_parse(b)
+        Ok(v) =>
+            r = 0
+        Err(e) =>
+            r = 1
+    return r
+
+// Parse-or-fail helper for the well-formed-input assertions below. A real
+// parse error here means the KAT's own test data is broken (it was built to
+// be well-formed), so it fails loudly rather than silently continuing.
+fn _parse_ok(b) -> any
+    let r = null
+    match gguf_parse(b)
+        Ok(v) =>
+            r = v
+        Err(e) =>
+            print("FAIL: unexpected parse error: " + e)
+            exit(1)
+    return r
+
+// ── little-endian byte-writing helpers (test-data construction only) ──────
+fn _w_u32le(v) -> any
+    let out = bytes_create(0)
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+fn _w_u64le(v) -> any
+    let out = bytes_create(0)
+    let i = 0
+    while i < 8
+        out = bytes_append(out, (v >> (i * 8)) & 0xFF)
+        i = i + 1
+    out
+
+// length-prefixed UTF-8 string: u64 len + raw bytes
+fn _w_str(s) -> any
+    let sb = str_to_bytes(s)
+    let out = _w_u64le(bytes_len(sb))
+    out = bytes_concat(out, sb)
+    out
+
+fn main()
+    // ── build a minimal valid GGUF v3 buffer ────────────────────────────
+    // magic "GGUF"
+    let buf = bytes_create(0)
+    buf = bytes_append(buf, 0x47)
+    buf = bytes_append(buf, 0x47)
+    buf = bytes_append(buf, 0x55)
+    buf = bytes_append(buf, 0x46)
+    // version = 3
+    buf = bytes_concat(buf, _w_u32le(3))
+    // tensor_count = 1
+    buf = bytes_concat(buf, _w_u64le(1))
+    // metadata_kv_count = 7
+    buf = bytes_concat(buf, _w_u64le(7))
+
+    // metadata[0]: "general.architecture" = STRING "llama"
+    buf = bytes_concat(buf, _w_str("general.architecture"))
+    buf = bytes_concat(buf, _w_u32le(8))          // STRING
+    buf = bytes_concat(buf, _w_str("llama"))
+
+    // metadata[1]: "general.file_type" = UINT32 7
+    buf = bytes_concat(buf, _w_str("general.file_type"))
+    buf = bytes_concat(buf, _w_u32le(4))          // UINT32
+    buf = bytes_concat(buf, _w_u32le(7))
+
+    // metadata[2]: "tokenizer.ggml.scores" = ARRAY of FLOAT32 [1.5, 2.5, 3.5]
+    buf = bytes_concat(buf, _w_str("tokenizer.ggml.scores"))
+    buf = bytes_concat(buf, _w_u32le(9))          // ARRAY
+    buf = bytes_concat(buf, _w_u32le(6))          // element type FLOAT32
+    buf = bytes_concat(buf, _w_u64le(3))          // count = 3
+    let bits1 = 0
+    let bits2 = 0
+    let bits3 = 0
+    unsafe
+        let p1 = alloc_raw(4)
+        ptr_write_f32(p1, 1.5)
+        bits1 = ptr_read_u32(p1)
+        free_raw(p1)
+        let p2 = alloc_raw(4)
+        ptr_write_f32(p2, 2.5)
+        bits2 = ptr_read_u32(p2)
+        free_raw(p2)
+        let p3 = alloc_raw(4)
+        ptr_write_f32(p3, 3.5)
+        bits3 = ptr_read_u32(p3)
+        free_raw(p3)
+    buf = bytes_concat(buf, _w_u32le(bits1))
+    buf = bytes_concat(buf, _w_u32le(bits2))
+    buf = bytes_concat(buf, _w_u32le(bits3))
+
+    // metadata[3]: "test.bool_true" = BOOL 1
+    buf = bytes_concat(buf, _w_str("test.bool_true"))
+    buf = bytes_concat(buf, _w_u32le(7))          // BOOL
+    buf = bytes_append(buf, 1)
+
+    // metadata[4]: "test.int8_neg" = INT8 -5 (exercises the signed/negative
+    // decode path, otherwise entirely untested)
+    buf = bytes_concat(buf, _w_str("test.int8_neg"))
+    buf = bytes_concat(buf, _w_u32le(1))          // INT8
+    buf = bytes_append(buf, (0 - 5) & 0xFF)
+
+    // metadata[5]: "test.uint64_big" = UINT64 123456789012345 (exercises the
+    // 8-byte unsigned decode path with a value too large for 32 bits)
+    buf = bytes_concat(buf, _w_str("test.uint64_big"))
+    buf = bytes_concat(buf, _w_u32le(10))         // UINT64
+    buf = bytes_concat(buf, _w_u64le(123456789012345))
+
+    // metadata[6]: "test.float64" = FLOAT64 2.718281828 (exercises the
+    // 8-byte float decode path, otherwise entirely untested)
+    buf = bytes_concat(buf, _w_str("test.float64"))
+    buf = bytes_concat(buf, _w_u32le(12))         // FLOAT64
+    let bits_f64 = 0
+    unsafe
+        let pf64 = alloc_raw(8)
+        ptr_write_f64(pf64, 2.718281828)
+        bits_f64 = ptr_read_u64(pf64)
+        free_raw(pf64)
+    buf = bytes_concat(buf, _w_u64le(bits_f64))
+
+    // tensor_info[0]: "token_embd.weight", dims [4096, 32000], type=1 (F16),
+    // offset=131072. type/offset are deliberately non-zero so a bug that
+    // silently leaves either field at its default 0 cannot pass.
+    buf = bytes_concat(buf, _w_str("token_embd.weight"))
+    buf = bytes_concat(buf, _w_u32le(2))          // n_dims
+    buf = bytes_concat(buf, _w_u64le(4096))
+    buf = bytes_concat(buf, _w_u64le(32000))
+    buf = bytes_concat(buf, _w_u32le(1))          // ggml type (F16)
+    buf = bytes_concat(buf, _w_u64le(131072))     // offset
+
+    // ── parse and verify ─────────────────────────────────────────────────
+    let model = _parse_ok(buf)
+    eq_i("version", gguf_version(model), 3)
+    eq_i("tensor_count", gguf_tensor_count(model), 1)
+    eq_s("arch", gguf_arch(model), "llama")
+
+    let meta = gguf_metadata(model)
+    eq_i("meta has file_type", contains(meta, "general.file_type"), 1)
+    eq_i("file_type value", meta["general.file_type"], 7)
+    eq_i("meta has scores array", contains(meta, "tokenizer.ggml.scores"), 1)
+    let scores = meta["tokenizer.ggml.scores"]
+    eq_i("scores len", len(scores), 3)
+    // verify actual decoded element VALUES, not just the count — this is
+    // the only thing that proves the FLOAT32 array element loop reads the
+    // right bytes at the right offsets, not merely "some 3 values"
+    eq_f("scores[0]", scores[0], 1.5)
+    eq_f("scores[1]", scores[1], 2.5)
+    eq_f("scores[2]", scores[2], 3.5)
+
+    eq_i("meta has bool_true", contains(meta, "test.bool_true"), 1)
+    eq_i("bool_true value", meta["test.bool_true"], 1)
+    eq_i("meta has int8_neg", contains(meta, "test.int8_neg"), 1)
+    eq_i("int8_neg value", meta["test.int8_neg"], 0 - 5)
+    eq_i("meta has uint64_big", contains(meta, "test.uint64_big"), 1)
+    eq_i("uint64_big value", meta["test.uint64_big"], 123456789012345)
+    eq_i("meta has float64", contains(meta, "test.float64"), 1)
+    eq_f("float64 value", meta["test.float64"], 2.718281828)
+
+    let names = gguf_tensor_names(model)
+    eq_i("tensor names len", len(names), 1)
+    eq_s("tensor name 0", names[0], "token_embd.weight")
+
+    let info = gguf_tensor_info(model, "token_embd.weight")
+    eq_i("info has dims", contains(info, "dims"), 1)
+    let dims = info["dims"]
+    eq_i("dims len", len(dims), 2)
+    eq_i("dims[0]", dims[0], 4096)
+    eq_i("dims[1]", dims[1], 32000)
+    eq_i("info type", info["type"], 1)
+    eq_i("info offset", info["offset"], 131072)
+
+    // unknown tensor name -> empty dict
+    let missing = gguf_tensor_info(model, "does_not_exist")
+    eq_i("missing tensor info is empty", len(missing), 0)
+
+    // ── malformed-input rejection paths (never crash, always Err) ────────
+    eq_i("empty buffer rejected", is_parse_err(bytes_create(0)), 1)
+
+    let bad_magic = bytes_create(0)
+    bad_magic = bytes_append(bad_magic, 0x00)
+    bad_magic = bytes_append(bad_magic, 0x00)
+    bad_magic = bytes_append(bad_magic, 0x00)
+    bad_magic = bytes_append(bad_magic, 0x00)
+    eq_i("bad magic rejected", is_parse_err(bad_magic), 1)
+
+    // valid magic, but version 1 (unsupported)
+    let bad_version = bytes_create(0)
+    bad_version = bytes_append(bad_version, 0x47)
+    bad_version = bytes_append(bad_version, 0x47)
+    bad_version = bytes_append(bad_version, 0x55)
+    bad_version = bytes_append(bad_version, 0x46)
+    bad_version = bytes_concat(bad_version, _w_u32le(1))
+    eq_i("unsupported version rejected", is_parse_err(bad_version), 1)
+
+    // truncated right after a valid magic+version (no tensor/kv counts at all)
+    let truncated = bytes_create(0)
+    truncated = bytes_append(truncated, 0x47)
+    truncated = bytes_append(truncated, 0x47)
+    truncated = bytes_append(truncated, 0x55)
+    truncated = bytes_append(truncated, 0x46)
+    truncated = bytes_concat(truncated, _w_u32le(3))
+    eq_i("truncated after version rejected", is_parse_err(truncated), 1)
+
+    // claims 5 tensors but buffer ends right after the counts -> rejected,
+    // not hung and not silently truncated to 0 tensors
+    let over_claimed = bytes_create(0)
+    over_claimed = bytes_append(over_claimed, 0x47)
+    over_claimed = bytes_append(over_claimed, 0x47)
+    over_claimed = bytes_append(over_claimed, 0x55)
+    over_claimed = bytes_append(over_claimed, 0x46)
+    over_claimed = bytes_concat(over_claimed, _w_u32le(3))
+    over_claimed = bytes_concat(over_claimed, _w_u64le(5))
+    over_claimed = bytes_concat(over_claimed, _w_u64le(0))
+    eq_i("over-claimed tensor count rejected", is_parse_err(over_claimed), 1)
+
+    print("ALL GGUF LOADER KAT TESTS PASSED")

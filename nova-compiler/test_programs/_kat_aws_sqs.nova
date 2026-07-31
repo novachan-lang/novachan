@@ -1,0 +1,440 @@
+// ============================================================================
+// _kat_aws_sqs — KAT for std/net/aws_sqs (AWS SQS client)
+// ============================================================================
+// Exercises only the PURE surface (no network I/O ever happens in this
+// file): the binary-safe HMAC-SHA256/SHA-256 primitives, the SigV4
+// canonical-request/string-to-sign/signature pipeline, the signed
+// request-URL builder, the XML response parsers, and the input-validation
+// guard clauses on the live wrappers (which all return Err before any
+// http_get call, so they are safe and deterministic to call here too).
+//
+//   A. sqs_hmac_sha256 against RFC 4231 Test Case 1 (authoritative vector).
+//   B. binary-safety differential probes — an embedded 0x00 byte inside the
+//      HMAC key must NOT be silently truncated away (the classic NOVA
+//      `string` NUL-truncation trap this module's design note calls out).
+//   C. sha256("") — the well-known empty-payload hash used for every
+//      GET request this client signs.
+//   D. SigV4 canonical-request / string-to-sign STRUCTURE (line count,
+//      field placement, blank-line-before-signed-headers).
+//   E. sqs_signature: deterministic, 64 lowercase hex chars, and avalanches
+//      (changes) when secret / date_stamp / region / string-to-sign changes.
+//   F. sqs_request_url construction for all 4 SQS actions: host/path/query
+//      correctness, all 5 X-Amz-* fields + a well-formed X-Amz-Signature,
+//      determinism, and signature sensitivity to the signed parameters.
+//   G. XML response parsing (success / error / empty-result / malformed /
+//      transport-failure) for SendMessage, ReceiveMessage, DeleteMessage,
+//      ListQueues.
+//   H. Input-validation guard clauses on sqs_send/receive/delete/list_queues
+//      (empty queue_url, empty message_body, oversized message_body,
+//      oversized SIGNED URL for an under-the-cap body, empty receipt_handle,
+//      missing credentials) — all return Err before any network call is
+//      attempted.
+// ============================================================================
+import std/net/aws_sqs
+import std/net/querystring
+
+// ── Small check helpers (established KAT convention) ───────────────────────
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+// Asserts r is Ok, returns the unwrapped payload. Single trailing return
+// (no `return null` on any path) -- avoids the documented return-null/
+// return-value mistag.
+fn ck_ok(label: string, r: Result) -> any
+    let v = null
+    if is_ok(r)
+        v = unwrap(r)
+    else
+        print("FAIL " + label + ": expected Ok, got Err: " + unwrap_err(r))
+        exit(1)
+    return v
+
+fn ck_err(label: string, r: Result)
+    if is_ok(r)
+        print("FAIL " + label + ": expected Err, got Ok")
+        exit(1)
+
+fn _is_hex64(s: string) -> bool
+    if len(s) != 64
+        return false
+    let i = 0
+    let okall = true
+    while i < 64
+        let c = ord(char_at(s, i))
+        let okc = (c >= 48 and c <= 57) or (c >= 97 and c <= 102)
+        if not okc
+            okall = false
+        i = i + 1
+    okall
+
+// ── A. RFC 4231 Test Case 1: HMAC-SHA-256(key=0x0b*20, "Hi There") ─────────
+// key   = 0x0b repeated 20 times
+// data  = "Hi There"
+// HMAC-SHA-256 = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+// (RFC 4231 / RFC 2202 test vector, independently cross-checked.)
+fn t_hmac_rfc4231_case1()
+    let key = bytes(20)
+    let i = 0
+    while i < 20
+        bytes_set(key, i, 0x0b)
+        i = i + 1
+    let msg = str_to_bytes("Hi There")
+    let mac = sqs_hmac_sha256(key, msg)
+    cks("RFC4231-case1-HMAC-SHA256", sqs_hex_of_bytes(mac), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    print("ok A.rfc4231-case1")
+
+// ── B. Binary-safety differential probes ───────────────────────────────────
+fn t_hmac_binary_safety()
+    // Two 40-byte keys, identical except ONE byte: key_a has a literal 0x00
+    // at position 10 (exactly what a NUL-truncating implementation would cut
+    // the key short at); key_b has 0x01 there instead. If that byte were
+    // being ignored/truncated, both MACs would be identical.
+    let key_a = bytes(40)
+    let key_b = bytes(40)
+    let i = 0
+    while i < 40
+        bytes_set(key_a, i, 65)
+        bytes_set(key_b, i, 65)
+        i = i + 1
+    bytes_set(key_a, 10, 0)
+    bytes_set(key_b, 10, 1)
+    let msg = str_to_bytes("nul-safety-probe")
+    let mac_a = sqs_hex_of_bytes(sqs_hmac_sha256(key_a, msg))
+    let mac_b = sqs_hex_of_bytes(sqs_hmac_sha256(key_b, msg))
+    if mac_a == mac_b
+        print("FAIL B.hmac-binary-safety: embedded 0x00 byte was ignored (NUL-truncation)")
+        exit(1)
+
+    // A 40-byte key that is all-zero EXCEPT for a nonzero byte at the very
+    // END (index 39) must NOT collapse to the same MAC as a zero-length
+    // key. This is the real differential for a strlen()-style length bug:
+    // a naive C-string-style bytes_len() would see byte 0 == 0x00 and
+    // (mis-)report length 0, silently dropping the whole key -- including
+    // that trailing nonzero byte -- and colliding with the truly-empty key.
+    //
+    // (An ALL-zero 40-byte key is NOT a valid probe here, and the previous
+    // version of this test asserted exactly that -- it was a false-fail
+    // waiting to happen: RFC 2104's K0 construction zero-pads any key <=
+    // the 64-byte block size out to the full block size, so a 40-byte
+    // all-zero key and a 0-byte key both correctly zero-pad to the
+    // IDENTICAL 64-byte K0. Producing the same MAC in that case is the
+    // mathematically CORRECT answer for a sound HMAC implementation, not a
+    // truncation bug -- asserting otherwise would reject correct code.)
+    let key_tail = bytes(40)
+    bytes_set(key_tail, 39, 0xFF)
+    let key_empty = bytes(0)
+    let mac_tail = sqs_hex_of_bytes(sqs_hmac_sha256(key_tail, msg))
+    let mac_empty = sqs_hex_of_bytes(sqs_hmac_sha256(key_empty, msg))
+    if mac_tail == mac_empty
+        print("FAIL B.hmac-binary-safety: key with leading 0x00 bytes collapsed to the empty key's MAC (length truncated at first NUL)")
+        exit(1)
+    print("ok B.hmac-binary-safety")
+
+// ── C. sha256("") — the empty-payload hash used for every signed GET ───────
+fn t_sha256_empty()
+    cks("C.sha256-empty", sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    print("ok C.sha256-empty")
+
+// ── D. Canonical-request / string-to-sign STRUCTURE ────────────────────────
+fn t_sigv4_structure()
+    let scope = sqs_scope("20260731", "us-east-1")
+    cks("D.scope", scope, "20260731/us-east-1/sqs/aws4_request")
+
+    let payload_hash = sha256("")
+    let creq = sqs_canonical_request("GET", "/", "Action=ListQueues", "host:sqs.us-east-1.amazonaws.com\n", "host", payload_hash)
+    let lines = split(creq, "\n")
+    // METHOD, URI, QUERY, "host:...", "" (blank line before SignedHeaders),
+    // SignedHeaders, PayloadHash == 7 parts.
+    cki("D.creq.line-count", len(lines), 7)
+    cks("D.creq.line0.method", lines[0], "GET")
+    cks("D.creq.line1.uri", lines[1], "/")
+    cks("D.creq.line2.query", lines[2], "Action=ListQueues")
+    cks("D.creq.line3.headers", lines[3], "host:sqs.us-east-1.amazonaws.com")
+    cks("D.creq.line4.blank", lines[4], "")
+    cks("D.creq.line5.signedheaders", lines[5], "host")
+    cks("D.creq.line6.payloadhash", lines[6], payload_hash)
+
+    let sts = sqs_string_to_sign("20260731T000000Z", scope, creq)
+    let sts_lines = split(sts, "\n")
+    cki("D.sts.line-count", len(sts_lines), 4)
+    cks("D.sts.line0.algo", sts_lines[0], "AWS4-HMAC-SHA256")
+    cks("D.sts.line1.date", sts_lines[1], "20260731T000000Z")
+    cks("D.sts.line2.scope", sts_lines[2], scope)
+    cks("D.sts.line3.hash", sts_lines[3], sha256(creq))
+    print("ok D.sigv4-structure")
+
+// ── E. sqs_signature: deterministic, well-formed, avalanches ───────────────
+fn t_sigv4_signature()
+    let sts = "AWS4-HMAC-SHA256\n20260731T000000Z\n20260731/us-east-1/sqs/aws4_request\n" + sha256("")
+    let sig1 = sqs_signature("SECRETKEY1", "20260731", "us-east-1", sts)
+    let sig2 = sqs_signature("SECRETKEY1", "20260731", "us-east-1", sts)
+    cks("E.sig.determinism", sig1, sig2)
+    if not _is_hex64(sig1)
+        print("FAIL E.sig.format: not 64 lowercase hex chars: " + sig1)
+        exit(1)
+
+    let sig_diff_secret = sqs_signature("SECRETKEY2", "20260731", "us-east-1", sts)
+    let sig_diff_date = sqs_signature("SECRETKEY1", "20260801", "us-east-1", sts)
+    let sig_diff_region = sqs_signature("SECRETKEY1", "20260731", "eu-west-1", sts)
+    let sig_diff_sts = sqs_signature("SECRETKEY1", "20260731", "us-east-1", sts + "x")
+    if sig_diff_secret == sig1
+        print("FAIL E.sig.avalanche: secret change had no effect")
+        exit(1)
+    if sig_diff_date == sig1
+        print("FAIL E.sig.avalanche: date_stamp change had no effect")
+        exit(1)
+    if sig_diff_region == sig1
+        print("FAIL E.sig.avalanche: region change had no effect")
+        exit(1)
+    if sig_diff_sts == sig1
+        print("FAIL E.sig.avalanche: string_to_sign change had no effect")
+        exit(1)
+    print("ok E.sigv4-signature")
+
+// Extracts the query-string portion of a signed URL, parsed into a dict.
+fn _parsed_query(url: string) -> dict
+    let qmark = find(url, "?")
+    if qmark < 0
+        return {}
+    qs_parse(slice(url, qmark + 1, len(url)))
+
+// ── F. sqs_request_url construction, per action ─────────────────────────────
+
+fn t_url_send()
+    let params = {}
+    params["Action"] = "SendMessage"
+    params["Version"] = "2012-11-05"
+    params["QueueUrl"] = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+    params["MessageBody"] = "hello world & friends"
+    let host = "sqs.us-east-1.amazonaws.com"
+    let path = "/123456789012/MyQueue"
+    let url = sqs_request_url("AKIDEXAMPLE", "secretkey", "us-east-1", host, path, params, "20260731T000000Z", "20260731")
+    let url2 = sqs_request_url("AKIDEXAMPLE", "secretkey", "us-east-1", host, path, params, "20260731T000000Z", "20260731")
+    cks("F.send.determinism", url, url2)
+
+    if not starts_with(url, "https://" + host + path + "?")
+        print("FAIL F.send: unexpected host/path prefix: " + url)
+        exit(1)
+
+    let p = _parsed_query(url)
+    cks("F.send.Action", qs_get(p, "Action"), "SendMessage")
+    cks("F.send.Version", qs_get(p, "Version"), "2012-11-05")
+    cks("F.send.QueueUrl", qs_get(p, "QueueUrl"), "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue")
+    cks("F.send.MessageBody", qs_get(p, "MessageBody"), "hello world & friends")
+    cks("F.send.X-Amz-Algorithm", qs_get(p, "X-Amz-Algorithm"), "AWS4-HMAC-SHA256")
+    cks("F.send.X-Amz-Credential", qs_get(p, "X-Amz-Credential"), "AKIDEXAMPLE/20260731/us-east-1/sqs/aws4_request")
+    cks("F.send.X-Amz-Date", qs_get(p, "X-Amz-Date"), "20260731T000000Z")
+    cks("F.send.X-Amz-Expires", qs_get(p, "X-Amz-Expires"), "30")
+    cks("F.send.X-Amz-SignedHeaders", qs_get(p, "X-Amz-SignedHeaders"), "host")
+    let sig = qs_get(p, "X-Amz-Signature")
+    if not _is_hex64(sig)
+        print("FAIL F.send.X-Amz-Signature format: " + sig)
+        exit(1)
+
+    // Sensitivity: a different MessageBody must sign to a different value.
+    let params2 = {}
+    params2["Action"] = "SendMessage"
+    params2["Version"] = "2012-11-05"
+    params2["QueueUrl"] = params["QueueUrl"]
+    params2["MessageBody"] = "a completely different body"
+    let url3 = sqs_request_url("AKIDEXAMPLE", "secretkey", "us-east-1", host, path, params2, "20260731T000000Z", "20260731")
+    let sig3 = qs_get(_parsed_query(url3), "X-Amz-Signature")
+    if sig3 == sig
+        print("FAIL F.send: different MessageBody produced the same signature")
+        exit(1)
+    print("ok F.url-send")
+
+fn t_url_receive()
+    let params = {}
+    params["Action"] = "ReceiveMessage"
+    params["Version"] = "2012-11-05"
+    params["QueueUrl"] = "https://sqs.eu-west-1.amazonaws.com/999999999999/OrderEvents"
+    params["MaxNumberOfMessages"] = "5"
+    let host = "sqs.eu-west-1.amazonaws.com"
+    let path = "/999999999999/OrderEvents"
+    let url = sqs_request_url("AKIDEXAMPLE", "secretkey", "eu-west-1", host, path, params, "20260731T120000Z", "20260731")
+    if not starts_with(url, "https://" + host + path + "?")
+        print("FAIL F.receive: unexpected host/path prefix: " + url)
+        exit(1)
+    let p = _parsed_query(url)
+    cks("F.receive.Action", qs_get(p, "Action"), "ReceiveMessage")
+    cks("F.receive.MaxNumberOfMessages", qs_get(p, "MaxNumberOfMessages"), "5")
+    cks("F.receive.X-Amz-Credential", qs_get(p, "X-Amz-Credential"), "AKIDEXAMPLE/20260731/eu-west-1/sqs/aws4_request")
+    if not _is_hex64(qs_get(p, "X-Amz-Signature"))
+        print("FAIL F.receive.X-Amz-Signature format")
+        exit(1)
+    print("ok F.url-receive")
+
+fn t_url_delete()
+    let params = {}
+    params["Action"] = "DeleteMessage"
+    params["Version"] = "2012-11-05"
+    params["QueueUrl"] = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+    params["ReceiptHandle"] = "AQEBRXbz+SOME+RECEIPT+HANDLE=="
+    let host = "sqs.us-east-1.amazonaws.com"
+    let path = "/123456789012/MyQueue"
+    let url = sqs_request_url("AKIDEXAMPLE", "secretkey", "us-east-1", host, path, params, "20260731T000000Z", "20260731")
+    let p = _parsed_query(url)
+    cks("F.delete.Action", qs_get(p, "Action"), "DeleteMessage")
+    cks("F.delete.ReceiptHandle", qs_get(p, "ReceiptHandle"), "AQEBRXbz+SOME+RECEIPT+HANDLE==")
+    if not _is_hex64(qs_get(p, "X-Amz-Signature"))
+        print("FAIL F.delete.X-Amz-Signature format")
+        exit(1)
+    print("ok F.url-delete")
+
+fn t_url_list_queues()
+    let params = {}
+    params["Action"] = "ListQueues"
+    params["Version"] = "2012-11-05"
+    let host = "sqs.us-east-1.amazonaws.com"
+    let path = "/"
+    let url = sqs_request_url("AKIDEXAMPLE", "secretkey", "us-east-1", host, path, params, "20260731T000000Z", "20260731")
+    if not starts_with(url, "https://" + host + "/?")
+        print("FAIL F.listq: unexpected host/path prefix: " + url)
+        exit(1)
+    let p = _parsed_query(url)
+    cks("F.listq.Action", qs_get(p, "Action"), "ListQueues")
+    if not _is_hex64(qs_get(p, "X-Amz-Signature"))
+        print("FAIL F.listq.X-Amz-Signature format")
+        exit(1)
+    print("ok F.url-list-queues")
+
+// ── G. XML response parsing ─────────────────────────────────────────────────
+
+fn t_xml_send()
+    let ok_xml = "<SendMessageResponse><SendMessageResult><MD5OfMessageBody>d41d8cd98f00b204e9800998ecf8427e</MD5OfMessageBody><MessageId>5fea7756-0ea4-451a-a703-a558b933e274</MessageId></SendMessageResult><ResponseMetadata><RequestId>27daac76-34dd-47df-bd01-1f6e873584a0</RequestId></ResponseMetadata></SendMessageResponse>"
+    let d = ck_ok("G.send.success", sqs_parse_send_response(ok_xml))
+    cks("G.send.message_id", d["message_id"], "5fea7756-0ea4-451a-a703-a558b933e274")
+    cks("G.send.md5_of_body", d["md5_of_body"], "d41d8cd98f00b204e9800998ecf8427e")
+
+    let err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>InvalidParameterValue</Code><Message>Body must not be empty.</Message></Error><RequestId>abc-123</RequestId></ErrorResponse>"
+    let r_err = sqs_parse_send_response(err_xml)
+    ck_err("G.send.error", r_err)
+    if find(unwrap_err(r_err), "InvalidParameterValue") < 0
+        print("FAIL G.send.error: message missing Code: " + unwrap_err(r_err))
+        exit(1)
+
+    ck_err("G.send.missing-result", sqs_parse_send_response("<SendMessageResponse><ResponseMetadata><RequestId>x</RequestId></ResponseMetadata></SendMessageResponse>"))
+    ck_err("G.send.transport-failure", sqs_parse_send_response(""))
+    ck_err("G.send.malformed", sqs_parse_send_response("not xml at all <<<"))
+    print("ok G.xml-send")
+
+fn t_xml_receive()
+    let msg1 = "<Message><MessageId>id-1</MessageId><ReceiptHandle>rh-1</ReceiptHandle><MD5OfBody>md5-1</MD5OfBody><Body>body one</Body></Message>"
+    let msg2 = "<Message><MessageId>id-2</MessageId><ReceiptHandle>rh-2</ReceiptHandle><MD5OfBody>md5-2</MD5OfBody><Body>body two &amp; more</Body></Message>"
+    let ok_xml = "<ReceiveMessageResponse><ReceiveMessageResult>" + msg1 + msg2 + "</ReceiveMessageResult><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></ReceiveMessageResponse>"
+    let msgs = ck_ok("G.receive.multi", sqs_parse_receive_response(ok_xml))
+    cki("G.receive.multi.count", len(msgs), 2)
+    cks("G.receive.multi[0].message_id", msgs[0]["message_id"], "id-1")
+    cks("G.receive.multi[0].receipt_handle", msgs[0]["receipt_handle"], "rh-1")
+    cks("G.receive.multi[0].body", msgs[0]["body"], "body one")
+    cks("G.receive.multi[0].md5_of_body", msgs[0]["md5_of_body"], "md5-1")
+    cks("G.receive.multi[1].message_id", msgs[1]["message_id"], "id-2")
+    cks("G.receive.multi[1].body", msgs[1]["body"], "body two & more")
+
+    let empty_xml = "<ReceiveMessageResponse><ReceiveMessageResult/><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></ReceiveMessageResponse>"
+    let empty_msgs = ck_ok("G.receive.empty", sqs_parse_receive_response(empty_xml))
+    cki("G.receive.empty.count", len(empty_msgs), 0)
+
+    let err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>AWS.SimpleQueueService.NonExistentQueue</Code><Message>The specified queue does not exist.</Message></Error><RequestId>r</RequestId></ErrorResponse>"
+    ck_err("G.receive.error", sqs_parse_receive_response(err_xml))
+    ck_err("G.receive.transport-failure", sqs_parse_receive_response(""))
+    print("ok G.xml-receive")
+
+fn t_xml_delete()
+    let ok_xml = "<DeleteMessageResponse><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></DeleteMessageResponse>"
+    let v = ck_ok("G.delete.success", sqs_parse_delete_response(ok_xml))
+    if not v
+        print("FAIL G.delete.success: expected true")
+        exit(1)
+
+    let err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>ReceiptHandleIsInvalid</Code><Message>bad handle</Message></Error><RequestId>r</RequestId></ErrorResponse>"
+    ck_err("G.delete.error", sqs_parse_delete_response(err_xml))
+    ck_err("G.delete.unexpected-root", sqs_parse_delete_response("<SomeOtherResponse></SomeOtherResponse>"))
+    ck_err("G.delete.transport-failure", sqs_parse_delete_response(""))
+    print("ok G.xml-delete")
+
+fn t_xml_list_queues()
+    let q1 = "<QueueUrl>https://sqs.us-east-1.amazonaws.com/123456789012/Q1</QueueUrl>"
+    let q2 = "<QueueUrl>https://sqs.us-east-1.amazonaws.com/123456789012/Q2</QueueUrl>"
+    let ok_xml = "<ListQueuesResponse><ListQueuesResult>" + q1 + q2 + "</ListQueuesResult><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></ListQueuesResponse>"
+    let urls = ck_ok("G.listq.multi", sqs_parse_list_queues_response(ok_xml))
+    cki("G.listq.multi.count", len(urls), 2)
+    cks("G.listq.multi[0]", urls[0], "https://sqs.us-east-1.amazonaws.com/123456789012/Q1")
+    cks("G.listq.multi[1]", urls[1], "https://sqs.us-east-1.amazonaws.com/123456789012/Q2")
+
+    let empty_xml = "<ListQueuesResponse><ListQueuesResult/><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></ListQueuesResponse>"
+    let empty_urls = ck_ok("G.listq.empty", sqs_parse_list_queues_response(empty_xml))
+    cki("G.listq.empty.count", len(empty_urls), 0)
+
+    let err_xml = "<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>denied</Message></Error><RequestId>r</RequestId></ErrorResponse>"
+    ck_err("G.listq.error", sqs_parse_list_queues_response(err_xml))
+    print("ok G.xml-list-queues")
+
+// ── H. Input-validation guard clauses (never reach the network) ────────────
+
+// A string > SQS's 262144-byte MessageBody limit, built by doubling
+// (O(log n) concatenations -- avoids an O(n^2) char-by-char build).
+fn _oversized_body() -> string
+    let s = "x"
+    while len(s) < 262145
+        s = s + s
+    s
+
+// A string of EXACTLY `n` bytes (n <= 262144), built by doubling then
+// trimming -- used to probe the URL-length guard (_sqs_max_url_len, 8000)
+// with a body that is comfortably UNDER the 262144 MessageBody limit but
+// large enough that the fully-signed query-string GET url exceeds 8000
+// bytes. This is the one guard clause in the module's public wrappers that
+// sqs_send computes AFTER building the full signed URL (still before any
+// http_get) -- distinct from the cheap len(message_body) check above, so it
+// deserves its own KAT probe rather than being assumed correct by analogy.
+fn _body_of_len(n: int) -> string
+    let s = "x"
+    while len(s) < n
+        s = s + s
+    slice(s, 0, n)
+
+fn t_guards()
+    let good_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+    ck_err("H.send.empty-queue-url", sqs_send("", "body", "ak", "sk", "us-east-1"))
+    ck_err("H.send.empty-body", sqs_send(good_url, "", "ak", "sk", "us-east-1"))
+    ck_err("H.send.missing-creds", sqs_send(good_url, "body", "", "sk", "us-east-1"))
+    ck_err("H.send.oversized-body", sqs_send(good_url, _oversized_body(), "ak", "sk", "us-east-1"))
+    // 8000-byte body: well under the 262144 MessageBody cap, but the fully
+    // signed GET url (body + QueueUrl + all 5 X-Amz-* fields, url-encoded)
+    // comes out to ~8400 bytes -- over _sqs_max_url_len's 8000 floor. Must
+    // Err (never emit a url a real proxy/LB would reject with 414), and
+    // must do so WITHOUT ever calling http_get (this KAT does no network I/O).
+    ck_err("H.send.url-too-long", sqs_send(good_url, _body_of_len(8000), "ak", "sk", "us-east-1"))
+    ck_err("H.receive.empty-queue-url", sqs_receive("", 5, "ak", "sk", "us-east-1"))
+    ck_err("H.receive.missing-creds", sqs_receive(good_url, 5, "ak", "", "us-east-1"))
+    ck_err("H.delete.empty-queue-url", sqs_delete("", "rh", "ak", "sk", "us-east-1"))
+    ck_err("H.delete.empty-receipt-handle", sqs_delete(good_url, "", "ak", "sk", "us-east-1"))
+    ck_err("H.listq.missing-creds", sqs_list_queues("", "sk", "us-east-1"))
+    print("ok H.guards")
+
+fn main()
+    t_hmac_rfc4231_case1()
+    t_hmac_binary_safety()
+    t_sha256_empty()
+    t_sigv4_structure()
+    t_sigv4_signature()
+    t_url_send()
+    t_url_receive()
+    t_url_delete()
+    t_url_list_queues()
+    t_xml_send()
+    t_xml_receive()
+    t_xml_delete()
+    t_xml_list_queues()
+    t_guards()
+    print("AWS-SQS KAT PASS")

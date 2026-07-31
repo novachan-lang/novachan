@@ -1,0 +1,565 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/onnx_loader
+// ============================================================================
+// Parses ONNX (Open Neural Network Exchange, onnx.ai) model files: the
+// `.onnx` format is a single Protocol Buffers (proto3) message of type
+// `ModelProto`, defined by onnx/onnx.proto. This module does NOT depend on
+// protoc or any .proto-schema compiler — it walks the wire format directly
+// using std/encoding/protobuf's generic tag/varint/length-delimited
+// primitives, decoding ONLY the fields ONNX tooling actually needs
+// (metadata, graph topology, initializer shapes). Fields this module does
+// not recognize (attributes, sparse tensors, functions, training info,
+// quantization annotations, ...) are skipped byte-exactly rather than
+// misread, so a well-formed but "bigger than we care about" ModelProto
+// never desynchronizes the parse.
+//
+// ONNX MESSAGE SHAPES DECODED (field numbers from onnx/onnx.proto, stable
+// since ONNX IR version 3 — verified against the published schema):
+//
+//   ModelProto            ir_version=1 (varint), producer_name=2 (string),
+//                          producer_version=3 (string), domain=4 (string),
+//                          model_version=5 (varint), graph=7 (message),
+//                          opset_import=8 (repeated message)
+//   OperatorSetIdProto     domain=1 (string), version=2 (varint)
+//   GraphProto             node=1 (repeated message), name=2 (string),
+//                          initializer=5 (repeated message),
+//                          input=11 (repeated message), output=12 (repeated
+//                          message)  [ValueInfoProto]
+//   NodeProto              input=1 (repeated string), output=2 (repeated
+//                          string), name=3 (string), op_type=4 (string)
+//   TensorProto            dims=1 (repeated int64, packed-or-unpacked
+//                          varint), name=8 (string)
+//   ValueInfoProto         name=1 (string)
+//
+// PUBLIC API
+//   onnx_parse(data: bytes)          -> Result   ok(model dict) / err(msg)
+//   onnx_node_count(model: dict)     -> int       number of graph nodes
+//   onnx_opset_version(model: dict)  -> int       version of the default
+//                                                  ("") operator set domain
+//                                                  (falls back to the first
+//                                                  opset_import entry if no
+//                                                  "" domain is present)
+//   onnx_input_names(model: dict)    -> list      graph-level input names
+//                                                  (ValueInfoProto.name)
+//   onnx_output_names(model: dict)   -> list      graph-level output names
+//   onnx_tensor_shapes(model: dict)  -> dict      initializer name -> shape
+//                                                  (list of int dims)
+//
+// MODEL DICT SHAPE (the ok() payload of onnx_parse), all keys always
+// present (defaulted when the source field is absent from the wire):
+//   ir_version           int
+//   producer_name         string
+//   producer_version      string
+//   domain                string
+//   model_version         int
+//   graph_name            string
+//   opset_import          list of {domain: string, version: int} dicts
+//   nodes                 list of {op_type, name, inputs, outputs} dicts
+//                          (inputs/outputs are lists of tensor-name strings)
+//   initializer_names     list of string
+//   initializer_shapes    dict: tensor name -> list of int dims
+//   graph_input_names     list of string
+//   graph_output_names    list of string
+//
+// WIRE-FORMAT WALK (every _ol_parse_* function below follows the SAME
+// dispatch shape — kept per-message rather than fully generic because each
+// message routes different field numbers into different result slots, but
+// the "what to do when the wire type is NOT varint/LEN" logic is identical
+// everywhere and is factored into _ol_advance_unhandled to avoid duplicating
+// it 6 times):
+//   VARINT (0)  -> pb_read_varint,     value used if fnum is recognized
+//   LEN     (2) -> pb_read_len_delim,  payload used/recursed if fnum is
+//                                       recognized (payload is already a
+//                                       bounds-clamped `bytes` slice, so
+//                                       recursing into it can never read
+//                                       past the parent's own boundary)
+//   I32 (5) / I64 (1) -> skipped by fixed width (4 / 8 bytes), clamped to
+//                                       the buffer end
+//   anything else (group tags 3/4, or any undefined wire type) -> the
+//                                       message is malformed; the field
+//                                       cannot be skipped without knowing
+//                                       its schema (no length prefix), so
+//                                       the parse for THAT message reports
+//                                       an error rather than silently
+//                                       reading garbage as the next tag
+//
+// DEFENSIVE DECODING
+//   Every length-delimited read goes through pb_read_len_delim, which
+//   clamps a declared length to what is actually present in the buffer
+//   (see std/encoding/protobuf) — a truncated/adversarial length prefix can
+//   never read out of bounds. TensorProto.dims accepts BOTH the proto3
+//   default packed-varint encoding (one LEN occurrence holding concatenated
+//   varints) and the legacy/explicit unpacked encoding (one VARINT
+//   occurrence per dim) — real-world exporters have shipped both.
+//   NodeProto.attribute is intentionally never recursed into: ONNX control-
+//   flow ops (Loop/If/Scan) embed a full nested GraphProto inside an
+//   AttributeProto, and recursing there would need unbounded-depth handling
+//   for a value this loader does not need — it is skipped as an opaque LEN
+//   payload instead, which also means adversarially deep subgraph-in-
+//   attribute nesting can never blow the parser's call stack.
+//
+// SYMBOL COLLISION GUARD: all private helpers are prefixed _ol_.
+//
+// Depends on: std/encoding/protobuf (tag/varint/length-delimited wire
+// primitives). No other dependencies.
+// ============================================================================
+
+import std/encoding/protobuf
+
+// ── shared wire-type dispatch helper ─────────────────────────────────────────
+
+// _ol_advance_unhandled: compute the next parse position for a field whose
+// wire type is NOT VARINT (0) or LEN (2) — i.e. I32 (5), I64 (1), or an
+// invalid/deprecated wire type (group start/end = 3/4, or any undefined
+// code). `next` is the position right after the tag (matching pb_read_tag's
+// third return element); `n` is the total length of the buffer being
+// walked (submessages are always parsed as their own bounds-clamped slice,
+// so `n` IS the message's own end, never the parent's).
+//
+// Returns [new_pos, err] where err == "" for I32/I64 (successfully skipped
+// by fixed width, clamped so it can never run past `n`), or a non-empty
+// message for a wire type that cannot be skipped at all without knowing the
+// message schema — in that case new_pos == n, which ends the caller's parse
+// loop (rather than looping forever re-reading the same malformed tag).
+fn _ol_advance_unhandled(wt: int, next: int, n: int) -> list
+    if wt == pb_wire_i32()
+        let np = next + 4
+        if np > n
+            np = n
+        return [np, ""]
+    if wt == pb_wire_i64()
+        let np = next + 8
+        if np > n
+            np = n
+        return [np, ""]
+    [n, "onnx_loader: unsupported protobuf wire type " + str(wt) + " (malformed input or deprecated groups)"]
+
+// _ol_read_packed_varints: decode a "packed repeated" numeric field's LEN
+// payload — a flat concatenation of unsigned varints with no framing
+// between them — into a list of ints. Used for TensorProto.dims when it
+// arrives as a single packed occurrence (the proto3 default for a repeated
+// scalar numeric field).
+//
+// Bounds-safe: pb_read_varint (== vi_decode) always consumes at least one
+// byte when p < blen, so p strictly increases every iteration; the extra
+// `if vr[1] <= p` guard is a defense-in-depth belt against any future
+// change to that invariant rather than a path this can currently take.
+fn _ol_read_packed_varints(buf: bytes) -> list
+    let out = []
+    let p = 0
+    let blen = bytes_len(buf)
+    while p < blen
+        let vr = pb_read_varint(buf, p)
+        push(out, vr[0])
+        if vr[1] <= p
+            p = blen
+        else
+            p = vr[1]
+    out
+
+// ── OperatorSetIdProto ───────────────────────────────────────────────────────
+
+// _ol_parse_opset: decode one OperatorSetIdProto submessage.
+// Returns [dict{domain,version}, err].
+fn _ol_parse_opset(buf: bytes) -> list
+    let d = {}
+    d["domain"] = ""
+    d["version"] = 0
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            if fnum == 2
+                d["version"] = vr[0]
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 1
+                    d["domain"] = bytes_to_str(lr[0])
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+    [d, err]
+
+// ── ValueInfoProto (only the name is needed) ─────────────────────────────────
+
+// _ol_parse_valueinfo_name: decode one ValueInfoProto submessage, returning
+// only its name (field 1) — its `type`/`doc_string` fields are skipped.
+// Returns [name_string, err].
+fn _ol_parse_valueinfo_name(buf: bytes) -> list
+    let name = ""
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 1
+                    name = bytes_to_str(lr[0])
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+    [name, err]
+
+// ── TensorProto (only dims + name are needed, for initializer shapes) ───────
+
+// _ol_parse_tensor: decode one TensorProto submessage's dims (field 1,
+// packed-or-unpacked varint) and name (field 8). All other fields
+// (data_type, float_data/int32_data/..., raw_data, segment, ...) are
+// skipped — this loader reports SHAPE, not tensor contents.
+// Returns [dict{name, dims}, err].
+fn _ol_parse_tensor(buf: bytes) -> list
+    let t = {}
+    t["name"] = ""
+    let dims = []
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            if fnum == 1
+                push(dims, vr[0])
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 1
+                    let packed = _ol_read_packed_varints(lr[0])
+                    let pi = 0
+                    let pn = len(packed)
+                    while pi < pn
+                        push(dims, packed[pi])
+                        pi = pi + 1
+                else
+                    if fnum == 8
+                        t["name"] = bytes_to_str(lr[0])
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+    t["dims"] = dims
+    [t, err]
+
+// ── NodeProto ────────────────────────────────────────────────────────────────
+
+// _ol_parse_node: decode one NodeProto submessage — input names (field 1),
+// output names (field 2), name (field 3), op_type (field 4). `domain`,
+// `attribute`, and `doc_string` are skipped (see module header for why
+// `attribute` in particular is never recursed into).
+// Returns [dict{name, op_type, inputs, outputs}, err].
+fn _ol_parse_node(buf: bytes) -> list
+    let nd = {}
+    nd["name"] = ""
+    nd["op_type"] = ""
+    let inputs = []
+    let outputs = []
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 1
+                    push(inputs, bytes_to_str(lr[0]))
+                else
+                    if fnum == 2
+                        push(outputs, bytes_to_str(lr[0]))
+                    else
+                        if fnum == 3
+                            nd["name"] = bytes_to_str(lr[0])
+                        else
+                            if fnum == 4
+                                nd["op_type"] = bytes_to_str(lr[0])
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+    nd["inputs"] = inputs
+    nd["outputs"] = outputs
+    [nd, err]
+
+// ── GraphProto ───────────────────────────────────────────────────────────────
+
+// _ol_parse_graph: decode one GraphProto submessage — node (field 1,
+// repeated), name (field 2), initializer (field 5, repeated), input
+// (field 11, repeated ValueInfoProto -> names only), output (field 12,
+// repeated ValueInfoProto -> names only). `doc_string`, `value_info`,
+// `sparse_initializer`, and `quantization_annotation` are skipped.
+// Returns [dict{name, node_list, initializer_list, input_names,
+// output_names}, err] — err is the FIRST error seen from this message or
+// any nested submessage (parsing still continues past it so a single bad
+// node/tensor cannot hide sibling data, but the caller is told the graph
+// was not fully well-formed).
+fn _ol_parse_graph(buf: bytes) -> list
+    let g = {}
+    g["name"] = ""
+    let nodes = []
+    let inits = []
+    let inputs = []
+    let outputs = []
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 1
+                    let nr = _ol_parse_node(lr[0])
+                    push(nodes, nr[0])
+                    if err == "" and nr[1] != ""
+                        err = nr[1]
+                else
+                    if fnum == 2
+                        g["name"] = bytes_to_str(lr[0])
+                    else
+                        if fnum == 5
+                            let tr = _ol_parse_tensor(lr[0])
+                            push(inits, tr[0])
+                            if err == "" and tr[1] != ""
+                                err = tr[1]
+                        else
+                            if fnum == 11
+                                let vin = _ol_parse_valueinfo_name(lr[0])
+                                push(inputs, vin[0])
+                                if err == "" and vin[1] != ""
+                                    err = vin[1]
+                            else
+                                if fnum == 12
+                                    let vout = _ol_parse_valueinfo_name(lr[0])
+                                    push(outputs, vout[0])
+                                    if err == "" and vout[1] != ""
+                                        err = vout[1]
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+    g["node_list"] = nodes
+    g["initializer_list"] = inits
+    g["input_names"] = inputs
+    g["output_names"] = outputs
+    [g, err]
+
+// ── ModelProto (top level) ───────────────────────────────────────────────────
+
+// _ol_parse_model: decode the top-level ModelProto — the WHOLE contents of
+// an .onnx file. `buf` must be exactly the file's bytes (or an equivalent
+// in-memory buffer); this function walks it from position 0 to its end.
+// Returns [model dict (see module header for shape), err].
+fn _ol_parse_model(buf: bytes) -> list
+    let ir_version = 0
+    let producer_name = ""
+    let producer_version = ""
+    let domain = ""
+    let model_version = 0
+    let graph_name = ""
+    let nodes = []
+    let inits = []
+    let ginputs = []
+    let goutputs = []
+    let opsets = []
+    let err = ""
+    let pos = 0
+    let n = bytes_len(buf)
+    while pos < n
+        let tag = pb_read_tag(buf, pos)
+        let fnum = tag[0]
+        let wt = tag[1]
+        let next = tag[2]
+        if wt == pb_wire_varint()
+            let vr = pb_read_varint(buf, next)
+            if fnum == 1
+                ir_version = vr[0]
+            else
+                if fnum == 5
+                    model_version = vr[0]
+            pos = vr[1]
+        else
+            if wt == pb_wire_len()
+                let lr = pb_read_len_delim(buf, next)
+                if fnum == 2
+                    producer_name = bytes_to_str(lr[0])
+                else
+                    if fnum == 3
+                        producer_version = bytes_to_str(lr[0])
+                    else
+                        if fnum == 4
+                            domain = bytes_to_str(lr[0])
+                        else
+                            if fnum == 7
+                                let gr = _ol_parse_graph(lr[0])
+                                let gd = gr[0]
+                                graph_name = gd["name"]
+                                nodes = gd["node_list"]
+                                inits = gd["initializer_list"]
+                                ginputs = gd["input_names"]
+                                goutputs = gd["output_names"]
+                                if err == "" and gr[1] != ""
+                                    err = gr[1]
+                            else
+                                if fnum == 8
+                                    let orr = _ol_parse_opset(lr[0])
+                                    push(opsets, orr[0])
+                                    if err == "" and orr[1] != ""
+                                        err = orr[1]
+                pos = lr[1]
+            else
+                let sk = _ol_advance_unhandled(wt, next, n)
+                if err == ""
+                    err = sk[1]
+                pos = sk[0]
+
+    let init_names = []
+    let shapes = {}
+    let ii = 0
+    let ni = len(inits)
+    while ii < ni
+        let td = inits[ii]
+        let tname = td["name"]
+        push(init_names, tname)
+        shapes[tname] = td["dims"]
+        ii = ii + 1
+
+    let m = {}
+    m["ir_version"] = ir_version
+    m["producer_name"] = producer_name
+    m["producer_version"] = producer_version
+    m["domain"] = domain
+    m["model_version"] = model_version
+    m["graph_name"] = graph_name
+    m["opset_import"] = opsets
+    m["nodes"] = nodes
+    m["initializer_names"] = init_names
+    m["initializer_shapes"] = shapes
+    m["graph_input_names"] = ginputs
+    m["graph_output_names"] = goutputs
+    [m, err]
+
+// ── accessor defaults (defend the read-side API against a hand-built or
+//    partially-populated model dict, not just one produced by onnx_parse) ──
+
+fn _ol_get_list(model: dict, key: string) -> list
+    if contains(model, key)
+        return model[key]
+    []
+
+fn _ol_get_dict(model: dict, key: string) -> dict
+    if contains(model, key)
+        return model[key]
+    {}
+
+// ── PUBLIC API ────────────────────────────────────────────────────────────────
+
+// onnx_parse: parse a complete in-memory .onnx file (a serialized
+// ModelProto). Returns ok(model dict) on success (see module header for the
+// exact shape), or err(message) for an empty buffer or a message that used
+// an unrecoverable wire type (group tags / undefined wire type — see
+// _ol_advance_unhandled). A structurally valid ModelProto that merely omits
+// optional fields (no graph, no opset_import, ...) still parses to ok() —
+// every field defaults rather than fails, matching proto3's own
+// all-fields-optional semantics.
+fn onnx_parse(data: bytes) -> Result
+    if bytes_len(data) == 0
+        return err("onnx_parse: empty buffer")
+    let r = _ol_parse_model(data)
+    if r[1] != ""
+        return err("onnx_parse: " + r[1])
+    ok(r[0])
+
+// onnx_node_count: number of nodes (operators) in the model's graph.
+fn onnx_node_count(model: dict) -> int
+    len(_ol_get_list(model, "nodes"))
+
+// onnx_opset_version: the version of the DEFAULT operator set — the
+// opset_import entry whose domain is "" (the ai.onnx core domain; this is
+// what every ONNX tool means by "opset version" unless a custom-domain
+// opset is explicitly being asked about). Falls back to the first
+// opset_import entry's version if no "" domain entry is present, and to 0
+// if opset_import is empty entirely (a technically-invalid but not
+// uncommon-in-the-wild minimal/test model).
+fn onnx_opset_version(model: dict) -> int
+    let opsets = _ol_get_list(model, "opset_import")
+    let n = len(opsets)
+    let fallback = 0
+    let have_fallback = 0
+    let i = 0
+    while i < n
+        let o = opsets[i]
+        let dom = ""
+        if contains(o, "domain")
+            dom = o["domain"]
+        let ver = 0
+        if contains(o, "version")
+            ver = o["version"]
+        if dom == ""
+            return ver
+        if have_fallback == 0
+            fallback = ver
+            have_fallback = 1
+        i = i + 1
+    fallback
+
+// onnx_input_names: graph-level input names (GraphProto.input[].name) —
+// the model's external inputs, in declaration order.
+fn onnx_input_names(model: dict) -> list
+    _ol_get_list(model, "graph_input_names")
+
+// onnx_output_names: graph-level output names (GraphProto.output[].name)
+// — the model's external outputs, in declaration order.
+fn onnx_output_names(model: dict) -> list
+    _ol_get_list(model, "graph_output_names")
+
+// onnx_tensor_shapes: initializer (weight/constant) tensor name -> shape,
+// where shape is a list of int dims (e.g. [1, 3, 224, 224]). A 0-length
+// list means a scalar (rank-0) tensor, matching TensorProto's own
+// convention (an empty `dims` repeated field IS a valid scalar shape, not
+// a missing-field indicator).
+fn onnx_tensor_shapes(model: dict) -> dict
+    _ol_get_dict(model, "initializer_shapes")

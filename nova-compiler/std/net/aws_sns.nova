@@ -1,0 +1,752 @@
+// ============================================================================
+// NOVA Standard Library — std/net/aws_sns
+// ============================================================================
+// Amazon SNS (Simple Notification Service) client over the AWS "Query API"
+// (Action=<Op>&...&Version=2010-03-31 request shape, XML response body).
+//
+// PUBLIC API:
+//   sns_publish(topic_arn, message, access_key, secret_key, region) -> Result
+//     ok = the MessageId (string) AWS assigned the published message.
+//   sns_subscribe(topic_arn, protocol, endpoint, access_key, secret_key, region) -> Result
+//     ok = the SubscriptionArn (or the literal "pending confirmation" when the
+//     protocol requires the endpoint to confirm, e.g. email/http(s)).
+//   sns_list_topics(access_key, secret_key, region) -> Result
+//     ok = a list of TopicArn strings. v1 does not follow NextToken pagination
+//     (a topic list beyond one page returns only its first page) — tracked
+//     limitation, not a silent-wrong result (AWS pages at 100 topics).
+//   sns_list_subscriptions(topic_arn, access_key, secret_key, region) -> Result
+//     ok = a list of dicts (flat — NOVA has no nested-dict literal), each with
+//     keys: "subscription_arn", "owner", "protocol", "endpoint", "topic_arn".
+//     Uses the ListSubscriptionsByTopic action (matches the topic_arn param).
+//   sns_unsubscribe(subscription_arn, access_key, secret_key, region) -> Result
+//     ok = the response RequestId (string; "" if AWS omitted it).
+//
+// AUTHENTICATION — WHY QUERY-STRING SigV4, NOT HEADER SigV4:
+//   AWS SigV4 normally signs an Authorization HEADER (host/x-amz-date/
+//   x-amz-content-sha256/Authorization). This module can only reach the
+//   network via the two global HTTP builtins (`http_get(url)`, `http_post`
+//   (url,body,content_type)) — NEITHER accepts a custom-headers dict (that
+//   capability lives in forge_http_client's `http_request`, a FORGE-layer
+//   module std/ must not depend on — see LEAF note below). SigV4 has a
+//   second, equally official signing mode built exactly for this situation:
+//   "Authenticating Requests: Using Query Parameters" — the ENTIRE
+//   Authorization (X-Amz-Algorithm/Credential/Date/Expires/SignedHeaders/
+//   Signature) rides in the URL's query string instead of a header, so a
+//   plain GET with no custom headers is a fully valid signed AWS request.
+//   Every sns_* call below is therefore issued as GET against a presigned
+//   URL built by sns_presigned_url. TRADEOFF: the whole request (including
+//   Message for Publish) lives in the URL, so this module is not suited to
+//   very large SNS messages (SNS itself allows up to 256 KB; a URL that long
+//   will be rejected by most HTTP stacks well before that). Practical
+//   messages (well under ~4 KB) are unaffected. A POST+header-signed path
+//   is a tracked follow-up once a headers-capable builtin exists.
+//
+// CRYPTO — WHY SELF-CONTAINED, NOT `import forge_crypto`/`forge_awssigv4`:
+//   SigV4's signing-key derivation chains FOUR HMAC-SHA256 calls, each one
+//   feeding the PREVIOUS call's raw 32-byte digest in as the next call's KEY.
+//   A raw digest is binary and averages a ~1-in-8 chance of containing a 0x00
+//   byte; NOVA's `string` is C-string-shaped (reference_nova_string_nul_
+//   truncation) — feeding that digest through the *string*-based `hmac_sha256`
+//   builtin (which takes/returns NOVA strings) would silently truncate the key
+//   on exactly those unlucky dates/regions/secrets, corrupting every fourth-
+//   ish signature. The correct fix is a BINARY-SAFE HMAC/SHA-256 operating on
+//   byte lists throughout — which is exactly what forge_awssigv4 already gets
+//   right by composing forge_crypto (forge/forge_crypto.nova,
+//   hmac_sha256_bytes). This module cannot `import` that: std/ is the leaf
+//   stdlib layer and forge/ is the framework layer built ON TOP of std/ (see
+//   project module-layering convention) — a std/net leaf reaching UP into
+//   forge/ would invert that dependency direction. So the SAME algorithm
+//   (FIPS 180-4 SHA-256 + RFC 2104 HMAC over int-byte-lists, 32-bit words
+//   masked via `& 4294967295` because NOVA ints are 64-bit) is reimplemented
+//   here, self-contained, under the `_sns_` prefix. It is exercised
+//   end-to-end (not just unit-tested in isolation) by _kat_aws_sns.nova
+//   against a hand-derived-and-independently-recomputed (Python
+//   hashlib/hmac) AWS SigV4 query-signing worked example — the same
+//   known-answer-vector standard this project holds every crypto primitive
+//   to.
+//
+// XML — STRING-SEARCH, NOT A GENERIC PARSER:
+//   SNS Query API responses are shallow, fixed-shape XML (a handful of named
+//   leaf tags, optionally repeated inside <member> blocks for list actions).
+//   A full recursive-descent parser (std/text/xml.nova) is more machinery
+//   than this shape needs and would be another std->std import this LEAF
+//   module deliberately avoids (see IMPLEMENTATION RULES: pure NOVA, no
+//   imports). Tag extraction is plain find/slice on the raw text (same
+//   proven approach as std/data/rss_parse.nova's _rss_extract_tag), with
+//   entity-unescaping for &amp;/&lt;/&gt;/&quot;/&apos; and single-byte
+//   numeric refs (&#NN; / &#xHH;) — SNS message bodies can legitimately
+//   contain any of those.
+//
+// PARAMETER ENCODING:
+//   Every value (Message text, ARNs, endpoints...) is RFC 3986
+//   percent-encoded via sns_url_encode before it enters a canonical query
+//   string — required both for a well-formed URL AND because SigV4 signs the
+//   EXACT encoded bytes; an unencoded space or ':' in the canonical query
+//   would silently produce a signature AWS rejects.
+//
+// LEAF — imports NOTHING (see CRYPTO and XML notes above for why).
+// ============================================================================
+
+// ── RFC 3986 percent-encoding (self-contained; mirrors std/encoding/percent's
+//    algorithm — see CRYPTO note above for why this module can't import it) ──
+
+fn _sns_pct_alpha() -> string
+    "0123456789ABCDEF"
+
+// 1 if byte value b is in the RFC 3986 unreserved set (A-Z a-z 0-9 - . _ ~).
+fn _sns_pct_unreserved(b: int) -> int
+    if b >= 65 and b <= 90
+        return 1
+    if b >= 97 and b <= 122
+        return 1
+    if b >= 48 and b <= 57
+        return 1
+    if b == 45 or b == 46 or b == 95 or b == 126
+        return 1
+    return 0
+
+// RFC 3986 percent-encode a whole string (its raw UTF-8 bytes; every byte
+// outside the unreserved set becomes "%XX" with uppercase hex digits).
+fn sns_url_encode(s: string) -> string
+    let alpha = _sns_pct_alpha()
+    let data = str_to_bytes(s)
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i < nb
+        let b = bytes_get(data, i) & 0xFF
+        if _sns_pct_unreserved(b) == 1
+            out = out + chr(b)
+        else
+            let hi = (b >> 4) & 0x0F
+            let lo = b & 0x0F
+            out = out + "%" + char_at(alpha, hi) + char_at(alpha, lo)
+        i = i + 1
+    out
+
+// ── Pure-NOVA SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104), byte-list based
+//    (binary-safe — see CRYPTO note above) ──────────────────────────────────
+
+fn _sns_rotr32(x: int, n: int) -> int
+    ((x >> n) | (x << (32 - n))) & 4294967295
+
+// SHA-256 over a byte list (ints 0..255) -> a 32-byte digest as a byte list.
+fn _sns_sha256_bytes(msg: list) -> list
+    let k = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+    let ml = len(msg)
+    let m = []
+    let i = 0
+    while i < ml
+        push(m, msg[i] & 255)
+        i = i + 1
+    push(m, 128)
+    // Pad with zero bytes until len(m) mod 64 == 56 (room for the 8-byte
+    // bit-length). Avoids `%` per project convention: a - (a/b)*b.
+    let rem = len(m) - (len(m) / 64) * 64
+    while rem != 56
+        push(m, 0)
+        rem = len(m) - (len(m) / 64) * 64
+    let bitlen = ml * 8
+    let j = 7
+    while j >= 0
+        push(m, (bitlen >> (j * 8)) & 255)
+        j = j - 1
+    let h0 = 0x6a09e667
+    let h1 = 0xbb67ae85
+    let h2 = 0x3c6ef372
+    let h3 = 0xa54ff53a
+    let h4 = 0x510e527f
+    let h5 = 0x9b05688c
+    let h6 = 0x1f83d9ab
+    let h7 = 0x5be0cd19
+    let nchunks = len(m) / 64
+    let c = 0
+    while c < nchunks
+        let base = c * 64
+        let w = []
+        let t = 0
+        while t < 16
+            let o = base + t * 4
+            push(w, ((m[o] << 24) | (m[o + 1] << 16) | (m[o + 2] << 8) | m[o + 3]) & 4294967295)
+            t = t + 1
+        while t < 64
+            let x15 = w[t - 15]
+            let s0 = (_sns_rotr32(x15, 7) ^ _sns_rotr32(x15, 18) ^ (x15 >> 3)) & 4294967295
+            let x2 = w[t - 2]
+            let s1 = (_sns_rotr32(x2, 17) ^ _sns_rotr32(x2, 19) ^ (x2 >> 10)) & 4294967295
+            push(w, (w[t - 16] + s0 + w[t - 7] + s1) & 4294967295)
+            t = t + 1
+        let a = h0
+        let b = h1
+        let cc = h2
+        let d = h3
+        let e = h4
+        let f = h5
+        let g = h6
+        let hh = h7
+        let r = 0
+        while r < 64
+            let big1 = (_sns_rotr32(e, 6) ^ _sns_rotr32(e, 11) ^ _sns_rotr32(e, 25)) & 4294967295
+            let ch = ((e & f) ^ ((e ^ 4294967295) & g)) & 4294967295
+            let t1 = (hh + big1 + ch + k[r] + w[r]) & 4294967295
+            let big0 = (_sns_rotr32(a, 2) ^ _sns_rotr32(a, 13) ^ _sns_rotr32(a, 22)) & 4294967295
+            let maj = ((a & b) ^ (a & cc) ^ (b & cc)) & 4294967295
+            let t2 = (big0 + maj) & 4294967295
+            hh = g
+            g = f
+            f = e
+            e = (d + t1) & 4294967295
+            d = cc
+            cc = b
+            b = a
+            a = (t1 + t2) & 4294967295
+            r = r + 1
+        h0 = (h0 + a) & 4294967295
+        h1 = (h1 + b) & 4294967295
+        h2 = (h2 + cc) & 4294967295
+        h3 = (h3 + d) & 4294967295
+        h4 = (h4 + e) & 4294967295
+        h5 = (h5 + f) & 4294967295
+        h6 = (h6 + g) & 4294967295
+        h7 = (h7 + hh) & 4294967295
+        c = c + 1
+    let out = []
+    let hs = [h0, h1, h2, h3, h4, h5, h6, h7]
+    let q = 0
+    while q < 8
+        let hv = hs[q]
+        push(out, (hv >> 24) & 255)
+        push(out, (hv >> 16) & 255)
+        push(out, (hv >> 8) & 255)
+        push(out, hv & 255)
+        q = q + 1
+    out
+
+// A string's raw UTF-8 bytes as a byte list (via str_to_bytes -> the real
+// bytes, not codepoint guesses).
+fn _sns_str_to_blist(s: string) -> list
+    let nb = str_to_bytes(s)
+    let n = bytes_len(nb)
+    let out = []
+    let i = 0
+    while i < n
+        push(out, bytes_get(nb, i))
+        i = i + 1
+    out
+
+// Lowercase hex of a byte list.
+fn _sns_hex_of(blist: list) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let i = 0
+    while i < len(blist)
+        let b = blist[i]
+        out = out + char_at(digs, (b >> 4) & 15) + char_at(digs, b & 15)
+        i = i + 1
+    out
+
+fn _sns_sha256_hex(s: string) -> string
+    _sns_hex_of(_sns_sha256_bytes(_sns_str_to_blist(s)))
+
+// HMAC-SHA-256 (RFC 2104) over byte lists -> a 32-byte MAC as a byte list.
+// Block size B = 64; a key longer than B is hashed first, then padded to B.
+fn _sns_hmac_sha256_bytes(key: list, msg: list) -> list
+    let k0 = key
+    if len(k0) > 64
+        k0 = _sns_sha256_bytes(k0)
+    let inner_in = []
+    let outer_in = []
+    let i = 0
+    while i < 64
+        let kb = 0
+        if i < len(k0)
+            kb = k0[i]
+        push(inner_in, kb ^ 0x36)
+        push(outer_in, kb ^ 0x5c)
+        i = i + 1
+    let j = 0
+    while j < len(msg)
+        push(inner_in, msg[j])
+        j = j + 1
+    let inner = _sns_sha256_bytes(inner_in)
+    let z = 0
+    while z < len(inner)
+        push(outer_in, inner[z])
+        z = z + 1
+    _sns_sha256_bytes(outer_in)
+
+// ── SigV4 primitives (query-parameter signing variant — see AUTHENTICATION
+//    note above) ──────────────────────────────────────────────────────────
+
+fn _sns_sigv4_scope(date_stamp: string, region: string, service: string) -> string
+    date_stamp + "/" + region + "/" + service + "/aws4_request"
+
+fn _sns_sigv4_canonical_request(method: string, uri: string, query: string, canonical_headers: string, signed_headers: string, payload_hash: string) -> string
+    let nl = chr(10)
+    method + nl + uri + nl + query + nl + canonical_headers + nl + signed_headers + nl + payload_hash
+
+fn _sns_sigv4_string_to_sign(amz_date: string, scope: string, creq: string) -> string
+    let nl = chr(10)
+    "AWS4-HMAC-SHA256" + nl + amz_date + nl + scope + nl + _sns_sha256_hex(creq)
+
+// The SigV4 signing key: HMAC chain seeded with "AWS4"+secret over
+// date -> region -> service -> "aws4_request" (each step's digest becomes
+// the next step's binary-safe HMAC key — the exact reason this module
+// cannot use the string-based `hmac_sha256` builtin; see CRYPTO note).
+fn _sns_sigv4_signing_key(secret: string, date_stamp: string, region: string, service: string) -> list
+    let k1 = _sns_hmac_sha256_bytes(_sns_str_to_blist("AWS4" + secret), _sns_str_to_blist(date_stamp))
+    let k2 = _sns_hmac_sha256_bytes(k1, _sns_str_to_blist(region))
+    let k3 = _sns_hmac_sha256_bytes(k2, _sns_str_to_blist(service))
+    _sns_hmac_sha256_bytes(k3, _sns_str_to_blist("aws4_request"))
+
+fn _sns_sigv4_signature_hex(secret: string, date_stamp: string, region: string, service: string, sts: string) -> string
+    let key = _sns_sigv4_signing_key(secret, date_stamp, region, service)
+    _sns_hex_of(_sns_hmac_sha256_bytes(key, _sns_str_to_blist(sts)))
+
+// ── UTC "now" as SigV4's two clock strings (self-contained epoch->calendar;
+//    std/time/strftime is not importable here — see LEAF note above) ───────
+
+// Zero-pad a non-negative integer to `width` digits.
+fn _sns_zpad(n: int, width: int) -> string
+    let out = str(n)
+    while len(out) < width
+        out = "0" + out
+    out
+
+// Howard Hinnant's civil_from_days: proleptic-Gregorian days-since-epoch
+// (1970-01-01 = 0) -> [year, month, day]. Integer-only, no external date
+// library. Correct for the full practical "now" range this module needs
+// (any Unix timestamp >= 0); the z<0 branch is kept for defensiveness on
+// pre-epoch inputs but is not exercised by _sns_now_stamps.
+fn _sns_civil_from_days(z_in: int) -> list
+    let z = z_in + 719468
+    let era = z / 146097
+    if z < 0
+        era = (z - 146096) / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = mp + 3
+    if mp >= 10
+        m = mp - 9
+    if m <= 2
+        y = y + 1
+    [y, m, d]
+
+// A Unix epoch (seconds, UTC) -> SigV4's two clock strings:
+// [amz_date "YYYYMMDDTHHMMSSZ", date_stamp "YYYYMMDD"].
+fn sns_epoch_to_stamps(epoch: int) -> list
+    let days = epoch / 86400
+    let secs_of_day = epoch - days * 86400
+    if secs_of_day < 0
+        secs_of_day = secs_of_day + 86400
+        days = days - 1
+    let hh = secs_of_day / 3600
+    let mm = (secs_of_day - hh * 3600) / 60
+    let ss = secs_of_day - hh * 3600 - mm * 60
+    let ymd = _sns_civil_from_days(days)
+    let date_stamp = _sns_zpad(ymd[0], 4) + _sns_zpad(ymd[1], 2) + _sns_zpad(ymd[2], 2)
+    let amz_date = date_stamp + "T" + _sns_zpad(hh, 2) + _sns_zpad(mm, 2) + _sns_zpad(ss, 2) + "Z"
+    [amz_date, date_stamp]
+
+fn _sns_now_stamps() -> list
+    sns_epoch_to_stamps(time_ms() / 1000)
+
+// ── URL construction ─────────────────────────────────────────────────────
+
+fn _sns_host(region: string) -> string
+    "sns." + region + ".amazonaws.com"
+
+// The plain (unsigned) SNS Query API endpoint for a region.
+fn sns_endpoint_url(region: string) -> string
+    "https://" + _sns_host(region) + "/"
+
+// key1=val1&key2=val2..., every key/value RFC-3986 percent-encoded, in the
+// EXACT order `pairs` is given (see sns_presigned_url for why no sort step
+// is needed).
+fn _sns_build_canonical_query(pairs: list) -> string
+    let parts = []
+    let i = 0
+    while i < len(pairs)
+        let k = pairs[i][0]
+        let v = pairs[i][1]
+        push(parts, sns_url_encode(k) + "=" + sns_url_encode(v))
+        i = i + 1
+    join(parts, "&")
+
+// Build a fully SigV4 query-string-signed GET URL for one SNS Query API
+// action. `action_params` is the action's own params (Action, Version, and
+// whichever of TopicArn/Message/Protocol/Endpoint/SubscriptionArn apply) as
+// [key,value] pairs, ALREADY in ascending-key order (see the sns_*_params
+// builders below). No general sort is implemented: every action param name
+// (Action, Endpoint, Message, Protocol, SubscriptionArn, TopicArn, Version)
+// starts with a letter in 'A'..'V', and every SigV4 query param name starts
+// with "X-Amz-" ('X') — so simply appending the X-Amz-* block (itself
+// already alphabetical: Algorithm < Credential < Date < Expires <
+// SignedHeaders) after `action_params` yields the true byte-order-sorted
+// CanonicalQueryString SigV4 requires, with zero sort code.
+fn sns_presigned_url(region: string, action_params: list, access_key: string, secret_key: string, amz_date: string, date_stamp: string) -> string
+    let host = _sns_host(region)
+    let scope = _sns_sigv4_scope(date_stamp, region, "sns")
+    let credential = access_key + "/" + scope
+    let amz_params = []
+    push(amz_params, ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"])
+    push(amz_params, ["X-Amz-Credential", credential])
+    push(amz_params, ["X-Amz-Date", amz_date])
+    push(amz_params, ["X-Amz-Expires", "300"])
+    push(amz_params, ["X-Amz-SignedHeaders", "host"])
+    let all_params = []
+    let i = 0
+    while i < len(action_params)
+        push(all_params, action_params[i])
+        i = i + 1
+    i = 0
+    while i < len(amz_params)
+        push(all_params, amz_params[i])
+        i = i + 1
+    let canonical_query = _sns_build_canonical_query(all_params)
+    let canonical_headers = "host:" + host + chr(10)
+    let signed_headers = "host"
+    let payload_hash = _sns_sha256_hex("")
+    let creq = _sns_sigv4_canonical_request("GET", "/", canonical_query, canonical_headers, signed_headers, payload_hash)
+    let sts = _sns_sigv4_string_to_sign(amz_date, scope, creq)
+    let sig = _sns_sigv4_signature_hex(secret_key, date_stamp, region, "sns", sts)
+    "https://" + host + "/?" + canonical_query + "&X-Amz-Signature=" + sig
+
+// ── Per-action parameter lists (ascending key order — see sns_presigned_url)
+
+fn sns_publish_params(topic_arn: string, message: string) -> list
+    let p = []
+    push(p, ["Action", "Publish"])
+    push(p, ["Message", message])
+    push(p, ["TopicArn", topic_arn])
+    push(p, ["Version", "2010-03-31"])
+    p
+
+fn sns_subscribe_params(topic_arn: string, protocol: string, endpoint: string) -> list
+    let p = []
+    push(p, ["Action", "Subscribe"])
+    push(p, ["Endpoint", endpoint])
+    push(p, ["Protocol", protocol])
+    push(p, ["TopicArn", topic_arn])
+    push(p, ["Version", "2010-03-31"])
+    p
+
+fn sns_list_topics_params() -> list
+    let p = []
+    push(p, ["Action", "ListTopics"])
+    push(p, ["Version", "2010-03-31"])
+    p
+
+// Uses ListSubscriptionsByTopic (the real AWS action name for "subscriptions
+// of one topic" — plain ListSubscriptions takes no TopicArn and lists every
+// subscription on the account instead).
+fn sns_list_subscriptions_params(topic_arn: string) -> list
+    let p = []
+    push(p, ["Action", "ListSubscriptionsByTopic"])
+    push(p, ["TopicArn", topic_arn])
+    push(p, ["Version", "2010-03-31"])
+    p
+
+fn sns_unsubscribe_params(subscription_arn: string) -> list
+    let p = []
+    push(p, ["Action", "Unsubscribe"])
+    push(p, ["SubscriptionArn", subscription_arn])
+    push(p, ["Version", "2010-03-31"])
+    p
+
+// ── XML response parsing (string-search — see XML note above) ──────────────
+
+// Find `needle` in `haystack` starting the search at byte-offset `pos`.
+// -1 if not found or pos is out of [0, len(haystack)] range.
+fn _sns_find_from(haystack: string, needle: string, pos: int) -> int
+    let n = len(haystack)
+    if pos < 0 or pos > n
+        return -1
+    let r = find(slice(haystack, pos, n), needle)
+    if r < 0
+        return -1
+    r + pos
+
+fn _sns_is_digit(c: int) -> int
+    if c >= 48 and c <= 57
+        return 1
+    return 0
+
+// Decimal digits -> int; -1 if `s` is empty or contains a non-digit.
+fn _sns_parse_dec(s: string) -> int
+    let n = len(s)
+    if n == 0
+        return -1
+    let v = 0
+    let i = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        if _sns_is_digit(c) == 0
+            return -1
+        v = v * 10 + (c - 48)
+        i = i + 1
+    v
+
+// Hex digits (case-insensitive) -> int; -1 if `s` is empty or invalid.
+fn _sns_parse_hex(s: string) -> int
+    let n = len(s)
+    if n == 0
+        return -1
+    let v = 0
+    let i = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        let d = -1
+        if _sns_is_digit(c) == 1
+            d = c - 48
+        else if c >= 65 and c <= 70
+            d = c - 55
+        else if c >= 97 and c <= 102
+            d = c - 87
+        if d < 0
+            return -1
+        v = v * 16 + d
+        i = i + 1
+    v
+
+// Decode the 5 standard XML entities plus single-byte numeric references
+// (&#NN; decimal, &#xHH; hex). A numeric reference outside 0..255 (NOVA's
+// chr() only produces one raw byte — see nova_rt_chr) or any malformed/
+// unrecognized entity is left AS-IS (never silently mangled or dropped).
+fn _sns_xml_unescape(s: string) -> string
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        if c == "&"
+            let semi = _sns_find_from(s, ";", i)
+            if semi >= 0 and semi <= i + 10
+                let ent = slice(s, i + 1, semi)
+                let decoded = ""
+                let matched = 0
+                if ent == "amp"
+                    decoded = "&"
+                    matched = 1
+                else if ent == "lt"
+                    decoded = "<"
+                    matched = 1
+                else if ent == "gt"
+                    decoded = ">"
+                    matched = 1
+                else if ent == "quot"
+                    decoded = chr(34)
+                    matched = 1
+                else if ent == "apos"
+                    decoded = "'"
+                    matched = 1
+                else if len(ent) > 1 and char_at(ent, 0) == "#"
+                    let numpart = slice(ent, 1, len(ent))
+                    let code = -1
+                    if len(numpart) > 1 and (char_at(numpart, 0) == "x" or char_at(numpart, 0) == "X")
+                        code = _sns_parse_hex(slice(numpart, 1, len(numpart)))
+                    else
+                        code = _sns_parse_dec(numpart)
+                    if code >= 0 and code <= 255
+                        decoded = chr(code)
+                        matched = 1
+                if matched == 1
+                    out = out + decoded
+                    i = semi + 1
+                else
+                    out = out + c
+                    i = i + 1
+            else
+                out = out + c
+                i = i + 1
+        else
+            out = out + c
+            i = i + 1
+    out
+
+// The text content of the FIRST <tag>...</tag> in `xml` ("" if absent).
+fn _sns_tag_value(xml: string, tag: string) -> string
+    let open_tag = "<" + tag + ">"
+    let close_tag = "</" + tag + ">"
+    let start = find(xml, open_tag)
+    if start < 0
+        return ""
+    let content_start = start + len(open_tag)
+    let end_rel = _sns_find_from(xml, close_tag, content_start)
+    if end_rel < 0
+        return ""
+    _sns_xml_unescape(slice(xml, content_start, end_rel))
+
+// All <tag>...</tag> blocks' raw inner XML, in document order. `pos`
+// strictly advances every iteration (past each close tag found), so the
+// `guard` cap is a defense-in-depth bound, not the real loop-termination
+// condition, against a pathological/adversarial response.
+fn _sns_extract_blocks(xml: string, tag: string) -> list
+    let open_tag = "<" + tag + ">"
+    let close_tag = "</" + tag + ">"
+    let blocks = []
+    let pos = 0
+    let guard = 0
+    let done = false
+    while (not done) and guard < 100000
+        guard = guard + 1
+        let s = _sns_find_from(xml, open_tag, pos)
+        if s < 0
+            done = true
+        else
+            let cstart = s + len(open_tag)
+            let e = _sns_find_from(xml, close_tag, cstart)
+            if e < 0
+                done = true
+            else
+                push(blocks, slice(xml, cstart, e))
+                pos = e + len(close_tag)
+    blocks
+
+// "" if `xml` carries no AWS <ErrorResponse>; otherwise "<Code>: <Message>"
+// (or whichever of the two is present).
+fn _sns_parse_error(xml: string) -> string
+    let code = _sns_tag_value(xml, "Code")
+    let msg = _sns_tag_value(xml, "Message")
+    if len(code) == 0 and len(msg) == 0
+        return ""
+    if len(code) == 0
+        return msg
+    if len(msg) == 0
+        return code
+    code + ": " + msg
+
+fn sns_parse_publish_response(xml: string) -> Result
+    if len(xml) == 0
+        return err("sns_publish: empty response")
+    let em = _sns_parse_error(xml)
+    if len(em) > 0
+        return err(em)
+    let mid = _sns_tag_value(xml, "MessageId")
+    if len(mid) == 0
+        return err("sns_publish: MessageId not found in response")
+    ok(mid)
+
+fn sns_parse_subscribe_response(xml: string) -> Result
+    if len(xml) == 0
+        return err("sns_subscribe: empty response")
+    let em = _sns_parse_error(xml)
+    if len(em) > 0
+        return err(em)
+    let arn = _sns_tag_value(xml, "SubscriptionArn")
+    if len(arn) == 0
+        return err("sns_subscribe: SubscriptionArn not found in response")
+    ok(arn)
+
+fn sns_parse_list_topics_response(xml: string) -> Result
+    if len(xml) == 0
+        return err("sns_list_topics: empty response")
+    let em = _sns_parse_error(xml)
+    if len(em) > 0
+        return err(em)
+    let blocks = _sns_extract_blocks(xml, "member")
+    let out = []
+    let i = 0
+    while i < len(blocks)
+        let arn = _sns_tag_value(blocks[i], "TopicArn")
+        if len(arn) > 0
+            push(out, arn)
+        i = i + 1
+    ok(out)
+
+fn sns_parse_list_subscriptions_response(xml: string) -> Result
+    if len(xml) == 0
+        return err("sns_list_subscriptions: empty response")
+    let em = _sns_parse_error(xml)
+    if len(em) > 0
+        return err(em)
+    let blocks = _sns_extract_blocks(xml, "member")
+    let out = []
+    let i = 0
+    while i < len(blocks)
+        let b = blocks[i]
+        let d = {}
+        d["subscription_arn"] = _sns_tag_value(b, "SubscriptionArn")
+        d["owner"] = _sns_tag_value(b, "Owner")
+        d["protocol"] = _sns_tag_value(b, "Protocol")
+        d["endpoint"] = _sns_tag_value(b, "Endpoint")
+        d["topic_arn"] = _sns_tag_value(b, "TopicArn")
+        push(out, d)
+        i = i + 1
+    ok(out)
+
+fn sns_parse_unsubscribe_response(xml: string) -> Result
+    if len(xml) == 0
+        return err("sns_unsubscribe: empty response")
+    let em = _sns_parse_error(xml)
+    if len(em) > 0
+        return err(em)
+    ok(_sns_tag_value(xml, "RequestId"))
+
+// ── Public API — live network calls ─────────────────────────────────────
+
+fn sns_publish(topic_arn: string, message: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(topic_arn) == 0
+        return err("sns_publish: topic_arn is required")
+    if len(access_key) == 0 or len(secret_key) == 0
+        return err("sns_publish: access_key and secret_key are required")
+    if len(region) == 0
+        return err("sns_publish: region is required")
+    let params = sns_publish_params(topic_arn, message)
+    let stamps = _sns_now_stamps()
+    let url = sns_presigned_url(region, params, access_key, secret_key, stamps[0], stamps[1])
+    sns_parse_publish_response(http_get(url))
+
+fn sns_subscribe(topic_arn: string, protocol: string, endpoint: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(topic_arn) == 0
+        return err("sns_subscribe: topic_arn is required")
+    if len(protocol) == 0
+        return err("sns_subscribe: protocol is required")
+    if len(endpoint) == 0
+        return err("sns_subscribe: endpoint is required")
+    if len(access_key) == 0 or len(secret_key) == 0
+        return err("sns_subscribe: access_key and secret_key are required")
+    if len(region) == 0
+        return err("sns_subscribe: region is required")
+    let params = sns_subscribe_params(topic_arn, protocol, endpoint)
+    let stamps = _sns_now_stamps()
+    let url = sns_presigned_url(region, params, access_key, secret_key, stamps[0], stamps[1])
+    sns_parse_subscribe_response(http_get(url))
+
+fn sns_list_topics(access_key: string, secret_key: string, region: string) -> Result
+    if len(access_key) == 0 or len(secret_key) == 0
+        return err("sns_list_topics: access_key and secret_key are required")
+    if len(region) == 0
+        return err("sns_list_topics: region is required")
+    let params = sns_list_topics_params()
+    let stamps = _sns_now_stamps()
+    let url = sns_presigned_url(region, params, access_key, secret_key, stamps[0], stamps[1])
+    sns_parse_list_topics_response(http_get(url))
+
+fn sns_list_subscriptions(topic_arn: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(topic_arn) == 0
+        return err("sns_list_subscriptions: topic_arn is required")
+    if len(access_key) == 0 or len(secret_key) == 0
+        return err("sns_list_subscriptions: access_key and secret_key are required")
+    if len(region) == 0
+        return err("sns_list_subscriptions: region is required")
+    let params = sns_list_subscriptions_params(topic_arn)
+    let stamps = _sns_now_stamps()
+    let url = sns_presigned_url(region, params, access_key, secret_key, stamps[0], stamps[1])
+    sns_parse_list_subscriptions_response(http_get(url))
+
+fn sns_unsubscribe(subscription_arn: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(subscription_arn) == 0
+        return err("sns_unsubscribe: subscription_arn is required")
+    if len(access_key) == 0 or len(secret_key) == 0
+        return err("sns_unsubscribe: access_key and secret_key are required")
+    if len(region) == 0
+        return err("sns_unsubscribe: region is required")
+    let params = sns_unsubscribe_params(subscription_arn)
+    let stamps = _sns_now_stamps()
+    let url = sns_presigned_url(region, params, access_key, secret_key, stamps[0], stamps[1])
+    sns_parse_unsubscribe_response(http_get(url))

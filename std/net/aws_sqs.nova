@@ -1,0 +1,506 @@
+// ============================================================================
+// NOVA Standard Library — std/net/aws_sqs
+// ============================================================================
+// A real (no-SDK) AWS Simple Queue Service client: send/receive/delete a
+// message and list queues, over plain HTTP + the SQS Query Protocol (XML).
+//
+// PUBLIC API (network — actually calls AWS, returns Result):
+//   sqs_send(queue_url, message_body, access_key, secret_key, region)      -> Result   Ok({"message_id","md5_of_body"})
+//   sqs_receive(queue_url, max_messages, access_key, secret_key, region)  -> Result   Ok(list<message dict>)
+//   sqs_delete(queue_url, receipt_handle, access_key, secret_key, region) -> Result   Ok(true)
+//   sqs_list_queues(access_key, secret_key, region)                       -> Result   Ok(list<string queue url>)
+//
+//   A message dict: {"message_id","receipt_handle","body","md5_of_body"}.
+//
+// PUBLIC API (pure — no I/O, deterministic, what the KAT exercises directly):
+//   sqs_scope(date_stamp, region)                                    -> string
+//   sqs_canonical_request(method, uri, query, headers, signed, hash) -> string
+//   sqs_string_to_sign(amz_date, scope, canonical_request)           -> string
+//   sqs_signature(secret, date_stamp, region, string_to_sign)        -> string
+//   sqs_request_url(access_key, secret, region, host, path, params,
+//                    amz_date, date_stamp)                           -> string
+//   sqs_hmac_sha256(key: bytes, msg: bytes)                          -> bytes
+//   sqs_hex_of_bytes(b: bytes)                                       -> string
+//   sqs_parse_send_response(xml_body)                                -> Result
+//   sqs_parse_receive_response(xml_body)                             -> Result
+//   sqs_parse_delete_response(xml_body)                              -> Result
+//   sqs_parse_list_queues_response(xml_body)                         -> Result
+//
+// ── WHY QUERY-STRING SigV4 AUTH (not a header) ─────────────────────────────
+// This runtime's HTTP builtins are `http_get(url) -> string` and
+// `http_post(url, body, content_type) -> string` — neither can carry a
+// caller-supplied `Authorization` or `X-Amz-Date` header. SigV4 has TWO
+// documented signing forms: header-based (needs custom headers — unavailable
+// here) and "Authorization Query Parameters" (the mechanism S3 presigned
+// URLs use), where every SigV4 field rides the query string as
+// X-Amz-Algorithm / X-Amz-Credential / X-Amz-Date / X-Amz-Expires /
+// X-Amz-SignedHeaders / X-Amz-Signature and the ONLY signed header is
+// "host". That form needs no custom header support, so this module signs
+// every request that way and always sends it with `http_get`. All 4 SQS
+// Query Protocol actions used here (SendMessage/ReceiveMessage/
+// DeleteMessage/ListQueues) accept GET.
+//
+// KNOWN LIMITATION (honest, not hidden): because request parameters
+// (including MessageBody) ride the URL's query string, not a POST body,
+// there is a practical URL-length ceiling long before SQS's 256 KiB
+// MessageBody limit. `sqs_send` enforces `_SQS_MAX_URL_LEN` (8000 bytes,
+// the common conservative floor across proxies/load balancers/servers) and
+// returns an explicit Err instead of emitting a URL a real server would
+// reject with 414 — never a silent truncation. A future POST-with-signed-
+// body path needs a header-capable HTTP builtin (`http_post_headers`, not
+// present in this runtime today) to sign a real `Authorization` header.
+//
+// ── BINARY-SAFE HMAC (the classic NOVA `string` NUL-truncation trap) ───────
+// SigV4's derived signing key is produced by chaining HMAC-SHA256 four
+// times; every intermediate "key" after the first round is a raw 32-byte
+// digest that, byte-for-byte, WILL sometimes contain 0x00. NOVA's `string`
+// is a NUL-terminated C string — the native `hmac_sha256(string,string)`
+// builtin therefore silently truncates any key or message that happens to
+// contain an embedded 0x00 (see the project's documented string-NUL-
+// truncation gotcha). This module never puts binary key/digest material in
+// a `string`: `sqs_hmac_sha256` operates entirely on `bytes` (built from
+// the native, binary-safe `sha256_of_bytes(bytes) -> hex` builtin plus
+// `bytes_get`/`bytes_set`/`bytes_concat`), so an embedded 0x00 anywhere in
+// the HMAC chain is carried through correctly instead of cutting the key
+// short mid-chain.
+//
+// ── XML PARSING ──────────────────────────────────────────────────────────
+// SQS's Query Protocol responses (and its `<ErrorResponse>` error shape)
+// are XML; parsing rides std/text/xml's safe recursive-descent parser (no
+// DTD/entity expansion, depth-capped, never crashes on malformed input) —
+// not reimplemented here.
+//
+// ── IMPORTS (std-to-std only — this module never depends on forge/) ───────
+//   std/net/url          — url_parse: split a queue URL into host/path.
+//   std/net/querystring   — qs_build: RFC-3986 canonical query-string
+//                            construction (the exact encoding SigV4 needs).
+//   std/text/xml          — xml_parse/xml_find/xml_find_all/xml_text: the
+//                            safe inbound XML parser.
+//   std/time/datetime     — dt_from_epoch: UTC calendar breakdown of
+//                            time_ms(), formatted into amz_date/date_stamp.
+//
+// SYMBOL COLLISION GUARD: every private helper here is prefixed `_sqs_`.
+//
+// LEAF for crypto: the SHA-256/HMAC-SHA256 primitives ride the runtime's
+// native `sha256`/`sha256_of_bytes` builtins (never a hand-rolled SHA-256
+// compression loop) — no forge_crypto dependency.
+import std/net/url
+import std/net/querystring
+import std/text/xml
+import std/time/datetime
+
+// SQS API version pinned by this client (the "Version" query parameter
+// every SQS Query Protocol request must carry).
+fn _sqs_api_version() -> string
+    "2012-11-05"
+
+// Conservative URL-length ceiling for the GET-based signed request (see
+// header note on the query-string-auth limitation). Comfortably under the
+// ~8KB floor common to proxies/load balancers/application servers.
+fn _sqs_max_url_len() -> int
+    8000
+
+// ── RFC-3986 percent-encoding for a URI PATH segment ───────────────────────
+// (qs_build from std/net/querystring already handles QUERY key/value
+// encoding correctly; this is the analogous encoder for path segments,
+// which must NOT escape the '/' separators between them.)
+
+fn _sqs_is_unreserved(b: int) -> bool
+    if b >= 65 and b <= 90
+        return true
+    if b >= 97 and b <= 122
+        return true
+    if b >= 48 and b <= 57
+        return true
+    b == 45 or b == 95 or b == 46 or b == 126
+
+// Uppercase hex digit for nibble 0..15 (AWS SigV4 requires UPPERCASE %XX).
+fn _sqs_hexch(n: int) -> string
+    if n < 10
+        return chr(48 + n)
+    chr(55 + n)
+
+fn _sqs_pct_encode(s: string) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(char_at(s, i))
+        if _sqs_is_unreserved(b)
+            out = out + char_at(s, i)
+        else
+            let hi = b / 16
+            let lo = b - hi * 16
+            out = out + "%" + _sqs_hexch(hi) + _sqs_hexch(lo)
+        i = i + 1
+    out
+
+// canonical URI: every path segment percent-encoded, '/' separators kept
+// literal. Empty path -> "/" (SigV4 canonical URI is never empty).
+fn _sqs_uri_encode_path(path: string) -> string
+    if len(path) == 0
+        return "/"
+    let segs = split(path, "/")
+    let out = []
+    for seg in segs
+        push(out, _sqs_pct_encode(seg))
+    join(out, "/")
+
+// ── UTC date formatting (amz_date "YYYYMMDDTHHMMSSZ" / date_stamp "YYYYMMDD") ──
+
+fn _sqs_pad2(v: int) -> string
+    if v < 10
+        return "0" + str(v)
+    str(v)
+
+fn _sqs_pad4(v: int) -> string
+    if v < 10
+        return "000" + str(v)
+    if v < 100
+        return "00" + str(v)
+    if v < 1000
+        return "0" + str(v)
+    str(v)
+
+// [amz_date, date_stamp] for the current instant (UTC, via wall-clock
+// time_ms() -> dt_from_epoch — never the process-local monotonic clock_ns()).
+fn _sqs_now_dates() -> list
+    let epoch = time_ms() / 1000
+    let d = dt_from_epoch(epoch)
+    let y = _sqs_pad4(d["year"])
+    let mo = _sqs_pad2(d["month"])
+    let da = _sqs_pad2(d["day"])
+    let hh = _sqs_pad2(d["hour"])
+    let mi = _sqs_pad2(d["min"])
+    let ss = _sqs_pad2(d["sec"])
+    let amz_date = y + mo + da + "T" + hh + mi + ss + "Z"
+    let date_stamp = y + mo + da
+    [amz_date, date_stamp]
+
+// ── Binary-safe SHA-256 / HMAC-SHA256 (bytes in, bytes out — see header) ───
+
+// Decode a lowercase/uppercase hex string into its raw bytes. Odd trailing
+// nibble (malformed input) is dropped defensively rather than reading past
+// the buffer.
+fn _sqs_hex_to_bytes(hex: string) -> bytes
+    let n = len(hex)
+    let out_len = n / 2
+    let out = bytes(out_len)
+    let i = 0
+    while i < out_len
+        let hi = _sqs_hexval(ord(char_at(hex, i * 2)))
+        let lo = _sqs_hexval(ord(char_at(hex, i * 2 + 1)))
+        bytes_set(out, i, hi * 16 + lo)
+        i = i + 1
+    out
+
+fn _sqs_hexval(c: int) -> int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    if c >= 65 and c <= 70
+        return c - 55
+    0
+
+// SHA-256 digest of `b` as raw bytes (32 bytes), via the native binary-safe
+// sha256_of_bytes(bytes) -> hex builtin, decoded back to bytes for chaining.
+fn _sqs_sha256_bytes_of(b: bytes) -> bytes
+    _sqs_hex_to_bytes(sha256_of_bytes(b))
+
+// Lowercase hex encoding of a byte buffer.
+fn sqs_hex_of_bytes(b: bytes) -> string
+    let digs = "0123456789abcdef"
+    let n = bytes_len(b)
+    let out = ""
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i)
+        let hi = v / 16
+        let lo = v - hi * 16
+        out = out + char_at(digs, hi) + char_at(digs, lo)
+        i = i + 1
+    out
+
+// HMAC-SHA256 (RFC 2104), block size 64, entirely over `bytes` — no `key`
+// or `msg` is ever coerced through NOVA's NUL-truncating `string`. A key
+// longer than the block size is hashed down first; a shorter key is
+// zero-padded to 64 bytes (matching RFC 2104's K0 construction exactly).
+fn sqs_hmac_sha256(key: bytes, msg: bytes) -> bytes
+    let klen = bytes_len(key)
+    let k0 = key
+    if klen > 64
+        k0 = _sqs_sha256_bytes_of(key)
+        klen = bytes_len(k0)
+    let ipad = bytes(64)
+    let opad = bytes(64)
+    let i = 0
+    while i < 64
+        let kb = 0
+        if i < klen
+            kb = bytes_get(k0, i)
+        bytes_set(ipad, i, kb ^ 0x36)
+        bytes_set(opad, i, kb ^ 0x5c)
+        i = i + 1
+    let inner = bytes_concat(ipad, msg)
+    let inner_hash = _sqs_sha256_bytes_of(inner)
+    let outer = bytes_concat(opad, inner_hash)
+    _sqs_sha256_bytes_of(outer)
+
+// ── SigV4 (credential scope / canonical request / string-to-sign / signature) ──
+// Service is fixed to "sqs" (this module is SQS-specific — no generic
+// service parameter to get wrong at a call site).
+
+fn sqs_scope(date_stamp: string, region: string) -> string
+    date_stamp + "/" + region + "/sqs/aws4_request"
+
+// The signing key: HMAC chain seeded with "AWS4"+secret, over
+// date_stamp -> region -> "sqs" -> "aws4_request" (AWS's documented
+// derivation). Every intermediate key is raw digest bytes — see the
+// binary-safety note above for why this cannot go through `string`.
+fn _sqs_signing_key(secret: string, date_stamp: string, region: string) -> bytes
+    let k1 = sqs_hmac_sha256(str_to_bytes("AWS4" + secret), str_to_bytes(date_stamp))
+    let k2 = sqs_hmac_sha256(k1, str_to_bytes(region))
+    let k3 = sqs_hmac_sha256(k2, str_to_bytes("sqs"))
+    sqs_hmac_sha256(k3, str_to_bytes("aws4_request"))
+
+// CanonicalRequest = METHOD\nURI\nQUERY\nCANONICAL_HEADERS\n\nSIGNED_HEADERS\nPAYLOAD_HASH.
+// `canonical_headers` already carries its own trailing "\n" per entry (AWS's
+// CanonicalHeaders definition), so exactly one more "\n" here produces the
+// single required blank line before SIGNED_HEADERS.
+fn sqs_canonical_request(method: string, uri: string, query: string, canonical_headers: string, signed_headers: string, payload_hash: string) -> string
+    let nl = chr(10)
+    method + nl + uri + nl + query + nl + canonical_headers + nl + signed_headers + nl + payload_hash
+
+// StringToSign = "AWS4-HMAC-SHA256\n<amz_date>\n<scope>\nHEX(SHA256(canonical_request))".
+fn sqs_string_to_sign(amz_date: string, scope: string, canonical_request: string) -> string
+    let nl = chr(10)
+    "AWS4-HMAC-SHA256" + nl + amz_date + nl + scope + nl + sha256(canonical_request)
+
+// The final signature (lowercase hex) = HEX(HMAC(signing_key, string_to_sign)).
+fn sqs_signature(secret: string, date_stamp: string, region: string, string_to_sign: string) -> string
+    let key = _sqs_signing_key(secret, date_stamp, region)
+    let mac = sqs_hmac_sha256(key, str_to_bytes(string_to_sign))
+    sqs_hex_of_bytes(mac)
+
+// ── Signed request URL (query-string SigV4 auth) — PURE, deterministic ────
+// Builds the full "https://<host><path>?<query>&X-Amz-Signature=<sig>" GET
+// URL for one SQS action. `params` carries the action's OWN parameters
+// (Action, Version, QueueUrl, MessageBody, ...) — NOT the X-Amz-* auth
+// fields, which this function adds itself. Takes amz_date/date_stamp as
+// explicit inputs (not "now") so it is fully deterministic and testable —
+// the live sqs_send/sqs_receive/sqs_delete/sqs_list_queues wrappers below
+// are the only callers that supply the current instant.
+fn sqs_request_url(access_key: string, secret: string, region: string, host: string, path: string, params: dict, amz_date: string, date_stamp: string) -> string
+    let scope = sqs_scope(date_stamp, region)
+    let credential = access_key + "/" + scope
+    let p = {}
+    let ks = keys(params)
+    let i = 0
+    while i < len(ks)
+        p[ks[i]] = params[ks[i]]
+        i = i + 1
+    p["X-Amz-Algorithm"] = "AWS4-HMAC-SHA256"
+    p["X-Amz-Credential"] = credential
+    p["X-Amz-Date"] = amz_date
+    p["X-Amz-Expires"] = "30"
+    p["X-Amz-SignedHeaders"] = "host"
+    let canonical_query = qs_build(p)
+    let canonical_uri = _sqs_uri_encode_path(path)
+    let nl = chr(10)
+    let canonical_headers = "host:" + host + nl
+    let signed_headers = "host"
+    let payload_hash = sha256("")
+    let creq = sqs_canonical_request("GET", canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash)
+    let sts = sqs_string_to_sign(amz_date, scope, creq)
+    let sig = sqs_signature(secret, date_stamp, region, sts)
+    "https://" + host + canonical_uri + "?" + canonical_query + "&X-Amz-Signature=" + sig
+
+// Live variant: signs with the CURRENT UTC instant.
+fn _sqs_live_url(access_key: string, secret: string, region: string, host: string, path: string, params: dict) -> string
+    let dates = _sqs_now_dates()
+    sqs_request_url(access_key, secret, region, host, path, params, dates[0], dates[1])
+
+// ── XML response parsing (pure — the other half of the KAT surface) ───────
+
+// SQS's Query Protocol error shape:
+//   <ErrorResponse><Error><Type>..</Type><Code>..</Code><Message>..</Message></Error><RequestId>..</RequestId></ErrorResponse>
+fn _sqs_error_from_root(root: dict) -> Result
+    let errnode = xml_find(root, "Error")
+    let code = "Unknown"
+    let msg = ""
+    if errnode != null
+        code = xml_text(xml_find(errnode, "Code"))
+        msg = xml_text(xml_find(errnode, "Message"))
+    err("SQS " + code + ": " + msg)
+
+// A response body xml_parse flagged as malformed, or an empty (transport-
+// failure) body, funnels through this one place.
+fn _sqs_transport_or_parse_error(caller: string, body: string) -> Result
+    if len(body) == 0
+        return err(caller + ": request failed (no response)")
+    err(caller + ": malformed XML response")
+
+fn sqs_parse_send_response(xml_body: string) -> Result
+    if len(xml_body) == 0
+        return _sqs_transport_or_parse_error("sqs_send", xml_body)
+    let root = xml_parse(xml_body)
+    if contains(root["attrs"], "error")
+        return _sqs_transport_or_parse_error("sqs_send", xml_body)
+    if root["tag"] == "ErrorResponse"
+        return _sqs_error_from_root(root)
+    let result = xml_find(root, "SendMessageResult")
+    if result == null
+        return err("sqs_send: missing SendMessageResult in response")
+    let out = {}
+    out["message_id"] = xml_text(xml_find(result, "MessageId"))
+    out["md5_of_body"] = xml_text(xml_find(result, "MD5OfMessageBody"))
+    ok(out)
+
+fn sqs_parse_receive_response(xml_body: string) -> Result
+    if len(xml_body) == 0
+        return _sqs_transport_or_parse_error("sqs_receive", xml_body)
+    let root = xml_parse(xml_body)
+    if contains(root["attrs"], "error")
+        return _sqs_transport_or_parse_error("sqs_receive", xml_body)
+    if root["tag"] == "ErrorResponse"
+        return _sqs_error_from_root(root)
+    let result = xml_find(root, "ReceiveMessageResult")
+    let out = []
+    if result == null
+        return ok(out)
+    let msgs = xml_find_all(result, "Message")
+    let i = 0
+    while i < len(msgs)
+        let m = msgs[i]
+        let md = {}
+        md["message_id"] = xml_text(xml_find(m, "MessageId"))
+        md["receipt_handle"] = xml_text(xml_find(m, "ReceiptHandle"))
+        md["body"] = xml_text(xml_find(m, "Body"))
+        md["md5_of_body"] = xml_text(xml_find(m, "MD5OfBody"))
+        push(out, md)
+        i = i + 1
+    ok(out)
+
+fn sqs_parse_delete_response(xml_body: string) -> Result
+    if len(xml_body) == 0
+        return _sqs_transport_or_parse_error("sqs_delete", xml_body)
+    let root = xml_parse(xml_body)
+    if contains(root["attrs"], "error")
+        return _sqs_transport_or_parse_error("sqs_delete", xml_body)
+    if root["tag"] == "ErrorResponse"
+        return _sqs_error_from_root(root)
+    if root["tag"] != "DeleteMessageResponse"
+        return err("sqs_delete: unexpected response")
+    ok(true)
+
+fn sqs_parse_list_queues_response(xml_body: string) -> Result
+    if len(xml_body) == 0
+        return _sqs_transport_or_parse_error("sqs_list_queues", xml_body)
+    let root = xml_parse(xml_body)
+    if contains(root["attrs"], "error")
+        return _sqs_transport_or_parse_error("sqs_list_queues", xml_body)
+    if root["tag"] == "ErrorResponse"
+        return _sqs_error_from_root(root)
+    let result = xml_find(root, "ListQueuesResult")
+    let out = []
+    if result == null
+        return ok(out)
+    let nodes = xml_find_all(result, "QueueUrl")
+    let i = 0
+    while i < len(nodes)
+        push(out, xml_text(nodes[i]))
+        i = i + 1
+    ok(out)
+
+// ── Public network API ─────────────────────────────────────────────────────
+
+// Send `message_body` to `queue_url`. SQS bounds MessageBody to 1..262144
+// bytes; this client additionally bounds the SIGNED REQUEST URL itself (see
+// header note) since the body rides the query string.
+fn sqs_send(queue_url: string, message_body: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(queue_url) == 0
+        return err("sqs_send: empty queue_url")
+    if len(access_key) == 0 or len(secret_key) == 0 or len(region) == 0
+        return err("sqs_send: missing credentials/region")
+    if len(message_body) == 0
+        return err("sqs_send: empty message_body")
+    if len(message_body) > 262144
+        return err("sqs_send: message_body exceeds SQS's 262144-byte limit")
+    let u = url_parse(queue_url)
+    let host = u["host"]
+    if len(host) == 0
+        return err("sqs_send: invalid queue_url")
+    let path = u["path"]
+    if len(path) == 0
+        path = "/"
+    let params = {}
+    params["Action"] = "SendMessage"
+    params["Version"] = _sqs_api_version()
+    params["QueueUrl"] = queue_url
+    params["MessageBody"] = message_body
+    let url = _sqs_live_url(access_key, secret_key, region, host, path, params)
+    if len(url) > _sqs_max_url_len()
+        return err("sqs_send: message_body too large for a GET-based signed request (url length " + str(len(url)) + " exceeds " + str(_sqs_max_url_len()) + " bytes)")
+    sqs_parse_send_response(http_get(url))
+
+// Receive up to `max_messages` (clamped to SQS's 1..10 range) from `queue_url`.
+fn sqs_receive(queue_url: string, max_messages: int, access_key: string, secret_key: string, region: string) -> Result
+    if len(queue_url) == 0
+        return err("sqs_receive: empty queue_url")
+    if len(access_key) == 0 or len(secret_key) == 0 or len(region) == 0
+        return err("sqs_receive: missing credentials/region")
+    let mm = max_messages
+    if mm < 1
+        mm = 1
+    if mm > 10
+        mm = 10
+    let u = url_parse(queue_url)
+    let host = u["host"]
+    if len(host) == 0
+        return err("sqs_receive: invalid queue_url")
+    let path = u["path"]
+    if len(path) == 0
+        path = "/"
+    let params = {}
+    params["Action"] = "ReceiveMessage"
+    params["Version"] = _sqs_api_version()
+    params["QueueUrl"] = queue_url
+    params["MaxNumberOfMessages"] = str(mm)
+    let url = _sqs_live_url(access_key, secret_key, region, host, path, params)
+    sqs_parse_receive_response(http_get(url))
+
+// Delete the message identified by `receipt_handle` from `queue_url`.
+fn sqs_delete(queue_url: string, receipt_handle: string, access_key: string, secret_key: string, region: string) -> Result
+    if len(queue_url) == 0
+        return err("sqs_delete: empty queue_url")
+    if len(receipt_handle) == 0
+        return err("sqs_delete: empty receipt_handle")
+    if len(access_key) == 0 or len(secret_key) == 0 or len(region) == 0
+        return err("sqs_delete: missing credentials/region")
+    let u = url_parse(queue_url)
+    let host = u["host"]
+    if len(host) == 0
+        return err("sqs_delete: invalid queue_url")
+    let path = u["path"]
+    if len(path) == 0
+        path = "/"
+    let params = {}
+    params["Action"] = "DeleteMessage"
+    params["Version"] = _sqs_api_version()
+    params["QueueUrl"] = queue_url
+    params["ReceiptHandle"] = receipt_handle
+    let url = _sqs_live_url(access_key, secret_key, region, host, path, params)
+    sqs_parse_delete_response(http_get(url))
+
+// List every queue URL visible to these credentials in `region`.
+fn sqs_list_queues(access_key: string, secret_key: string, region: string) -> Result
+    if len(access_key) == 0 or len(secret_key) == 0 or len(region) == 0
+        return err("sqs_list_queues: missing credentials/region")
+    let host = "sqs." + region + ".amazonaws.com"
+    let path = "/"
+    let params = {}
+    params["Action"] = "ListQueues"
+    params["Version"] = _sqs_api_version()
+    let url = _sqs_live_url(access_key, secret_key, region, host, path, params)
+    sqs_parse_list_queues_response(http_get(url))
