@@ -2736,6 +2736,90 @@ int64_t nova_rt_dict_map_keys(int64_t handle, int64_t closure) {
     return result;
 }
 
+int64_t nova_rt_list_sum_float(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) {
+        double z = 0.0; int64_t r; memcpy(&r, &z, 8); return r;
+    }
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    double total = 0.0;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t v = l->data[i];
+        if (nova_mem_find_tag((void*)(uintptr_t)v) == NOVA_MEM_RAW) {
+            double d = atof((const char*)(uintptr_t)v);
+            total += d;
+        } else {
+            double d; memcpy(&d, &v, 8);
+            if (d > -1e15 && d < 1e15) total += d;
+            else total += (double)v;
+        }
+    }
+    int64_t r; memcpy(&r, &total, 8); return r;
+}
+
+int64_t nova_rt_list_average(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) {
+        double z = 0.0; int64_t r; memcpy(&r, &z, 8); return r;
+    }
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->size == 0) { double z = 0.0; int64_t r; memcpy(&r, &z, 8); return r; }
+    int64_t total = 0;
+    for (int64_t i = 0; i < l->size; i++) total += l->data[i];
+    double avg = (double)total / (double)l->size;
+    int64_t r; memcpy(&r, &avg, 8); return r;
+}
+
+int64_t nova_rt_list_each_cons(int64_t handle, int64_t n) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (n <= 0 || n > l->size) return result;
+    for (int64_t i = 0; i <= l->size - n; i++) {
+        int64_t sub = nova_rt_list_create();
+        for (int64_t j = 0; j < n; j++) nova_rt_list_append(sub, l->data[i + j]);
+        nova_rt_list_append(result, sub);
+    }
+    return result;
+}
+
+int64_t nova_rt_list_to_dict(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_dict_create();
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t dict = nova_rt_dict_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t pair = l->data[i];
+        if (nova_mem_find_tag((void*)(uintptr_t)pair) == NOVA_MEM_LIST) {
+            NovaList* p = (NovaList*)(uintptr_t)pair;
+            if (p->size >= 2) nova_rt_dict_set(dict, p->data[0], p->data[1]);
+        }
+    }
+    return dict;
+}
+
+int64_t nova_rt_to_hex(int64_t val) {
+    char buf[24];
+    int len = snprintf(buf, sizeof(buf), "%llx", (unsigned long long)(uint64_t)val);
+    char* out = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!out) return (int64_t)(uintptr_t)"0";
+    memcpy(out, buf, len + 1);
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_from_hex(int64_t s) {
+    const char* str = nova_str_safe(s);
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) str += 2;
+    int64_t val = 0;
+    for (int i = 0; str[i]; i++) {
+        char c = str[i];
+        int digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else break;
+        val = (val << 4) | digit;
+    }
+    return val;
+}
+
 int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
