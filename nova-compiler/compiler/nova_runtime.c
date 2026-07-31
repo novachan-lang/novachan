@@ -29127,3 +29127,102 @@ int64_t nova_rt_list_sample_indices(int64_t handle, int64_t n) {
     for (int64_t i = 0; i < lim; i++) nova_rt_list_append(out, i);
     return out;
 }
+
+/* nova_rt_list_prefix_match: length of common prefix between two lists */
+int64_t nova_rt_list_prefix_match(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    if (!a || !b) return 0;
+    int64_t lim = a->size < b->size ? a->size : b->size;
+    for (int64_t i = 0; i < lim; i++) {
+        if (a->data[i] != b->data[i]) return i;
+    }
+    return lim;
+}
+
+/* nova_rt_dict_zip_lists: create dict from list of keys and list of values */
+int64_t nova_rt_dict_zip_lists(int64_t keys_handle, int64_t vals_handle) {
+    NovaList* keys = (NovaList*)(uintptr_t)keys_handle;
+    NovaList* vals = (NovaList*)(uintptr_t)vals_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!keys || !vals) return out;
+    int64_t lim = keys->size < vals->size ? keys->size : vals->size;
+    for (int64_t i = 0; i < lim; i++)
+        nova_rt_dict_set(out, keys->data[i], vals->data[i]);
+    return out;
+}
+
+/* nova_rt_str_to_char_list: split string into list of single-char strings */
+int64_t nova_rt_str_to_char_list(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!s) return out;
+    char buf[2] = {0, 0};
+    for (size_t i = 0; s[i]; i++) {
+        buf[0] = s[i];
+        nova_rt_list_append(out, nova_rt_create_string(buf));
+    }
+    return out;
+}
+
+/* nova_rt_list_cycle_n: repeat list N times */
+int64_t nova_rt_list_cycle_n(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    for (int64_t r = 0; r < n; r++)
+        for (int64_t i = 0; i < l->size; i++)
+            nova_rt_list_append(out, l->data[i]);
+    return out;
+}
+
+/* nova_rt_dict_values_sorted_asc: list of values sorted ascending */
+int64_t nova_rt_dict_values_sorted_asc(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++)
+        if (d->hashes[i] != 0) nova_rt_list_append(out, d->vals[i]);
+    nova_rt_list_sort(out);
+    return out;
+}
+
+/* nova_rt_list_dedup_stable: remove duplicates preserving first occurrence */
+int64_t nova_rt_list_dedup_stable(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int found = 0;
+        NovaList* ol = (NovaList*)(uintptr_t)out;
+        for (int64_t j = 0; j < ol->size; j++) {
+            if (ol->data[j] == l->data[i]) { found = 1; break; }
+        }
+        if (!found) nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_list_indices_where_gt: list of indices where element > threshold */
+int64_t nova_rt_list_indices_where_gt(int64_t handle, int64_t threshold) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++)
+        if (l->data[i] > threshold) nova_rt_list_append(out, i);
+    return out;
+}
+
+/* nova_rt_str_is_pangram: check if string contains all 26 English letters */
+int64_t nova_rt_str_is_pangram(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int seen[26] = {0};
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c >= 'a' && c <= 'z') seen[c - 'a'] = 1;
+    }
+    for (int i = 0; i < 26; i++) if (!seen[i]) return 0;
+    return 1;
+}
