@@ -290,6 +290,48 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `92e91cd5` 8 builtins (1297) — str_remove_suffix_if, list_group_by_mod, dict_keys_shortest, str_is_upper_only, list_running_avg, dict_values_flat, str_byte_count, list_zip_map
 - `541ac463` 8 builtins (1305) — list_second_max, list_second_min, str_count_vowels, str_count_consonants, dict_min_key, dict_max_key, str_swap_case, list_partition_even_odd
 
+**BUILTIN SOUNDNESS CAMPAIGN (2026-08-01) — the mass-produced builtins were not production-grade.**
+
+Adding ~1300 builtins by copying each new function from its neighbour propagated three
+defect classes wholesale. A 3-lens audit fleet + independent verification found them; every
+finding below was re-verified by reading the source, and the crashes were *measured*, not argued.
+
+- `e25932b1` **duplicate LLVM `declare` — EVERY compiled program failed to link.** 10 duplicates
+  (list_remove, list_remove_at, list_filled, to_float, result_and_then, result_or_else across
+  both backends). LLVM rejects a redeclared function, and the declare block goes into every
+  emitted program, so nothing compiled at all. `nova_rt_to_float` was declared with CONFLICTING
+  attributes (`nounwind` vs `nounwind readnone`) — an unsound `readnone` lets LLVM hoist/CSE a
+  call that does touch memory. **Hidden for weeks by dev-mode's deferred reconverge.**
+  Also hardened `_bootstrap_reconverge.ps1`: it checked only `Test-Path` after linking, so a
+  failed link left a STALE exe in place, passed, and let the next pass run the WRONG compiler —
+  reporting a bogus "DIVERGED" instead of the real error. Now deletes the target and checks
+  clang's exit code.
+- `e67ee810` **builtin soundness sweep — 8 of 10 probe classes segfaulted before it.**
+  Measured pre-fix vs post-fix, one isolated probe per case:
+
+  | case | pre-fix | post-fix |
+  |---|---|---|
+  | `flatten_map([1,2,3])` (elements read as ptrs 0x1/0x2/0x3) | CRASH 139 | ok |
+  | `truncate_ellipsis(s, -5)` → `buf[-5]=0` heap **underflow** | CRASH 127 | ok |
+  | `str_mul` / `repeat_each` — `len*n` wrapped size_t | CRASH 139 | ok |
+  | `dict_to_query_string` 9 KB key vs 4096 buf | CRASH 139 | ok |
+  | `pad_both(null,null)` | CRASH 139 | ok |
+  | `list_sum_int(42)`, `max_by_abs("str")` — wrong-type handle | CRASH 139 | ok |
+
+  Root cause: all 173 `nova_mem_find_tag` checks in the file sit before line ~19765; the
+  builtin region (24000+) had **zero** across 239 functions, substituting a NULL-only guard
+  that stops a literal null but not a valid handle of the wrong type. Fixed with checked
+  accessors (`nova_as_list`/`nova_as_dict`) + `nova_str_safe` over 511 casts — since the
+  functions already had `if (!x)` guards, those guards become correct with no logic change.
+  Plus 14 arithmetic fixes (overflow-checked sizing, clamped negative lengths, `INT64_MIN`
+  negation UB in gcd/lcm/max_by_abs/min_by_abs).
+  **New standing gate:** `_run_builtin_soundness.ps1` — links straight against the runtime,
+  needs no compiler, so it runs even mid-reconverge.
+
+**LESSON:** volume-first builtin authoring produced CVE-class defects at scale. Every new
+builtin must verify the accessor + size-arithmetic contract against the actual struct
+definition, never against the adjacent function.
+
 **SOUNDNESS FIX (this session):**
 - `08b03d37` **dense-dict iteration — 59 dict builtins read uninitialized heap.** NovaDict is DENSE
   (`keys/vals/hashes[0..size-1]` live, compacted, no holes; `[size..cap)` uninitialized). 59 builtins
