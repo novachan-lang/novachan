@@ -1,0 +1,173 @@
+// std/crypto/pbkdf2 -- Password-Based Key Derivation Function 2, HMAC-SHA256 PRF (RFC 2898 / RFC 8018).
+//
+// DK = T(1) || T(2) || ... || T(blocks), each T(i) = F(P, S, c, i) = U1 ^ U2 ^ ... ^ Uc where
+//   U1 = HMAC(P, S | INT32BE(i)), Uj = HMAC(P, U(j-1)) for j = 2..c.
+//
+// Binary-safety note (same reasoning as std/crypto/hkdf): PBKDF2's own RFC 8018 test vectors
+// include a salt/password containing embedded 0x00 bytes, and the block index INT32BE(i) is
+// itself mostly zero bytes for i=1 (0x00 0x00 0x00 0x01). NOVA's C-string-backed `hmac_sha256`
+// builtin would silently truncate at any of those. This module therefore does HMAC over
+// byte-LISTS via the native size-based `sha256_of_bytes` builtin, never the strlen-based
+// string builtins, for the core `pb_derive_bytes`. `pb_derive` is a plain-text convenience
+// wrapper (fine for ordinary passwords, which don't contain NUL) built on top of that core.
+//
+// LEAF -- imports nothing.
+
+// PRIVATE: hex nibble value 0..15, or -1 if not a hex digit.
+fn _pb_nibble(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return o - 48
+    if o >= 97 and o <= 102
+        return o - 87
+    if o >= 65 and o <= 70
+        return o - 55
+    -1
+
+// PRIVATE: lowercase hex string -> byte list.
+fn _pb_hex_to_list(hex: string) -> any
+    let n = len(hex)
+    let out = []
+    let i = 0
+    while i + 1 < n
+        let hi = _pb_nibble(char_at(hex, i))
+        let lo = _pb_nibble(char_at(hex, i + 1))
+        push(out, (hi << 4) | lo)
+        i = i + 2
+    out
+
+// PRIVATE: byte list -> lowercase hex string.
+fn _pb_list_to_hex(lst: any) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = len(lst)
+    let i = 0
+    while i < n
+        let b = lst[i]
+        out = out + char_at(digs, (b >> 4) & 0xF) + char_at(digs, b & 0xF)
+        i = i + 1
+    out
+
+// PRIVATE: plain text -> byte list via ord() of each char. Safe for ordinary passwords/salts
+// (no embedded NUL); for binary-exact inputs use the *_bytes core functions with hex-decoded lists.
+fn _pb_str_to_list(s: string) -> any
+    let n = len(s)
+    let out = []
+    let i = 0
+    while i < n
+        push(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+// PRIVATE: concatenate two byte lists.
+fn _pb_concat(a: any, b: any) -> any
+    let out = []
+    let i = 0
+    while i < len(a)
+        push(out, a[i])
+        i = i + 1
+    i = 0
+    while i < len(b)
+        push(out, b[i])
+        i = i + 1
+    out
+
+// PRIVATE: byte list -> `bytes` handle for the native sha256_of_bytes builtin.
+fn _pb_list_to_bytesval(lst: any) -> any
+    let n = len(lst)
+    let b = bytes_create(n)
+    let i = 0
+    while i < n
+        bytes_set(b, i, lst[i])
+        i = i + 1
+    b
+
+// PRIVATE: SHA-256 of a byte list -> 32-byte digest as a byte list.
+fn _pb_sha256(lst: any) -> any
+    let bv = _pb_list_to_bytesval(lst)
+    _pb_hex_to_list(sha256_of_bytes(bv))
+
+// PRIVATE: HMAC-SHA256(key_bytes, msg_bytes) -> 32-byte digest as a byte list.
+fn _pb_hmac(key: any, msg: any) -> any
+    let k0 = key
+    if len(k0) > 64
+        k0 = _pb_sha256(k0)
+    let kpad = []
+    let i = 0
+    while i < 64
+        if i < len(k0)
+            push(kpad, k0[i])
+        else
+            push(kpad, 0)
+        i = i + 1
+    let ipad = []
+    let opad = []
+    i = 0
+    while i < 64
+        push(ipad, kpad[i] ^ 0x36)
+        push(opad, kpad[i] ^ 0x5c)
+        i = i + 1
+    let inner = _pb_sha256(_pb_concat(ipad, msg))
+    _pb_sha256(_pb_concat(opad, inner))
+
+// PRIVATE: 4-byte big-endian encoding of a block index (RFC 2898 INT()).
+fn _pb_int32be(v: int) -> any
+    let out = []
+    push(out, (v >> 24) & 0xFF)
+    push(out, (v >> 16) & 0xFF)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+    out
+
+// pb_derive_bytes(password_bytes, salt_bytes, iterations, dk_len) -> hex string of dk_len bytes.
+// The binary-exact core: both inputs are byte lists (list of ints 0..255), so this is correct
+// even for passwords/salts containing 0x00 (see RFC 8018 test case with "pass\0word").
+fn pb_derive_bytes(password: any, salt: any, iterations: int, dk_len: int) -> string
+    if dk_len <= 0
+        return ""
+    if iterations < 1
+        return ""
+    let blocks = (dk_len + 31) / 32
+    let dk = []
+    let bi = 1
+    while bi <= blocks
+        let salt_blk = _pb_concat(salt, _pb_int32be(bi))
+        let u = _pb_hmac(password, salt_blk)
+        // NOVA lists are reference-typed: `let t = u` would alias u, not copy it, so a later
+        // `u = _pb_hmac(...)` reassignment is fine (rebinds u to a fresh list) but writing into
+        // t via t[k]=... BEFORE that reassignment would silently corrupt u too. Copy explicitly.
+        let t = []
+        let ci = 0
+        while ci < 32
+            push(t, u[ci])
+            ci = ci + 1
+        let j = 2
+        while j <= iterations
+            u = _pb_hmac(password, u)
+            let k = 0
+            while k < 32
+                t[k] = t[k] ^ u[k]
+                k = k + 1
+            j = j + 1
+        let take = dk_len - len(dk)
+        if take > 32
+            take = 32
+        let m = 0
+        while m < take
+            push(dk, t[m])
+            m = m + 1
+        bi = bi + 1
+    _pb_list_to_hex(dk)
+
+// pb_derive(password, salt, iterations, dk_len) -> hex string of dk_len bytes.
+// Plain-text convenience wrapper over pb_derive_bytes (password/salt as ordinary strings).
+fn pb_derive(password: string, salt: string, iterations: int, dk_len: int) -> string
+    pb_derive_bytes(_pb_str_to_list(password), _pb_str_to_list(salt), iterations, dk_len)
+
+// pb_verify(password, salt, iterations, expected_hex) -> bool. Recomputes and compares in
+// (best-effort) constant time via the runtime's ct_eq (hex text has no embedded NUL, so it's
+// safe to use the strlen-based constant-time comparator here).
+fn pb_verify(password: string, salt: string, iterations: int, expected_hex: string) -> bool
+    let dk_len = len(expected_hex) / 2
+    let got = pb_derive(password, salt, iterations, dk_len)
+    ct_eq(got, expected_hex) == 1

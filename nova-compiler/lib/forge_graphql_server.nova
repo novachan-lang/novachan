@@ -1,0 +1,189 @@
+// forge_graphql_server — GraphQL execution engine.
+// Schema definition + query parsing + field resolution + execution.
+// Pure data structures — plugs into any HTTP server via forge.
+
+fn gql_schema_new() -> dict
+    {"types": {}, "query_type": "Query", "mutation_type": "Mutation", "resolvers": {}}
+
+fn gql_add_type(schema: dict, name: string, fields: dict) -> dict
+    schema["types"][name] = fields
+    schema
+
+fn gql_add_resolver(schema: dict, type_name: string, field_name: string, resolver_fn: string) -> dict
+    let key = type_name + "." + field_name
+    schema["resolvers"][key] = resolver_fn
+    schema
+
+fn gql_parse_query(query: string) -> dict
+    let q = trim(query)
+    let op_type = "query"
+    let op_name = ""
+    let fields = []
+    let pos = 0
+    if starts_with(q, "query")
+        op_type = "query"
+        pos = 5
+    if starts_with(q, "mutation")
+        op_type = "mutation"
+        pos = 8
+    if starts_with(q, "subscription")
+        op_type = "subscription"
+        pos = 12
+    let rest = trim(slice(q, pos, len(q)))
+    if len(rest) > 0 and not starts_with(rest, "{")
+        let brace = index_of(rest, "{")
+        if brace >= 0
+            op_name = trim(slice(rest, 0, brace))
+            rest = slice(rest, brace, len(rest))
+    if starts_with(rest, "{")
+        rest = slice(rest, 1, len(rest))
+    if ends_with(rest, "}")
+        rest = slice(rest, 0, len(rest) - 1)
+    let raw_fields = _gql_parse_selection_set(trim(rest))
+    {"operation": op_type, "name": op_name, "selections": raw_fields}
+
+fn _gql_parse_selection_set(text: string) -> list
+    let fields = []
+    let t = trim(text)
+    let i = 0
+    while i < len(t)
+        while i < len(t) and (slice(t, i, i + 1) == " " or slice(t, i, i + 1) == "\n" or slice(t, i, i + 1) == ",")
+            i = i + 1
+        if i >= len(t)
+            break
+        let start = i
+        while i < len(t) and slice(t, i, i + 1) != " " and slice(t, i, i + 1) != "\n" and slice(t, i, i + 1) != "," and slice(t, i, i + 1) != "{" and slice(t, i, i + 1) != "}"
+            i = i + 1
+        let fname = slice(t, start, i)
+        if len(fname) == 0
+            i = i + 1
+            continue
+        while i < len(t) and slice(t, i, i + 1) == " "
+            i = i + 1
+        let sub = []
+        if i < len(t) and slice(t, i, i + 1) == "{"
+            let depth = 1
+            let inner_start = i + 1
+            i = i + 1
+            while i < len(t) and depth > 0
+                if slice(t, i, i + 1) == "{"
+                    depth = depth + 1
+                if slice(t, i, i + 1) == "}"
+                    depth = depth - 1
+                i = i + 1
+            let inner = slice(t, inner_start, i - 1)
+            sub = _gql_parse_selection_set(trim(inner))
+        let field = {"name": fname, "sub": sub}
+        if contains(fname, "(")
+            let paren = index_of(fname, "(")
+            field["name"] = slice(fname, 0, paren)
+            let args_str = slice(fname, paren + 1, len(fname))
+            if ends_with(args_str, ")")
+                args_str = slice(args_str, 0, len(args_str) - 1)
+            field["args"] = _gql_parse_args(args_str)
+        push(fields, field)
+    fields
+
+fn _gql_parse_args(args_str: string) -> dict
+    let result = {}
+    let parts = split(args_str, ",")
+    let i = 0
+    while i < len(parts)
+        let part = trim(parts[i])
+        let colon = index_of(part, ":")
+        if colon > 0
+            let key = trim(slice(part, 0, colon))
+            let val = trim(slice(part, colon + 1, len(part)))
+            if starts_with(val, "\"") and ends_with(val, "\"")
+                val = slice(val, 1, len(val) - 1)
+            result[key] = val
+        i = i + 1
+    result
+
+fn gql_execute(schema: dict, parsed_query: dict, root_value: dict, context: dict) -> dict
+    let op = parsed_query["operation"]
+    let type_name = schema["query_type"]
+    if op == "mutation"
+        type_name = schema["mutation_type"]
+    let data = _gql_resolve_fields(schema, type_name, parsed_query["selections"], root_value, context)
+    {"data": data, "errors": []}
+
+fn _gql_resolve_fields(schema: dict, type_name: string, selections: list, parent: dict, context: dict) -> dict
+    let result = {}
+    let i = 0
+    while i < len(selections)
+        let sel = selections[i]
+        let fname = sel["name"]
+        let resolver_key = type_name + "." + fname
+        let value = null
+        if contains(schema["resolvers"], resolver_key)
+            let resolver_name = schema["resolvers"][resolver_key]
+            value = _gql_call_resolver(resolver_name, parent, context, sel)
+        else
+            if contains(parent, fname)
+                value = parent[fname]
+        if len(sel["sub"]) > 0 and type_of(value) == "dict"
+            value = _gql_resolve_fields(schema, fname, sel["sub"], value, context)
+        if len(sel["sub"]) > 0 and type_of(value) == "list"
+            let resolved_list = []
+            let j = 0
+            while j < len(value)
+                if type_of(value[j]) == "dict"
+                    push(resolved_list, _gql_resolve_fields(schema, fname, sel["sub"], value[j], context))
+                else
+                    push(resolved_list, value[j])
+                j = j + 1
+            value = resolved_list
+        result[fname] = value
+        i = i + 1
+    result
+
+fn _gql_call_resolver(resolver_name: string, parent: dict, context: dict, selection: dict) -> any
+    if contains(context, "_resolvers") and type_of(context["_resolvers"]) == "dict"
+        let resolvers = context["_resolvers"]
+        if contains(resolvers, resolver_name)
+            return resolvers[resolver_name]
+    if contains(parent, resolver_name)
+        return parent[resolver_name]
+    null
+
+fn gql_introspect_types(schema: dict) -> list
+    let result = []
+    let type_names = keys(schema["types"])
+    let i = 0
+    while i < len(type_names)
+        let tn = type_names[i]
+        let fields = schema["types"][tn]
+        let field_list = []
+        let fnames = keys(fields)
+        let j = 0
+        while j < len(fnames)
+            let fn_name = fnames[j]
+            let fn_type = fields[fn_name]
+            push(field_list, {"name": fn_name, "type": fn_type})
+            j = j + 1
+        push(result, {"name": tn, "fields": field_list})
+        i = i + 1
+    result
+
+fn gql_validate_query(schema: dict, parsed_query: dict) -> list
+    let errors = []
+    let op = parsed_query["operation"]
+    let type_name = schema["query_type"]
+    if op == "mutation"
+        type_name = schema["mutation_type"]
+    if not contains(schema["types"], type_name)
+        push(errors, "Root type '{type_name}' not defined in schema")
+        return errors
+    let type_fields = schema["types"][type_name]
+    let sels = parsed_query["selections"]
+    let i = 0
+    while i < len(sels)
+        let fname = sels[i]["name"]
+        if not contains(type_fields, fname) and fname != "__typename" and fname != "__schema" and fname != "__type"
+            push(errors, "Field '{fname}' not found on type '{type_name}'")
+        i = i + 1
+    errors
+
+fn gql_to_json_response(result: dict) -> string
+    to_json(result)

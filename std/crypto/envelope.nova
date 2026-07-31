@@ -1,0 +1,80 @@
+// std/crypto/envelope -- envelope encryption: a two-tier key hierarchy where a per-message data
+// encryption key (DEK) encrypts the payload, and a long-lived master key encrypts only the DEK
+// (this is why envelope encryption scales: rotating the master key means re-wrapping small DEKs,
+// never re-encrypting bulk data; it's the same shape as AWS KMS / GCP KMS envelope encryption).
+//
+// Composed from two other std/crypto modules (cross-module imports within std/crypto are an
+// established pattern -- see std/crypto/argon2id importing std/crypto/blake2b):
+//   - std/crypto/key_wrap  wraps the DEK under the master key (tier 1).
+//   - std/crypto/mac_siv   encrypts the plaintext under the DEK (tier 2).
+// An HMAC-SHA256 tag over (edek, ciphertext) under the master key binds the two tiers together
+// and lets ev_open detect tampering with either field before doing any unwrapping.
+//
+// KNOWN LIMITATION (like std/crypto/secret_share's PRNG and std/crypto/blockpad's ISO 10126
+// padding): the DEK is derived deterministically from (master_key_hex, plaintext_hex) rather
+// than drawn from a CSPRNG, so ev_seal is a pure function -- this makes it reproducible for
+// KATs, but it means sealing the SAME plaintext under the SAME master key twice yields the SAME
+// DEK (though still a different-looking ciphertext, since std/crypto/mac_siv's own SIV already
+// depends on the plaintext). Production use should mix in a fresh random per-message value when
+// deriving the DEK.
+//
+// Depends on: std/crypto/key_wrap, std/crypto/mac_siv.
+
+import std/crypto/key_wrap
+import std/crypto/mac_siv
+
+// PRIVATE: the fixed "nonce" mac_siv sees. mac_siv's own SIV is already a function of the
+// plaintext (see that module's doc), so a fixed context tag here just domain-separates envelope
+// encryption from other mac_siv callers -- it is not standing in for real nonce-uniqueness.
+fn _ev_nonce_tag() -> string
+    "nova-envelope-v1"
+
+// PRIVATE: deterministic per-message DEK, bound to both the master key and the plaintext.
+fn _ev_derive_dek(master_key_hex: string, plaintext_hex: string) -> string
+    sha256(master_key_hex + ":" + plaintext_hex + ":DEK")
+
+// ev_seal(master_key_hex, plaintext_hex) -> sealed dict with fields "edek" (DEK wrapped under
+// the master key), "ciphertext" (siv || ciphertext, plaintext encrypted under the DEK), and
+// "tag" (HMAC-SHA256 over edek||ciphertext under the master key, for tamper detection).
+fn ev_seal(master_key_hex: string, plaintext_hex: string) -> any
+    let dek_hex = _ev_derive_dek(master_key_hex, plaintext_hex)
+    let edek_hex = kw_wrap(master_key_hex, dek_hex)
+    let ciphertext = ms_encrypt(dek_hex, _ev_nonce_tag(), plaintext_hex)
+    let tag_hex = hmac_sha256(master_key_hex, edek_hex + ciphertext)
+    let sealed = {}
+    sealed["edek"] = edek_hex
+    sealed["ciphertext"] = ciphertext
+    sealed["tag"] = tag_hex
+    sealed
+
+// ev_open(master_key_hex, sealed) -> plaintext_hex, or "" if the integrity tag doesn't match or
+// the DEK fails to unwrap under master_key_hex (fail-closed on any check).
+fn ev_open(master_key_hex: string, sealed: any) -> string
+    if not contains(sealed, "edek")
+        return ""
+    if not contains(sealed, "ciphertext")
+        return ""
+    if not contains(sealed, "tag")
+        return ""
+    let edek_hex = sealed["edek"]
+    let ciphertext = sealed["ciphertext"]
+    let tag_hex = sealed["tag"]
+    let expected_tag = hmac_sha256(master_key_hex, edek_hex + ciphertext)
+    if ct_eq(tag_hex, expected_tag) != 1
+        return ""
+    let dek_hex = kw_unwrap(master_key_hex, edek_hex)
+    if len(dek_hex) == 0
+        return ""
+    ms_decrypt(dek_hex, ciphertext)
+
+// ev_verify(master_key_hex, sealed) -> bool. True iff the integrity tag over sealed's edek and
+// ciphertext matches under master_key_hex, without attempting to unwrap or decrypt anything.
+fn ev_verify(master_key_hex: string, sealed: any) -> bool
+    if not contains(sealed, "edek")
+        return false
+    if not contains(sealed, "ciphertext")
+        return false
+    if not contains(sealed, "tag")
+        return false
+    let expected_tag = hmac_sha256(master_key_hex, sealed["edek"] + sealed["ciphertext"])
+    ct_eq(sealed["tag"], expected_tag) == 1

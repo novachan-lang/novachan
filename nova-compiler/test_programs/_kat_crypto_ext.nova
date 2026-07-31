@@ -1,0 +1,234 @@
+// KAT harness for the 12 new std/crypto modules: hkdf, pbkdf2, hmac_util, hash_chain,
+// key_wrap, secret_share, hash_tree, mac_siv, password, timing, envelope, kdf_context.
+// Uses authoritative vectors where they exist (RFC 5869 HKDF-SHA256 test case 1, RFC 8018
+// PBKDF2-HMAC-SHA256 test cases 1/2/3/6, Wikipedia's canonical HMAC-SHA256 vector) and
+// self-consistency / round-trip / adversarial checks elsewhere.
+import std/crypto/hkdf
+import std/crypto/pbkdf2
+import std/crypto/hmac_util
+import std/crypto/hash_chain
+import std/crypto/key_wrap
+import std/crypto/secret_share
+import std/crypto/hash_tree
+import std/crypto/mac_siv
+import std/crypto/password
+import std/crypto/timing
+import std/crypto/envelope
+import std/crypto/kdf_context
+
+fn _nibble(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return o - 48
+    if o >= 97 and o <= 102
+        return o - 87
+    if o >= 65 and o <= 70
+        return o - 55
+    -1
+
+// Test-only hex -> byte list helper (proves NUL-safety of pb_derive_bytes without needing a
+// NOVA string literal containing an embedded NUL character).
+fn _hex_to_list(hex: string) -> any
+    let n = len(hex)
+    let out = []
+    let i = 0
+    while i + 1 < n
+        let hi = _nibble(char_at(hex, i))
+        let lo = _nibble(char_at(hex, i + 1))
+        push(out, (hi << 4) | lo)
+        i = i + 2
+    out
+
+// Each check_* returns 1 (pass) or 0 (fail) rather than mutating shared state: NOVA's
+// module-level "baked var" storage only ships reference-typed dict/list mutations back to the
+// caller across named-function boundaries (see _kat_module_state.nova, "GAP 5") -- a
+// module-level scalar `int` mutated from a helper function is NOT visible back in main() (each
+// call gets its own copy). So the harness collects results into a list and sums it instead.
+fn check_s(name: string, got: string, want: string) -> int
+    if got == want
+        print("ok " + name)
+        return 1
+    print("FAIL " + name)
+    print("  got  = " + got)
+    print("  want = " + want)
+    0
+
+fn check_b(name: string, got: bool, want: bool) -> int
+    if got == want
+        print("ok " + name)
+        return 1
+    print("FAIL " + name + " got=" + str(got) + " want=" + str(want))
+    0
+
+fn check_i(name: string, got: int, want: int) -> int
+    if got == want
+        print("ok " + name)
+        return 1
+    print("FAIL " + name + " got=" + str(got) + " want=" + str(want))
+    0
+
+fn main()
+    let results = []
+    // ── 1. hkdf: RFC 5869 SHA-256 test case 1 ──────────────────────────────
+    let ikm = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    let salt = "000102030405060708090a0b0c"
+    let info = "f0f1f2f3f4f5f6f7f8f9"
+    let want_prk = "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+    let want_okm = "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+    let prk = hk_extract(salt, ikm)
+    push(results, check_s("hkdf-rfc5869-prk", prk, want_prk))
+    push(results, check_s("hkdf-rfc5869-okm", hk_expand(prk, info, 42), want_okm))
+    push(results, check_s("hkdf-rfc5869-derive", hk_derive(ikm, salt, info, 42), want_okm))
+    // salt="" uses HashLen zero bytes -- must not crash and must be deterministic.
+    let prk_nosalt = hk_extract("", ikm)
+    push(results, check_b("hkdf-empty-salt-deterministic", hk_extract("", ikm) == prk_nosalt, true))
+    push(results, check_b("hkdf-empty-salt-differs-from-explicit", prk_nosalt != prk, true))
+
+    // ── 2. pbkdf2: RFC 8018 PBKDF2-HMAC-SHA256 test cases 1, 2, 3 ──────────
+    push(results, check_s("pbkdf2-tc1-c1", pb_derive("password", "salt", 1, 20), "120fb6cffcf8b32c43e7225256c4f837a86548c9"))
+    push(results, check_s("pbkdf2-tc2-c2", pb_derive("password", "salt", 2, 20), "ae4d0c95af6b46d32d0adff928f06dd02a303f8e"))
+    push(results, check_s("pbkdf2-tc3-c4096", pb_derive("password", "salt", 4096, 20), "c5e478d59288c841aa530db6845c4c8d962893a0"))
+    // RFC 8018 test case 6: password="pass\0word", salt="sa\0lt", c=4096, dkLen=16 -- embedded
+    // NUL bytes in both P and S. Built as byte lists (via hex) rather than NOVA string literals,
+    // since NOVA strings are C-string-backed and can't carry an embedded NUL through source text.
+    let pw6 = _hex_to_list("7061737300776f7264")
+    let salt6 = _hex_to_list("7361006c74")
+    push(results, check_s("pbkdf2-tc6-embedded-nul", pb_derive_bytes(pw6, salt6, 4096, 16), "89b69d0516f829893c696226650a8687"))
+    push(results, check_b("pbkdf2-verify-correct", pb_verify("password", "salt", 1, "120fb6cffcf8b32c43e7225256c4f837a86548c9"), true))
+    push(results, check_b("pbkdf2-verify-wrong", pb_verify("password", "salt", 1, "0000000000000000000000000000000000000000"), false))
+
+    // ── 3. hmac_util: Wikipedia's canonical HMAC-SHA256 test vector ───────
+    let mac = hu_mac("key", "The quick brown fox jumps over the lazy dog")
+    push(results, check_s("hmac_util-wikipedia-vector", mac, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"))
+    push(results, check_b("hmac_util-verify-correct", hu_verify("key", "The quick brown fox jumps over the lazy dog", mac), true))
+    push(results, check_b("hmac_util-verify-wrong-msg", hu_verify("key", "The quick brown fox jumps over the lazy cat", mac), false))
+    push(results, check_b("hmac_util-verify-wrong-key", hu_verify("wrongkey", "The quick brown fox jumps over the lazy dog", mac), false))
+    let trunc = hu_truncate(mac, 16)
+    push(results, check_i("hmac_util-truncate-len", len(trunc), 32))
+    push(results, check_b("hmac_util-truncate-is-prefix", trunc == slice(mac, 0, 32), true))
+    push(results, check_b("hmac_util-verify-truncated-correct", hu_verify_truncated("key", "The quick brown fox jumps over the lazy dog", trunc), true))
+    push(results, check_b("hmac_util-verify-truncated-wrong", hu_verify_truncated("key", "The quick brown fox jumps over the lazy cat", trunc), false))
+    push(results, check_b("hmac_util-recommended-length", hu_is_recommended_length(16), true))
+    push(results, check_b("hmac_util-not-recommended-length", hu_is_recommended_length(4), false))
+
+    // ── 4. hash_chain: forward-consistency + S/KEY-style step verification ─
+    let chain = hc_build("kat-seed", 5)
+    push(results, check_i("hash_chain-length", len(chain), 5))
+    push(results, check_s("hash_chain-h0", hc_at(chain, 0), sha256("kat-seed")))
+    push(results, check_b("hash_chain-verify-consistent", hc_verify(chain), true))
+    push(results, check_b("hash_chain-verify-against-seed", hc_verify_against_seed("kat-seed", chain), true))
+    push(results, check_b("hash_chain-verify-against-wrong-seed", hc_verify_against_seed("wrong-seed", chain), false))
+    let tampered = hc_build("kat-seed", 5)
+    tampered[2] = "0000000000000000000000000000000000000000000000000000000000000000"
+    push(results, check_b("hash_chain-verify-tampered", hc_verify(tampered), false))
+    push(results, check_s("hash_chain-anchor", hc_anchor(chain), chain[4]))
+    push(results, check_b("hash_chain-step-verify", hc_verify_step(chain[1], chain[4], 3), true))
+    push(results, check_b("hash_chain-step-verify-wrong-steps", hc_verify_step(chain[1], chain[4], 2), false))
+
+    // ── 5. key_wrap: HMAC-CTR wrap/unwrap round trip + integrity check ────
+    let kek = sha256("kat-kek")
+    let raw_key = sha256("kat-raw-key")
+    let wrapped = kw_wrap(kek, raw_key)
+    push(results, check_i("key_wrap-length-grows-by-8-bytes", len(wrapped), len(raw_key) + 16))
+    push(results, check_s("key_wrap-roundtrip", kw_unwrap(kek, wrapped), raw_key))
+    push(results, check_b("key_wrap-verify-correct-kek", kw_verify(kek, wrapped), true))
+    let wrong_kek = sha256("kat-wrong-kek")
+    push(results, check_s("key_wrap-unwrap-wrong-kek-fails-closed", kw_unwrap(wrong_kek, wrapped), ""))
+    push(results, check_b("key_wrap-verify-wrong-kek", kw_verify(wrong_kek, wrapped), false))
+
+    // ── 6. secret_share: Shamir 3-of-5 over GF(2^31-1) ─────────────────────
+    let secret = 123456789
+    let shares = ss_split(secret, 5, 3)
+    push(results, check_i("secret_share-share-count", len(shares), 5))
+    push(results, check_i("secret_share-combine-first3", ss_combine(shares, 3), secret))
+    let subset = [shares[1], shares[3], shares[4]]
+    push(results, check_i("secret_share-combine-different-subset", ss_combine(subset, 3), secret))
+    let too_few = [shares[0], shares[1]]
+    push(results, check_b("secret_share-below-threshold-fails", ss_combine(too_few, 3) != secret, true))
+
+    // ── 7. hash_tree: SHA-256 Merkle tree with inclusion proof ────────────
+    let leaves = ["alpha", "bravo", "charlie", "delta"]
+    let root = ht_build(leaves)
+    push(results, check_i("hash_tree-root-length", len(root), 64))
+    let proof2 = ht_proof(leaves, 2)
+    push(results, check_b("hash_tree-verify-correct", ht_verify(root, "charlie", proof2, 2), true))
+    push(results, check_b("hash_tree-verify-wrong-leaf", ht_verify(root, "echo", proof2, 2), false))
+    let bad_root = sha256("not-the-root")
+    push(results, check_b("hash_tree-verify-wrong-root", ht_verify(bad_root, "charlie", proof2, 2), false))
+    let single = ht_build(["only"])
+    push(results, check_s("hash_tree-single-leaf-root", single, ht_build(["only"])))
+
+    // ── 8. mac_siv: synthetic-IV encrypt/decrypt round trip ───────────────
+    let siv_key = sha256("kat-siv-key")
+    let nonce = "6e6f6e6365"
+    let plaintext_hex = "48656c6c6f2c204e4f5641"
+    let siv_ct = ms_encrypt(siv_key, nonce, plaintext_hex)
+    push(results, check_s("mac_siv-roundtrip", ms_decrypt(siv_key, siv_ct), plaintext_hex))
+    push(results, check_b("mac_siv-verify-correct", ms_verify(siv_key, nonce, plaintext_hex, siv_ct), true))
+    push(results, check_b("mac_siv-verify-wrong-plaintext", ms_verify(siv_key, nonce, "00", siv_ct), false))
+    push(results, check_s("mac_siv-deterministic", ms_encrypt(siv_key, nonce, plaintext_hex), siv_ct))
+    let different_nonce_ct = ms_encrypt(siv_key, "6f74686572", plaintext_hex)
+    push(results, check_b("mac_siv-different-nonce-different-output", different_nonce_ct != siv_ct, true))
+
+    // ── 9. password: strength buckets, common-password gate, policy ───────
+    push(results, check_i("password-strength-common-weak", pw_strength("password"), 0))
+    push(results, check_i("password-strength-short-weak", pw_strength("abc"), 0))
+    push(results, check_b("password-strength-longrandom-is-strong", pw_strength("xQ7#mK2$vL9pR4&wZ8Tn") >= 3, true))
+    push(results, check_b("password-common-hit", pw_common("password"), true))
+    push(results, check_b("password-common-hit-mixedcase", pw_common("PaSsWoRd"), true))
+    push(results, check_b("password-common-miss", pw_common("Xk9-mQ2-vL7-Zr4"), false))
+    push(results, check_b("password-policy-ok", is_ok(pw_policy("Abcdef1!", 8, true, true, true)), true))
+    push(results, check_b("password-policy-too-short", is_err(pw_policy("Ab1!", 8, true, true, true)), true))
+    push(results, check_b("password-policy-no-upper", is_err(pw_policy("abcdef1!", 8, true, true, true)), true))
+    push(results, check_b("password-policy-no-digit", is_err(pw_policy("Abcdefgh!", 8, true, true, true)), true))
+    push(results, check_b("password-policy-no-special", is_err(pw_policy("Abcdefg1", 8, true, true, true)), true))
+    push(results, check_b("password-policy-relaxed-ok", is_ok(pw_policy("abcdefgh", 8, false, false, false)), true))
+
+    // ── 10. timing: constant-time-style comparison/select/zero-test ───────
+    push(results, check_b("timing-ct-compare-equal", ct_compare("deadbeef", "deadbeef"), true))
+    push(results, check_b("timing-ct-compare-unequal", ct_compare("deadbeef", "deadbeee"), false))
+    push(results, check_i("timing-ct-select-true", ct_select(1, 111, 222), 111))
+    push(results, check_i("timing-ct-select-false", ct_select(0, 111, 222), 222))
+    push(results, check_i("timing-ct-select-nonzero-cond", ct_select(42, 111, 222), 111))
+    push(results, check_b("timing-ct-is-zero-true", ct_is_zero(0), true))
+    push(results, check_b("timing-ct-is-zero-false-pos", ct_is_zero(5), false))
+    push(results, check_b("timing-ct-is-zero-false-neg", ct_is_zero(-5), false))
+    push(results, check_b("timing-ct-not-zero", ct_not_zero(7), true))
+    let sel_bytes = ct_select_bytes(1, [1, 2, 3], [9, 9, 9])
+    push(results, check_b("timing-ct-select-bytes-true", sel_bytes[0] == 1 and sel_bytes[1] == 2 and sel_bytes[2] == 3, true))
+    let sel_bytes0 = ct_select_bytes(0, [1, 2, 3], [9, 9, 9])
+    push(results, check_b("timing-ct-select-bytes-false", sel_bytes0[0] == 9 and sel_bytes0[1] == 9 and sel_bytes0[2] == 9, true))
+
+    // ── 11. envelope: two-tier seal/open round trip + tamper detection ────
+    let master = sha256("kat-master-key")
+    let payload_hex = "74776f2d7469657220656e76656c6f7065"
+    let sealed = ev_seal(master, payload_hex)
+    push(results, check_s("envelope-roundtrip", ev_open(master, sealed), payload_hex))
+    push(results, check_b("envelope-verify-correct", ev_verify(master, sealed), true))
+    let wrong_master = sha256("kat-wrong-master")
+    push(results, check_s("envelope-open-wrong-master-fails-closed", ev_open(wrong_master, sealed), ""))
+    let tampered_sealed = {}
+    tampered_sealed["edek"] = sealed["edek"]
+    tampered_sealed["ciphertext"] = sealed["ciphertext"] + "00"
+    tampered_sealed["tag"] = sealed["tag"]
+    push(results, check_b("envelope-verify-tampered-ciphertext", ev_verify(master, tampered_sealed), false))
+    push(results, check_s("envelope-open-tampered-fails-closed", ev_open(master, tampered_sealed), ""))
+
+    // ── 12. kdf_context: context-bound key separation via HKDF ────────────
+    let cm = sha256("kat-context-master")
+    let k1 = kc_derive(cm, "session-tokens", 1)
+    let k1_again = kc_derive(cm, "session-tokens", 1)
+    let k2 = kc_derive(cm, "session-tokens", 2)
+    let kother = kc_derive(cm, "webhook-signing", 1)
+    push(results, check_s("kdf_context-deterministic", k1, k1_again))
+    push(results, check_b("kdf_context-different-counter-differs", k1 != k2, true))
+    push(results, check_b("kdf_context-different-label-differs", k1 != kother, true))
+    push(results, check_s("kdf_context-rotate-matches-next-counter", kc_rotate(cm, "session-tokens", 1), k2))
+    push(results, check_i("kdf_context-derive-len", len(kc_derive_len(cm, "session-tokens", 1, 48)), 96))
+
+    let total = len(results)
+    let passed = sum(results)
+    print("")
+    print(str(passed) + "/" + str(total) + " passed")
+    if passed != total
+        exit(1)

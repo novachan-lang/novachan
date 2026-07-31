@@ -1,0 +1,255 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/base58
+// ============================================================================
+// Binary-safe Bitcoin Base58 encoding and decoding. NO base58check — no SHA
+// dependency. This is pure Base58 over arbitrary byte payloads.
+//
+// WHY THIS EXISTS (and why forge/forge_base58.nova is wrong for binary data):
+//   forge_base58 encodes/decodes a NOVA int — it cannot handle multi-byte binary
+//   payloads. Inputs longer than ~8 bytes overflow, 0x00 bytes are invisible
+//   inside NOVA strings (NUL-truncation), and the leading-zero convention is not
+//   implemented. This module takes and returns `bytes` on the data side, making
+//   0x00 an ordinary byte that survives round-trips intact.
+//
+// THE DRAWBACK AVOIDED:
+//   Python's third-party base58 libraries often fail silently on leading 0x00
+//   bytes or require the caller to handle them. This implementation encodes
+//   each leading 0x00 byte as a literal '1' character and restores them on decode.
+//
+// PUBLIC API:
+//   base58_encode(data: bytes) -> string
+//   base58_decode(s: string) -> bytes
+//
+// ALPHABET (index 0..57):
+//   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+//   Omits 0, O, I, l to prevent visual ambiguity when humans transcribe addresses.
+//
+// ALGORITHM — carry-based long division over a byte array:
+//   Base58 treats the payload as a big-endian arbitrary-precision integer and
+//   repeatedly divides by 58. A 64-bit int can hold at most 8 bytes before
+//   overflow (256^8 = 1.8e19 > 2^63). Real payloads are 20-50 bytes. We maintain
+//   a list of byte values (0..255) and perform carry-based long division
+//   left-to-right, exactly as paper long division. Each pass yields one Base58
+//   digit (LSB-first); after all passes we reverse to get the final string.
+//   Decode is the inverse: carry-based multiply-add right-to-left.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   We mask after every right-shift that extracts a byte value (& 0xFF) to
+//   guard against sign extension on negative-looking intermediate values.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _b58_ to avoid collisions with other std
+//   modules compiled into the same binary.
+
+// ── Alphabet ─────────────────────────────────────────────────────────────────
+
+fn _b58_alpha() -> string
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+// Return the Base58 character at alphabet index v (0..57).
+fn _b58_char(v) -> string
+    let alpha = _b58_alpha()
+    alpha[v]
+
+// Return the numeric value (0..57) for a Base58 character, or -1 if invalid.
+// The alphabet skips four characters: 0 (48), I (73), O (79), l (108).
+// We map via ord-range arithmetic rather than a 58-entry lookup table
+// (NOVA has no multi-line list literals).
+fn _b58_val(c) -> int
+    let b = ord(c)
+    // '1'..'9'  indices 0..8    (ASCII 49..57)
+    if b >= 49 and b <= 57
+        return b - 49
+    // 'A'..'H'  indices 9..16   (ASCII 65..72; 'I'=73 is skipped)
+    if b >= 65 and b <= 72
+        return b - 65 + 9
+    // 'J'..'N'  indices 17..21  (ASCII 74..78; 'O'=79 is skipped)
+    if b >= 74 and b <= 78
+        return b - 74 + 17
+    // 'P'..'Z'  indices 22..32  (ASCII 80..90)
+    if b >= 80 and b <= 90
+        return b - 80 + 22
+    // 'a'..'k'  indices 33..43  (ASCII 97..107; 'l'=108 is skipped)
+    if b >= 97 and b <= 107
+        return b - 97 + 33
+    // 'm'..'z'  indices 44..57  (ASCII 109..122)
+    if b >= 109 and b <= 122
+        return b - 109 + 44
+    -1
+
+// ── Encode ───────────────────────────────────────────────────────────────────
+// base58_encode: convert arbitrary binary bytes to a Base58 string.
+//
+// Three phases:
+//   1. Count leading 0x00 bytes → each becomes a leading '1' in the output.
+//   2. Copy input into a mutable working buffer; repeatedly divide by 58 using
+//      carry-based long division over the byte array, collecting remainders.
+//   3. Reverse the remainder string and prepend the '1' prefix.
+
+fn base58_encode(data) -> string
+    let n = bytes_len(data)
+
+    // Empty input → empty output (no leading-zero special case, no digits).
+    if n == 0
+        return ""
+
+    // Count leading 0x00 bytes.
+    let nz = 0
+    let zi = 0
+    while zi < n
+        if bytes_get(data, zi) == 0
+            nz = nz + 1
+            zi = zi + 1
+        else
+            zi = n
+
+    // Prepend leading '1' chars for the leading 0x00 input bytes.
+    let prefix = ""
+    let pi = 0
+    while pi < nz
+        prefix = prefix + "1"
+        pi = pi + 1
+
+    // If the entire input was zero bytes, no digits to compute.
+    if nz == n
+        return prefix
+
+    // Build working copy of the byte array.
+    let work = bytes(0)
+    let ci = 0
+    while ci < n
+        work = bytes_append(work, bytes_get(data, ci))
+        ci = ci + 1
+
+    // Repeatedly divide work[] (big-endian base-256 number) by 58.
+    // Each iteration: carry-based left-to-right pass; collect remainder as digit.
+    // Loop terminates when work[] is all zeros.
+    let digits = ""
+    let running = 1
+    while running == 1
+        // Single division pass.
+        // We rebuild work from scratch each pass (NOVA bytes are append-only).
+        let carry = 0
+        let new_work = bytes(0)
+        let di = 0
+        let wn = bytes_len(work)
+        while di < wn
+            let val = carry * 256 + (bytes_get(work, di) & 0xFF)
+            let q = val / 58
+            carry = val - q * 58
+            new_work = bytes_append(new_work, q & 0xFF)
+            di = di + 1
+        work = new_work
+        // The remainder `carry` is our next Base58 digit (LSB order).
+        digits = digits + _b58_char(carry)
+        // Check termination: all bytes in work are zero.
+        let chk = 0
+        let wlen2 = bytes_len(work)
+        let all_z = 1
+        while chk < wlen2
+            if bytes_get(work, chk) != 0
+                all_z = 0
+            chk = chk + 1
+        if all_z == 1
+            running = 0
+
+    // Reverse digits (were collected LSB-first).
+    let rev = ""
+    let ri = len(digits) - 1
+    while ri >= 0
+        rev = rev + digits[ri]
+        ri = ri - 1
+
+    prefix + rev
+
+// ── Decode ───────────────────────────────────────────────────────────────────
+// base58_decode: convert a Base58 string back to bytes.
+//
+// Three phases:
+//   1. Count leading '1' chars → each becomes a leading 0x00 output byte.
+//   2. For each remaining character, look up its value (0..57) and
+//      carry-based multiply-add into a byte array (right-to-left):
+//        carry = digit_value
+//        for i in (buflen-1)..0:
+//            value   = buf[i] * 58 + carry
+//            buf[i]  = value & 0xFF
+//            carry   = (value >> 8) & 0xFF
+//      Because NOVA bytes are append-only, we do this right-to-left pass by
+//      collecting results into a reversed buffer, then un-reversing it.
+//   3. Strip leading 0x00 padding bytes (they come from zero-initialisation of
+//      the working buffer, not from the data), then prepend the 0x00 prefix bytes.
+//
+// Buffer sizing: log(58)/log(256) ≈ 0.732, so each Base58 char encodes < 1 byte.
+// A buffer of `slen` bytes is always sufficient (over-estimate; we trim).
+
+fn base58_decode(s) -> any
+    let slen = len(s)
+
+    // Empty string → empty bytes.
+    if slen == 0
+        return bytes(0)
+
+    // Count leading '1' chars.
+    let nones = 0
+    let oi = 0
+    while oi < slen
+        if s[oi] == "1"
+            nones = nones + 1
+            oi = oi + 1
+        else
+            oi = slen
+
+    // Allocate working buffer (slen bytes, all zero = big-endian zero).
+    let buflen = slen
+    let buf = bytes(0)
+    let bfi = 0
+    while bfi < buflen
+        buf = bytes_append(buf, 0)
+        bfi = bfi + 1
+
+    // Process each non-'1' character: carry-based multiply-add into buf[].
+    let si = nones
+    while si < slen
+        let c = s[si]
+        let dv = _b58_val(c)
+        if dv >= 0
+            // Right-to-left pass: collect updated bytes into rtl_buf (reversed order),
+            // then reverse back into buf.
+            let carry4 = dv
+            let rtl_buf = bytes(0)
+            let ml = buflen - 1
+            while ml >= 0
+                let cur4 = (bytes_get(buf, ml) & 0xFF) * 58 + carry4
+                carry4 = (cur4 >> 8) & 0xFF
+                rtl_buf = bytes_append(rtl_buf, cur4 & 0xFF)
+                ml = ml - 1
+            // Reverse rtl_buf back to left-to-right order.
+            let rev_buf = bytes(0)
+            let rl = bytes_len(rtl_buf) - 1
+            while rl >= 0
+                rev_buf = bytes_append(rev_buf, bytes_get(rtl_buf, rl))
+                rl = rl - 1
+            buf = rev_buf
+        si = si + 1
+
+    // Strip leading zero bytes from buf (zero-initialised padding, not data).
+    // Use a flag to break out of the scan once we hit a non-zero byte.
+    let strip_start = 0
+    let strip_done = 0
+    while strip_start < buflen and strip_done == 0
+        if bytes_get(buf, strip_start) == 0
+            strip_start = strip_start + 1
+        else
+            strip_done = 1
+
+    // Build final output: leading 0x00 bytes (from '1' prefix) + data bytes.
+    let final_out = bytes(0)
+    let fi = 0
+    while fi < nones
+        final_out = bytes_append(final_out, 0)
+        fi = fi + 1
+    let fj = strip_start
+    while fj < buflen
+        final_out = bytes_append(final_out, bytes_get(buf, fj))
+        fj = fj + 1
+    final_out

@@ -1,0 +1,121 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/pdf
+// ============================================================================
+// Minimal PDF 1.4 writer: produces a single-page, one-line-of-text PDF file
+// that opens correctly in any PDF 1.4+ reader.
+//
+// FORMAT OVERVIEW (the subset this module emits)
+//   %PDF-1.4                                  — header, first bytes of file
+//   1 0 obj  << /Type /Catalog /Pages 2 0 R >>            endobj
+//   2 0 obj  << /Type /Pages /Kids [3 0 R] /Count 1 >>    endobj
+//   3 0 obj  << /Type /Page /Parent 2 0 R /MediaBox [...]
+//                /Resources << /Font << /F1 4 0 R >> >>
+//                /Contents 5 0 R >>                       endobj
+//   4 0 obj  << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>  endobj
+//   5 0 obj  << /Length N >> stream ... endstream          endobj
+//                content stream draws the text: BT /F1 24 Tf 72 720 Td (t) Tj ET
+//   xref                                       — cross-reference table
+//     0 6                                        (start obj#, count incl. free)
+//     0000000000 65535 f                         (object 0 is always free)
+//     <10-digit offset> 00000 n   x5             (one line per real object)
+//   trailer  << /Size 6 /Root 1 0 R >>
+//   startxref
+//     <byte offset of the "xref" keyword above>
+//   %%EOF
+//
+// Every xref data line is exactly 20 bytes: "nnnnnnnnnn ggggg x \n"
+// (10-digit offset, space, 5-digit generation, space, 'n'/'f', space, LF) —
+// the fixed-width layout required by the PDF spec (ISO 32000-1 §7.5.4).
+//
+// PUBLIC API
+//   pdf_page(text) -> bytes
+//     Build a complete, valid single-page PDF 1.4 document that renders
+//     `text` (Helvetica 24pt, drawn at 72,720 — near the top of a US Letter
+//     page) via BT/Tj/ET in its content stream. `text` is escaped for PDF
+//     string-literal syntax (backslash, '(', ')').
+//
+// PRIVATE HELPERS — all prefixed _pdf_ to avoid link collisions.
+//
+// LEAF — imports nothing.
+// ============================================================================
+
+// ── Private: append a string's bytes to a bytes buffer ──────────────────────
+fn _pdf_put_str(out, s) -> bytes
+    bytes_concat(out, str_to_bytes(s))
+
+// ── Private: decimal string of n, zero-padded on the left to `width` chars ──
+fn _pdf_zpad(n, width) -> string
+    let s = str(n)
+    while len(s) < width
+        s = "0" + s
+    s
+
+// ── Private: escape a string for a PDF "(...)" literal ──────────────────────
+// PDF string literals require '\', '(' and ')' to be backslash-escaped.
+fn _pdf_escape_text(text) -> string
+    let result = ""
+    let i = 0
+    let n = len(text)
+    while i < n
+        let ch = slice(text, i, i + 1)
+        if ch == "\\"
+            result = result + "\\\\"
+        else if ch == "("
+            result = result + "\\("
+        else if ch == ")"
+            result = result + "\\)"
+        else
+            result = result + ch
+        i = i + 1
+    result
+
+// ── pdf_page ──────────────────────────────────────────────────────────────────
+// Build a valid single-page PDF 1.4 document showing `text` as its content.
+fn pdf_page(text) -> bytes
+    let out = bytes(0)
+    out = _pdf_put_str(out, "%PDF-1.4\n")
+
+    // Object 1 — Catalog.
+    let off1 = bytes_len(out)
+    out = _pdf_put_str(out, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+    // Object 2 — Pages (the page tree root).
+    let off2 = bytes_len(out)
+    out = _pdf_put_str(out, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+
+    // Object 3 — Page (US Letter, references the font resource and content stream).
+    // NOTE: each concatenation is its own single-line statement — NOVA does not
+    // support a trailing binary operator continuing an expression onto the next
+    // source line (it silently drops the continuation instead of erroring).
+    let off3 = bytes_len(out)
+    let obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+    obj3 = obj3 + "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+    out = _pdf_put_str(out, obj3)
+
+    // Object 4 — Font (Helvetica, one of the 14 standard PDF fonts; no embedding needed).
+    let off4 = bytes_len(out)
+    out = _pdf_put_str(out, "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+
+    // Object 5 — Contents stream: draws the text via BT ... Tj ... ET.
+    let off5 = bytes_len(out)
+    let escaped = _pdf_escape_text(text)
+    let content = "BT /F1 24 Tf 72 720 Td (" + escaped + ") Tj ET"
+    let content_len = len(content)
+    let obj5 = "5 0 obj\n<< /Length " + str(content_len) + " >>\nstream\n"
+    obj5 = obj5 + content + "\nendstream\nendobj\n"
+    out = _pdf_put_str(out, obj5)
+
+    // Cross-reference table. Object 0 is always the free-list head (generation
+    // 65535, type 'f'). Objects 1..5 are all in-use ('n') at their recorded offsets.
+    let xref_off = bytes_len(out)
+    let xref = "xref\n0 6\n"
+    xref = xref + "0000000000 65535 f \n"
+    xref = xref + _pdf_zpad(off1, 10) + " 00000 n \n"
+    xref = xref + _pdf_zpad(off2, 10) + " 00000 n \n"
+    xref = xref + _pdf_zpad(off3, 10) + " 00000 n \n"
+    xref = xref + _pdf_zpad(off4, 10) + " 00000 n \n"
+    xref = xref + _pdf_zpad(off5, 10) + " 00000 n \n"
+    xref = xref + "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" + str(xref_off) + "\n%%EOF"
+    out = _pdf_put_str(out, xref)
+
+    out

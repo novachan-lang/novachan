@@ -90,6 +90,14 @@
 //     varspec names are RFC 6570 VARCHAR (ALPHA / DIGIT / "_" / a limited
 //     pct-encoded triplet) — always ASCII by grammar — so char_at()
 //     codepoint indexing and slice()/len() byte indexing coincide there.
+//   * The ":N" prefix-length modifier is the one place a VALUE (not just a
+//     name) is length-limited, and RFC 6570 sec 2.4.1 is explicit that N
+//     counts CHARACTERS, not octets: "max-length ... refers to a maximum
+//     number of characters (not octets or percent-encoded triplets)". A
+//     multi-byte UTF-8 value therefore CANNOT be byte-sliced at offset N —
+//     that can split a codepoint mid-sequence and percent-encode a dangling
+//     lead byte into something that isn't valid UTF-8 once decoded. See
+//     _ut_truncate_chars, which walks code_points()/char_at() instead.
 //   * dict keys are strings; a missing key returns int 0 not "" — every
 //     reader here guards with contains() before reading a string value.
 //   * NOVA dicts require a homogeneous value type; ut_parse's result dict
@@ -240,25 +248,30 @@ fn _ut_op_config(op: string) -> list
         result.push("")
     result
 
+// _ut_build_piece: encode `value` and build the one-variable "piece" of an
+// expansion — "name=value", bare "name" (empty value + omit_eq), or the
+// bare encoded value (unnamed operators) — per the op-config booleans from
+// _ut_op_config. The single implementation shared by _ut_expand_one
+// (single-variable helpers) and _ut_expand_expr's per-token loop, so the
+// piece-construction rule can never drift between the two call sites.
+fn _ut_build_piece(name: string, value: string, named: bool, allow_reserved: bool, omit_eq: bool) -> string
+    let encoded = _ut_encode(value, allow_reserved)
+    if named
+        if len(value) == 0 and omit_eq
+            return name
+        return name + "=" + encoded
+    encoded
+
 // _ut_expand_one: core single-variable expander shared by ut_simple,
 // ut_reserved, ut_fragment, ut_label, ut_path, ut_query, ut_form, ut_matrix
-// and _ut_expand_expr's per-token loop.
+// and (via _ut_build_piece) _ut_expand_expr's per-token loop.
 fn _ut_expand_one(op: string, name: string, value: string) -> string
     let cfg = _ut_op_config(op)
     let prefix = cfg[0]
     let named = cfg[2] == "1"
     let allow_reserved = cfg[3] == "1"
     let omit_eq = cfg[4] == "1"
-    let encoded = _ut_encode(value, allow_reserved)
-    let piece = ""
-    if named
-        if len(value) == 0 and omit_eq
-            piece = name
-        else
-            piece = name + "=" + encoded
-    else
-        piece = encoded
-    prefix + piece
+    prefix + _ut_build_piece(name, value, named, allow_reserved, omit_eq)
 
 // ── Private: varspec (name[":"N | "*"]) parsing ────────────────────────────
 
@@ -312,6 +325,26 @@ fn _ut_parse_int(s: string) -> int
             v = v * 10 + (c - 48)
         i = i + 1
     v
+
+// _ut_truncate_chars: the first `n` Unicode CHARACTERS (not bytes) of `s`,
+// per RFC 6570 sec 2.4.1's ":" prefix modifier: "max-length ... refers to a
+// maximum number of characters (not octets or percent-encoded triplets)".
+// Byte-slicing a multi-byte UTF-8 value at a raw byte offset can split a
+// codepoint mid-sequence, leaving a dangling lead byte that percent-encodes
+// to a string which is not valid UTF-8 once decoded — this walks
+// code_points()/char_at()'s codepoint index instead so a truncated value is
+// always well-formed UTF-8. No-ops (returns `s` unchanged) when `n` is at
+// or beyond the character count, so callers need no separate length guard.
+fn _ut_truncate_chars(s: string, n: int) -> string
+    let cps = code_points(s)
+    if n >= len(cps)
+        return s
+    let result = ""
+    let i = 0
+    while i < n
+        result = result + char_at(s, i)
+        i = i + 1
+    result
 
 // ── Public: template parsing ────────────────────────────────────────────
 
@@ -421,18 +454,8 @@ fn _ut_expand_expr(content: string, vars: dict) -> string
             let value = vars[name]
             if len(trunc_s) > 0
                 let tn = _ut_parse_int(trunc_s)
-                if tn < len(value)
-                    value = slice(value, 0, tn)
-            let encoded = _ut_encode(value, allow_reserved)
-            let piece = ""
-            if named
-                if len(value) == 0 and omit_eq
-                    piece = name
-                else
-                    piece = name + "=" + encoded
-            else
-                piece = encoded
-            pieces.push(piece)
+                value = _ut_truncate_chars(value, tn)
+            pieces.push(_ut_build_piece(name, value, named, allow_reserved, omit_eq))
         j = j + 1
     if len(pieces) == 0
         return ""

@@ -1,0 +1,204 @@
+// forge_kafka_client -- higher-level Kafka producer/consumer API over the forge_kafka wire codec.
+// forge_kafka gives raw request/response BUILDERS and PARSERS (kf_produce_request / kf_parse_produce_response
+// / etc); this module wraps those into the shape an application actually wants to call: a producer/consumer
+// "handle" (a plain config dict -- broker list + topic, no live connection state -- matching this repo's
+// existing DB-client convention of a config struct that kf_connect/kf_send_request are driven from
+// separately) plus one-call request builders that return a fully FRAMED wire packet (int32 size + header +
+// body, ready for tcp_send_bytes) and one-call response decoders that return plain dicts/lists instead of
+// the raw [field, next_off] tuples the wire layer deals in.
+import forge_kafka
+
+// ---- producer / consumer config -------------------------------------------------------------------------
+// A config dict, not a live connection -- callers open the actual socket with kf_connect(host, port) against
+// whichever broker in `brokers` they choose (this module does no broker selection / leader discovery; that
+// is what kafka_decode_metadata is for).
+fn kafka_producer(brokers: list, topic: string) -> dict
+    {"brokers": brokers, "topic": topic, "client_id": "nova-kafka-client"}
+
+fn kafka_consumer(brokers: list, group_id: string, topic: string) -> dict
+    {"brokers": brokers, "group_id": group_id, "topic": topic, "client_id": "nova-kafka-client"}
+
+// ---- request builders -------------------------------------------------------------------------------------
+// Every builder here returns a FULLY FRAMED packet (size-prefix + RequestHeader + body) -- the direct output
+// of kf_frame_request -- so a caller can tcp_send_bytes() it straight onto an open kf_connect() socket with
+// no further assembly.
+let KAFKA_API_PRODUCE = 0
+let KAFKA_API_FETCH = 1
+let KAFKA_API_METADATA = 3
+
+// Single-record ProduceRequest v0 (one topic, one partition, one message) at acks=1 (leader ack only) with a
+// 5s server-side timeout -- the common case for a simple producer. For multi-record/multi-partition batches,
+// call kf_produce_request directly (this module intentionally trades that flexibility for a one-line call).
+fn kafka_produce_request(producer, key, value, partition: int) -> any
+    let header = kfc_request_header(KAFKA_API_PRODUCE, producer)
+    let messages = [[key, value]]
+    let topics = [[producer["topic"], [[partition, messages]]]]
+    let body = kf_produce_request(1, 5000, topics)
+    kf_frame_request(header, body)
+
+// FetchRequest v0 for one partition at `offset`, capped at `max_bytes`. replica_id = -1 (a normal consumer,
+// never a follower broker); max_wait_ms = 5000 (long-poll) with min_bytes = 1 (return as soon as any data
+// is available, don't wait to fill max_bytes).
+fn kafka_fetch_request(consumer, partition: int, offset: int, max_bytes: int) -> any
+    let header = kfc_request_header(KAFKA_API_FETCH, consumer)
+    let topics = [[consumer["topic"], [[partition, offset, max_bytes]]]]
+    let body = kf_fetch_request(0 - 1, 5000, 1, topics)
+    kf_frame_request(header, body)
+
+// MetadataRequest -- `topics` = list of topic-name strings to ask about, or [] to ask for ALL topics (the
+// wire meaning of an empty topics array in MetadataRequest v0).
+fn kafka_metadata_request(topics: list) -> any
+    let header = kf_request_header(KAFKA_API_METADATA, 0, 1, "nova-kafka-client")
+    let body = kf_be32(len(topics))
+    let i = 0
+    while i < len(topics)
+        body = bytes_concat(body, kf_wr_string(topics[i]))
+        i = i + 1
+    kf_frame_request(header, body)
+
+// Shared RequestHeader (v1) builder: api_version pinned to the classic v0 layouts this module targets,
+// correlation_id 1 (this module is one-request-per-call / no in-flight pipelining, so a fixed id is enough
+// to be echoed back and matched trivially by the caller), client_id from the producer/consumer config dict.
+fn kfc_request_header(api_key: int, cfg) -> any
+    kf_request_header(api_key, 0, 1, cfg["client_id"])
+
+// ---- response decoders -------------------------------------------------------------------------------------
+// Each decoder takes a full RESPONSE FRAME as received from kf_recv_response (i.e. `data` starts at that
+// call's returned body_bytes, which already has the outer size prefix AND correlation_id stripped -- so
+// parsing here starts at offset 0, unlike the request-side kf_parse_* helpers which read a whole frame
+// starting at the size prefix). This module only ever builds single topic/single-partition requests, so
+// each decoder reports the FIRST topic/partition entry found; a response with none (e.g. the broker
+// returned zero topics) decodes to explicit error/empty results rather than crashing.
+
+// ProduceResponse -> {"topic","partition","offset","error"}. error 0 = success; nonzero = a Kafka
+// protocol error code (e.g. 3 = UNKNOWN_TOPIC_OR_PARTITION). On a malformed/empty response, topic is "",
+// partition -1, offset -1, error -1 (a value no real Kafka error code uses) so callers can distinguish
+// "broker returned an error" (>=0) from "response didn't even parse" (-1) with a single check.
+fn kafka_decode_produce_response(data) -> dict
+    let pr = kf_parse_produce_response(data, 0)
+    let topics = pr[0]
+    if len(topics) == 0
+        return {"topic": "", "partition": 0 - 1, "offset": 0 - 1, "error": 0 - 1}
+    let t = topics[0]
+    let prs = t[1]
+    if len(prs) == 0
+        return {"topic": t[0], "partition": 0 - 1, "offset": 0 - 1, "error": 0 - 1}
+    let p = prs[0]
+    {"topic": t[0], "partition": p[0], "offset": p[2], "error": p[1]}
+
+// FetchResponse -> list of {"offset","key","value"} for the first topic/partition. key/value are raw
+// `bytes` (or null) -- binary-safe, matching kf_parse_fetch_response's contract (records are NOT assumed to
+// be UTF-8 text). An empty/malformed response, or a partition genuinely at end-of-log, both decode to [].
+fn kafka_decode_fetch_response(data) -> list
+    let fr = kf_parse_fetch_response(data, 0)
+    let topics = fr[0]
+    if len(topics) == 0
+        return []
+    let t = topics[0]
+    let prs = t[1]
+    if len(prs) == 0
+        return []
+    let p = prs[0]
+    let msgs = p[3]
+    let out = []
+    let i = 0
+    while i < len(msgs)
+        let m = msgs[i]
+        push(out, {"offset": m[0], "key": m[1], "value": m[2]})
+        i = i + 1
+    out
+
+// MetadataResponse -> {"brokers": [{"node_id","host","port"}...], "topics": [{"topic","error","partitions":
+// [{"partition","error","leader","replicas","isr"}...]}...]}.
+fn kafka_decode_metadata(data) -> dict
+    kfc_parse_metadata_response(data, 0)
+
+// -> dict (see kafka_decode_metadata). Every declared array count is clamped to the maximum the remaining
+// buffer could actually back before the loop runs, using each entry's minimum wire footprint -- the same
+// declared-count-DoS defense forge_kafka.nova's kf_parse_produce_response / kf_parse_fetch_response use
+// (a hostile/corrupt broker cannot make this parser allocate/iterate proportional to an unbounded field it
+// simply claims, only to what the buffer could genuinely contain).
+fn kfc_parse_metadata_response(b, off: int) -> any
+    let blen = bytes_len(b)
+    let bn = kf_rd_i32(b, off)
+    if bn < 0
+        bn = 0
+    let p = off + 4
+    // Broker minimum footprint: node_id(4) + host string-len(2) + port(4) = 10.
+    let max_brokers = (blen - p) / 10
+    if bn > max_brokers
+        bn = max_brokers
+    let brokers = []
+    let bi = 0
+    while bi < bn
+        let node_id = kf_rd_i32(b, p)
+        p = p + 4
+        let hr = kf_rd_string(b, p)
+        p = hr[1]
+        let port = kf_rd_i32(b, p)
+        p = p + 4
+        push(brokers, {"node_id": node_id, "host": hr[0], "port": port})
+        bi = bi + 1
+    let tn = kf_rd_i32(b, p)
+    if tn < 0
+        tn = 0
+    p = p + 4
+    // TopicMetadata minimum footprint: error(2) + topic string-len(2) + partition-count(4) = 8.
+    let max_topics = (blen - p) / 8
+    if tn > max_topics
+        tn = max_topics
+    let topics = []
+    let ti = 0
+    while ti < tn
+        let terr = kf_rd_i16(b, p)
+        p = p + 2
+        let tr = kf_rd_string(b, p)
+        p = tr[1]
+        let pn = kf_rd_i32(b, p)
+        if pn < 0
+            pn = 0
+        p = p + 4
+        // PartitionMetadata minimum footprint: error(2)+id(4)+leader(4)+replicas-count(4)+isr-count(4)=18.
+        let max_parts = (blen - p) / 18
+        if pn > max_parts
+            pn = max_parts
+        let parts = []
+        let pi = 0
+        while pi < pn
+            let perr = kf_rd_i16(b, p)
+            p = p + 2
+            let pid = kf_rd_i32(b, p)
+            p = p + 4
+            let leader = kf_rd_i32(b, p)
+            p = p + 4
+            let rn = kf_rd_i32(b, p)
+            if rn < 0
+                rn = 0
+            p = p + 4
+            let max_r = (blen - p) / 4
+            if rn > max_r
+                rn = max_r
+            let replicas = []
+            let ri = 0
+            while ri < rn
+                push(replicas, kf_rd_i32(b, p))
+                p = p + 4
+                ri = ri + 1
+            let isrn = kf_rd_i32(b, p)
+            if isrn < 0
+                isrn = 0
+            p = p + 4
+            let max_isr = (blen - p) / 4
+            if isrn > max_isr
+                isrn = max_isr
+            let isr = []
+            let ii = 0
+            while ii < isrn
+                push(isr, kf_rd_i32(b, p))
+                p = p + 4
+                ii = ii + 1
+            push(parts, {"partition": pid, "error": perr, "leader": leader, "replicas": replicas, "isr": isr})
+            pi = pi + 1
+        push(topics, {"topic": tr[0], "error": terr, "partitions": parts})
+        ti = ti + 1
+    {"brokers": brokers, "topics": topics}

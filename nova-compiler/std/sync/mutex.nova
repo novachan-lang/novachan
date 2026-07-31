@@ -1,0 +1,62 @@
+// std/sync/mutex — green-task-aware mutual-exclusion lock
+//
+// WHAT:
+//   A mutex that parks the calling green task (or OS thread) when contended,
+//   waking exactly one waiter on unlock. Zero spin, zero busy-wait.
+//
+// NOVA WAY — a lock is a channel with ONE token:
+//   A channel_bounded(1) pre-loaded with a single integer token IS a mutex.
+//   recv(m) = take the token   → parks the caller if another task holds it.
+//   send(m, 1) = return token  → wakes one parked waiter (FIFO, channel order).
+//   The NOVA channel runtime already implements the green-task-aware park/wake
+//   machinery, so mutex gets scheduler integration FOR FREE with no new runtime
+//   primitive.  The token value (1) is a meaningless sentinel; only its presence
+//   or absence matters.
+//
+// DRAWBACK AVOIDED vs alternatives:
+//   • Rust MutexGuard + Poisoned: NOVA needs no guard type, no poison flag, no
+//     lifetime annotations. HONEST TRADEOFF: MutexGuard exists to make missed-unlock
+//     a COMPILE error (RAII drop always unlocks) — NOVA does NOT yet give that safety.
+//     Until with_lock (a scoped helper, deferred) lands, a missed unlock (or a panic/
+//     early-return between lock and unlock) is a LATENT HANG the caller must avoid,
+//     not a type error. We avoid the ceremony, not (yet) the hazard.
+//   • Java: two separate systems (synchronized + j.u.c.locks), different semantics.
+//     NOVA has ONE primitive that composes.
+//   • OS mutex (pthreads/CRITICAL_SECTION): blocks an OS thread on contention.
+//     NOVA's channel parks only the green task; the carrier OS thread stays free
+//     to run other tasks, so a lock contention under NOVA is a green-task yield,
+//     not an OS-thread block.
+//
+// CAUTION — correct use (non-recursive, hand-balanced lock/unlock):
+//   • Call unlock(m) EXACTLY ONCE per successful lock/try_lock. A DOUBLE unlock HANGS
+//     the second unlocker — the capacity-1 channel is already full, so its send parks.
+//   • NOT re-entrant: calling lock(m) while you already hold m DEADLOCKS (you park
+//     waiting for yourself). Use a separate lock or restructure.
+//   • Any early-return/panic between lock and unlock leaves the mutex held forever.
+//     Until with_lock lands, keep the critical section small and unlock on EVERY path.
+
+// mutex_new() -> mutex
+//   Creates a new, unlocked mutex.
+//   A bounded channel of capacity 1 with the token already present means
+//   "no one holds the lock — the next recv succeeds immediately."
+fn mutex_new()
+    let m = channel_bounded(1)
+    send(m, 1)
+    return m
+
+// lock(m)
+//   Acquire the mutex.  Parks the caller until the token is available.
+fn lock(m)
+    recv(m)
+
+// unlock(m)
+//   Release the mutex.  Wakes one parked waiter (if any).
+fn unlock(m)
+    send(m, 1)
+
+// try_lock(m) -> bool (1 = acquired, 0 = currently held by another task)
+//   Non-blocking acquire attempt.  Returns 1 if the lock was taken, 0 otherwise.
+//   The caller MUST call unlock(m) after a successful try_lock.
+fn try_lock(m)
+    let r = try_recv(m)
+    return r[0]

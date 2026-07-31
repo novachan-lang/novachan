@@ -1,0 +1,183 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/naive_bayes
+// ============================================================================
+// Gaussian Naive Bayes classifier over a dense float feature matrix with
+// int class labels — assumes each feature is normally distributed within
+// each class, independently of the other features (the "naive"
+// independence assumption). Pure math, no dependencies — LEAF module.
+//
+// PUBLIC API
+//   nb_fit(features_2d, labels) -> dict   fitted model (see MODEL SHAPE)
+//   nb_predict(model, sample)   -> int    predicted label (argmax posterior)
+//
+// MODEL SHAPE (the dict returned by nb_fit), all keys always present:
+//   "classes"  list(int)         distinct labels, first-seen order
+//   "priors"   list(float)       P(class) for each entry in "classes"
+//   "means"    list(list(float)) means[c][f] = mean of feature f within
+//                                  class classes[c]
+//   "vars"     list(list(float)) vars[c][f] = variance of feature f within
+//                                  class classes[c] (population variance;
+//                                  a class with a single sample, or a
+//                                  feature with zero within-class variance,
+//                                  gets a small floor variance — see
+//                                  _NB_VAR_FLOOR below — so nb_predict's
+//                                  Gaussian pdf never divides by zero)
+//
+// nb_predict computes, for each class, log(prior) + sum_f
+// log(gaussian_pdf(sample[f]; mean[c][f], var[c][f])), and returns the
+// class with the highest total (log-space avoids underflow from
+// multiplying many small probabilities together, which is the standard
+// implementation of Gaussian NB — using raw products instead is a known
+// failure mode for wide feature vectors). Empty model (no classes fitted)
+// returns -1 (sentinel: no possible prediction).
+//
+// float codegen safety: |x| via if/else is not needed here (no absolute
+// values used), but every returned float is bound to a `let` before use in
+// a return-relevant position, and every float/float comparison is between
+// values already coerced with `* 1.0`.
+//
+// SYMBOL COLLISION GUARD: all private helpers and dict keys are qualified
+// with the nb_ / _nb_ prefix in this module's naming, and this module
+// declares no structs (only plain dicts/lists), so the struct-field-name
+// collision hazard does not apply.
+// ============================================================================
+
+// Variance floor: prevents a class/feature combination with zero observed
+// variance (e.g. a single training sample, or a constant feature) from
+// producing a divide-by-zero / infinite-density Gaussian pdf.
+fn _nb_var_floor() -> float
+    0.000001
+
+// nb_fit: estimate per-class prior, per-(class,feature) mean and variance.
+fn nb_fit(features_2d: list, labels: list) -> dict
+    let n = len(features_2d)
+    let model = {}
+    if n == 0
+        model["classes"] = []
+        model["priors"] = []
+        model["means"] = []
+        model["vars"] = []
+        return model
+    let d = len(features_2d[0])
+    // Discover distinct classes, first-seen order, and collect each
+    // class's row indices.
+    let classes = []
+    let class_rows = []
+    let i = 0
+    while i < n
+        let lbl = labels[i]
+        let ci = -1
+        let s = 0
+        while s < len(classes)
+            if classes[s] == lbl
+                ci = s
+            s = s + 1
+        if ci < 0
+            push(classes, lbl)
+            push(class_rows, [])
+            ci = len(classes) - 1
+        let rows = class_rows[ci]
+        push(rows, i)
+        i = i + 1
+    let priors = []
+    let means = []
+    let vars = []
+    let c = 0
+    while c < len(classes)
+        let rows = class_rows[c]
+        let rn = len(rows)
+        let prior = rn * 1.0 / (n * 1.0)
+        push(priors, prior)
+        // Column means for this class.
+        let col_mean = []
+        let f = 0
+        while f < d
+            let sum_f = 0.0
+            let r = 0
+            while r < rn
+                let row_idx = rows[r]
+                let row = features_2d[row_idx]
+                let v = 0.0
+                if f < len(row)
+                    v = row[f] * 1.0
+                sum_f = sum_f + v
+                r = r + 1
+            let mean_f = 0.0
+            if rn > 0
+                mean_f = sum_f / (rn * 1.0)
+            push(col_mean, mean_f)
+            f = f + 1
+        push(means, col_mean)
+        // Column (population) variances for this class.
+        let col_var = []
+        let f2 = 0
+        while f2 < d
+            let sum_sq = 0.0
+            let r2 = 0
+            while r2 < rn
+                let row_idx2 = rows[r2]
+                let row2 = features_2d[row_idx2]
+                let v2 = 0.0
+                if f2 < len(row2)
+                    v2 = row2[f2] * 1.0
+                let dev = v2 - col_mean[f2]
+                sum_sq = sum_sq + dev * dev
+                r2 = r2 + 1
+            let var_f = _nb_var_floor()
+            if rn > 0
+                let raw_var = sum_sq / (rn * 1.0)
+                if raw_var > var_f
+                    var_f = raw_var
+            push(col_var, var_f)
+            f2 = f2 + 1
+        push(vars, col_var)
+        c = c + 1
+    model["classes"] = classes
+    model["priors"] = priors
+    model["means"] = means
+    model["vars"] = vars
+    model
+
+// _nb_log_gaussian_pdf: log of the Gaussian probability density at x, for
+// the given mean and variance. var is assumed > 0 (nb_fit floors it).
+fn _nb_log_gaussian_pdf(x: float, mean: float, var: float) -> float
+    let two_pi = 6.283185307179586
+    let dev = x - mean
+    let exponent_term = 0.0 - (dev * dev) / (2.0 * var)
+    let norm_term = 0.0 - 0.5 * log(two_pi * var)
+    let result = norm_term + exponent_term
+    result
+
+// nb_predict: return the class label with the highest posterior
+// log-probability for `sample`.
+fn nb_predict(model: dict, sample: list) -> int
+    let classes = model["classes"]
+    if len(classes) == 0
+        return -1
+    let priors = model["priors"]
+    let means = model["means"]
+    let vars = model["vars"]
+    let best_i = 0
+    let best_score = 0.0
+    let c = 0
+    while c < len(classes)
+        let mean_row = means[c]
+        let var_row = vars[c]
+        let score = log(priors[c])
+        let f = 0
+        while f < len(mean_row)
+            let x = 0.0
+            if f < len(sample)
+                x = sample[f] * 1.0
+            let term = _nb_log_gaussian_pdf(x, mean_row[f], var_row[f])
+            score = score + term
+            f = f + 1
+        if c == 0
+            best_score = score
+            best_i = 0
+        else
+            if score > best_score
+                best_score = score
+                best_i = c
+        c = c + 1
+    classes[best_i]

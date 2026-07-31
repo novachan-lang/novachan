@@ -1,0 +1,243 @@
+// std/sketch/quotientfilter.nova — Quotient filter: compact membership filter.
+//
+// A quotient filter splits each item's hash h into:
+//   quotient  q_bits = high bits of h → index into the slot array (0..2^q-1)
+//   remainder r_bits = next r bits    → value stored in the slot
+//
+// Each slot stores:
+//   "occ"   (occupied)    — 1 if some item has this quotient
+//   "cont"  (continuation) — 1 if this run continues from a prior run
+//   "shift" (shifted)      — 1 if this slot's content was shifted right
+//   "rem"   (remainder)    — the stored remainder value (0 if empty)
+//
+// Representation: four parallel lists in the state dict:
+//   "occ"   — list of int (0/1)
+//   "cont"  — list of int (0/1)
+//   "shift" — list of int (0/1)
+//   "rem"   — list of int (remainder or 0)
+//   "slots" — total number of slots = 2^q
+//   "q"     — quotient bits
+//   "r"     — remainder bits (defaults to 8)
+//   "count" — number of items inserted
+//
+// CORRECTNESS GUARANTEE: NO FALSE NEGATIVES. If qf_add(state, item) is called,
+// qf_contains(state, item) is ALWAYS true.
+//
+// Implementation uses linear probing for collision resolution, which is correct
+// for quotient filters while remaining simple. A slot is "occupied" if any item
+// hashes to that quotient. Runs are stored in contiguous slots after the canonical
+// slot, shifting right when collisions occur.
+
+// ---------------------------------------------------------------------------
+// Private: 63-bit hash A. Seed=1125899906842597, mult=131.
+// ---------------------------------------------------------------------------
+fn _qf_h63(s)
+    let h = 1125899906842597
+    let n = len(s)
+    let i = 0
+    let mask = 0x7FFFFFFFFFFFFFFF
+    while i < n
+        let c = ord(char_at(s, i))
+        h = (h * 131 + c) & mask
+        i = i + 1
+    return h
+
+// ---------------------------------------------------------------------------
+// Private: extract the quotient (top q bits of a 63-bit hash, shifted down).
+// ---------------------------------------------------------------------------
+fn _qf_get_quotient(h, q, r)
+    // h is 63 bits; quotient = high q bits of the lower (q+r) bits used.
+    // We use bits [r .. r+q-1] of h.
+    let mask_r = (1 << r) - 1
+    let mask_q = (1 << q) - 1
+    return (h >> r) & mask_q
+
+// ---------------------------------------------------------------------------
+// Private: extract the remainder (bottom r bits of the hash).
+// ---------------------------------------------------------------------------
+fn _qf_get_remainder(h, q, r)
+    let mask_r = (1 << r) - 1
+    return h & mask_r
+
+// ---------------------------------------------------------------------------
+// Compute [quotient, remainder] fingerprint of item given q and r bit widths.
+// Returns a list [quotient, remainder].
+// ---------------------------------------------------------------------------
+fn qf_fingerprint(item, q, r)
+    let h = _qf_h63(item)
+    let quo = _qf_get_quotient(h, q, r)
+    let rem = _qf_get_remainder(h, q, r)
+    let result = []
+    push(result, quo)
+    push(result, rem)
+    return result
+
+// ---------------------------------------------------------------------------
+// Extract just the quotient from a hash h given q and r widths.
+// ---------------------------------------------------------------------------
+fn qf_quotient(h, q)
+    return h & ((1 << q) - 1)
+
+// ---------------------------------------------------------------------------
+// Extract just the remainder from a hash h given q and r widths.
+// ---------------------------------------------------------------------------
+fn qf_remainder(h, q, r)
+    let mask_r = (1 << r) - 1
+    return h & mask_r
+
+// ---------------------------------------------------------------------------
+// Create a new quotient filter with 2^q slots.
+// Uses r=8 remainder bits by default (good balance of FP rate and memory).
+// ---------------------------------------------------------------------------
+fn qf_new(q)
+    let slots = 1 << q
+    let occ = []
+    let cont = []
+    let shift = []
+    let rem = []
+    let i = 0
+    while i < slots
+        push(occ, 0)
+        push(cont, 0)
+        push(shift, 0)
+        push(rem, 0)
+        i = i + 1
+    let state = {}
+    state["occ"] = occ
+    state["cont"] = cont
+    state["shift"] = shift
+    state["rem"] = rem
+    state["slots"] = slots
+    state["q"] = q
+    state["r"] = 8
+    state["count"] = 0
+    return state
+
+// ---------------------------------------------------------------------------
+// Private: find the start of the run for canonical slot `quo`.
+// Walks backward from quo counting occupied slots, then forward counting
+// run-starts to locate where the run for quo begins.
+// ---------------------------------------------------------------------------
+fn _qf_find_run_start(state, quo)
+    let occ_arr = state["occ"]
+    let cont_arr = state["cont"]
+    let shift_arr = state["shift"]
+    let slots = state["slots"]
+    // Count how many occupied slots are at or before quo (these have runs
+    // stored somewhere at or after quo).
+    let bucket = quo
+    let j = quo
+    let occupied_count = 0
+    while j >= 0
+        if occ_arr[j] == 1
+            occupied_count = occupied_count + 1
+        j = j - 1
+    // Now scan forward from quo to find the occupied_count-th run start.
+    let run_count = 0
+    let s = quo
+    while s < slots
+        // A slot is a run start if it is not a continuation.
+        if cont_arr[s] == 0
+            if shift_arr[s] == 1 or occ_arr[s] == 1
+                // This is a run start slot.
+                run_count = run_count + 1
+                if run_count == occupied_count
+                    return s
+        s = s + 1
+    return s
+
+// ---------------------------------------------------------------------------
+// Add an item to the quotient filter.
+// Uses a simplified linear-probing insertion that maintains the
+// no-false-negatives invariant.
+// ---------------------------------------------------------------------------
+fn qf_add(state, item)
+    let q = state["q"]
+    let r = state["r"]
+    let slots = state["slots"]
+    let fp = qf_fingerprint(item, q, r)
+    let quo = fp[0]
+    let rem_val = fp[1]
+    let occ_arr = state["occ"]
+    let cont_arr = state["cont"]
+    let shift_arr = state["shift"]
+    let rem_arr = state["rem"]
+    // Mark the canonical slot as occupied.
+    occ_arr[quo] = 1
+    // Find a free slot for the remainder using linear probing.
+    let s = quo
+    while s < slots
+        if shift_arr[s] == 0 and cont_arr[s] == 0 and rem_arr[s] == 0
+            // Slot is available for our remainder.
+            rem_arr[s] = rem_val + 1
+            shift_arr[s] = 1
+            if s != quo
+                cont_arr[s] = 1
+            state["count"] = state["count"] + 1
+            return true
+        if rem_arr[s] == rem_val + 1
+            // Duplicate — remainder already stored in this slot.
+            // Check it belongs to our quotient's run by checking occupied.
+            // For simplicity: if occ[quo] is set and rem matches, treat as dup.
+            return true
+        s = s + 1
+    // Wrap around (filter near-full): insert at first free slot from start.
+    let s2 = 0
+    while s2 < quo
+        if shift_arr[s2] == 0 and cont_arr[s2] == 0 and rem_arr[s2] == 0
+            rem_arr[s2] = rem_val + 1
+            shift_arr[s2] = 1
+            cont_arr[s2] = 1
+            state["count"] = state["count"] + 1
+            return true
+        s2 = s2 + 1
+    return false
+
+// ---------------------------------------------------------------------------
+// Query: return true if item might be in the filter (no false negatives).
+// ---------------------------------------------------------------------------
+fn qf_contains(state, item)
+    let q = state["q"]
+    let r = state["r"]
+    let slots = state["slots"]
+    let fp = qf_fingerprint(item, q, r)
+    let quo = fp[0]
+    let rem_val = fp[1]
+    let occ_arr = state["occ"]
+    let rem_arr = state["rem"]
+    // If canonical slot not marked occupied, definitely absent.
+    if occ_arr[quo] == 0
+        return false
+    // Search from canonical slot forward for the remainder.
+    let s = quo
+    while s < slots
+        if rem_arr[s] == rem_val + 1
+            return true
+        s = s + 1
+    // Also search wrapped region.
+    let s2 = 0
+    while s2 < quo
+        if rem_arr[s2] == rem_val + 1
+            return true
+        s2 = s2 + 1
+    return false
+
+// ---------------------------------------------------------------------------
+// qf_may_contain is an alias for qf_contains.
+// ---------------------------------------------------------------------------
+fn qf_may_contain(state, item)
+    return qf_contains(state, item)
+
+// ---------------------------------------------------------------------------
+// Return the number of items inserted into the filter.
+// ---------------------------------------------------------------------------
+fn qf_count(state)
+    return state["count"]
+
+// ---------------------------------------------------------------------------
+// Return the load factor (items / slots) as a float.
+// ---------------------------------------------------------------------------
+fn qf_load_factor(state)
+    let c = state["count"]
+    let slots = state["slots"]
+    return c * 1.0 / (slots * 1.0)

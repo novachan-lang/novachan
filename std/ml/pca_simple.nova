@@ -1,0 +1,292 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/pca_simple
+// ============================================================================
+// Simple Principal Component Analysis over a dense 2D float dataset (list
+// of equal-length row vectors), using power iteration + deflation to find
+// the top-k eigenvectors of the covariance matrix — no LAPACK/BLAS, no
+// external dependency, just the linear algebra spelled out directly. Pure
+// math, no dependencies — LEAF module.
+//
+// PUBLIC API
+//   pc_mean_center(data_2d)           -> list   each column shifted to
+//                                                 mean 0 (rows unchanged in
+//                                                 count/width)
+//   pc_covariance(data_2d)            -> list   d x d POPULATION covariance
+//                                                 matrix (divides by n, not
+//                                                 n-1) of the columns
+//   pc_project(data_2d, components)   -> list   n x k matrix: each row
+//                                                 projected onto the top-k
+//                                                 principal components
+//                                                 (k = min(components, d))
+//
+// ALGORITHM (pc_project): mean-center the data, build the covariance
+// matrix, then repeatedly (1) run power iteration on the current residual
+// covariance to find its dominant eigenvector/eigenvalue, (2) deflate the
+// covariance by subtracting eigenvalue * outer(v, v), (3) move to the next
+// component. This standard "power iteration + Hotelling deflation" method
+// converges to the top-k eigenpairs in order of decreasing eigenvalue,
+// PROVIDED the top-k eigenvalues are distinct (repeated eigenvalues make
+// the eigenvector within the shared subspace ambiguous — an inherent
+// property of eigendecomposition, not a bug in this implementation).
+//
+// SIGN CONVENTION: eigenvectors from power iteration are only defined up to
+// sign (v and -v are equally valid). This module deterministically flips
+// each eigenvector so its first component is >= 0.0, matching the spirit of
+// scikit-learn's svd_flip — so pc_project's output is REPRODUCIBLE across
+// runs for the same input, not just "correct up to sign".
+//
+// Degenerate inputs (n==0, d==0, or components<=0) return [] rather than
+// crashing.
+//
+// float codegen safety: every returned/intermediate float is bound to a
+// `let` before use in a return-relevant position (see
+// reference_nova_float_codegen_geo_bearing — large inline multi-term float
+// expressions in a bare `return` have triggered uninitialized-slot bugs
+// elsewhere in this codebase).
+//
+// SYMBOL COLLISION GUARD: all private helpers prefixed _pc_.
+// ============================================================================
+
+// _pc_col_means: mean of each column across all rows. Assumes all rows have
+// the same width as row 0 (ragged input is not a supported use case for a
+// dense-matrix module; a shorter row simply contributes 0.0 past its own
+// length, which is a defined — if not "correct" for ragged data — result
+// rather than an out-of-bounds read).
+fn _pc_col_means(data_2d: list) -> list
+    let n = len(data_2d)
+    if n == 0
+        return []
+    let d = len(data_2d[0])
+    let sums = []
+    let c = 0
+    while c < d
+        push(sums, 0.0)
+        c = c + 1
+    let r = 0
+    while r < n
+        let row = data_2d[r]
+        let cc = 0
+        while cc < d
+            if cc < len(row)
+                sums[cc] = sums[cc] + row[cc] * 1.0
+            cc = cc + 1
+        r = r + 1
+    let means = []
+    let i = 0
+    while i < d
+        let mv = sums[i] / (n * 1.0)
+        push(means, mv)
+        i = i + 1
+    means
+
+// pc_mean_center: subtract the column mean from every element of its
+// column, returning a new 2D list (input is never mutated).
+fn pc_mean_center(data_2d: list) -> list
+    let n = len(data_2d)
+    if n == 0
+        return []
+    let means = _pc_col_means(data_2d)
+    let d = len(means)
+    let out = []
+    let r = 0
+    while r < n
+        let row = data_2d[r]
+        let new_row = []
+        let c = 0
+        while c < d
+            let v = 0.0
+            if c < len(row)
+                v = row[c] * 1.0
+            let centered = v - means[c]
+            push(new_row, centered)
+            c = c + 1
+        push(out, new_row)
+        r = r + 1
+    out
+
+// pc_covariance: d x d population covariance matrix of data_2d's columns.
+fn pc_covariance(data_2d: list) -> list
+    let n = len(data_2d)
+    if n == 0
+        return []
+    let centered = pc_mean_center(data_2d)
+    let d = len(centered[0])
+    let cov = []
+    let i = 0
+    while i < d
+        let row_out = []
+        let j = 0
+        while j < d
+            push(row_out, 0.0)
+            j = j + 1
+        push(cov, row_out)
+        i = i + 1
+    let r = 0
+    while r < n
+        let row = centered[r]
+        let a = 0
+        while a < d
+            let va = row[a]
+            let b = 0
+            while b < d
+                let vb = row[b]
+                let cov_row = cov[a]
+                cov_row[b] = cov_row[b] + va * vb
+                b = b + 1
+            a = a + 1
+        r = r + 1
+    let out = []
+    let x = 0
+    while x < d
+        let cov_row = cov[x]
+        let new_row = []
+        let y = 0
+        while y < d
+            let cell = cov_row[y] / (n * 1.0)
+            push(new_row, cell)
+            y = y + 1
+        push(out, new_row)
+        x = x + 1
+    out
+
+// _pc_matvec: matrix-vector product mat * vec (mat is a list of rows).
+fn _pc_matvec(mat: list, vec: list) -> list
+    let out = []
+    let r = 0
+    while r < len(mat)
+        let row = mat[r]
+        let acc = 0.0
+        let c = 0
+        while c < len(row)
+            acc = acc + row[c] * vec[c]
+            c = c + 1
+        push(out, acc)
+        r = r + 1
+    out
+
+// _pc_dot: dot product of two equal-length float lists.
+fn _pc_dot(a: list, b: list) -> float
+    let acc = 0.0
+    let i = 0
+    while i < len(a)
+        acc = acc + a[i] * b[i]
+        i = i + 1
+    acc
+
+// _pc_norm: Euclidean norm of a float list. Used where the sqrt result is
+// returned/consumed immediately (safe pattern — see _pc_normalize for the
+// riskier "divide many elements by one stored sqrt" case).
+fn _pc_norm(v: list) -> float
+    let s = _pc_dot(v, v)
+    let result = sqrt(s)
+    result
+
+// _pc_normalize: return a new unit-length copy of v (all-zero if v's norm
+// is 0.0 — never divides by zero).
+//
+// NOTE: sqrt() is called INLINE at the point of division rather than
+// computed once via _pc_norm and stored for reuse across the loop — a
+// documented NOVA codegen hazard (a stored/reused sqrt-of-accumulator
+// value has produced garbage in other modules, layout-dependently; the
+// confirmed-reliable workaround is to keep sqrt() inline in the consuming
+// expression). _pc_dot(v, v) itself is cheap to recompute per component
+// for the vector sizes this module targets.
+fn _pc_normalize(v: list) -> list
+    let sum_sq = _pc_dot(v, v)
+    let out = []
+    let i = 0
+    while i < len(v)
+        let comp = 0.0
+        if sum_sq != 0.0
+            comp = v[i] / sqrt(sum_sq)
+        push(out, comp)
+        i = i + 1
+    out
+
+// _pc_power_iteration: find the dominant eigenvector/eigenvalue of a
+// symmetric d x d matrix `mat` via `iters` power-iteration steps, starting
+// from the all-ones vector. Returns [eigenvector (list), eigenvalue
+// (float, as the Rayleigh quotient v^T*mat*v for the final unit vector)].
+// The eigenvector's sign is flipped, if needed, so its first component is
+// >= 0.0 (deterministic output — see module doc SIGN CONVENTION).
+fn _pc_power_iteration(mat: list, d: int, iters: int) -> list
+    let v = []
+    let i = 0
+    while i < d
+        push(v, 1.0)
+        i = i + 1
+    v = _pc_normalize(v)
+    let step = 0
+    while step < iters
+        let mv = _pc_matvec(mat, v)
+        let mv_norm = _pc_norm(mv)
+        if mv_norm != 0.0
+            v = _pc_normalize(mv)
+        step = step + 1
+    if len(v) > 0
+        if v[0] < 0.0
+            let flipped = []
+            let j = 0
+            while j < len(v)
+                push(flipped, 0.0 - v[j])
+                j = j + 1
+            v = flipped
+    let mv_final = _pc_matvec(mat, v)
+    let eigenvalue = _pc_dot(v, mv_final)
+    [v, eigenvalue]
+
+// _pc_deflate: Hotelling deflation — mat - eigenvalue * outer(v, v).
+// Returns a NEW matrix (input is never mutated).
+fn _pc_deflate(mat: list, v: list, eigenvalue: float) -> list
+    let d = len(mat)
+    let out = []
+    let i = 0
+    while i < d
+        let row = mat[i]
+        let new_row = []
+        let j = 0
+        while j < d
+            let outer_ij = eigenvalue * v[i] * v[j]
+            let cell = row[j] - outer_ij
+            push(new_row, cell)
+            j = j + 1
+        push(out, new_row)
+        i = i + 1
+    out
+
+// pc_project: project data_2d onto its top-k principal components,
+// k = min(components, d). Returns an n x k matrix.
+fn pc_project(data_2d: list, components: int) -> list
+    let n = len(data_2d)
+    if n == 0
+        return []
+    let centered = pc_mean_center(data_2d)
+    let d = len(centered[0])
+    if d == 0 or components <= 0
+        return []
+    let k = components
+    if k > d
+        k = d
+    let work_cov = pc_covariance(data_2d)
+    let eigenvectors = []
+    let c = 0
+    while c < k
+        let pair = _pc_power_iteration(work_cov, d, 200)
+        let vec = pair[0]
+        let eigenvalue = pair[1]
+        push(eigenvectors, vec)
+        work_cov = _pc_deflate(work_cov, vec, eigenvalue)
+        c = c + 1
+    let out = []
+    let r = 0
+    while r < n
+        let row = centered[r]
+        let proj_row = []
+        let e = 0
+        while e < k
+            let comp_val = _pc_dot(row, eigenvectors[e])
+            push(proj_row, comp_val)
+            e = e + 1
+        push(out, proj_row)
+        r = r + 1
+    out

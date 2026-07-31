@@ -1,0 +1,179 @@
+// std/io/path — POSIX-style path string manipulation (pure string ops; "/" separator; no filesystem access).
+//
+// WHAT: dirname/basename/ext/stem/join/is_absolute/normalize for path strings.
+//       All operations are purely string-based — no stat, no I/O, no OS calls.
+//
+// NOVA-way: composes existing string primitives (split/slice/char_at/len/join) into a clean path API.
+//       The compiler already exposes path_join/path_ext/path_parent BUILTINS on some targets, but those
+//       lack stem, dirname, and the list-based join that callers actually need. This module adds the
+//       complete string-helper layer, building everything from first principles so it works identically
+//       on every target (WASM, embedded, native).
+//
+// Drawback avoided: Python's os.path.join silently ignores leading segments when an absolute component
+//       appears mid-list ("join('/a', '/b') == '/b'"). Here path_join_list concatenates unconditionally
+//       — the caller controls the list; no silent component-erasure surprise.
+//
+// API:
+//   path_dirname(p)        -> everything before the last "/" (""->".", "/a"->"/", "a/b"->"a")
+//   path_basename(p)       -> last segment after the final "/"
+//   path_ext(p)            -> final ".xxx" extension incl dot; "" if none or dotfile
+//   path_stem(p)           -> basename without its final extension
+//   path_join_list(parts)  -> join a list of parts with single "/" (no duplicate slashes)
+//   path_is_absolute(p)    -> true if p starts with "/"
+//   path_normalize(p)      -> resolve "." and ".." segments; collapse "//"
+
+// Find index of the last "/" in s; returns -1 if absent.
+fn _pth_last_slash(s: string) -> int
+    let idx = 0 - 1
+    let i = 0
+    while i < len(s)
+        if char_at(s, i) == "/"
+            idx = i
+        i = i + 1
+    idx
+
+// Strip trailing slashes (but keep the string non-empty if it's just "/").
+fn _pth_strip_trail(s: string) -> string
+    let p = s
+    while len(p) > 1 and char_at(p, len(p) - 1) == "/"
+        p = slice(p, 0, len(p) - 1)
+    p
+
+// Join a list of strings with "/" between them (no dedup — private helper for normalize output).
+fn _pth_join_segs(parts: list) -> string
+    let out = ""
+    let i = 0
+    while i < len(parts)
+        if i > 0
+            out = out + "/"
+        out = out + parts[i]
+        i = i + 1
+    out
+
+// Pop the last element from a list, returning a new list without it.
+fn _pth_pop(parts: list) -> list
+    let out = []
+    let i = 0
+    while i < len(parts) - 1
+        push(out, parts[i])
+        i = i + 1
+    out
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+// Everything before the last "/".
+//   "/a/b/c.txt" -> "/a/b"
+//   "a"          -> "."
+//   "/x"         -> "/"
+//   ""            -> "."
+fn path_dirname(p: string) -> string
+    let s = _pth_strip_trail(p)
+    let idx = _pth_last_slash(s)
+    if idx < 0
+        return "."
+    if idx == 0
+        return "/"
+    slice(s, 0, idx)
+
+// Last segment after the final "/".
+//   "/a/b/c.txt" -> "c.txt"
+//   "a"          -> "a"
+//   "/x"         -> "x"
+fn path_basename(p: string) -> string
+    let s = _pth_strip_trail(p)
+    let idx = _pth_last_slash(s)
+    if idx < 0
+        return s
+    slice(s, idx + 1, len(s))
+
+// Final extension including the dot; "" if there is no dot, or the dot is the first char of the basename
+// (dotfiles: ".hidden" has no extension).
+//   "file.tar.gz" -> ".gz"
+//   "noext"       -> ""
+//   ".hidden"     -> ""
+fn path_ext(p: string) -> string
+    let base = path_basename(p)
+    let dot_idx = 0 - 1
+    let i = 0
+    while i < len(base)
+        if char_at(base, i) == "."
+            dot_idx = i
+        i = i + 1
+    if dot_idx <= 0
+        return ""
+    slice(base, dot_idx, len(base))
+
+// Basename without its final extension.
+//   "file.txt"    -> "file"
+//   "file.tar.gz" -> "file.tar"
+//   "noext"       -> "noext"
+//   ".hidden"     -> ".hidden"
+fn path_stem(p: string) -> string
+    let base = path_basename(p)
+    let dot_idx = 0 - 1
+    let i = 0
+    while i < len(base)
+        if char_at(base, i) == "."
+            dot_idx = i
+        i = i + 1
+    if dot_idx <= 0
+        return base
+    slice(base, 0, dot_idx)
+
+// Join a list of path segments with "/" between them, collapsing any internal duplicate slashes that
+// arise from the join. The first segment is taken as-is (so an absolute leading "/" is preserved).
+//   ["a","b","c"]  -> "a/b/c"
+//   ["/a","b"]     -> "/a/b"
+fn path_join_list(parts: list) -> string
+    if len(parts) == 0
+        return ""
+    let out = parts[0]
+    let i = 1
+    while i < len(parts)
+        let seg = parts[i]
+        // Strip leading slashes on subsequent segments to avoid double-slash.
+        while len(seg) > 0 and char_at(seg, 0) == "/"
+            seg = slice(seg, 1, len(seg))
+        // Strip trailing slash on accumulated out before appending.
+        while len(out) > 1 and char_at(out, len(out) - 1) == "/"
+            out = slice(out, 0, len(out) - 1)
+        if len(seg) > 0
+            out = out + "/" + seg
+        i = i + 1
+    out
+
+// True if p starts with "/".
+fn path_is_absolute(p: string) -> bool
+    len(p) > 0 and char_at(p, 0) == "/"
+
+// Resolve "." and ".." segments and collapse duplicate slashes. Preserves a leading "/".
+//   "a/./b/../c"    -> "a/c"
+//   "/a//b/./c"     -> "/a/b/c"
+//   "a/b/../../c"   -> "c"
+//   ".."            -> ".."
+fn path_normalize(p: string) -> string
+    let absolute = path_is_absolute(p)
+    let raw_parts = split(p, "/")
+    let stack = []
+    let i = 0
+    while i < len(raw_parts)
+        let seg = raw_parts[i]
+        if seg == "" or seg == "."
+            i = i + 1
+        else
+            if seg == ".."
+                if len(stack) > 0 and stack[len(stack) - 1] != ".."
+                    stack = _pth_pop(stack)
+                else
+                    if absolute == false
+                        push(stack, "..")
+                i = i + 1
+            else
+                push(stack, seg)
+                i = i + 1
+    let out = _pth_join_segs(stack)
+    if absolute
+        return "/" + out
+    if len(out) == 0
+        return "."
+    out

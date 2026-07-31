@@ -90,9 +90,10 @@ fn main()
     check("auth_17_header_decode_len_check", bytes_len(auth17) != 16)
 
     // ── 6. decode() when the declared header Length exceeds the PHYSICAL
-    // buffer (truncated packet) must bound to the actual buffer, never
-    // over-read / crash. Build a 25-byte physical buffer whose header claims
-    // Length=40. ──────────────────────────────────────────────────────────
+    // buffer (truncated receive) must REJECT THE WHOLE PACKET — RFC 2865 §3
+    // requires treating a physically-short packet as corrupt and silently
+    // discarding it, never accept-and-truncate. Build a 25-byte physical
+    // buffer whose header claims Length=40. No over-read either way. ──────
     let trunc = bytes_create(25)
     bytes_set(trunc, 0, 1)
     bytes_set(trunc, 1, 5)
@@ -102,25 +103,47 @@ fn main()
     while ti < 16
         bytes_set(trunc, 4 + ti, 0x11)
         ti = ti + 1
-    // attr region [20,25): type=1 length=5 value="AB" only 2 bytes fits pattern
+    // attr region [20,25): type=1 length=5 value="AB" only 2 bytes fits pattern —
+    // irrelevant to the outcome here: rejection must fire purely on buflen < declared.
     bytes_set(trunc, 20, 1)
     bytes_set(trunc, 21, 5)
     bytes_set(trunc, 22, 0x41)
     bytes_set(trunc, 23, 0x42)
     bytes_set(trunc, 24, 0x43)
     let trunc_dec = radius_decode(trunc)
-    check("trunc_header_accepted", contains(trunc_dec, "code"))
-    check("trunc_declared_length_is_40", trunc_dec["length"] == 40)
-    check("trunc_attrs_bounded_to_buffer_not_declared", len(trunc_dec["attrs"]) == 1)
-    if len(trunc_dec["attrs"]) == 1
-        check("trunc_attr_value_exact", hex_encode(trunc_dec["attrs"][0]["value"]) == "414243")
+    check("trunc_whole_packet_rejected", not contains(trunc_dec, "code"))
 
-    // Now truncate one byte earlier (buffer=24) so the attribute's own claim
-    // (5 bytes at offset 20, reaching 25) overruns the PHYSICAL buffer too ->
-    // must be rejected, zero attrs, no over-read.
-    let trunc2 = bytes_slice(trunc, 0, 24)
-    let trunc2_dec = radius_decode(trunc2)
-    check("trunc2_attr_overrun_physical_buffer_rejected", len(trunc2_dec["attrs"]) == 0)
+    // Even a SINGLE byte short of the declared Length must reject (39
+    // physical bytes vs declared 40) — not just the grossly-truncated case.
+    let trunc39 = bytes_create(39)
+    bytes_set(trunc39, 0, 1)
+    bytes_set(trunc39, 1, 5)
+    bytes_set(trunc39, 2, 0x00)
+    bytes_set(trunc39, 3, 40)
+    let trunc39_dec = radius_decode(trunc39)
+    check("trunc_one_byte_short_rejected", not contains(trunc39_dec, "code"))
+
+    // A DIFFERENT scenario: declared Length EXACTLY equals the physical
+    // buffer length (no truncation at the header level) but the lone
+    // attribute's own Length field claims more than fits inside the
+    // declared region. This must also reject the WHOLE packet — a
+    // malformed attribute is never silently dropped while the rest of a
+    // "successful" decode is kept (trailing-content acceptance).
+    let overrun_within = bytes_create(24)
+    bytes_set(overrun_within, 0, 1)
+    bytes_set(overrun_within, 1, 5)
+    bytes_set(overrun_within, 2, 0x00)
+    bytes_set(overrun_within, 3, 24)      // declared == physical buffer length
+    let oi = 0
+    while oi < 16
+        bytes_set(overrun_within, 4 + oi, 0x11)
+        oi = oi + 1
+    bytes_set(overrun_within, 20, 1)
+    bytes_set(overrun_within, 21, 5)      // claims value reaching offset 25, region ends at 24
+    bytes_set(overrun_within, 22, 0x41)
+    bytes_set(overrun_within, 23, 0x42)
+    let overrun_dec = radius_decode(overrun_within)
+    check("attr_overrun_within_declared_region_rejected", not contains(overrun_dec, "code"))
 
     // ── 7. NAS-IP-Address boundary dotted-quads: 0.0.0.0 and 255.255.255.255 ──
     let ip_zero = radius_attr_nas_ip_address_str("0.0.0.0")

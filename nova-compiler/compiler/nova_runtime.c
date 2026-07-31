@@ -10013,6 +10013,10 @@ int64_t nova_rt_max(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t nova_rt_min(int64_t a, int64_t b) { return a < b ? a : b; }
 int64_t nova_rt_fmax(int64_t a, int64_t b) { return f2i(fmax(nova_float_arg(a), nova_float_arg(b))); }
 int64_t nova_rt_fmin(int64_t a, int64_t b) { return f2i(fmin(nova_float_arg(a), nova_float_arg(b))); }
+int64_t nova_rt_fmax_ri(int64_t a, int64_t b) { return f2i(fmax(i2f(a), (double)b)); }
+int64_t nova_rt_fmax_li(int64_t a, int64_t b) { return f2i(fmax((double)a, i2f(b))); }
+int64_t nova_rt_fmin_ri(int64_t a, int64_t b) { return f2i(fmin(i2f(a), (double)b)); }
+int64_t nova_rt_fmin_li(int64_t a, int64_t b) { return f2i(fmin((double)a, i2f(b))); }
 int64_t nova_rt_float_to_int(int64_t x) { return (int64_t)nova_float_arg(x); }
 int64_t nova_rt_int_to_float(int64_t x) { return f2i((double)x); }
 

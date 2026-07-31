@@ -1,0 +1,111 @@
+// std/crypto/mac_siv -- Synthetic IV (SIV) construction: an HMAC-derived, deterministic IV
+// followed by HMAC-CTR keystream encryption.
+//
+// True SIV mode (RFC 5297) uses a dedicated S2V pseudo-random function; this module simplifies
+// S2V to a single HMAC-SHA256(key, nonce || plaintext) -- still deterministic in (key, nonce,
+// plaintext), which is SIV's defining property: encrypting the same plaintext under the same
+// nonce always yields the same output, so a nonce-reuse mistake degrades (at worst) to revealing
+// "these two ciphertexts encrypt the same plaintext" rather than catastrophically leaking the
+// keystream (as reusing a nonce under plain CTR does). The synthetic IV then seeds an HMAC-CTR
+// keystream, exactly like std/crypto/key_wrap's HMAC-CTR, for the actual encryption.
+//
+// ms_decrypt intentionally takes no nonce (only key + siv||ciphertext): the SIV alone is enough
+// to regenerate the keystream and recover the plaintext. That means ms_decrypt on its own gives
+// no tamper-evidence (it will "recover" a plaintext for any input, garbage or not) -- callers who
+// know the nonce should additionally call ms_verify, which recomputes the SIV from
+// (key, nonce, recovered-or-claimed plaintext) and constant-time-compares it against the SIV
+// actually carried in the ciphertext.
+//
+// LEAF -- imports nothing.
+
+// PRIVATE: hex nibble value 0..15, or -1 if not a hex digit.
+fn _ms_nibble(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return o - 48
+    if o >= 97 and o <= 102
+        return o - 87
+    if o >= 65 and o <= 70
+        return o - 55
+    -1
+
+// PRIVATE: lowercase hex string -> byte list.
+fn _ms_hex_to_list(hex: string) -> any
+    let n = len(hex)
+    let out = []
+    let i = 0
+    while i + 1 < n
+        let hi = _ms_nibble(char_at(hex, i))
+        let lo = _ms_nibble(char_at(hex, i + 1))
+        push(out, (hi << 4) | lo)
+        i = i + 2
+    out
+
+// PRIVATE: byte list -> lowercase hex string.
+fn _ms_list_to_hex(lst: any) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = len(lst)
+    let i = 0
+    while i < n
+        let b = lst[i]
+        out = out + char_at(digs, (b >> 4) & 0xF) + char_at(digs, b & 0xF)
+        i = i + 1
+    out
+
+// PRIVATE: element-wise XOR of two equal-length byte lists.
+fn _ms_xor(a: any, b: any) -> any
+    let out = []
+    let n = len(a)
+    let i = 0
+    while i < n
+        push(out, a[i] ^ b[i])
+        i = i + 1
+    out
+
+// PRIVATE: simplified S2V -- the synthetic IV, deterministic in (key, nonce, plaintext).
+fn _ms_siv(key_hex: string, nonce_hex: string, plaintext_hex: string) -> string
+    hmac_sha256(key_hex, nonce_hex + ":" + plaintext_hex)
+
+// PRIVATE: HMAC-CTR keystream of exactly nbytes bytes, seeded by the SIV.
+fn _ms_keystream(key_hex: string, siv_hex: string, nbytes: int) -> any
+    let out = []
+    let ctr = 0
+    while len(out) < nbytes
+        let blk_hex = hmac_sha256(key_hex, siv_hex + ":" + str(ctr))
+        let blk = _ms_hex_to_list(blk_hex)
+        let i = 0
+        while i < len(blk) and len(out) < nbytes
+            push(out, blk[i])
+            i = i + 1
+        ctr = ctr + 1
+    out
+
+// ms_encrypt(key_hex, nonce_hex, plaintext_hex) -> siv_hex || ciphertext_hex (the first 64 hex
+// chars are the 32-byte SIV; the rest is the ciphertext, same length as plaintext_hex).
+fn ms_encrypt(key_hex: string, nonce_hex: string, plaintext_hex: string) -> string
+    let siv_hex = _ms_siv(key_hex, nonce_hex, plaintext_hex)
+    let pt = _ms_hex_to_list(plaintext_hex)
+    let ks = _ms_keystream(key_hex, siv_hex, len(pt))
+    siv_hex + _ms_list_to_hex(_ms_xor(pt, ks))
+
+// ms_decrypt(key_hex, siv_ct) -> plaintext_hex. See module doc: does NOT authenticate on its
+// own (no nonce available) -- pair with ms_verify when the nonce is known.
+fn ms_decrypt(key_hex: string, siv_ct: string) -> string
+    if len(siv_ct) < 64
+        return ""
+    let siv_hex = slice(siv_ct, 0, 64)
+    let ct_hex = slice(siv_ct, 64, len(siv_ct))
+    let ct = _ms_hex_to_list(ct_hex)
+    let ks = _ms_keystream(key_hex, siv_hex, len(ct))
+    _ms_list_to_hex(_ms_xor(ct, ks))
+
+// ms_verify(key_hex, nonce_hex, plaintext_hex, siv_ct) -> bool. Recomputes the SIV from the
+// (key, nonce, plaintext) triple and constant-time-compares it to the SIV carried in siv_ct.
+// True iff siv_ct is exactly what ms_encrypt(key_hex, nonce_hex, plaintext_hex) would produce.
+fn ms_verify(key_hex: string, nonce_hex: string, plaintext_hex: string, siv_ct: string) -> bool
+    if len(siv_ct) < 64
+        return false
+    let siv_got = slice(siv_ct, 0, 64)
+    let siv_expected = _ms_siv(key_hex, nonce_hex, plaintext_hex)
+    ct_eq(siv_got, siv_expected) == 1

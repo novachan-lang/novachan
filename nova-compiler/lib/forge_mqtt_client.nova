@@ -1,0 +1,159 @@
+// forge_mqtt_client -- higher-level MQTT 3.1.1 pub/sub API over the forge_mqtt wire codec.
+// Where forge_mqtt speaks list<int> byte-lists (matching std/net/mqtt_* codecs) and owns the TCP
+// transport, this module speaks `dict` config + `any` (NovaBytes) packets -- the shape an
+// application-level pub/sub client wants: build a config once, turn it into wire packets, and
+// decode server responses (CONNACK/SUBACK/PUBLISH) back into plain dicts.
+//
+// PUBLIC API:
+//   mqtt_client_config(host, port, client_id) -> dict
+//     {host, port, client_id, keep_alive=60, clean_session=1, username="", password=""}
+//   mqtt_connect_packet(config) -> any        -- CONNECT packet as NovaBytes
+//   mqtt_publish_packet(topic, payload, qos, retain) -> any -- PUBLISH packet as NovaBytes
+//   mqtt_subscribe_packet(packet_id, topics_qos) -> any     -- SUBSCRIBE packet as NovaBytes
+//     topics_qos: list of {"topic": string, "qos": int} dicts
+//   mqtt_ping_packet() -> any                 -- PINGREQ packet as NovaBytes
+//   mqtt_disconnect_packet() -> any           -- DISCONNECT packet as NovaBytes
+//   mqtt_decode_connack(data) -> dict         -- {session_present, return_code}, {} if malformed
+//   mqtt_decode_suback(data) -> dict          -- {packet_id, granted_qos}, {} if malformed
+//   mqtt_decode_publish(data) -> dict         -- {topic, payload, qos, retain}, {} if malformed
+//
+// Reuses mqtt_connect/mqtt_publish/mqtt_subscribe/mqtt_pingreq/mqtt_disconnect (packet builders)
+// and mqtt_connack_decode/mqtt_suback_decode/mqtt_publish_decode (packet parsers) from forge_mqtt
+// and the std/net/mqtt_* codecs it wraps. This module owns ONLY the dict<->list<->bytes shaping.
+// NOVA imports are not transitive, so the std/net/mqtt_* codec modules forge_mqtt itself depends
+// on must be imported here directly too (mirroring forge_mqtt.nova's own import list).
+import forge/forge_mqtt
+import std/net/mqtt_fixed
+import std/net/mqtt_connect
+import std/net/mqtt_publish
+import std/net/mqtt_sub
+
+// ── byte-list <-> NovaBytes wire conversions (this module speaks `any` bytes at its boundary) ──
+
+fn _mqc_list_to_bytes(lst: list) -> any
+    let b = bytes(0)
+    let i = 0
+    let n = len(lst)
+    while i < n
+        b = bytes_append(b, lst[i])
+        i = i + 1
+    b
+
+fn _mqc_bytes_to_list(b) -> list
+    let out = []
+    let i = 0
+    let n = bytes_len(b)
+    while i < n
+        push(out, bytes_get(b, i))
+        i = i + 1
+    out
+
+// ── Config ───────────────────────────────────────────────────────────────────────────────────
+
+// mqtt_client_config: build a client config dict with sane defaults (keep_alive=60s,
+// clean_session=1, no auth). Callers can override any key before passing to mqtt_connect_packet.
+fn mqtt_client_config(host: string, port: int, client_id: string) -> dict
+    let cfg = {}
+    cfg["host"] = host
+    cfg["port"] = port
+    cfg["client_id"] = client_id
+    cfg["keep_alive"] = 60
+    cfg["clean_session"] = 1
+    cfg["username"] = ""
+    cfg["password"] = ""
+    cfg
+
+// ── Packet builders ──────────────────────────────────────────────────────────────────────────
+
+// mqtt_connect_packet: build a CONNECT packet from a client config dict.
+// (username/password are accepted in the config for forward-compat but the underlying
+// mqtt_connect codec does not yet encode them -- clean_session + keep_alive + client_id only.)
+fn mqtt_connect_packet(config: dict) -> any
+    let keep_alive = 60
+    if contains(config, "keep_alive")
+        keep_alive = config["keep_alive"]
+    let clean = 1
+    if contains(config, "clean_session")
+        clean = config["clean_session"]
+    let pkt = mqtt_connect(config["client_id"], keep_alive, clean)
+    _mqc_list_to_bytes(pkt)
+
+// mqtt_publish_packet: build a PUBLISH packet. payload is a string (converted to raw bytes on
+// the wire); qos is 0/1/2; retain is 1 to set the RETAIN flag, 0 otherwise.
+// packet_id is fixed at 1 for qos>0 (matches this module's fire-once builder use case --
+// callers needing distinct packet ids per in-flight QoS>0 publish should track their own
+// counter and call mqtt_publish from forge_mqtt directly).
+fn mqtt_publish_packet(topic: string, payload: string, qos: int, retain: int) -> any
+    let payload_bytes = []
+    let i = 0
+    let n = len(payload)
+    while i < n
+        push(payload_bytes, ord(slice(payload, i, i + 1)))
+        i = i + 1
+    let pkt = mqtt_publish(topic, payload_bytes, qos, 1)
+    let raw = _mqc_list_to_bytes(pkt)
+    if retain == 1
+        let byte0 = bytes_get(raw, 0) | 0x01
+        bytes_set(raw, 0, byte0)
+    raw
+
+// mqtt_subscribe_packet: build a SUBSCRIBE packet. topics_qos is a list of
+// {"topic": string, "qos": int} dicts.
+fn mqtt_subscribe_packet(packet_id: int, topics_qos: list) -> any
+    let filters = []
+    let i = 0
+    let n = len(topics_qos)
+    while i < n
+        let entry = topics_qos[i]
+        let pair = [entry["topic"], entry["qos"]]
+        push(filters, pair)
+        i = i + 1
+    let pkt = mqtt_subscribe(packet_id, filters)
+    _mqc_list_to_bytes(pkt)
+
+// mqtt_ping_packet: build a PINGREQ packet (fixed header only, no payload).
+fn mqtt_ping_packet() -> any
+    _mqc_list_to_bytes(mqtt_pingreq())
+
+// mqtt_disconnect_packet: build a DISCONNECT packet (fixed header only, no payload).
+fn mqtt_disconnect_packet() -> any
+    _mqc_list_to_bytes(mqtt_disconnect())
+
+// ── Packet decoders ──────────────────────────────────────────────────────────────────────────
+
+// mqtt_decode_connack: parse a CONNACK packet. Returns {} on malformed input.
+fn mqtt_decode_connack(data) -> dict
+    mqtt_connack_decode(_mqc_bytes_to_list(data))
+
+// mqtt_decode_suback: parse a SUBACK packet into {packet_id, granted_qos}.
+// Returns {} on malformed input.
+fn mqtt_decode_suback(data) -> dict
+    let sa = mqtt_suback_decode(_mqc_bytes_to_list(data))
+    if len(sa) == 0
+        return {}
+    let result = {}
+    result["packet_id"] = sa["packet_id"]
+    result["granted_qos"] = sa["return_codes"]
+    result
+
+// mqtt_decode_publish: parse an incoming PUBLISH packet into {topic, payload, qos, retain}.
+// payload is returned as a string (raw bytes decoded 1:1, matching the encode side of
+// mqtt_publish_packet). Returns {} on malformed input.
+fn mqtt_decode_publish(data) -> dict
+    let lst = _mqc_bytes_to_list(data)
+    let pd = mqtt_publish_decode(lst)
+    if len(pd) == 0
+        return {}
+    let result = {}
+    result["topic"] = pd["topic"]
+    let payload_list = pd["payload"]
+    let payload_str = ""
+    let i = 0
+    let n = len(payload_list)
+    while i < n
+        payload_str = payload_str + chr(payload_list[i])
+        i = i + 1
+    result["payload"] = payload_str
+    result["qos"] = pd["qos"]
+    result["retain"] = lst[0] & 0x01
+    result

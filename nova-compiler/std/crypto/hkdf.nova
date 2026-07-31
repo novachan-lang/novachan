@@ -1,0 +1,155 @@
+// std/crypto/hkdf -- HMAC-based Extract-and-Expand Key Derivation Function (RFC 5869), SHA-256.
+//
+// HKDF has two stages:
+//   Extract: PRK = HMAC-Hash(salt, IKM)              -- concentrates entropy from a (possibly
+//            non-uniform) input keying material into a fixed-length pseudorandom key.
+//   Expand:  OKM = T(1) || T(2) || ... || T(N)        -- stretches PRK into `length` bytes of
+//            output keying material, bound to an `info` context string.
+//            T(0) = empty; T(i) = HMAC-Hash(PRK, T(i-1) | info | i) for a single counter byte i.
+//
+// Binary-safety note: RFC 5869's own test vectors use salts/IKM containing 0x00 bytes and the
+// Expand counter is a raw byte that is itself 0x00..0xFF. NOVA's string-based `hmac_sha256`
+// builtin is a C string under the hood (nul-terminated) and would silently truncate at any
+// embedded 0x00 (see reference_nova_string_nul_truncation). So this module does HMAC over
+// byte-LISTS (plain NOVA lists, no C-string truncation risk) and only touches the native
+// `sha256_of_bytes` builtin (which hashes a `bytes` handle's actual `size`, not strlen) --
+// never the string-based `sha256`/`hmac_sha256` builtins. All public functions take/return
+// lowercase hex strings so callers never have to think about this.
+//
+// LEAF -- imports nothing.
+
+// PRIVATE: hex nibble value 0..15, or -1 if not a hex digit.
+fn _hk_nibble(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return o - 48
+    if o >= 97 and o <= 102
+        return o - 87
+    if o >= 65 and o <= 70
+        return o - 55
+    -1
+
+// PRIVATE: lowercase hex string -> byte list (list of ints 0..255). Odd trailing nibble ignored.
+fn _hk_hex_to_list(hex: string) -> any
+    let n = len(hex)
+    let out = []
+    let i = 0
+    while i + 1 < n
+        let hi = _hk_nibble(char_at(hex, i))
+        let lo = _hk_nibble(char_at(hex, i + 1))
+        push(out, (hi << 4) | lo)
+        i = i + 2
+    out
+
+// PRIVATE: byte list -> lowercase hex string.
+fn _hk_list_to_hex(lst: any) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = len(lst)
+    let i = 0
+    while i < n
+        let b = lst[i]
+        out = out + char_at(digs, (b >> 4) & 0xF) + char_at(digs, b & 0xF)
+        i = i + 1
+    out
+
+// PRIVATE: concatenate two byte lists.
+fn _hk_concat(a: any, b: any) -> any
+    let out = []
+    let i = 0
+    while i < len(a)
+        push(out, a[i])
+        i = i + 1
+    i = 0
+    while i < len(b)
+        push(out, b[i])
+        i = i + 1
+    out
+
+// PRIVATE: byte list -> `bytes` handle (for the native sha256_of_bytes builtin).
+fn _hk_list_to_bytesval(lst: any) -> any
+    let n = len(lst)
+    let b = bytes_create(n)
+    let i = 0
+    while i < n
+        bytes_set(b, i, lst[i])
+        i = i + 1
+    b
+
+// PRIVATE: SHA-256 of a byte list -> 32-byte digest as a byte list. Binary-safe (uses size, not strlen).
+fn _hk_sha256(lst: any) -> any
+    let bv = _hk_list_to_bytesval(lst)
+    let hexh = sha256_of_bytes(bv)
+    _hk_hex_to_list(hexh)
+
+// PRIVATE: HMAC-SHA256(key_bytes, msg_bytes) -> 32-byte digest as a byte list (RFC 2104).
+fn _hk_hmac(key: any, msg: any) -> any
+    let k0 = key
+    if len(k0) > 64
+        k0 = _hk_sha256(k0)
+    let kpad = []
+    let i = 0
+    while i < 64
+        if i < len(k0)
+            push(kpad, k0[i])
+        else
+            push(kpad, 0)
+        i = i + 1
+    let ipad = []
+    let opad = []
+    i = 0
+    while i < 64
+        push(ipad, kpad[i] ^ 0x36)
+        push(opad, kpad[i] ^ 0x5c)
+        i = i + 1
+    let inner = _hk_sha256(_hk_concat(ipad, msg))
+    _hk_sha256(_hk_concat(opad, inner))
+
+// hk_extract(salt_hex, ikm_hex) -> prk_hex.
+// If salt_hex is "", RFC 5869 defines the salt as HashLen (32) zero bytes.
+fn hk_extract(salt_hex: string, ikm_hex: string) -> string
+    let salt_list = []
+    if len(salt_hex) == 0
+        let i = 0
+        while i < 32
+            push(salt_list, 0)
+            i = i + 1
+    else
+        salt_list = _hk_hex_to_list(salt_hex)
+    let ikm_list = _hk_hex_to_list(ikm_hex)
+    let prk = _hk_hmac(salt_list, ikm_list)
+    _hk_list_to_hex(prk)
+
+// hk_expand(prk_hex, info_hex, length) -> okm_hex (length bytes, i.e. length*2 hex chars).
+// length must be <= 255*32 = 8160 (RFC 5869 hard limit -- the counter byte only goes 1..255).
+fn hk_expand(prk_hex: string, info_hex: string, length: int) -> string
+    if length <= 0
+        return ""
+    if length > 8160
+        return ""
+    let prk_list = _hk_hex_to_list(prk_hex)
+    let info_list = []
+    if len(info_hex) > 0
+        info_list = _hk_hex_to_list(info_hex)
+    let n = (length + 31) / 32
+    let t_prev = []
+    let okm = []
+    let i = 1
+    while i <= n
+        let input = _hk_concat(t_prev, info_list)
+        push(input, i)
+        let t_i = _hk_hmac(prk_list, input)
+        okm = _hk_concat(okm, t_i)
+        t_prev = t_i
+        i = i + 1
+    let out = []
+    let j = 0
+    while j < length
+        push(out, okm[j])
+        j = j + 1
+    _hk_list_to_hex(out)
+
+// hk_derive(ikm_hex, salt_hex, info_hex, length) -> okm_hex. Convenience: extract-then-expand.
+fn hk_derive(ikm_hex: string, salt_hex: string, info_hex: string, length: int) -> string
+    let prk = hk_extract(salt_hex, ikm_hex)
+    hk_expand(prk, info_hex, length)

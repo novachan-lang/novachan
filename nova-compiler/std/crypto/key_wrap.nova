@@ -1,0 +1,127 @@
+// std/crypto/key_wrap -- simplified, HMAC-SHA256-PRF-based key wrapping (RFC 3394 concepts,
+// without AES).
+//
+// True AES Key Wrap (RFC 3394) is a dedicated block-cipher mode; NOVA's std/crypto layer has no
+// AES. This module keeps RFC 3394's two useful ideas -- (1) a keystream driven by the
+// key-encryption-key so wrapping is deterministic and reversible, (2) a fixed integrity constant
+// prepended before wrapping so unwrap can detect a wrong KEK / corrupted ciphertext -- and
+// implements the keystream as HMAC-SHA256(KEK, "KW" || counter) in CTR-like mode (a standard,
+// sound way to turn a PRF into a stream cipher). This is NOT a NIST-validated AES-KW
+// implementation; it is a simplified construction with the same shape.
+//
+// LEAF -- imports nothing.
+
+// RFC 3394's default integrity check value, reused here as our magic prefix (8 bytes).
+fn _kw_magic() -> string
+    "a6a6a6a6a6a6a6a6"
+
+// PRIVATE: hex nibble value 0..15, or -1 if not a hex digit.
+fn _kw_nibble(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return o - 48
+    if o >= 97 and o <= 102
+        return o - 87
+    if o >= 65 and o <= 70
+        return o - 55
+    -1
+
+// PRIVATE: lowercase hex string -> byte list.
+fn _kw_hex_to_list(hex: string) -> any
+    let n = len(hex)
+    let out = []
+    let i = 0
+    while i + 1 < n
+        let hi = _kw_nibble(char_at(hex, i))
+        let lo = _kw_nibble(char_at(hex, i + 1))
+        push(out, (hi << 4) | lo)
+        i = i + 2
+    out
+
+// PRIVATE: byte list -> lowercase hex string.
+fn _kw_list_to_hex(lst: any) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = len(lst)
+    let i = 0
+    while i < n
+        let b = lst[i]
+        out = out + char_at(digs, (b >> 4) & 0xF) + char_at(digs, b & 0xF)
+        i = i + 1
+    out
+
+// PRIVATE: byte list [start, end) sub-range (bounds-checked, clamps to [0, len]).
+fn _kw_sublist(lst: any, start: int, end: int) -> any
+    let n = len(lst)
+    let s = start
+    let e = end
+    if s < 0
+        s = 0
+    if e > n
+        e = n
+    let out = []
+    let i = s
+    while i < e
+        push(out, lst[i])
+        i = i + 1
+    out
+
+// PRIVATE: element-wise XOR of two equal-length byte lists.
+fn _kw_xor(a: any, b: any) -> any
+    let out = []
+    let n = len(a)
+    let i = 0
+    while i < n
+        push(out, a[i] ^ b[i])
+        i = i + 1
+    out
+
+// PRIVATE: HMAC-CTR keystream of exactly nbytes bytes, derived from kek_hex.
+// Block i = HMAC-SHA256(kek_hex, "KW" + str(i)) for i = 0, 1, 2, ... (32 bytes per block).
+fn _kw_keystream(kek_hex: string, nbytes: int) -> any
+    let out = []
+    let ctr = 0
+    while len(out) < nbytes
+        let blk_hex = hmac_sha256(kek_hex, "KW" + str(ctr))
+        let blk = _kw_hex_to_list(blk_hex)
+        let i = 0
+        while i < len(blk) and len(out) < nbytes
+            push(out, blk[i])
+            i = i + 1
+        ctr = ctr + 1
+    out
+
+// kw_wrap(kek_hex, key_hex) -> wrapped_hex. Prepends the 8-byte magic, then XORs with an
+// HMAC-CTR keystream derived from kek_hex. Output is 8 bytes longer than key_hex (16 hex chars).
+fn kw_wrap(kek_hex: string, key_hex: string) -> string
+    let plain = _kw_concat_hex(_kw_magic(), key_hex)
+    let plain_list = _kw_hex_to_list(plain)
+    let ks = _kw_keystream(kek_hex, len(plain_list))
+    _kw_list_to_hex(_kw_xor(plain_list, ks))
+
+// PRIVATE: plain hex string concatenation (helper so the intent at each call site is clear).
+fn _kw_concat_hex(a: string, b: string) -> string
+    a + b
+
+// kw_unwrap(kek_hex, wrapped_hex) -> key_hex, or "" if the magic check fails (wrong KEK or
+// corrupted/truncated input -- fail-closed).
+fn kw_unwrap(kek_hex: string, wrapped_hex: string) -> string
+    let wrapped_list = _kw_hex_to_list(wrapped_hex)
+    if len(wrapped_list) < 8
+        return ""
+    let ks = _kw_keystream(kek_hex, len(wrapped_list))
+    let plain_list = _kw_xor(wrapped_list, ks)
+    let magic_got = _kw_list_to_hex(_kw_sublist(plain_list, 0, 8))
+    if ct_eq(magic_got, _kw_magic()) != 1
+        return ""
+    _kw_list_to_hex(_kw_sublist(plain_list, 8, len(plain_list)))
+
+// kw_verify(kek_hex, wrapped_hex) -> bool. True iff wrapped_hex unwraps cleanly under kek_hex
+// (magic check passes) without exposing the unwrapped key.
+fn kw_verify(kek_hex: string, wrapped_hex: string) -> bool
+    let wrapped_list = _kw_hex_to_list(wrapped_hex)
+    if len(wrapped_list) < 8
+        return false
+    let ks = _kw_keystream(kek_hex, 8)
+    let magic_got = _kw_list_to_hex(_kw_xor(_kw_sublist(wrapped_list, 0, 8), ks))
+    ct_eq(magic_got, _kw_magic()) == 1

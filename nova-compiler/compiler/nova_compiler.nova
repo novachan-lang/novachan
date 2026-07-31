@@ -3762,17 +3762,47 @@ fn _make_from_json_method(tname: string, fields: list, structset: dict, ln: int)
 // (Brace-started malformed like `{bad` decodes to an empty dict -> ok(defaults); documented v1 gap.)
 // Consumed by the typed-let rewrite (`let r: Result<T> = from_json_safe(s)`); the slot stays
 // SUM-typed so `match r { Ok(t) => .. Err(e) => .. }` tag-dispatches.
-fn _make_from_json_safe_method(tname: string, ln: int) -> Stmt
+fn _make_from_json_safe_method(tname: string, fields: list, structset: dict, ln: int) -> Stmt
     let body = []
-    // Hygienic locals: `_fjs*` names can't collide with a user's top-level `let s` /
-    // `let d`, which would otherwise leak into this SYNTHESIZED method's inference
-    // (top-level scope is second-class) and mis-type it. Fixes >=2 trait-conforming
-    // types declared at top level (was: Ct__from_json_safe mis-typed via a top-level d).
     let dec = Expr("call", "json_decode", 0, [Expr("ident", "_fjss", 0, [], [], ln)], [], ln)
     push(body, Stmt("assign", "_fjsd", dec, [], [], [], [], ln))
     let cond = Expr("binop", "!=", 0, [Expr("call", "type_name", 0, [Expr("ident", "_fjsd", 0, [], [], ln)], [], ln), Expr("str", "dict", 0, [], [], ln)], [], ln)
     let errret = Stmt("return", "", Expr("call", "err", 0, [Expr("str", "expected a JSON object for " + tname, 0, [], [], ln)], [], ln), [], [], [], [], ln)
     push(body, Stmt("if", "", cond, [errret], [], [], [], ln))
+    let fi = 0
+    let fn2 = len(fields)
+    while fi < fn2
+        match fields[fi]
+            Param(fname, ftype, fdef) =>
+                let key = Expr("str", fname, 0, [], [], ln)
+                let dref = Expr("ident", "_fjsd", 0, [], [], ln)
+                let has = Expr("call", "contains", 0, [dref, key], [], ln)
+                let valexpr = Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)
+                let got = Expr("call", "type_name", 0, [valexpr], [], ln)
+                let inner = []
+                if ftype == "int" or ftype == "Int"
+                    let bad = Expr("binop", "!=", 0, [got, Expr("str", "int", 0, [], [], ln)], [], ln)
+                    let emsg = Expr("binop", "+", 0, [Expr("str", "field '" + fname + "': expected int, got ", 0, [], [], ln), Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)], [], ln)
+                    push(inner, Stmt("if", "", bad, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [], ln))
+                else if ftype == "float" or ftype == "Float"
+                    let gotf = Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)
+                    let notfloat = Expr("binop", "!=", 0, [gotf, Expr("str", "float", 0, [], [], ln)], [], ln)
+                    let gotf2 = Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)
+                    let notint = Expr("binop", "!=", 0, [gotf2, Expr("str", "int", 0, [], [], ln)], [], ln)
+                    let both = Expr("binop", "and", 0, [notfloat, notint], [], ln)
+                    let emsg = Expr("binop", "+", 0, [Expr("str", "field '" + fname + "': expected float, got ", 0, [], [], ln), Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)], [], ln)
+                    push(inner, Stmt("if", "", both, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [], ln))
+                else if ftype == "string" or ftype == "String"
+                    let bad = Expr("binop", "!=", 0, [got, Expr("str", "string", 0, [], [], ln)], [], ln)
+                    let emsg = Expr("binop", "+", 0, [Expr("str", "field '" + fname + "': expected string, got ", 0, [], [], ln), Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)], [], ln)
+                    push(inner, Stmt("if", "", bad, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [], ln))
+                else if contains(structset, ftype)
+                    let bad = Expr("binop", "!=", 0, [got, Expr("str", "dict", 0, [], [], ln)], [], ln)
+                    let emsg = Expr("binop", "+", 0, [Expr("str", "field '" + fname + "': expected object, got ", 0, [], [], ln), Expr("call", "type_name", 0, [Expr("index", "", 0, [Expr("ident", "_fjsd", 0, [], [], ln), key], [], ln)], [], ln)], [], ln)
+                    push(inner, Stmt("if", "", bad, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [], ln))
+                if len(inner) > 0
+                    push(body, Stmt("if", "", has, inner, [], [], [], ln))
+        fi = fi + 1
     let okval = Expr("call", "ok", 0, [Expr("call", tname + "__from_json", 0, [Expr("ident", "_fjsd", 0, [], [], ln)], [], ln)], [], ln)
     push(body, Stmt("return", "", okval, [], [], [], [], ln))
     Stmt("fn", tname + "__from_json_safe", null_expr(), body, [Param("_fjss", "string", null_expr())], [], [], ln)
@@ -4377,7 +4407,7 @@ fn expand_derives(stmts: list) -> list
                         // Result-returning extractor, and every normal unit (no shadow) still gets it
                         // unconditionally, so cross-module from_json_safe keeps working.
                         if contains(user_fns, sname + "__from_json_safe") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
-                            push(generated, _make_from_json_safe_method(sname, sln))
+                            push(generated, _make_from_json_safe_method(sname, sparams, jsonset, sln))
                         // <T>__from_dict (query_as/form_as core) -- same ok/err shadow gate.
                         if contains(user_fns, sname + "__from_dict") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
                             push(generated, _make_from_dict_method(sname, sparams, jsonset, sln))
@@ -7904,6 +7934,10 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_fabs(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_fmax(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_fmin(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_fmax_ri(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_fmax_li(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_fmin_ri(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_fmin_li(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_fmod(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_float_to_int(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_int_to_float(i64) nounwind")
@@ -17307,10 +17341,26 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 // the result as int. Route to fmax/fmin/fabs and type float. (Both
                 // operands float only; mixed int/float would need a promotion insert.)
                 if (value == "nova_rt_max" or value == "nova_rt_min") and len(args) == 2
-                    if ir_reg_type(rt, args[0]) == "float" and ir_reg_type(rt, args[1]) == "float"
+                    let _mlt = ir_reg_type(rt, args[0])
+                    let _mrt = ir_reg_type(rt, args[1])
+                    if _mlt == "float" and _mrt == "float"
                         let mfv = "nova_rt_fmax"
                         if value == "nova_rt_min"
                             mfv = "nova_rt_fmin"
+                        if dest != ""
+                            rt[dest] = "float"
+                        return IrInst(op, dest, ir_type_float(), args, mfv, num, effect, line)
+                    if _mlt == "float" and _mrt == "int"
+                        let mfv = "nova_rt_fmax_ri"
+                        if value == "nova_rt_min"
+                            mfv = "nova_rt_fmin_ri"
+                        if dest != ""
+                            rt[dest] = "float"
+                        return IrInst(op, dest, ir_type_float(), args, mfv, num, effect, line)
+                    if _mlt == "int" and _mrt == "float"
+                        let mfv = "nova_rt_fmax_li"
+                        if value == "nova_rt_min"
+                            mfv = "nova_rt_fmin_li"
                         if dest != ""
                             rt[dest] = "float"
                         return IrInst(op, dest, ir_type_float(), args, mfv, num, effect, line)
@@ -17362,7 +17412,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         rtype = "list"
                     else if value == "nova_rt_dict_create" or value == "nova_rt_dict_merge" or value == "nova_rt_lockfile_read" or value == "nova_rt_pkg_resolve" or value == "nova_rt_regex_named_captures"
                         rtype = "dict"
-                    else if value == "nova_rt_sin" or value == "nova_rt_cos" or value == "nova_rt_tan" or value == "nova_rt_asin" or value == "nova_rt_acos" or value == "nova_rt_atan" or value == "nova_rt_atan2" or value == "nova_rt_log" or value == "nova_rt_log2" or value == "nova_rt_log10" or value == "nova_rt_exp" or value == "nova_rt_fabs" or value == "nova_rt_fmod" or value == "nova_rt_sqrt" or value == "nova_rt_pow" or value == "nova_rt_fmax" or value == "nova_rt_fmin" or value == "nova_rt_random_float" or value == "nova_rt_int_to_float" or value == "nova_rt_to_float" or value == "nova_rt_parse_float" or value == "nova_rt_float_from_bits" or value == "nova_rt_f32_from_bits" or value == "nova_rt_sinh" or value == "nova_rt_cosh" or value == "nova_rt_tanh" or value == "nova_rt_cbrt" or value == "nova_rt_hypot" or value == "nova_rt_clamp" or value == "nova_rt_copysign" or value == "nova_rt_fma" or value == "nova_rt_nextafter" or value == "nova_rt_lgamma" or value == "nova_rt_erf" or value == "nova_rt_rng_float" or value == "nova_rt_pi" or value == "nova_rt_e"
+                    else if value == "nova_rt_sin" or value == "nova_rt_cos" or value == "nova_rt_tan" or value == "nova_rt_asin" or value == "nova_rt_acos" or value == "nova_rt_atan" or value == "nova_rt_atan2" or value == "nova_rt_log" or value == "nova_rt_log2" or value == "nova_rt_log10" or value == "nova_rt_exp" or value == "nova_rt_fabs" or value == "nova_rt_fmod" or value == "nova_rt_sqrt" or value == "nova_rt_pow" or value == "nova_rt_fmax" or value == "nova_rt_fmin" or value == "nova_rt_fmax_ri" or value == "nova_rt_fmax_li" or value == "nova_rt_fmin_ri" or value == "nova_rt_fmin_li" or value == "nova_rt_random_float" or value == "nova_rt_int_to_float" or value == "nova_rt_to_float" or value == "nova_rt_parse_float" or value == "nova_rt_float_from_bits" or value == "nova_rt_f32_from_bits" or value == "nova_rt_sinh" or value == "nova_rt_cosh" or value == "nova_rt_tanh" or value == "nova_rt_cbrt" or value == "nova_rt_hypot" or value == "nova_rt_clamp" or value == "nova_rt_copysign" or value == "nova_rt_fma" or value == "nova_rt_nextafter" or value == "nova_rt_lgamma" or value == "nova_rt_erf" or value == "nova_rt_rng_float" or value == "nova_rt_pi" or value == "nova_rt_e"
                         rtype = "float"
                         _rawfloat = 1
                     else if contains(frt, value)
@@ -17994,7 +18044,7 @@ fn ir_reg_is_raw_double(rv: string, rt: dict, defop: dict, defval: dict, frt: di
         return 1
     if op == "call"
         let cv = defval[rv]
-        if cv == "nova_rt_sin" or cv == "nova_rt_cos" or cv == "nova_rt_tan" or cv == "nova_rt_asin" or cv == "nova_rt_acos" or cv == "nova_rt_atan" or cv == "nova_rt_atan2" or cv == "nova_rt_log" or cv == "nova_rt_log2" or cv == "nova_rt_log10" or cv == "nova_rt_exp" or cv == "nova_rt_fabs" or cv == "nova_rt_fmod" or cv == "nova_rt_sqrt" or cv == "nova_rt_pow" or cv == "nova_rt_fmax" or cv == "nova_rt_fmin" or cv == "nova_rt_random_float" or cv == "nova_rt_int_to_float" or cv == "nova_rt_to_float" or cv == "nova_rt_parse_float" or cv == "nova_rt_float_from_bits" or cv == "nova_rt_f32_from_bits" or cv == "nova_rt_sinh" or cv == "nova_rt_cosh" or cv == "nova_rt_tanh" or cv == "nova_rt_cbrt" or cv == "nova_rt_hypot" or cv == "nova_rt_clamp" or cv == "nova_rt_copysign" or cv == "nova_rt_fma" or cv == "nova_rt_nextafter" or cv == "nova_rt_lgamma" or cv == "nova_rt_erf" or cv == "nova_rt_rng_float" or cv == "nova_rt_pi" or cv == "nova_rt_e"
+        if cv == "nova_rt_sin" or cv == "nova_rt_cos" or cv == "nova_rt_tan" or cv == "nova_rt_asin" or cv == "nova_rt_acos" or cv == "nova_rt_atan" or cv == "nova_rt_atan2" or cv == "nova_rt_log" or cv == "nova_rt_log2" or cv == "nova_rt_log10" or cv == "nova_rt_exp" or cv == "nova_rt_fabs" or cv == "nova_rt_fmod" or cv == "nova_rt_sqrt" or cv == "nova_rt_pow" or cv == "nova_rt_fmax" or cv == "nova_rt_fmin" or cv == "nova_rt_fmax_ri" or cv == "nova_rt_fmax_li" or cv == "nova_rt_fmin_ri" or cv == "nova_rt_fmin_li" or cv == "nova_rt_random_float" or cv == "nova_rt_int_to_float" or cv == "nova_rt_to_float" or cv == "nova_rt_parse_float" or cv == "nova_rt_float_from_bits" or cv == "nova_rt_f32_from_bits" or cv == "nova_rt_sinh" or cv == "nova_rt_cosh" or cv == "nova_rt_tanh" or cv == "nova_rt_cbrt" or cv == "nova_rt_hypot" or cv == "nova_rt_clamp" or cv == "nova_rt_copysign" or cv == "nova_rt_fma" or cv == "nova_rt_nextafter" or cv == "nova_rt_lgamma" or cv == "nova_rt_erf" or cv == "nova_rt_rng_float" or cv == "nova_rt_pi" or cv == "nova_rt_e"
             return 1
         if contains(frt, "@raw@" + cv)
             return 1
@@ -20720,6 +20770,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_fabs(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_fmax(i64, i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_fmin(i64, i64) nounwind readnone")
+    ire_line(e, "declare i64 @nova_rt_fmax_ri(i64, i64) nounwind readnone")
+    ire_line(e, "declare i64 @nova_rt_fmax_li(i64, i64) nounwind readnone")
+    ire_line(e, "declare i64 @nova_rt_fmin_ri(i64, i64) nounwind readnone")
+    ire_line(e, "declare i64 @nova_rt_fmin_li(i64, i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_fmod(i64, i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_float_to_int(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_int_to_float(i64) nounwind readnone")

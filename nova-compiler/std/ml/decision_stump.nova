@@ -1,0 +1,190 @@
+// ============================================================================
+// NOVA Standard Library — std/ml/decision_stump
+// ============================================================================
+// Weighted single-feature, single-threshold decision stump — the canonical
+// weak learner used by AdaBoost and other boosting algorithms. Pure math,
+// no dependencies — LEAF module.
+//
+// LABEL CONVENTION: `labels` are ints in {-1, +1} (the standard AdaBoost
+// convention — NOT {0, 1}). Use 2*label-1 to convert {0,1} labels before
+// calling this module.
+//
+// PUBLIC API
+//   ds_fit(features, labels, weights) -> dict   best stump (see STUMP SHAPE)
+//   ds_predict(stump, sample)         -> int    apply a fitted stump to one
+//                                                 sample; returns -1 or +1
+//
+// STUMP SHAPE (the dict returned by ds_fit), all keys always present:
+//   "feature_index"  int     which column of `features` this stump splits on
+//   "threshold"      float   the split point
+//   "polarity"       int     +1 or -1 (see ds_predict's rule below)
+//   "error"          float   the stump's total WEIGHTED misclassification
+//                              error on the training set it was fit to
+//
+// ds_predict's rule: predict polarity if sample[feature_index] <= threshold,
+// else predict -polarity. This is the standard AdaBoost stump prediction
+// rule — a threshold split whose "which side is +1" is controlled by
+// polarity, so ds_fit only ever needs to search thresholds, not thresholds
+// AND a separate direction flag combinatorially (see ALGORITHM below for
+// why polarity is derived from error, not searched).
+//
+// ALGORITHM (ds_fit): for every feature column, build the set of
+// midpoint thresholds between adjacent sorted values in that column (plus
+// two sentinel thresholds below the min and above the max, covering the
+// degenerate "this feature is not discriminative — always predict one
+// class" case). For each threshold, the WEIGHTED error of polarity=+1 and
+// polarity=-1 are complements of the total sample weight (flipping
+// polarity flips every prediction, so error(-1) = total_weight -
+// error(+1)) — so only error(+1) is computed directly, then whichever
+// polarity gives error <= total_weight/2 is kept. The (feature, threshold,
+// polarity) triple with the globally smallest weighted error across all
+// features and thresholds is returned.
+//
+// Degenerate input (n==0 or d==0) returns a stump with feature_index=-1,
+// threshold=0.0, polarity=1, error=0.0 — ds_predict on such a stump always
+// returns polarity's "no active feature" default (+1) since indexing
+// sample[-1] never happens (ds_predict bounds-checks feature_index).
+//
+// float codegen safety: every returned float is bound to a `let` before
+// return; this module does not compute any sqrt/log/exp so the
+// sqrt-codegen hazard documented elsewhere does not apply here.
+//
+// SYMBOL COLLISION GUARD: all private helpers prefixed _ds_.
+// ============================================================================
+
+// _ds_sorted_col: ascending-sorted COPY of a float list, built via
+// binary-search insertion (mirrors std/collections/heapmedian's proven-safe
+// insert pattern). The input is never mutated.
+fn _ds_sorted_col(col: list) -> list
+    let out = []
+    let i = 0
+    while i < len(col)
+        let v = col[i]
+        let lo = 0
+        let hi = len(out)
+        let done = 0
+        while done == 0
+            if lo >= hi
+                done = 1
+            else
+                let mid = (lo + hi) / 2
+                if out[mid] < v
+                    lo = mid + 1
+                else
+                    hi = mid
+        insert(out, lo, v)
+        i = i + 1
+    out
+
+// _ds_candidate_thresholds: midpoints between adjacent sorted values, plus
+// two sentinels (below the minimum, above the maximum).
+fn _ds_candidate_thresholds(sorted_col: list) -> list
+    let n = len(sorted_col)
+    let out = []
+    if n == 0
+        return out
+    push(out, sorted_col[0] - 1.0)
+    let i = 0
+    while i < n - 1
+        let mid = (sorted_col[i] + sorted_col[i + 1]) / 2.0
+        push(out, mid)
+        i = i + 1
+    push(out, sorted_col[n - 1] + 1.0)
+    out
+
+// _ds_total_weight: sum of a float weight list.
+fn _ds_total_weight(weights: list) -> float
+    let acc = 0.0
+    let i = 0
+    while i < len(weights)
+        acc = acc + weights[i] * 1.0
+        i = i + 1
+    acc
+
+// _ds_weighted_error_pos: weighted misclassification error assuming
+// polarity=+1 (predict +1 when col[i] <= threshold, else -1) for feature
+// column `col` against `labels`/`weights`.
+fn _ds_weighted_error_pos(col: list, labels: list, weights: list, threshold: float) -> float
+    let acc = 0.0
+    let i = 0
+    while i < len(col)
+        let pred = -1
+        if col[i] <= threshold
+            pred = 1
+        if pred != labels[i]
+            acc = acc + weights[i] * 1.0
+        i = i + 1
+    acc
+
+// ds_fit: search every (feature, threshold) pair for the minimum-weighted-
+// error stump, deriving polarity from the complement-error trick.
+fn ds_fit(features: list, labels: list, weights: list) -> dict
+    let stump = {}
+    let n = len(features)
+    if n == 0
+        stump["feature_index"] = -1
+        stump["threshold"] = 0.0
+        stump["polarity"] = 1
+        stump["error"] = 0.0
+        return stump
+    let d = len(features[0])
+    if d == 0
+        stump["feature_index"] = -1
+        stump["threshold"] = 0.0
+        stump["polarity"] = 1
+        stump["error"] = 0.0
+        return stump
+    let total_weight = _ds_total_weight(weights)
+    let best_feature = 0
+    let best_threshold = 0.0
+    let best_polarity = 1
+    let best_error = total_weight + 1.0
+    let f = 0
+    while f < d
+        let col = []
+        let r = 0
+        while r < n
+            let row = features[r]
+            let v = 0.0
+            if f < len(row)
+                v = row[f] * 1.0
+            push(col, v)
+            r = r + 1
+        let sorted_col = _ds_sorted_col(col)
+        let candidates = _ds_candidate_thresholds(sorted_col)
+        let c = 0
+        while c < len(candidates)
+            let t = candidates[c]
+            let err_pos = _ds_weighted_error_pos(col, labels, weights, t)
+            let err = err_pos
+            let pol = 1
+            if err_pos > total_weight - err_pos
+                err = total_weight - err_pos
+                pol = -1
+            if err < best_error
+                best_error = err
+                best_feature = f
+                best_threshold = t
+                best_polarity = pol
+            c = c + 1
+        f = f + 1
+    stump["feature_index"] = best_feature
+    stump["threshold"] = best_threshold
+    stump["polarity"] = best_polarity
+    stump["error"] = best_error
+    stump
+
+// ds_predict: apply a fitted stump to a single sample. Returns +1 or -1.
+// An out-of-range feature_index (only possible for the degenerate
+// feature_index=-1 stump from an empty/zero-width ds_fit call) predicts
+// +1 (the polarity default).
+fn ds_predict(stump: dict, sample: list) -> int
+    let fi = stump["feature_index"]
+    let polarity = stump["polarity"]
+    if fi < 0 or fi >= len(sample)
+        return polarity
+    let threshold = stump["threshold"]
+    let v = sample[fi] * 1.0
+    if v <= threshold
+        return polarity
+    0 - polarity

@@ -1,0 +1,143 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/hex
+// ============================================================================
+// Binary-safe hex encode/decode. The raw-data side is `bytes` so 0x00 is
+// an ordinary byte that is never truncated, never lost. The hex TEXT side is
+// a plain string (hex digits are 0-9 a-f — no 0x00 ever appears in it).
+//
+// WHY THIS EXISTS (and why forge/forge_hex.nova is WRONG):
+//   forge_hex operates on NOVA `string` for BOTH sides. NOVA strings are
+//   NUL-terminated C-string-shaped: a 0x00 byte inside a string silently
+//   truncates it (reference_nova_string_nul_truncation). Binary payloads —
+//   crypto keys, wire frames, packed structs — ROUTINELY contain 0x00 bytes.
+//   This module takes and returns `bytes` on the data side, making 0x00 an
+//   ordinary byte on every encode + decode path.
+//
+// THE DRAWBACK AVOIDED:
+//   Python binascii.hexlify is sound (bytes in, bytes out) but returns bytes
+//   for the text side too, requiring an extra .decode('ascii'). NOVA cleanly
+//   separates: raw payload = bytes, hex text = string. No extra step.
+//
+// PUBLIC API:
+//   hex_encode(data: bytes) -> string
+//     Every input byte maps to exactly two lowercase hex digits.
+//     The output string contains only [0-9a-f] — no 0x00 can appear.
+//     A zero byte in `data` encodes as "00" and round-trips correctly.
+//
+//   hex_decode(s: string) -> bytes
+//     Accepts both uppercase [A-F] and lowercase [a-f] hex digits.
+//     Leading/trailing ASCII whitespace (space/tab/CR/LF) is ignored.
+//     On odd-length input OR any non-hex character: returns bytes(0)
+//     (a zero-length bytes value, NOT a -1 sentinel — the caller checks
+//     bytes_len on the result; bytes(0) is distinct from a valid empty
+//     encode which also returns "" / bytes(0)).
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   Right-shifts on values known-positive are safe, but we mask with & 0xFF
+//   and & 0x0F everywhere to be explicit and guard against sign-extension.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _hex_ to avoid collisions when other
+//   std modules are compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// The 16-character lowercase hex alphabet for encode.
+fn _hex_alpha() -> string
+    "0123456789abcdef"
+
+// Map one hex character (digit or A-F or a-f) to its nibble value 0..15.
+// Returns -1 for any character outside the hex alphabet.
+// Returns -2 for ASCII whitespace (space/tab/CR/LF) — caller treats as trim.
+// Returns -3 for any other character — caller returns error.
+fn _hex_nibble(c) -> int
+    let b = ord(c)
+    // '0'..'9' -> 0..9
+    if b >= 48 and b <= 57
+        return b - 48
+    // 'a'..'f' -> 10..15
+    if b >= 97 and b <= 102
+        return b - 97 + 10
+    // 'A'..'F' -> 10..15
+    if b >= 65 and b <= 70
+        return b - 65 + 10
+    // ASCII whitespace: space(32) tab(9) CR(13) LF(10)
+    if b == 32 or b == 9 or b == 13 or b == 10
+        return -2
+    // anything else is illegal
+    -3
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// hex_encode: convert binary bytes to a lowercase hex string.
+//
+// Each input byte produces exactly two hex characters (zero-padded nibbles).
+// The result contains only [0-9a-f]. A 0x00 input byte encodes as "00" and
+// is fully recoverable via hex_decode — there is no NUL-truncation hazard
+// because the encoded string never contains a 0x00 character.
+//
+// Examples:
+//   hex_encode(bytes of [0x61,0x62,0x63]) == "616263"
+//   hex_encode(bytes of [0x00,0xFF,0x10]) == "00ff10"
+//   hex_encode(bytes of [])               == ""
+fn hex_encode(data) -> string
+    let alpha = _hex_alpha()
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i < nb
+        let b = bytes_get(data, i) & 0xFF
+        let hi = (b >> 4) & 0x0F
+        let lo = b & 0x0F
+        out = out + alpha[hi] + alpha[lo]
+        i = i + 1
+    out
+
+// hex_decode: convert a hex string back to bytes.
+//
+// Accepts both uppercase and lowercase hex digits. Leading and trailing ASCII
+// whitespace (space/tab/CR/LF) is stripped before processing. Whitespace in
+// the MIDDLE of the string is NOT accepted — any non-hex, non-whitespace-at-
+// edge character causes an error return.
+//
+// Error return: bytes(0) — a zero-length bytes object — on:
+//   - odd number of hex digits after whitespace stripping
+//   - any non-hex character in the middle of the input
+//
+// Examples:
+//   hex_decode("616263")  -> bytes [0x61,0x62,0x63]
+//   hex_decode("00FF")    -> bytes [0x00,0xFF]   (case-insensitive)
+//   hex_decode("  616263 ") -> bytes [0x61,0x62,0x63]  (whitespace stripped)
+//   hex_decode("6162x3")  -> bytes(0)  (bad character)
+//   hex_decode("616")     -> bytes(0)  (odd length)
+fn hex_decode(s) -> any
+    // ── Step 1: trim leading whitespace ──────────────────────────────────────
+    let sn = len(s)
+    let start = 0
+    while start < sn and (_hex_nibble(s[start]) == -2)
+        start = start + 1
+    // ── Step 2: trim trailing whitespace ─────────────────────────────────────
+    let stop = sn
+    while stop > start and (_hex_nibble(s[stop - 1]) == -2)
+        stop = stop - 1
+    // ── Step 3: count hex digits in [start..stop); any non-hex = error ───────
+    let hex_len = stop - start
+    if hex_len == 0
+        return bytes(0)
+    // Odd number of hex digits is malformed.
+    if hex_len - (hex_len / 2) * 2 != 0
+        return bytes(0)
+    // ── Step 4: decode pairs ──────────────────────────────────────────────────
+    let out = bytes(0)
+    let i = start
+    while i < stop
+        let hi_v = _hex_nibble(s[i])
+        let lo_v = _hex_nibble(s[i + 1])
+        // Any non-hex character (including -2 whitespace in the interior) is an error.
+        if hi_v < 0 or lo_v < 0
+            return bytes(0)
+        out = bytes_append(out, (hi_v * 16 + lo_v) & 0xFF)
+        i = i + 2
+    out
