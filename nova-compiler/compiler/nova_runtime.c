@@ -28856,3 +28856,135 @@ int64_t nova_rt_list_uniq_adjacent(int64_t handle) {
     }
     return out;
 }
+
+/* nova_rt_str_snake_to_camel: convert snake_case to camelCase */
+int64_t nova_rt_str_snake_to_camel(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    int next_upper = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '_') { next_upper = 1; continue; }
+        if (next_upper && s[i] >= 'a' && s[i] <= 'z') {
+            buf[j++] = (char)(s[i] - 32);
+            next_upper = 0;
+        } else {
+            buf[j++] = s[i];
+            next_upper = 0;
+        }
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_values_min: minimum value in dict (assumed int) */
+int64_t nova_rt_dict_values_min(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int first = 1;
+    int64_t mn = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            if (first || d->vals[i] < mn) { mn = d->vals[i]; first = 0; }
+        }
+    }
+    return mn;
+}
+
+/* nova_rt_str_is_title_case: check if first letter of each word is uppercase */
+int64_t nova_rt_str_is_title_case(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return 0;
+    int at_word_start = 1;
+    for (size_t i = 0; s[i]; i++) {
+        if (s[i] == ' ') { at_word_start = 1; continue; }
+        if (at_word_start) {
+            if (!(s[i] >= 'A' && s[i] <= 'Z')) return 0;
+            at_word_start = 0;
+        } else {
+            if (s[i] >= 'A' && s[i] <= 'Z') return 0;
+        }
+    }
+    return 1;
+}
+
+/* nova_rt_str_repeat_each: repeat each character N times */
+int64_t nova_rt_str_repeat_each(int64_t str_handle, int64_t n) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || n <= 0) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len * (size_t)n + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        for (int64_t k = 0; k < n; k++) buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_skip_while: skip elements from start while they equal target */
+int64_t nova_rt_list_skip_while(int64_t handle, int64_t target) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    int64_t start = 0;
+    while (start < l->size && l->data[start] == target) start++;
+    for (int64_t i = start; i < l->size; i++) nova_rt_list_append(out, l->data[i]);
+    return out;
+}
+
+/* nova_rt_str_wrap_at: insert newlines at column width */
+int64_t nova_rt_str_wrap_at(int64_t str_handle, int64_t width) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || width <= 0) return str_handle;
+    size_t len = strlen(s);
+    size_t extra = len / (size_t)width + 1;
+    char* buf = (char*)malloc(len + extra + 1);
+    if (!buf) return str_handle;
+    size_t j = 0, col = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\n') { buf[j++] = '\n'; col = 0; continue; }
+        if (col >= (size_t)width) { buf[j++] = '\n'; col = 0; }
+        buf[j++] = s[i];
+        col++;
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_take_every: take every Nth element */
+int64_t nova_rt_list_take_every(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    for (int64_t i = 0; i < l->size; i += n) nova_rt_list_append(out, l->data[i]);
+    return out;
+}
+
+/* nova_rt_str_rot13: ROT13 cipher */
+int64_t nova_rt_str_rot13(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] >= 'a' && s[i] <= 'z') buf[i] = (char)((s[i] - 'a' + 13) % 26 + 'a');
+        else if (s[i] >= 'A' && s[i] <= 'Z') buf[i] = (char)((s[i] - 'A' + 13) % 26 + 'A');
+        else buf[i] = s[i];
+    }
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
