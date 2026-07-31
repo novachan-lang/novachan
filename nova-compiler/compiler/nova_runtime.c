@@ -23922,6 +23922,156 @@ int64_t nova_rt_abi_version(void) {
    contiguous int64_t at offsets 0, 8, 16. We treat the handle as a pointer
    to that flat memory and write 1, 2, 3 in. After the call, NOVA reads
    t.a/t.b/t.c via its normal field-access path and sees the new values. */
+/* nova_rt_str_title_case: "hello world" -> "Hello World" */
+int64_t nova_rt_str_title_case(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    int cap_next = 1;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '_' || c == '-') {
+            buf[i] = (char)c;
+            cap_next = 1;
+        } else if (cap_next && c >= 'a' && c <= 'z') {
+            buf[i] = (char)(c - 32);
+            cap_next = 0;
+        } else {
+            buf[i] = (char)c;
+            cap_next = 0;
+        }
+    }
+    buf[slen] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_camel_case: "hello_world" / "hello-world" / "hello world" -> "helloWorld" */
+int64_t nova_rt_str_camel_case(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    size_t out = 0;
+    int cap_next = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '_' || c == '-') {
+            cap_next = 1;
+        } else if (cap_next && c >= 'a' && c <= 'z') {
+            buf[out++] = (char)(c - 32);
+            cap_next = 0;
+        } else if (!cap_next && out == 0 && c >= 'A' && c <= 'Z') {
+            buf[out++] = (char)(c + 32);
+            cap_next = 0;
+        } else {
+            buf[out++] = (char)c;
+            cap_next = 0;
+        }
+    }
+    buf[out] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_snake_case: "helloWorld" / "Hello World" / "hello-world" -> "hello_world" */
+int64_t nova_rt_str_snake_case(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen * 2 + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    size_t out = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '-') {
+            if (out > 0 && buf[out-1] != '_') buf[out++] = '_';
+        } else if (c >= 'A' && c <= 'Z') {
+            if (out > 0 && buf[out-1] != '_') buf[out++] = '_';
+            buf[out++] = (char)(c + 32);
+        } else {
+            buf[out++] = (char)c;
+        }
+    }
+    buf[out] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_kebab_case: "helloWorld" / "Hello World" / "hello_world" -> "hello-world" */
+int64_t nova_rt_str_kebab_case(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen * 2 + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    size_t out = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '_') {
+            if (out > 0 && buf[out-1] != '-') buf[out++] = '-';
+        } else if (c >= 'A' && c <= 'Z') {
+            if (out > 0 && buf[out-1] != '-') buf[out++] = '-';
+            buf[out++] = (char)(c + 32);
+        } else {
+            buf[out++] = (char)c;
+        }
+    }
+    buf[out] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_interleave: [1,2,3] + [a,b,c] -> [1,a,2,b,3,c] */
+int64_t nova_rt_list_interleave(int64_t h1, int64_t h2) {
+    NovaList* a = (NovaList*)(uintptr_t)h1;
+    NovaList* b = (NovaList*)(uintptr_t)h2;
+    int64_t r = nova_rt_list_new();
+    if (!a && !b) return r;
+    int64_t alen = a ? a->size : 0;
+    int64_t blen = b ? b->size : 0;
+    int64_t maxlen = alen > blen ? alen : blen;
+    for (int64_t i = 0; i < maxlen; i++) {
+        if (i < alen) nova_rt_list_append(r, a->data[i]);
+        if (i < blen) nova_rt_list_append(r, b->data[i]);
+    }
+    return r;
+}
+
+/* nova_rt_str_indent: add prefix to each line */
+int64_t nova_rt_str_indent(int64_t str_val, int64_t prefix_val) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* pfx = (const char*)(uintptr_t)prefix_val;
+    if (!s) return nova_rt_create_string((void*)"");
+    if (!pfx) return str_val;
+    size_t slen = strlen(s);
+    size_t plen = strlen(pfx);
+    size_t lines = 1;
+    for (size_t i = 0; i < slen; i++) if (s[i] == '\n') lines++;
+    char* buf = (char*)malloc(slen + lines * plen + 1);
+    if (!buf) return str_val;
+    size_t out = 0;
+    memcpy(buf, pfx, plen); out += plen;
+    for (size_t i = 0; i < slen; i++) {
+        buf[out++] = s[i];
+        if (s[i] == '\n' && i + 1 < slen) {
+            memcpy(buf + out, pfx, plen);
+            out += plen;
+        }
+    }
+    buf[out] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
