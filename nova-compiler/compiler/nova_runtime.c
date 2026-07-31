@@ -30144,3 +30144,125 @@ int64_t nova_rt_str_byte_count(int64_t str_handle) {
 int64_t nova_rt_list_zip_map(int64_t keys_handle, int64_t vals_handle) {
     return nova_rt_dict_zip_lists(keys_handle, vals_handle);
 }
+
+/* nova_rt_list_second_max: second-largest distinct value, or the max if all equal */
+int64_t nova_rt_list_second_max(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t max1 = l->data[0], max2 = INT64_MIN;
+    int found_second = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        int64_t v = l->data[i];
+        if (v > max1) { max2 = max1; max1 = v; found_second = 1; }
+        else if (v < max1 && (!found_second || v > max2)) { max2 = v; found_second = 1; }
+    }
+    return found_second ? max2 : max1;
+}
+
+/* nova_rt_list_second_min: second-smallest distinct value, or the min if all equal */
+int64_t nova_rt_list_second_min(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t min1 = l->data[0], min2 = INT64_MAX;
+    int found_second = 0;
+    for (int64_t i = 1; i < l->size; i++) {
+        int64_t v = l->data[i];
+        if (v < min1) { min2 = min1; min1 = v; found_second = 1; }
+        else if (v > min1 && (!found_second || v < min2)) { min2 = v; found_second = 1; }
+    }
+    return found_second ? min2 : min1;
+}
+
+/* nova_rt_str_count_vowels: count a/e/i/o/u (case-insensitive) */
+int64_t nova_rt_str_count_vowels(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int64_t count = 0;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u') count++;
+    }
+    return count;
+}
+
+/* nova_rt_str_count_consonants: count alphabetic non-vowels (case-insensitive) */
+int64_t nova_rt_str_count_consonants(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    int64_t count = 0;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c >= 'a' && c <= 'z' && c != 'a' && c != 'e' && c != 'i' && c != 'o' && c != 'u') count++;
+    }
+    return count;
+}
+
+/* nova_rt_dict_min_key: numerically smallest key (keys parsed as integers) */
+int64_t nova_rt_dict_min_key(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t best = 0;
+    int found = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            int64_t kv = k ? strtoll(k, NULL, 10) : 0;
+            if (!found || kv < best) { best = kv; found = 1; }
+        }
+    }
+    return best;
+}
+
+/* nova_rt_dict_max_key: numerically largest key (keys parsed as integers) */
+int64_t nova_rt_dict_max_key(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t best = 0;
+    int found = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            const char* k = (const char*)(uintptr_t)d->keys[i];
+            int64_t kv = k ? strtoll(k, NULL, 10) : 0;
+            if (!found || kv > best) { best = kv; found = 1; }
+        }
+    }
+    return best;
+}
+
+/* nova_rt_str_swap_case: swap upper<->lower for every letter */
+int64_t nova_rt_str_swap_case(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return nova_rt_create_string("");
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return nova_rt_create_string("");
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c >= 'a' && c <= 'z') buf[i] = c - 32;
+        else if (c >= 'A' && c <= 'Z') buf[i] = c + 32;
+        else buf[i] = c;
+    }
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_partition_even_odd: dict with "even" and "odd" keys mapping to lists */
+int64_t nova_rt_list_partition_even_odd(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    int64_t evens = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t odds = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (l) {
+        for (int64_t i = 0; i < l->size; i++) {
+            if ((l->data[i] % 2 + 2) % 2 == 0) nova_rt_list_append(evens, l->data[i]);
+            else nova_rt_list_append(odds, l->data[i]);
+        }
+    }
+    nova_rt_dict_set(out, nova_rt_create_string("even"), evens);
+    nova_rt_dict_set(out, nova_rt_create_string("odd"), odds);
+    return out;
+}
