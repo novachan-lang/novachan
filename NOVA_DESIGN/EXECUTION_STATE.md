@@ -159,11 +159,22 @@ keys, and all list ops over comprehension results — all verified correct.
   `"call"` — the EMITTER turns it into `nova_rt_str_concat`.
   KAT `_kat_w6_uaf_guard` pins what must NOT be dropped (two-use temp still readable, stored
   results readable, chains, container-retained values). `_kat_w6_temp_drop` measures the delta.
-  **REMAINING (part 2):** the concat RESULT bound to a slot and rebound each iteration. Root
-  identified: the FULLRC slot-drop pass's owned-set is only make_list/dict/struct/closure +
-  channel_create — FRESH STRINGS ARE NOT IN IT, so such a slot is never droppable.
+- ✅ `23af36ca` **Wave-B #6 part 2 — fresh strings are OWNED. Slot-rebind leak 1000 -> 1.**
+  Wave-B #6 is CLOSED for the string-temp class: the original 2000-per-1000-iteration leak now
+  measures **1** (the final live value). ASAN-clean, 14 KATs green under FULLRC.
+    part 1 `c6ca9ad7`  temp-arg leak     2000 -> 1000
+    part 2 `23af36ca`  slot-rebind leak  1000 -> 1
+  Root: the FULLRC slot-drop pass's owned-set was CONTAINER-ONLY (make_list/dict/struct/closure
+  + channel_create), so a slot holding a fresh STRING was never droppable. Added the same verified
+  producer whitelist plus the `add`-with-str-result form (how string `+` is represented).
+  Safe because widening the owned-set only adds CANDIDATES — the escape guard (a value passed at
+  arg index > 0 of a call marks its slot escaped) and the all-stores-owned rule (a string LITERAL
+  is neither a call nor an add, so such a slot stays non-droppable) both still apply. KAT
+  `_kat_w6_slot_string` pins the escape guard: 5 pushed strings remain readable after the loop.
+  **STILL OPEN:** `_move6_insert_leak_test` reports its 2001 baseline unchanged — ITS leak is the
+  retained-INSERT case (MOVE-on-insert), which neither part touches.
 
-**NEXT (resume here):** Wave-B #6 part 2 (add fresh-string producers to the slot owned-set) — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
+**NEXT (resume here):** MOVE-on-insert (the retained-insert half of Wave-B #6) — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
 fix · CYCLE 2 map/HOF float boxing (explicitly "needs a focused session").

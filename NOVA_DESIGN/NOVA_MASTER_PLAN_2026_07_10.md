@@ -59,6 +59,15 @@
 > reachable at ordinary server load), **ALPN server ✅ `58a7a6a3`** (SChannel + OpenSSL), **CYCLE 2
 > partial ✅ `4861b196`** (2 of 3 float-HOF cases; the third's blocker is measured and documented).
 >
+> **✅ Wave-B #6 RC leak (string-temp class) CLOSED** — `c6ca9ad7` + `23af36ca`. The measured leak
+> goes 2000 -> 1 per 1000 iterations (the 1 is the final live value), ASAN-clean in both memory
+> modes. The pinned test's model was WRONG: the dominant leak was a TEMP-ARG LIFETIME gap (the
+> intermediate `str(i)` handed to `str_concat`, which retains nothing), plus a slot-drop owned-set
+> that was container-only so fresh STRINGS were never droppable on rebind. Soundness rests on
+> three whole-function conditions — whitelisted fresh-allocation producer, used EXACTLY ONCE, and
+> a whitelisted NON-RETAINING consumer — which keeps borrows (CORE_GAP 0.10 UAF) permanently off
+> the path. Retained-insert (MOVE-on-insert) remains open.
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
