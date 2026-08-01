@@ -10562,6 +10562,32 @@ fn _ir_is_elem_hof(name: string) -> bool
         return true
     false
 
+// Wave-B #6 — PRODUCER whitelist. Does this runtime call return a FRESH, caller-owned
+// allocation? Only names verified by reading the runtime belong here. Everything not listed is
+// UNCLASSIFIED and therefore never dropped (fail-closed), which is what keeps borrows
+// (index_get/field_get results) permanently off this path — the CORE_GAP 0.10 UAF.
+// NOTE nova_rt_int_to_str returns a STATIC CACHE entry for 0<=v<10000 rather than an allocation;
+// that is safe here because nova_rc_dec is pointer-validated and nova_mem_find_tag explicitly
+// rejects the int_to_str cache range, so dropping it degrades to a no-op.
+fn _wb6_is_fresh_alloc(fname: string) -> bool
+    if fname == "nova_rt_str_concat" or fname == "nova_rt_str_concat_safe"
+        return true
+    if fname == "nova_rt_int_to_str" or fname == "nova_rt_float_to_str"
+        return true
+    if fname == "nova_rt_bool_to_str" or fname == "nova_rt_any_to_str"
+        return true
+    false
+
+// Wave-B #6 — CONSUMER whitelist. Does this call READ its arguments without retaining them?
+// Verified against the runtime: nova_rt_str_concat/_safe pull both args through nova_str_safe and
+// allocate a NEW buffer, keeping no reference to either. RETAINING consumers (list_append,
+// dict_set, channel_send, make_closure captures, any user fn) are deliberately absent — eliding
+// their retain is MOVE-on-insert, a separate and riskier change that must not ride along here.
+fn _wb6_is_borrowing_consumer(fname: string) -> bool
+    if fname == "nova_rt_str_concat" or fname == "nova_rt_str_concat_safe"
+        return true
+    false
+
 fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) -> string
     let lname = "__lambda_" + str(b.ir_lamc)
     let tname = "__tramp_" + str(b.ir_lamc)
@@ -20966,6 +20992,14 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_emit_width_wrap(e, dest, _wraw, tn)
                         else if tk == "str"
                             ire_indent(e, dest + " = call i64 @nova_rt_str_concat(i64 " + args[0] + ", i64 " + args[1] + ")")
+                            // Wave-B #6: drop a fresh owned temp this concat just consumed. str_concat
+                            // reads both args through nova_str_safe and allocates a NEW buffer — it
+                            // retains neither — so a temp used ONLY here is dead after this line.
+                            let _w6ck = "@tmp@" + dest
+                            if contains(e.ire_fullrc_drop, _w6ck)
+                                for _w6cd in split(str(e.ire_fullrc_drop[_w6ck]), " ")
+                                    if _w6cd != ""
+                                        ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6cd + ")")
                         else
                             ire_indent(e, dest + " = call i64 @nova_rt_add(i64 " + args[0] + ", i64 " + args[1] + ")")
             else if op == "sub"
@@ -21622,6 +21656,16 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     call_str = call_str + ")"
                     if dest != ""
                         ire_indent(e, dest + " = " + call_str)
+                        // Wave-B #6: drop any FRESH OWNED TEMPORARY this call just consumed. The
+                        // pre-pass proved each listed register is a whitelisted fresh allocation
+                        // used EXACTLY ONCE in the whole function, and that this call is a proven
+                        // NON-RETAINING consumer — so after the call nothing can reference it.
+                        // Emitted AFTER the call so the value is still live for the callee.
+                        let _w6key = "@tmp@" + dest
+                        if contains(e.ire_fullrc_drop, _w6key)
+                            for _w6dr in split(str(e.ire_fullrc_drop[_w6key]), " ")
+                                if _w6dr != ""
+                                    ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6dr + ")")
                         // Beat-C: a float-typed call (the raw-double math builtins) returns raw
                         // double bits. Mark it so a consuming float op reads it via bitcast, not
                         // a defensive nova_rt_unbox. Mirrors fmul/const_float result tracking.
@@ -22306,6 +22350,70 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                 for _frc_s in keys(_frc_stored)
                     if not contains(_frc_bad, _frc_s)
                         e.ire_fullrc_drop[_frc_s] = 1
+
+                // ── Wave-B #6: OWNED-TEMP DROP ──────────────────────────────────────────────
+                // The measured leak is NOT the insert-inc the old test modelled. In
+                // `"row-" + str(i)` the INTERMEDIATE str(i) allocation is passed to
+                // nova_rt_str_concat, which READS it and allocates a new string. It never
+                // retains it, nothing else references it, and nobody dropped the +1 -> every
+                // intermediate leaked (pinned baseline: 2001 per 2000 iterations).
+                //
+                // A register is droppable ONLY if all three hold, checked over the WHOLE function:
+                //   (a) produced by a whitelisted FRESH-ALLOCATION call (never a borrow),
+                //   (b) used EXACTLY ONCE anywhere in the function,
+                //   (c) that one use is an argument to a whitelisted NON-RETAINING consumer.
+                // (b) is what makes it safe without liveness: a single use cannot be live after
+                // its consumer. A BORROW (index_get/field_get) can never satisfy (a) — that is
+                // exactly the CORE_GAP 0.10 use-after-free this must stay away from.
+                // The consumer whitelist is deliberately tiny and PROVEN by reading the runtime:
+                // nova_rt_str_concat/_safe take their args through nova_str_safe and allocate a
+                // fresh buffer, retaining neither. Retaining consumers (append/dict_set/send) are
+                // EXCLUDED here — MOVE-on-insert is a separate, riskier change.
+                // Recorded under an "@tmp@" key (a slot name can never contain '@') as
+                // dest -> space-separated arg regs to drop right after that call.
+                let _wb6_owned = {}
+                let _wb6_uses = {}
+                let _wb6_at = {}
+                for _w6b in blocks
+                    match _w6b
+                        IrBlock(_w6l, _w6insts, _w6t) =>
+                            for _w6i in _w6insts
+                                match _w6i
+                                    IrInst(_w6o, _w6d, _w6ty, _w6a, _w6v, _w6n, _w6e, _w6ln) =>
+                                        if _w6o == "call" and _w6d != "" and _wb6_is_fresh_alloc(_w6v)
+                                            _wb6_owned[_w6d] = 1
+                                        let _w6ai = 0
+                                        while _w6ai < len(_w6a)
+                                            let _w6r = _w6a[_w6ai]
+                                            if contains(_wb6_uses, _w6r)
+                                                _wb6_uses[_w6r] = _wb6_uses[_w6r] + 1
+                                            else
+                                                _wb6_uses[_w6r] = 1
+                                            // Remember the single NON-RETAINING consumer (by its dest).
+                                            // NOTE string `+` is IR op "add" with a str-typed result — the
+                                            // EMITTER turns that into nova_rt_str_concat. It is not a "call"
+                                            // instruction, which is why matching only on calls found nothing.
+                                            let _w6cons = false
+                                            if _w6o == "call" and _wb6_is_borrowing_consumer(_w6v)
+                                                _w6cons = true
+                                            if _w6o == "add"
+                                                match _w6ty
+                                                    IrType(_w6tk, _w6tn, _w6tp, _w6tid) =>
+                                                        if _w6tk == "str"
+                                                            _w6cons = true
+                                            if _w6cons and _w6d != ""
+                                                _wb6_at[_w6r] = _w6d
+                                            else
+                                                _wb6_at[_w6r] = ""
+                                            _w6ai = _w6ai + 1
+                for _w6reg in keys(_wb6_owned)
+                    if contains(_wb6_uses, _w6reg) and _wb6_uses[_w6reg] == 1
+                        if contains(_wb6_at, _w6reg) and _wb6_at[_w6reg] != ""
+                            let _w6k = "@tmp@" + _wb6_at[_w6reg]
+                            if contains(e.ire_fullrc_drop, _w6k)
+                                e.ire_fullrc_drop[_w6k] = str(e.ire_fullrc_drop[_w6k]) + " " + _w6reg
+                            else
+                                e.ire_fullrc_drop[_w6k] = _w6reg
             // #15 S5 ABI: build a lookup for this function's by-value param info
             // _s5_pmap[pi] = struct_name iff param pi is by-value eligible
             let _s5_pmap = {}
@@ -22975,6 +23083,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_file_size(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_file_mtime(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_rc_drop_reassign(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_rc_drop_temp(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_is_dir(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_make_dir(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_file_chmod(i64, i64) nounwind")

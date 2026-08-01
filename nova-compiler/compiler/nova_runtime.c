@@ -12047,6 +12047,28 @@ int64_t nova_rt_rc_drop_reassign(int64_t oldv, int64_t newv) {
     return 0;
 }
 
+/* Wave-B #6 — drop a FRESH OWNED TEMPORARY once its single consumer is done with it.
+   The measured leak: in `"row-" + str(i)` the intermediate str(i) allocation is handed to
+   nova_rt_str_concat, which READS it (nova_str_safe) and allocates a NEW string — it never
+   retains the argument, and nothing else ever references it. Nobody dropped that +1, so every
+   such intermediate leaked (2001 per 2000 iterations on the pinned baseline).
+
+   The compiler emits this ONLY for a register its whole-function pre-pass proved is
+     (a) produced by a whitelisted FRESH-ALLOCATION call, and
+     (b) used EXACTLY ONCE in the entire function, and
+     (c) that one use is as an argument to a whitelisted NON-RETAINING consumer.
+   A BORROW (index_get/field_get result) can never satisfy (a), which is what keeps this off the
+   CORE_GAP 0.10 use-after-free path — eliding/dropping a borrow is precisely that bug.
+
+   nova_rc_dec is pointer-validated (range, alignment, magic, structural), and find_tag explicitly
+   rejects the int_to_str small-int cache range — so even the one producer that can legitimately
+   return a NON-owned pointer (nova_rt_int_to_str for 0<=v<10000 returns a static cache entry)
+   degrades to a safe no-op here. Runtime validation is the backstop; the analysis is the guard. */
+int64_t nova_rt_rc_drop_temp(int64_t v) {
+    nova_rc_dec(v);
+    return 0;
+}
+
 /* ── Memory Cleanup ─────────────────────────────────────────────────────── */
 
 int64_t nova_rt_alloc_count(void) {
