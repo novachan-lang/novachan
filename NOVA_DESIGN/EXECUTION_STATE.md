@@ -114,6 +114,34 @@ additive (no existing code breaks) but it is a public-API design decision, so it
 INT64_MAX, shifts, negative int division, nested dicts, list slicing, negative indexing, sort over
 keys, and all list ops over comprehension results — all verified correct.
 
+**BATCH 2 — BACKLOG ITEMS LANDED (2026-08-01, certified `gen5==gen6` `721e5369`):**
+- ✅ `3f851358` **FD_SETSIZE guard — POSIX `select()` had a STACK BUFFER OVERFLOW above 1024 FDs.**
+  Windows `fd_set` is `{count, array[FD_SETSIZE]}` so the `#define FD_SETSIZE 4096` genuinely resizes
+  it; POSIX `fd_set` is a FIXED BITMAP indexed BY DESCRIPTOR NUMBER that glibc pins at 1024 regardless.
+  `FD_SET(fd,...)` with fd>=1024 wrote past a stack object — reachable from any server accepting >1024
+  concurrent connections, i.e. ordinary load. Now: never FD_SET an out-of-range fd, cap the wait to 1ms,
+  and wake those waiters so they retry (a spurious wake is harmless; skipping them would park forever).
+  Mitigation, not the end state — POSIX >1024 wants poll()/epoll(), still open.
+- ✅ `58a7a6a3` **ALPN server** — `tls_listen_alpn(s, "h2,http/1.1")` on BOTH SChannel (blob as a 3rd
+  input buffer to AcceptSecurityContext + SECPKG_ATTR_APPLICATION_PROTOCOL query) and OpenSSL
+  (`SSL_CTX_set_alpn_select_cb`, server preference wins). Fail-open by design.
+- ✅ `4861b196` **CYCLE 2 PARTIAL** — float HOF callbacks box at the trampoline. FIXED: `map(named_fn)`
+  and `map(fn(x) named_fn(x))`. STILL OPEN: `map(fn(x) x.price)` — measured at IR level, `frt` for the
+  lambda is not "float" because `ir_analyze_return_type` doesn't resolve a bare struct-field read.
+  Making it do so is what the in-code note at ~20408 records as "tried and REVERTED (perturbs the S4
+  fixpoint)", so it was NOT bolted on.
+- ✅ `808342ca` **LOCK-6 Phase 2 `@cdecl` — PROVEN FROM A REAL C HOST.** A C program with its own main
+  called NOVA with NO prior init (`event(21)=42`) and used a NOVA fn as a genuine `qsort` comparator
+  (`sorted: 1 2 3 5 7 9`). Root enabler: `nova_rt_init()` is NOT idempotent (critical sections + signal
+  handlers), so added `nova_rt_ensure_init()` (InitOnceExecuteOnce / pthread_once) and routed
+  `nova_rt_init_args` through it too. Composes with `@export`. **LOCK-6 no longer blocks Prism/Edge/Reactor.**
+- ✅ `0496cd60` **LOCK-5 `kill()` — safepoint termination.** `kill(pid)` / `kill_pending()`. The target
+  unwinds through its OWN fault_buf, i.e. the exact path a panic takes, so teardown is the proven one.
+  Cooperative by design (BEAM's reduction-boundary trade): async teardown would free RC objects still in
+  use and could abandon a held lock. **LOCK-5 no longer leaves Mesh supervision "fiction".**
+  OPEN: a task parked forever on a channel is not force-unlinked (needs per-list locked removal);
+  signal-based involuntary preemption remains post-v1.
+
 **NEXT (resume here):** Wave-B #6 RC leak — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
