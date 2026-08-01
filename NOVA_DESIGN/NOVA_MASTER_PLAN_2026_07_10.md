@@ -68,6 +68,14 @@
 > a whitelisted NON-RETAINING consumer — which keeps borrows (CORE_GAP 0.10 UAF) permanently off
 > the path. Retained-insert (MOVE-on-insert) remains open.
 >
+> **✅ Wave-B #6 MOVE-on-insert `f74454c1`** (certified `a4c72825`) — the gated
+> `_move6_insert_leak_test` now prints **CONCAT/DICTSET INSERT LEAK CLOSED**: concat 2001 -> 2,
+> dictset 2001 -> 2, ASAN-clean. Safe because inserts universally RETAIN (the `no_rc` elision was
+> already disabled as unsound by CORE_GAP 0.10), so the temp's un-released original +1 IS the leak
+> and dropping it restores the RC invariant. Only the retained VALUE position is ever a candidate.
+> Remaining: inserting the result of a USER call (the `call` column) needs a producer proof for
+> user fns.
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*

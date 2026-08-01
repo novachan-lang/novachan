@@ -174,7 +174,33 @@ keys, and all list ops over comprehension results — all verified correct.
   **STILL OPEN:** `_move6_insert_leak_test` reports its 2001 baseline unchanged — ITS leak is the
   retained-INSERT case (MOVE-on-insert), which neither part touches.
 
-**NEXT (resume here):** MOVE-on-insert (the retained-insert half of Wave-B #6) — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
+- ✅ `f74454c1` (certified `a4c72825`) **Wave-B #6 part 3 — MOVE-on-insert. The gated test itself now
+  prints `CONCAT/DICTSET INSERT LEAK CLOSED`.** concat 2001 -> 2, dictset 2001 -> 2. ASAN-clean.
+  **Why it is safe NOW when the earlier attempt was not:** a container insert universally RETAINS —
+  `list_append_no_rc`'s elision was DISABLED as unsound by CORE_GAP 0.10 (ASAN caught the UAF), so
+  both variants take their own +1. The temp's ORIGINAL +1 was simply never released; dropping it
+  makes the container sole owner, i.e. the RC invariant restored.
+  POSITION IS ENFORCED: only the RETAINED VALUE slot is a candidate (append arg 1, dict_set arg 2,
+  index_set arg 2) — dropping arg 0 would free a live container.
+  Two discoveries, both from reading emitted IR: (1) a string concat RESULT is itself a fresh
+  allocation and is the value most often inserted — it was a consumer but not a PRODUCER; (2)
+  `d[k] = v` is IR op `index_set` which has **no dest**, and marking was keyed on the consuming
+  instruction's dest, silently excluding every dict assignment. Marking is now keyed on the VALUE
+  REGISTER, which also removed the multi-temp joining logic.
+
+**WAVE-B #6 SCOREBOARD (per 1000 iterations):**
+| part | class | before | after |
+|---|---|---|---|
+| 1 `c6ca9ad7` | temp-arg | 2000 | 1000 |
+| 2 `23af36ca` | slot-rebind strings | 1000 | 1 |
+| 3 `f74454c1` | MOVE-on-insert | concat 2001 / dictset 2001 | 2 / 2 |
+
+**STILL OPEN:** the pinned test's `call` column stays 2001 — inserting the result of a USER
+function call. Closing it needs the producer whitelist to cover user fns, which requires PROVING
+a callee returns a fresh allocation rather than a borrow (a borrow would be CORE_GAP 0.10). Not
+guessed at.
+
+**NEXT (resume here):** insert-of-user-call-result (the `call` column), then the XL backlog — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
 fix · CYCLE 2 map/HOF float boxing (explicitly "needs a focused session").
