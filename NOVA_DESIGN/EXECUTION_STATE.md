@@ -142,7 +142,28 @@ keys, and all list ops over comprehension results — all verified correct.
   OPEN: a task parked forever on a channel is not force-unlinked (needs per-list locked removal);
   signal-based involuntary preemption remains post-v1.
 
-**NEXT (resume here):** Wave-B #6 RC leak — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
+- ✅ `c6ca9ad7` **Wave-B #6 (part 1) — fresh owned TEMPORARIES are now dropped. Targeted leak
+  HALVED 2000 -> 1000, ASAN-clean in BOTH modes.** The pinned test's model was WRONG: the leak is
+  not the insert-inc but a TEMP-ARG LIFETIME gap — in `"row-" + str(i)` the INTERMEDIATE `str(i)`
+  allocation goes to `str_concat`, which reads it and allocates a NEW string, retaining nothing,
+  and nobody dropped the +1.
+  **Soundness (dropping a BORROW is CORE_GAP 0.10 = UAF):** a register is dropped only if ALL of
+  (a) produced by a whitelisted FRESH-ALLOCATION call — a borrow can never qualify, (b) used
+  EXACTLY ONCE in the whole function — which is what makes it sound with no liveness analysis,
+  since one use cannot be live after its consumer, (c) that use is an arg to a whitelisted
+  NON-RETAINING consumer. Whitelists verified by READING the runtime. Retaining consumers are
+  excluded (that is MOVE-on-insert, separate + riskier). `nova_rc_dec` is pointer-validated as a
+  backstop and `find_tag` rejects the `int_to_str` small-int CACHE range, so the one producer that
+  can return a non-owned pointer degrades to a no-op.
+  **Gotcha that cost two cycles:** string `+` is IR op `"add"` with a str-typed result, NOT a
+  `"call"` — the EMITTER turns it into `nova_rt_str_concat`.
+  KAT `_kat_w6_uaf_guard` pins what must NOT be dropped (two-use temp still readable, stored
+  results readable, chains, container-retained values). `_kat_w6_temp_drop` measures the delta.
+  **REMAINING (part 2):** the concat RESULT bound to a slot and rebound each iteration. Root
+  identified: the FULLRC slot-drop pass's owned-set is only make_list/dict/struct/closure +
+  channel_create — FRESH STRINGS ARE NOT IN IT, so such a slot is never droppable.
+
+**NEXT (resume here):** Wave-B #6 part 2 (add fresh-string producers to the slot owned-set) — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
 fix · CYCLE 2 map/HOF float boxing (explicitly "needs a focused session").
