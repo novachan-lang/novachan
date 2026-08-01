@@ -44,6 +44,21 @@
 > `let d = Doubler(3)` case needs DEFERRED call constraints (measured: callee is still a type var at
 > constrain time). *Dev-mode: compile-checked + KAT-gated; full both-mode regression batched.*
 >
+> **✅ 2026-08-01 BATCH 2 — TWO LOCK-NOW ITEMS MOVED** (certified `gen5==gen6`, `721e5369`):
+> **LOCK-6 Phase 2 `@cdecl` ✅ `808342ca`** — NOVA functions are now callable FROM C. Proven from a real
+> C host with its own main: called into NOVA with no prior init, and used a NOVA fn as a genuine `qsort`
+> comparator. Enabler: `nova_rt_init()` is NOT idempotent (critical sections + signal handlers), so
+> `nova_rt_ensure_init()` (InitOnceExecuteOnce/pthread_once) now guards every entry. **LOCK-6 no longer
+> blocks Prism/Edge/Reactor.** Open (owner's call): an exact C prototype for 32-bit-return callbacks
+> needs a signature on the annotation — a public-API decision, not invented at implementation time.
+> **LOCK-5 `kill()` ✅ `0496cd60`** — green tasks can be terminated at a safepoint, unwinding through the
+> same fault boundary a panic uses. Cooperative by design (BEAM's reduction-boundary trade). **LOCK-5 no
+> longer leaves Mesh supervision "fiction".** Open: force-unlinking a channel-parked task; signal-based
+> preemption stays post-v1.
+> Also: **FD_SETSIZE guard ✅ `3f851358`** (POSIX `select()` was a stack buffer overflow above 1024 FDs —
+> reachable at ordinary server load), **ALPN server ✅ `58a7a6a3`** (SChannel + OpenSSL), **CYCLE 2
+> partial ✅ `4861b196`** (2 of 3 float-HOF cases; the third's blocker is measured and documented).
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
