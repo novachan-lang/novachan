@@ -2448,6 +2448,9 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                         let_type = let_type + ">>"
                     else if ltkk == "COMMA"
                         let_type = let_type + ","
+                    // LOCK-10: a NUMBER inside type args is a CONST GENERIC (the 3 in `Vec<3>`). This loop appended only IDENTs, so the number was silently DROPPED and `Vec<3>` became `Vec<>` — the same shape as the CLUSTER B comma-drop. Without this the const never reaches the type.
+                    else if ltkk == "INT"
+                        let_type = let_type + ltvv
                     else if ltkk == "IDENT"
                         let_type = let_type + ltvv
                     p = p + 1
@@ -2731,6 +2734,9 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                         type_ann = type_ann + ">>"
                     else if tkk == "COMMA" and tvv == ","
                         type_ann = type_ann + ","
+                    // LOCK-10: NUMBER = const-generic arg (see the note at the first capture loop).
+                    else if tkk == "INT"
+                        type_ann = type_ann + tvv
                     else if tkk == "IDENT"
                         type_ann = type_ann + tvv
                     p = p + 1
@@ -2787,6 +2793,9 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                         ret_ann = ret_ann + ">>"
                     else if rtkk == "COMMA" and rtvv == ","
                         ret_ann = ret_ann + ","
+                    // LOCK-10: NUMBER = const-generic arg (see the note at the first capture loop).
+                    else if rtkk == "INT"
+                        ret_ann = ret_ann + rtvv
                     else if rtkk == "IDENT"
                         ret_ann = ret_ann + rtvv
                     p = p + 1
@@ -2920,6 +2929,9 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                     target = target + ">>"
                 else if atkk == "COMMA" and atvv == ","
                     target = target + ","
+                // LOCK-10: NUMBER = const-generic arg (see the note at the first capture loop).
+                else if atkk == "INT"
+                    target = target + atvv
                 else if atkk == "IDENT"
                     target = target + atvv
                 p = p + 1
@@ -2985,6 +2997,9 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                                     ftype = ftype + ">>"
                                 else if ftkk == "COMMA"
                                     ftype = ftype + ","
+                                // LOCK-10: NUMBER = const-generic arg (see the note at the first capture loop).
+                                else if ftkk == "INT"
+                                    ftype = ftype + ftvv
                                 else if ftkk == "IDENT"
                                     ftype = ftype + ftvv
                                 p2 = p2 + 1
@@ -3027,6 +3042,9 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                                     ftype = ftype + ">>"
                                 else if ftkk == "COMMA"
                                     ftype = ftype + ","
+                                // LOCK-10: NUMBER = const-generic arg (see the note at the first capture loop).
+                                else if ftkk == "INT"
+                                    ftype = ftype + ftvv
                                 else if ftkk == "IDENT"
                                     ftype = ftype + ftvv
                                 p2 = p2 + 1
@@ -14433,6 +14451,31 @@ fn nt_fn(ps: list, ret: NType) -> NType
 fn nt_struct(sname: string) -> NType
     NType("struct", sname, [], 0)
 
+// LOCK-10 / L5 — CONST GENERICS: an INTEGER-VALUED type parameter, e.g. the 3 and 4 in
+// `Matrix<3, 4>`. The master plan's instruction at this stage is to RESERVE THE REPRESENTATION
+// now and complete inference after L7, because Cortex's tensor type and Pulse's schema types
+// encode it into their PUBLIC types — build them without it and shape errors stay runtime
+// crashes (Python-tier) and the API has to be redesigned later.
+//
+// `NType.params` already accommodates this structurally, so no struct change is needed: the
+// value rides in `id`, with `name` carrying its printable form. Unification then treats two
+// const nodes as equal iff their integers match — which is what makes a matmul inner-dimension
+// mismatch a COMPILE error instead of a runtime one.
+fn nt_const(n: int) -> NType
+    NType("const", str(n), [], n)
+
+// Is this annotation token an integer literal (a const-generic argument rather than a type name)?
+fn _is_const_generic_arg(t: string) -> bool
+    if len(t) == 0
+        return false
+    let i = 0
+    while i < len(t)
+        let c = t[i]
+        if c < "0" or c > "9"
+            return false
+        i = i + 1
+    true
+
 fn nt_var(vid: int) -> NType
     NType("var", "", [], vid)
 
@@ -14705,6 +14748,8 @@ fn ti_type_str(t: NType) -> string
         NType(kind, name, params, id) =>
             if kind == "var"
                 return "?T" + str(id)
+            if kind == "const"
+                return name
             if kind == "list" and len(params) > 0
                 return "List<" + ti_type_str(params[0]) + ">"
             if kind == "dict" and len(params) >= 2
@@ -14884,6 +14929,21 @@ fn ti_unify_d(st: TiState, a: NType, b: NType, line: int, depth: int)
                             return
                         if wak == "struct"
                             if wan == wbn
+                                // LOCK-10: a NOMINAL name match is not sufficient once a struct
+                                // carries type ARGUMENTS — `Vec<3>` and `Vec<4>` are the same
+                                // nominal type but different const-generic instantiations, and
+                                // returning here unconditionally is what let a shape mismatch
+                                // through. Unify the arguments pairwise when BOTH sides carry
+                                // them (an un-parameterised occurrence stays wildcard-compatible,
+                                // so ordinary non-generic structs are completely unaffected).
+                                if len(wap) > 0 and len(wbp) > 0
+                                    if len(wap) == len(wbp)
+                                        let _cgi = 0
+                                        while _cgi < len(wap)
+                                            ti_unify_d(st, wap[_cgi], wbp[_cgi], line, depth + 1)
+                                            _cgi = _cgi + 1
+                                    else
+                                        ti_error(st, "type mismatch: expected " + ti_type_str(wa) + ", found " + ti_type_str(wb) + " (different number of type arguments)", line)
                                 return
                             ti_error(st, "type mismatch: expected " + ti_type_str(wa) + ", found " + ti_type_str(wb), line)
                             return
@@ -14914,6 +14974,22 @@ fn ti_unify_d(st: TiState, a: NType, b: NType, line: int, depth: int)
                             ti_error(st, "recursive type: this expression would have an infinite type (a value cannot contain itself)", line)
                             return
                         ti_bind(st, wbi, wa)
+                        return
+                    // LOCK-10 / L5 CONST GENERICS: two integer-valued type parameters unify iff
+                    // their VALUES are equal. This is the whole point of the feature — it makes a
+                    // matmul inner-dimension mismatch (`Matrix<2,3> * Matrix<4,5>`) a COMPILE
+                    // error naming both extents, instead of a runtime crash. Checked BEFORE the
+                    // `any` escape below so a const never silently unifies with a wildcard.
+                    if wak == "const" or wbk == "const"
+                        if wak == "const" and wbk == "const"
+                            if wai != wbi
+                                ti_error(st, "const generic mismatch: " + wan + " vs " + wbn + " (these sizes must be equal)", line)
+                            return
+                        // A const vs a non-const, non-var type is a genuine kind error. (A `var`
+                        // was already bound above, so a const CAN still be inferred into a slot.)
+                        if wak == "any" or wbk == "any" or wak == "nothing" or wbk == "nothing"
+                            return
+                        ti_error(st, "expected a const generic size, found " + ti_type_str(wa) + " vs " + ti_type_str(wb), line)
                         return
                     if wak == "nothing" or wbk == "nothing"
                         return
@@ -16500,6 +16576,11 @@ fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
     // is_some/is_none and match Some/None all type-check against it directly.
     if ends_with(ann, "?")
         return nt_sum(ti_ann_to_type_g(st, slice(ann, 0, len(ann) - 1), gmap), nt_unit())
+    // LOCK-10: an all-digit annotation is a CONST GENERIC argument (the 3 in `Matrix<3,4>`),
+    // not a type name. Checked before the gmap/alias lookups since a digit string can never
+    // be a generic parameter name or an alias.
+    if _is_const_generic_arg(ann)
+        return nt_const(parse_int(ann))
     if contains(gmap, ann)
         return gmap[ann]
     // Resolve transparent type aliases (type Name = Target) before any
@@ -16560,6 +16641,27 @@ fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
         if len(args) >= 1
             return nt_channel(ti_ann_to_type_g(st, args[0], gmap))
         return nt_channel(nt_any())
+    // LOCK-10 CONST GENERICS: a user generic struct's arguments were DROPPED here (`Vec<3>` became
+    // a bare nt_struct("Vec")), which is why a size mismatch could never be detected — there was
+    // nothing left to compare.
+    // Carry the arguments ONLY when at least one is a const generic. Doing it for every generic
+    // struct would switch `Box<int>` etc. from erased to structurally-checked across 1830+ stdlib
+    // modules in one step — a much wider behavioural change than this item calls for. Scoping it
+    // to const args gives shape checking exactly where it is wanted and leaves every existing
+    // generic struct byte-identical.
+    let _cg_any = false
+    let _cg_i = 0
+    while _cg_i < len(args)
+        if _is_const_generic_arg(args[_cg_i])
+            _cg_any = true
+        _cg_i = _cg_i + 1
+    if _cg_any
+        let _cg_ps = []
+        let _cg_j = 0
+        while _cg_j < len(args)
+            push(_cg_ps, ti_ann_to_type_g(st, args[_cg_j], gmap))
+            _cg_j = _cg_j + 1
+        return NType("struct", base, _cg_ps, 0)
     ti_ann_to_type(base)
 
 fn ti_extract_generics(annotations: list) -> list
