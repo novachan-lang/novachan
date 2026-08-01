@@ -10588,6 +10588,27 @@ fn _wb6_is_borrowing_consumer(fname: string) -> bool
         return true
     false
 
+// Wave-B #6 part 3 — MOVE-on-insert. A container insert RETAINS its element: it takes its own
+// +1. (nova_rt_list_append_no_rc's retain-elision was DISABLED as UNSOUND by CORE_GAP 0.10 —
+// an uncounted insert is irreconcilable with the counted removal/destructor — so BOTH variants
+// now retain.) The temp's ORIGINAL +1 was never released, which is the leak. Dropping it after
+// the insert is correct MOVE semantics: the container becomes the sole owner.
+// This is only ever applied to the VALUE position (see _wb6_insert_value_idx) — dropping the
+// CONTAINER would free a live list — and only to a temp used EXACTLY ONCE.
+fn _wb6_is_retaining_insert(fname: string) -> bool
+    if fname == "nova_rt_list_append" or fname == "nova_rt_list_append_no_rc"
+        return true
+    if fname == "nova_rt_dict_set" or fname == "nova_rt_dict_set_no_rc"
+        return true
+    false
+
+// Which argument index carries the RETAINED VALUE: append(list, elem) -> 1;
+// dict_set(dict, key, val) -> 2. Only that position is ever a MOVE candidate.
+fn _wb6_insert_value_idx(fname: string) -> int
+    if fname == "nova_rt_dict_set" or fname == "nova_rt_dict_set_no_rc"
+        return 2
+    1
+
 fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) -> string
     let lname = "__lambda_" + str(b.ir_lamc)
     let tname = "__tramp_" + str(b.ir_lamc)
@@ -20995,11 +21016,9 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             // Wave-B #6: drop a fresh owned temp this concat just consumed. str_concat
                             // reads both args through nova_str_safe and allocates a NEW buffer — it
                             // retains neither — so a temp used ONLY here is dead after this line.
-                            let _w6ck = "@tmp@" + dest
-                            if contains(e.ire_fullrc_drop, _w6ck)
-                                for _w6cd in split(str(e.ire_fullrc_drop[_w6ck]), " ")
-                                    if _w6cd != ""
-                                        ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6cd + ")")
+                            for _w6cd in args
+                                if contains(e.ire_fullrc_drop, "@tmpv@" + _w6cd)
+                                    ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6cd + ")")
                         else
                             ire_indent(e, dest + " = call i64 @nova_rt_add(i64 " + args[0] + ", i64 " + args[1] + ")")
             else if op == "sub"
@@ -21661,11 +21680,9 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         // used EXACTLY ONCE in the whole function, and that this call is a proven
                         // NON-RETAINING consumer — so after the call nothing can reference it.
                         // Emitted AFTER the call so the value is still live for the callee.
-                        let _w6key = "@tmp@" + dest
-                        if contains(e.ire_fullrc_drop, _w6key)
-                            for _w6dr in split(str(e.ire_fullrc_drop[_w6key]), " ")
-                                if _w6dr != ""
-                                    ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6dr + ")")
+                        for _w6dr in args
+                            if contains(e.ire_fullrc_drop, "@tmpv@" + _w6dr)
+                                ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + _w6dr + ")")
                         // Beat-C: a float-typed call (the raw-double math builtins) returns raw
                         // double bits. Mark it so a consuming float op reads it via bitcast, not
                         // a defensive nova_rt_unbox. Mirrors fmul/const_float result tracking.
@@ -21861,6 +21878,11 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         is_lv = is_lbbx
                     let is_lcv = ire_fresh_tmp(e, "_is.lcv")
                     ire_indent(e, is_lcv + " = call i64 @nova_rt_index_set(i64 " + args[0] + ", i64 " + args[1] + ", i64 " + is_lv + ")")
+                    // MOVE-on-insert: index_set RETAINS the value, so a single-use owned temp
+                    // handed to it is now solely owned by the container -> drop our +1.
+                    if len(args) >= 3
+                        if contains(e.ire_fullrc_drop, "@tmpv@" + args[2])
+                            ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + args[2] + ")")
                     // W5b soundness: nova_rt_index_set -> list_set increfs the stored value; if it came from a
                     // local slot, mark that slot non-droppable (more marks only ever PREVENT frees -> never a UAF).
                     if contains(e.ire_load_origin, args[2])
@@ -21882,6 +21904,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         if contains(e.ire_load_origin, args[2])
                             e.ire_slot_escaped[e.ire_load_origin[args[2]]] = 1
                     ire_indent(e, is_dtmp + " = call i64 @" + is_dfn + "(i64 " + args[0] + ", i64 " + args[1] + ", i64 " + args[2] + ")")
+                    // MOVE-on-insert (dict branch): dict_set RETAINS the value, so a single-use
+                    // owned temp is now solely owned by the dict -> drop our +1. The fbox/bbox
+                    // variants BOX the value, so what the dict holds is a NEW object and the
+                    // original temp is even more clearly dead; both are safe.
+                    if contains(e.ire_fullrc_drop, "@tmpv@" + args[2])
+                        ire_indent(e, "call i64 @nova_rt_rc_drop_temp(i64 " + args[2] + ")")
                 else
                     let is_gtmp = ire_fresh_tmp(e, "_is.gv")
                     let is_gv = args[2]
@@ -22400,6 +22428,15 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                     IrInst(_w6o, _w6d, _w6ty, _w6a, _w6v, _w6n, _w6e, _w6ln) =>
                                         if _w6o == "call" and _w6d != "" and _wb6_is_fresh_alloc(_w6v)
                                             _wb6_owned[_w6d] = 1
+                                        // A string concat RESULT is a fresh allocation too, and it is
+                                        // the value most often handed straight to an insert
+                                        // (`tmp.push("row-" + str(i))`). Same `add`-with-str-result form
+                                        // the slot pass treats as owned.
+                                        if _w6o == "add" and _w6d != ""
+                                            match _w6ty
+                                                IrType(_w6ok, _w6on, _w6op, _w6oid) =>
+                                                    if _w6ok == "str"
+                                                        _wb6_owned[_w6d] = 1
                                         let _w6ai = 0
                                         while _w6ai < len(_w6a)
                                             let _w6r = _w6a[_w6ai]
@@ -22419,19 +22456,35 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                                     IrType(_w6tk, _w6tn, _w6tp, _w6tid) =>
                                                         if _w6tk == "str"
                                                             _w6cons = true
-                                            if _w6cons and _w6d != ""
-                                                _wb6_at[_w6r] = _w6d
+                                            // MOVE-on-insert: only the RETAINED VALUE position of a
+                                            // retaining insert. Position matters — dropping the
+                                            // CONTAINER (arg 0) would free a live list.
+                                            if _w6o == "call" and _wb6_is_retaining_insert(_w6v)
+                                                if _w6ai == _wb6_insert_value_idx(_w6v)
+                                                    _w6cons = true
+                                            // `d[k] = v` is IR op "index_set", not a dict_set CALL —
+                                            // the emitter picks the runtime fn. Same retain semantics,
+                                            // so the VALUE (args[2]) is a MOVE candidate; args[0]/[1]
+                                            // (container, key) are NOT.
+                                            if _w6o == "index_set" and _w6ai == 2
+                                                _w6cons = true
+                                            // Marking is by VALUE register, so the consuming
+                                            // instruction's dest is irrelevant — index_set has NO
+                                            // dest at all, which is why requiring one silently
+                                            // excluded every `d[k] = v` from MOVE-on-insert.
+                                            if _w6cons
+                                                _wb6_at[_w6r] = "1"
                                             else
                                                 _wb6_at[_w6r] = ""
                                             _w6ai = _w6ai + 1
                 for _w6reg in keys(_wb6_owned)
                     if contains(_wb6_uses, _w6reg) and _wb6_uses[_w6reg] == 1
                         if contains(_wb6_at, _w6reg) and _wb6_at[_w6reg] != ""
-                            let _w6k = "@tmp@" + _wb6_at[_w6reg]
-                            if contains(e.ire_fullrc_drop, _w6k)
-                                e.ire_fullrc_drop[_w6k] = str(e.ire_fullrc_drop[_w6k]) + " " + _w6reg
-                            else
-                                e.ire_fullrc_drop[_w6k] = _w6reg
+                            // Marked by the VALUE REGISTER, not by the consumer's dest: index_set
+                            // writes its result into a fresh temp rather than `dest`, so a dest key
+                            // could never reach it. Each consuming emit site just asks "is this
+                            // argument marked?" after emitting.
+                            e.ire_fullrc_drop["@tmpv@" + _w6reg] = 1
             // #15 S5 ABI: build a lookup for this function's by-value param info
             // _s5_pmap[pi] = struct_name iff param pi is by-value eligible
             let _s5_pmap = {}
