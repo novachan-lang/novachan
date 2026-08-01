@@ -225,7 +225,18 @@ guessed at.
 | 3 `f74454c1` | MOVE-on-insert | 2001 | 2 |
 | 4 `c9659065` | insert of user call | 2001 | 2 |
 
-**NEXT (resume here):** the XL backlog — LOCK-4 inc3d (packed sized arrays, completes LOCK-4) ·
+**LOCK-4 inc3d (packed sized arrays) — MEASURED BLOCKER, deferred with evidence.** inc3d changes the
+LAYOUT of `NovaList.data` (packed by width instead of 8 bytes per element). Measured in
+`nova_runtime.c`: **575 raw `->data[` accesses vs only 34 `elem_kind` guards** — i.e. ~541 sites read
+`l->data[i]` assuming 8-byte elements. Under a packed layout every one of those becomes a
+WRONG-WIDTH read: silent memory corruption, not a clean failure. Landing this safely needs either a
+width-guard audit of all 575 sites, or a proof that no unguarded entry point can ever observe a
+packed list (the S4 deopt discipline generalised). That is a design + audit job, and a PARTIAL
+implementation is strictly worse than none here. NOT attempted — this is the "widest runtime change"
+the plan calls it, and the failure mode is exactly the uninitialized/wrong-width read class this
+session spent its time eliminating.
+
+**NEXT (resume here):** the XL backlog — LOCK-4 inc3d (BLOCKED, see above) ·
 LOCK-1 full `@mod__fn` mangling · const generics · RC cycle collector · monotonic type-id vtables ·
 explicit SIMD · ARM aarch64 fibers · GPU lowering — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
