@@ -93,6 +93,15 @@
 > change and no dense type-id scheme. Plus `b6debe3e`: `IsBadReadPtr` removed from the `find_tag`
 > hot path (~10%) — it was redundant given the existing non-dereferencing range check.
 >
+> **✅ LOCK-10 / L5 CONST GENERICS `2ada8425`** (certified) — integer-valued type parameters; a
+> shape mismatch is now a COMPILE error naming both extents (`const generic mismatch: 3 vs 4`).
+> This is the third LOCK-NOW item to move. It matters because Cortex's tensor type and Pulse's
+> schema types encode shapes into their PUBLIC types — without it those stay runtime crashes and
+> the API must be redesigned later. Two bugs surfaced: struct unification compared NOMINAL NAME
+> only (so `Vec<3>` and `Vec<4>` were indistinguishable), and the six generic-arg capture loops
+> appended only IDENT tokens, silently dropping the number — the same shape as the CLUSTER B
+> comma-drop. REMAINS in this row: variance + associated types.
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
