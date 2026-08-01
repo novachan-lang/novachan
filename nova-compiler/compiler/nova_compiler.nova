@@ -10630,6 +10630,73 @@ fn _wb6_insert_value_idx(fname: string) -> int
         return 2
     1
 
+// ── Dynamic dispatch: BALANCED COMPARISON TREE (was a linear chain) ───────────────────────────
+// MEASURED motivation (see _bench_dispatch): the old emission compared the receiver's type hash
+// against every implementation in turn, so cost was LINEAR in the number of impls — 23 ns at 2
+// impls, 74 ns at 12, 146 ns at 24, against a 0.098 ms monomorphic control over the same 2.4M
+// dispatches. Doubling the impl count doubled the time.
+//
+// Sorting the impls by hash and emitting a binary search over them makes it O(log N) using ONLY
+// the existing eq/lt/branch ops — no new IR op, no runtime change, and no dense type-id scheme
+// (which would mean changing what struct slot 0 holds, a far wider change for a smaller marginal
+// gain over log N). At 24 impls this is ~5 comparisons instead of 24.
+//
+// Every "no match" leaf jumps to ONE shared fallback block, so the not-found behaviour (runtime
+// builtin, free fn, or the #8 S8.0 loud panic) is emitted exactly once and is unchanged.
+
+// Insertion sort of [hash, fn] pairs by hash. N is the number of implementations of one method —
+// tiny, and this runs at compile time, so an O(N^2) sort is the right complexity trade for clarity.
+fn _disp_sort_by_hash(impls: list) -> list
+    let out = []
+    for it in impls
+        push(out, it)
+    let i = 1
+    while i < len(out)
+        let cur = out[i]
+        let j = i - 1
+        while j >= 0 and out[j][0] > cur[0]
+            out[j + 1] = out[j]
+            j = j - 1
+        out[j + 1] = cur
+        i = i + 1
+    out
+
+// Emit the search over impls[lo, hi). Assumes the CURRENT block is open and ends it.
+fn _disp_emit_tree(b: IrBuilder, impls: list, lo: int, hi: int, hash_reg: string, arg_regs: list, slot: string, merge_lbl: string, miss_lbl: string)
+    if lo >= hi
+        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], miss_lbl, 0, "pure", b.ir_cur_line))
+        return
+    let mid = lo + (hi - lo) / 2
+    let dimp = impls[mid]
+    let mid_hash = dimp[0]
+    let mid_fn = dimp[1]
+    let hit_lbl = ir_fresh_label(b, "dyn_hit")
+    let lo_lbl = ir_fresh_label(b, "dyn_lo")
+    let hi_lbl = ir_fresh_label(b, "dyn_hi")
+    let ne_lbl = ir_fresh_label(b, "dyn_ne")
+    // equal? -> call this impl
+    let hc = ir_fresh_reg(b)
+    ir_emit_inst(b, "const_int", hc, ir_type_int(), [], str(mid_hash), mid_hash)
+    let ceq = ir_fresh_reg(b)
+    ir_emit_inst(b, "eq", ceq, ir_type_int(), [hash_reg, hc], "", 0)
+    ir_finish_block(b, IrInst("branch", "", ir_type_void(), [ceq, ne_lbl], hit_lbl, 0, "pure", b.ir_cur_line))
+    ir_start_block(b, hit_lbl)
+    let rr = ir_fresh_reg(b)
+    ir_emit_side(b, "call", rr, ir_type_any(), arg_regs, mid_fn, 0)
+    ir_emit_inst(b, "slot_store", "", ir_type_void(), [rr], slot, 0)
+    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_lbl, 0, "pure", b.ir_cur_line))
+    // not equal -> which half?
+    ir_start_block(b, ne_lbl)
+    let hc2 = ir_fresh_reg(b)
+    ir_emit_inst(b, "const_int", hc2, ir_type_int(), [], str(mid_hash), mid_hash)
+    let clt = ir_fresh_reg(b)
+    ir_emit_inst(b, "lt", clt, ir_type_int(), [hash_reg, hc2], "", 0)
+    ir_finish_block(b, IrInst("branch", "", ir_type_void(), [clt, hi_lbl], lo_lbl, 0, "pure", b.ir_cur_line))
+    ir_start_block(b, lo_lbl)
+    _disp_emit_tree(b, impls, lo, mid, hash_reg, arg_regs, slot, merge_lbl, miss_lbl)
+    ir_start_block(b, hi_lbl)
+    _disp_emit_tree(b, impls, mid + 1, hi, hash_reg, arg_regs, slot, merge_lbl, miss_lbl)
+
 fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) -> string
     let lname = "__lambda_" + str(b.ir_lamc)
     let tname = "__tramp_" + str(b.ir_lamc)
@@ -11750,25 +11817,44 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     let disp_zero = ir_fresh_reg(b)
                     ir_emit_inst(b, "const_int", disp_zero, ir_type_int(), [], "0", 0)
                     ir_emit_inst(b, "slot_store", "", ir_type_void(), [disp_zero], disp_slot, 0)
-                    let di = 0
-                    while di < len(disp_impls)
-                        let dimp = disp_impls[di]
-                        let dimp_hash = dimp[0]
-                        let dimp_fn = dimp[1]
-                        let disp_then = ir_fresh_label(b, "dyn_" + str(di))
-                        let disp_next = ir_fresh_label(b, "dyn_try" + str(di + 1))
-                        let disp_hash_c = ir_fresh_reg(b)
-                        ir_emit_inst(b, "const_int", disp_hash_c, ir_type_int(), [], str(dimp_hash), dimp_hash)
-                        let disp_cmp = ir_fresh_reg(b)
-                        ir_emit_inst(b, "eq", disp_cmp, ir_type_int(), [disp_hash, disp_hash_c], "", 0)
-                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [disp_cmp, disp_next], disp_then, 0, "pure", b.ir_cur_line))
-                        ir_start_block(b, disp_then)
-                        let disp_r = ir_fresh_reg(b)
-                        ir_emit_side(b, "call", disp_r, ir_type_any(), arg_regs, dimp_fn, 0)
-                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [disp_r], disp_slot, 0)
-                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], disp_merge, 0, "pure", b.ir_cur_line))
-                        ir_start_block(b, disp_next)
-                        di = di + 1
+                    // HYBRID dispatch, chosen by MEASUREMENT (_bench_dispatch, same 2.4M
+                    // dispatches at each width):
+                    //   impls |  linear  |  tree
+                    //       2 |  55.8 ms |  69.3 ms   <- tree 24% WORSE
+                    //       4 |  89.6 ms | 104.2 ms   <- tree 16% WORSE
+                    //      12 | 176.9 ms | 171.7 ms   <- break-even
+                    //      24 | 350.2 ms | 209.6 ms   <- tree 40% BETTER
+                    // The binary search costs an extra `lt` + branch per level, which at small N
+                    // outweighs the comparisons it saves — and most methods have 2-4 impls, so a
+                    // blanket tree would REGRESS the common case. Keep the linear chain below the
+                    // crossover and switch to O(log N) above it. Both paths converge on disp_miss,
+                    // so the fallback is emitted exactly once either way.
+                    let disp_miss = ir_fresh_label(b, "dyn_miss")
+                    if len(disp_impls) >= 8
+                        let disp_sorted = _disp_sort_by_hash(disp_impls)
+                        _disp_emit_tree(b, disp_sorted, 0, len(disp_sorted), disp_hash, arg_regs, disp_slot, disp_merge, disp_miss)
+                    else
+                        let di = 0
+                        while di < len(disp_impls)
+                            let dimp = disp_impls[di]
+                            let dimp_hash = dimp[0]
+                            let dimp_fn = dimp[1]
+                            let disp_then = ir_fresh_label(b, "dyn_" + str(di))
+                            let disp_next = ir_fresh_label(b, "dyn_try" + str(di + 1))
+                            let disp_hash_c = ir_fresh_reg(b)
+                            ir_emit_inst(b, "const_int", disp_hash_c, ir_type_int(), [], str(dimp_hash), dimp_hash)
+                            let disp_cmp = ir_fresh_reg(b)
+                            ir_emit_inst(b, "eq", disp_cmp, ir_type_int(), [disp_hash, disp_hash_c], "", 0)
+                            ir_finish_block(b, IrInst("branch", "", ir_type_void(), [disp_cmp, disp_next], disp_then, 0, "pure", b.ir_cur_line))
+                            ir_start_block(b, disp_then)
+                            let disp_r = ir_fresh_reg(b)
+                            ir_emit_side(b, "call", disp_r, ir_type_any(), arg_regs, dimp_fn, 0)
+                            ir_emit_inst(b, "slot_store", "", ir_type_void(), [disp_r], disp_slot, 0)
+                            ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], disp_merge, 0, "pure", b.ir_cur_line))
+                            ir_start_block(b, disp_next)
+                            di = di + 1
+                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], disp_miss, 0, "pure", b.ir_cur_line))
+                    ir_start_block(b, disp_miss)
                     let disp_fb_rt = resolve_runtime_fn(value)
                     if disp_fb_rt != value
                         let disp_fb_result = ir_fresh_reg(b)
