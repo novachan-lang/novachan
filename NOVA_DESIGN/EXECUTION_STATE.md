@@ -413,30 +413,30 @@ but not the strategic bottleneck.
 | `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
 | lexer: numeric separators | 0-A | C | ✅ ALREADY DONE (decimal/hex/binary all strip `_`; audit stale) | |
 | lexer: `\u{}` escapes / labeled break | 0-A | C | ⏸ DEFERRED (low-value: `from_codepoint` covers `\u`; labeled-break is involved, not a quick win) | |
-| RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ⬜ Wave-B #6 NEXT (leak CONFIRMED 2001; gated `_move6_insert_leak_test` 83650843; design=MOVE owned-temps only, borrow-builtins stay rc-inc=the 0.10 UAF) | |
+| RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ✅ **CLOSED 2026-08-01** — all 3 columns 2001->2 (`c6ca9ad7`+`23af36ca`+`f74454c1`+`c9659065`, certified `046943b4`); ASAN-clean; the gated test itself prints CONCAT/DICTSET INSERT LEAK CLOSED. (was: leak CONFIRMED 2001; gated `_move6_insert_leak_test` 83650843; design=MOVE owned-temps only, borrow-builtins stay rc-inc=the 0.10 UAF) | |
 | RC cycle collector | 0-B | A(XL) | ⬜ | |
 | ARM aarch64 fibers | 0-C | B | ⬜ | |
 | N>1 per-carrier I/O | 0-C | B | 🔄 goal met via single-poller (S-a/S-b/S-c); literal per-carrier shard not done (see ledger #6 audit) | |
 | **Windows TLS server** (of "ALPN + Windows TLS server") | 0-C | B | ✅ DONE `3c1f746d` — SChannel server: PFX cert load (dyn crypt32) + INBOUND cred + AcceptSecurityContext handshake + encrypted I/O; `tls_connect_insecure` (curl -k). Verified encrypted round-trip (gate [CI 2e3]). FOLLOW-ON: netpoller integration for concurrent HTTPS (blocking I/O today = sequential). | 3c1f746d |
-| **ALPN server** (of "ALPN + Windows TLS server") | 0-C | B | ⬜ REMAINS — pass SEC_APPLICATION_PROTOCOLS into AcceptSecurityContext + query negotiated proto (client ALPN already done `69c74b27`). Low-leverage until an h2 server consumes it. | |
+| **ALPN server** (of "ALPN + Windows TLS server") | 0-C | B | ✅ **CLOSED 2026-08-01** `58a7a6a3` — `tls_listen_alpn` on BOTH SChannel and OpenSSL, fail-open by design. (was: pass SEC_APPLICATION_PROTOCOLS into AcceptSecurityContext + query negotiated proto (client ALPN already done `69c74b27`). Low-leverage until an h2 server consumes it. | |
 | **S1 signal handling** (SIGINT/SIGTERM/SIGHUP) | 0-C | B | ✅ DONE `2ce90c6d` — shutdown already existed; added SIGHUP reload channel (`reload_requested`). | 2ce90c6d |
 | **S5 file perms/symlinks** (chmod/umask/symlink/readlink) | 0-C | B | ✅ DONE `2ce90c6d` — runtime builtins, POSIX-primary. KAT `_kat_perms`. | 2ce90c6d |
 | **S2 HTTP-client redirects+cookies** | 0-C(forge) | B | ✅ DONE `e11935a3`+ — http_get_follow (301/302/303/307/308 + relative-Location) + cookie jar (http_get_session). | e11935a3 |
 | **T-Pkg lockfile** (reproducible installs) | toolchain | B | ✅ DONE `dcd8fae8` — nova install honors+writes nova.lock. | dcd8fae8 |
 | **T-REPL** (broken by compiler relocation) | toolchain | B | ✅ FIXED+GATED `2543df3c` — stale runtime path repaired; `_test_repl.ps1` in CI. | 2543df3c |
-| FD_SETSIZE Linux guard | 0-C | B | ⬜ (Linux-only; can't verify on this Windows box) | |
-| safepoint preemption + kill (LOCK-5) | 0-C | A(XL) | ⬜ — STRATEGIC (blocks Mesh/Reactor) | |
+| FD_SETSIZE Linux guard | 0-C | B | ✅ **CLOSED 2026-08-01** `3f851358` — POSIX `select()` was a STACK BUFFER OVERFLOW above 1024 FDs (fd_set is a fixed 1024-bit bitmap indexed by descriptor number). Now never FD_SETs an out-of-range fd and wakes those waiters to retry. (Linux-only; not runnable on this Windows box) | |
+| safepoint preemption + kill (LOCK-5) | 0-C | A(XL) | ✅ **CLOSED 2026-08-01** `0496cd60` — safepoint `kill()` + `kill_pending()`; the target unwinds via its OWN fault_buf (the panic path), cooperative like BEAM's reduction boundary. OPEN: force-unlinking a channel-parked task; signal-based preemption stays post-v1 | |
 | constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ✅ `secure_zero` + `ct_eq` DONE `bab9fa57` (C runtime + compiler 4 sites + 5 callsites; `@redact`/`Secret<T>` = Phase 2) | bab9fa57 |
-| sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE (`bc5acb27`..`fe6177a6`); inc3c-part2 (slot-flow for runtime-valued sized vars) ATTEMPTED but gen3 hangs — DEFERRED for deep investigation | |
+| sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | 🔄 inc3c-part2 ✅ DONE `4f524b26` (slot width flow + annotation bridge — sized numerics are USABLE); **inc3d BLOCKED with evidence: 575 raw `->data[` reads vs 34 elem_kind guards, so a packed layout = silent wrong-width corruption**. Prior: inc1+inc2+inc3a+inc3b+inc3c-part1a DONE (`bc5acb27`..`fe6177a6`); inc3c-part2 (slot-flow for runtime-valued sized vars) ATTEMPTED but gen3 hangs — DEFERRED for deep investigation | |
 | module namespacing `@mod__fn` (LOCK-1) | ceil | A | 🔄 Phase-1 collision DETECTION done `724dad65` (two modules same-name → clear error); full mangling deferred (map in L11_NAMESPACING_MAP.md). | 724dad65 |
 | annotations→codegen (LOCK-2) | ceil | A(XL) | ✅ Phase-1 DONE: 15 annotation types (`1a65d7c0`..`e099c1ac`). Phase-2 user-extensible = OPEN (L1b, XL) | 1a65d7c0 |
 | macros/comptime | ceil | A(XL) | ✅ Phase-1+2 DONE `55d3fb7e`+`b7a5e1ca` (comptime eval + unicode escapes). Phase-3 quasi-quote = OPEN (L2b, XL) | b7a5e1ca |
-| const generics · variance · assoc types | ceil | A | ⬜ | |
+| const generics · variance · assoc types | ceil | A | 🔄 **const generics ✅ DONE `2ada8425`** (LOCK-10/L5): a shape mismatch is now a COMPILE error naming both extents. REMAINS: variance + associated types | |
 | custom index/iter/call operators (L8) | ceil | A | ✅ index+iter DONE `49f28f4f`; call-overload source-done `42e9c73f` (type inference + IR dispatch in nova_compiler.nova; blocked by gen3 truncation until reconverge) | 49f28f4f 42e9c73f |
 | enforced immutability `let mut` | ceil | A | ✅ DONE `1a65d7c0` (parser accepts `let mut`; existing `let` = immutable) | 1a65d7c0 |
-| `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | 🔄 Phase 1 DONE `b20fbb62` (`fn_ptr("name")` intrinsic → ptrtoint ptr @name to i64). Phase 2 (@cdecl annotation + C calling convention + trampoline) = OPEN | b20fbb62 |
-| monotonic type-id vtables | ceil | A | ⬜ | |
-| explicit SIMD path | ceil | A | ⬜ | |
+| `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | ✅ **Phase 2 DONE `808342ca`** — NOVA fns callable FROM C, PROVEN from a real C host (qsort comparator + no-prior-init entry); `nova_rt_ensure_init` added because `nova_rt_init` is NOT idempotent. REMAINS: struct-by-value (LOCK-11) + an exact-prototype signature on the annotation. Phase 1 was `b20fbb62` (`fn_ptr("name")` intrinsic → ptrtoint ptr @name to i64). Phase 2 (@cdecl annotation + C calling convention + trampoline) = OPEN | b20fbb62 |
+| monotonic type-id vtables | ceil | A | ✅ **CLOSED `789a4246`** — shipped as a MEASURED hybrid: dispatch was O(N) (23ns@2 impls -> 146ns@24); a blanket binary search would have REGRESSED the common 2-4 impl case 16-24%, so the crossover sits at >=8. Faster at every width, -37% at N=24. Plus `b6debe3e` (IsBadReadPtr off the find_tag hot path, ~10%) | |
+| explicit SIMD path | ceil | A | ✅ **CLOSED `6bd9416d`** — 7 kernels over raw float lists; clang confirms 4-wide AVX ("vectorization width: 4"). Refusal-guarded: a boxed list holds POINTERS, so non-raw operands are rejected, never misread as doubles | |
 | runtime builtins: math (D11) | rt | C | ✅ DONE (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf; reconverge pending) | (batch 2) |
 | runtime builtins: PRNG (D8) | rt | C | ✅ DONE (xoshiro256** seedable: rng_new/next/int/float; reconverge pending) | (batch 2) |
 | runtime builtins: signals/sockets/glob/sync/pack | rt | B/C | ✅ MOSTLY DONE (signals=builtins; sync=std/sync/; pack=std/encoding/pack; glob=std/os/glob; sockets=TCP builtins) | |
