@@ -249,7 +249,29 @@ session spent its time eliminating.
   KNOWN LIMITATION: a float LITERAL builds boxed, so it is not SIMD-ready; raw mode comes from
   pushing floats. Making literals build raw is a separate list-literal-construction change.
 
-**NEXT (resume here):** the XL backlog — LOCK-4 inc3d (BLOCKED, see above) ·
+**MONOTONIC TYPE-ID VTABLES — MEASURED AND SPECIFIED (was a hunch, now has numbers).**
+Dynamic method dispatch currently emits a LINEAR chain of `eq` + `branch`, one arm per
+implementation, over `nova_rt_type_hash(recv)`. Benchmarked with the SAME 2.4M total dispatches
+at each width (`_bench_dispatch` / `_bench_control`):
+
+| impls | time | per dispatch |
+|---|---|---|
+| 2 | 55.8 ms | 23 ns |
+| 4 | 89.6 ms | 37 ns |
+| 12 | 176.9 ms | 74 ns |
+| 24 | 350.2 ms | 146 ns |
+
+Monomorphic control (identical loop shape, one type -> static call): **0.098 ms**. The cost is
+almost perfectly LINEAR in the number of implementations — doubling N doubles the time — so the
+COMPARE CHAIN is the dominant term, not `find_tag`. (Removing `IsBadReadPtr` from `find_tag`
+bought ~10%: `b6debe3e`. That was worth doing but is not the main cost.)
+**This validates the backlog item with data.** The cheapest correct fix needs NO new runtime and
+NO struct-layout change: sort the implementations by hash and emit a BALANCED COMPARISON TREE
+instead of a linear chain, using only the existing `eq`/`lt`/`branch` ops -> O(log N). At N=24
+that is ~5 compares instead of 24. A true jump-table vtable would need DENSE type ids, which means
+changing what struct slot 0 holds — a much wider change for a smaller marginal gain over O(log N).
+
+**NEXT (resume here):** dispatch binary-search tree (specified above) · LOCK-4 inc3d (BLOCKED) ·
 LOCK-1 full `@mod__fn` mangling · const generics · RC cycle collector · monotonic type-id vtables ·
 explicit SIMD · ARM aarch64 fibers · GPU lowering — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
