@@ -65,3 +65,37 @@ ir_fnames/all_ir_fns → two same-named fns each emit `define @name` = LLVM dup 
 Silent-miscompile watch-list for Phase 2 mangling (each independently picks/emits a callee name and
 must agree on the mangled form): 8656-8668 (mod.func), 8583 (module-internal + cross-module bare),
 8203 (__fnref), 20413 (call-by-name registry), the ti_fn_types(bare)→frt(emit) seam @19957 vs 19997.
+
+## VERIFIED 2026-08-01 — Phase 1 works; Phase 2 refined
+
+**Phase 1 collision detection VERIFIED live (both halves):**
+- Two different modules exporting the same name -> clear compile error naming BOTH modules
+  (`function 'shared_name' is exported by two modules ('modx' and 'mody')`).
+- The same module reached TWICE (direct import + transitively via another module) is NOT a false
+  collision — module identity is the file path. Pinned by `_kat_l11_reimport`.
+
+**So LOCK-1's SOUNDNESS risk is already covered.** The silent last-wins and the opaque LLVM
+duplicate-symbol at link are both gone. What remains in Phase 2 is ERGONOMICS (unprefixed
+`seq.map` / `list.map` coexisting) plus FUTURE ABI safety across separately-compiled packages.
+
+**REFINED PHASE 2 — split it, because the two halves have very different risk:**
+
+*(2a) SYMBOL-ONLY MANGLING (the ABI half — safe, self-contained).* Mangle only the EMITTED LLVM
+name to `M__func`; keep source-level resolution flat. This addresses exactly the risk the master
+plan cites for doing LOCK-1 first ("bare `@name` symbols collide across packages -> ABI break if
+changed later") and does NOT break the bare-call convention, so none of the 1830+ stdlib modules
+need migrating. The map already establishes this is viable: inference resolves via
+`ti_modules[alias][value]` on the BARE name, so mangling emit-names alone does not break inference
+PROVIDED the `ti_fn_types`(bare) -> `frt`(emit) seed @19957 and the emit-keyed fixpoint @19997 are
+reconciled. Scope: the ~6 emit sites + the call sites + that one seam.
+NOTE its benefit is only realised once a package manager exists (6.1, still open) — until then it
+is pure future-proofing, which is the argument for doing it early rather than urgently.
+
+*(2b) MODULE-SCOPED RESOLUTION (the ergonomics half — genuinely XL).* Unprefixed same-named fns
+coexisting requires threading module context through lowering (absent today) across ~30 resolution
+sites and 11 name-keyed registries, and it BREAKS `seq_map(...)`-style bare calls. This is the part
+to schedule deliberately, not incrementally.
+
+**Do NOT attempt either half piecemeal.** The watch-list below lists 5 places that each
+independently pick/emit a callee name; any disagreement between them is a SILENT WRONG-CALLEE —
+the worst failure class, and one no existing test would catch.
