@@ -236,6 +236,19 @@ implementation is strictly worse than none here. NOT attempted — this is the "
 the plan calls it, and the failure mode is exactly the uninitialized/wrong-width read class this
 session spent its time eliminating.
 
+- ✅ `6bd9416d` (certified `f0421911`) **explicit SIMD path** — 7 builtins: `simd_add/sub/mul`,
+  `simd_scale`, `simd_dot/sum`, `simd_ready`. REAL vectorization, verified not assumed: clang reports
+  *"vectorized loop (vectorization width: 4, interleaved count: 4)"* = 4-wide AVX doubles. A raw
+  float list (elem_kind 2) is literally a contiguous `double[]`, so a plain loop over it vectorizes —
+  better than intrinsics here because one portable source covers SSE/AVX/NEON and the width follows
+  `-march`. SOUNDNESS: a boxed list holds POINTERS, so every kernel REFUSES unless both operands are
+  genuine raw float lists (empty list / 0.0 on refusal, never a garbage buffer); length mismatch uses
+  the SHORTER operand. `_kat_simd` pins that an int list AND a boxed float literal are both refused.
+  Also typed `simd_dot`/`simd_sum` float-returning in both whitelists — without that they returned
+  correct bits that `str()` printed as an integer (the CYCLE 3-G result-vs-operand-type class again).
+  KNOWN LIMITATION: a float LITERAL builds boxed, so it is not SIMD-ready; raw mode comes from
+  pushing floats. Making literals build raw is a separate list-literal-construction change.
+
 **NEXT (resume here):** the XL backlog — LOCK-4 inc3d (BLOCKED, see above) ·
 LOCK-1 full `@mod__fn` mangling · const generics · RC cycle collector · monotonic type-id vtables ·
 explicit SIMD · ARM aarch64 fibers · GPU lowering — **ATTENDED ONLY** (XL RC-lifetime work; a mistake

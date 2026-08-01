@@ -79,6 +79,13 @@
 > A fn returning `xs[0]`, `self.name`, its own param, or having any borrow path is REJECTED — pinned
 > by `_kat_w6_fresh_proof`, which also verifies the originals are unharmed. **Wave-B #6 CLOSED.**
 >
+> **✅ explicit SIMD path `6bd9416d`** (certified `f0421911`) — 7 vectorized kernels over raw float
+> lists; clang confirms 4-wide AVX. Refusal-guarded: a boxed list holds pointers, so non-raw operands
+> are rejected rather than misread as doubles. **LOCK-4 inc3d BLOCKED with evidence** — it changes
+> `NovaList.data`'s layout, and the runtime has 575 raw `->data[` reads vs only 34 `elem_kind` guards,
+> so a partial implementation is silent corruption. Needs a width-guard audit or a no-unguarded-access
+> proof; deliberately not attempted.
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
