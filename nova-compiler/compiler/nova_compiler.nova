@@ -8673,6 +8673,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_ws_spawn"
     else if name == "ws_task_count"
         "nova_rt_ws_task_count"
+    else if name == "ws_steal_count"
+        "nova_rt_ws_steal_count"
     else if name == "ws_shutdown"
         "nova_rt_ws_shutdown"
     else if name == "io_poll_create"
@@ -10156,6 +10158,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_ws_init(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_ws_spawn(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_ws_task_count() nounwind")
+    emit(cg, "declare i64 @nova_rt_ws_steal_count() nounwind")
     emit(cg, "declare i64 @nova_rt_ws_shutdown() nounwind")
     emit(cg, "declare i64 @nova_rt_io_poll_create() nounwind")
     emit(cg, "declare i64 @nova_rt_io_poll_add(i64, i64, i64) nounwind")
@@ -16367,6 +16370,7 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["hot_call3"] = NTypeScheme([], nt_fn([nt_int(), nt_any(), nt_any(), nt_any()], nt_any()))
     reg["ws_init"] = NTypeScheme([], nt_fn([nt_int()], nt_int()))
     reg["ws_spawn"] = NTypeScheme([], nt_fn([nt_any()], nt_int()))
+    reg["ws_steal_count"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["ws_task_count"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["ws_shutdown"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["io_poll_create"] = NTypeScheme([], nt_fn([], nt_int()))
@@ -24670,6 +24674,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_ws_init(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_ws_spawn(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_ws_task_count() nounwind")
+    ire_line(e, "declare i64 @nova_rt_ws_steal_count() nounwind")
     ire_line(e, "declare i64 @nova_rt_ws_shutdown() nounwind")
     ire_line(e, "declare i64 @nova_rt_io_poll_create() nounwind")
     ire_line(e, "declare i64 @nova_rt_io_poll_add(i64, i64, i64) nounwind")
@@ -24775,6 +24780,18 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     // (puts/printf/strcmp/nova_rt_*) — LLVM rejects duplicate
                     // declares with conflicting signatures.
                     let already_declared = en == "puts" or en == "printf" or en == "strcmp"
+                    // The comment above always CLAIMED nova_rt_* was covered here, but the check
+                    // never existed -- so `extern fn nova_rt_sched_slot_count()` (in _mn_churn)
+                    // emitted a SECOND declare of a symbol the runtime preamble already declares,
+                    // and LLVM rejects the whole module: "invalid redefinition of function".
+                    // Dedupe against what THIS module actually emitted rather than a hardcoded
+                    // name list, so any extern that shadows a runtime symbol is handled, not just
+                    // the three that happened to be known.
+                    if not already_declared
+                        let _dneedle = "@" + en + "("
+                        for _ol in e.ire_out
+                            if starts_with(_ol, "declare ") and contains(_ol, _dneedle)
+                                already_declared = true
                     let real_arg_sig = ""
                     let aj = 0
                     while aj < len(real_arg_types)
@@ -25862,19 +25879,24 @@ fn nova_find_runtime() -> string
         return env_rt
     let nh = env("NOVA_HOME")
     if len(nh) > 0
+        // CANONICAL FIRST. The runtime moved to compiler/ (nova_compiler.nova's sibling), but
+        // pre-move copies still sit at NOVA_HOME/nova_runtime.c and NOVA_HOME/output/. Probing
+        // those first let a STALE leftover shadow the live runtime: the REPL gate linked the old
+        // flat copy and died on `undefined symbol: nova_rt_rc_drop_temp` -- a symbol the live
+        // runtime has had since Wave-B #6. Ordering by canonical-ness makes a leftover harmless
+        // instead of silently authoritative.
+        let cand4 = path_join(nh, "compiler/nova_runtime.c")
+        if len(read_file(cand4)) > 100
+            return cand4
+        let cand3 = path_join(nh, "test_programs/compiler/nova_runtime.c")
+        if len(read_file(cand3)) > 100
+            return cand3
         let cand = path_join(nh, "output/nova_runtime.c")
         if len(read_file(cand)) > 100
             return cand
         let cand2 = path_join(nh, "nova_runtime.c")
         if len(read_file(cand2)) > 100
             return cand2
-        // canonical source lives in the compiler/ folder (nova_compiler.nova's sibling)
-        let cand3 = path_join(nh, "test_programs/compiler/nova_runtime.c")
-        if len(read_file(cand3)) > 100
-            return cand3
-        let cand4 = path_join(nh, "compiler/nova_runtime.c")
-        if len(read_file(cand4)) > 100
-            return cand4
     // Install-relative discovery: the runtime ships alongside the nova executable, so this works
     // from ANY cwd with NO env var -- the first-download experience (`nova run` in a fresh project).
     // gen3_test.exe / nova.exe sits next to output/nova_runtime.c (and a flat nova_runtime.c on install).

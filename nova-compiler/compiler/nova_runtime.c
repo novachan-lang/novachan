@@ -9037,6 +9037,12 @@ static void nova_mailbox_drain_close(int64_t handle) {
 static int nova_sched_root_exit = 0;
 static NovaSchedTask* nova_sched_root_task = NULL;
 
+/* Outstanding tasks on the work-stealing pool (defined with the WS subsystem further down).
+   They live in the per-worker deques, which nova_rq_pop() cannot see -- so without this the
+   carrier loop below mistakes "root parked on a channel + empty run queue" for a user
+   deadlock and quits silently, losing every message a ws task was about to send. */
+static int64_t nova_ws_outstanding(void);
+
 /* The carrier loop: run green tasks cooperatively until all are done (or the
    run-queue is empty while tasks remain parked — a user deadlock, which we
    bail out of rather than hang). */
@@ -9084,7 +9090,7 @@ int64_t nova_rt_sched_run(void) {
             if (g_carrier_count > 1) {
                 /* M:N: another carrier may still produce work (channel sends, spawns).
                    Exit when ALL tasks are done; otherwise brief idle then retry. */
-                if (nova_live_get() <= 0) break;
+                if (nova_live_get() <= 0 && nova_ws_outstanding() <= 0) break;
                 /* Stage 3b: Go-style root-exit at N>1 — PARITY with the single-carrier path below
                    (6651-6653). Once the ROOT (main) task has FINISHED, terminate even if a background
                    daemon still lingers (an SSE/WS keepalive ticker parked on sleep, or a stream parked
@@ -9123,7 +9129,7 @@ int64_t nova_rt_sched_run(void) {
                main FINISHES, a background task still blocked on I/O does NOT keep us alive. A true
                dead-peer recv now blocks (matching real blocking-recv semantics) rather than
                silently quitting; kill-on-timeout bounds a hung test. */
-            if ((nova_sleep_waiters || nova_offload_waiters || nova_io_waiters || nova_sched_has_timed_io() || nova_sched_has_listener()) &&
+            if ((nova_sleep_waiters || nova_offload_waiters || nova_io_waiters || nova_sched_has_timed_io() || nova_sched_has_listener() || nova_ws_outstanding() > 0) &&
                 nova_sched_root_task && nova_sched_root_task->status != 3) continue;
             break;   /* nothing runnable; no live-root timer/offload/io/timed-io/listener pending => done */
         }
@@ -9505,6 +9511,7 @@ static NovaWSWorker g_ws_workers[NOVA_WS_MAX_WORKERS];
 static int g_ws_worker_count = 0;
 static volatile int g_ws_shutdown = 0;
 static volatile int64_t g_ws_total_tasks = 0;
+static volatile int64_t g_ws_steals = 0;   /* successful steals; proves the deque actually load-balances */
 
 static void ws_deque_init(NovaWSDeque* d) {
     memset(d->buf, 0, sizeof(d->buf));
@@ -9598,6 +9605,13 @@ ws_worker_loop(void* arg) {
         if (!task && g_ws_worker_count > 1) {
             int victim = ws_random_victim(w->id, g_ws_worker_count);
             task = ws_deque_steal(&g_ws_workers[victim].deque);
+            if (task) {
+#ifdef _WIN32
+                InterlockedIncrement64(&g_ws_steals);
+#else
+                __sync_fetch_and_add(&g_ws_steals, 1);
+#endif
+            }
         }
         if (task) {
             spin = 0;
@@ -9635,12 +9649,30 @@ ws_worker_loop(void* arg) {
 #endif
 }
 
+/* Idempotent lazy start. `ws_spawn` is exposed to NOVA but `ws_init` was NOT, so a program
+   could reach ws_spawn with g_ws_worker_count == 0 — and ws_spawn indexes with
+   `g_ws_total_tasks % g_ws_worker_count`, i.e. an integer DIVISION BY ZERO. Verified: the
+   probe died before its next print (SIGFPE). Auto-starting on first use makes the exposed
+   builtin usable on its own, and the explicit ws_init(n) still overrides the worker count
+   BEFORE any spawn. */
+int64_t nova_rt_ws_init(int64_t num_workers);
+int64_t nova_rt_cpu_count(void);   /* fwd: defined further down */
+static void nova_ws_ensure_started(void) {
+    if (g_ws_worker_count <= 0) {
+        int hw = (int)nova_rt_cpu_count();
+        if (hw <= 0) hw = 4;
+        if (hw > NOVA_WS_MAX_WORKERS) hw = NOVA_WS_MAX_WORKERS;
+        nova_rt_ws_init(hw);
+    }
+}
+
 int64_t nova_rt_ws_init(int64_t num_workers) {
     int n = (int)num_workers;
     if (n <= 0 || n > NOVA_WS_MAX_WORKERS) n = 4;
     g_ws_worker_count = n;
     g_ws_shutdown = 0;
     g_ws_total_tasks = 0;
+    g_ws_steals = 0;
     for (int i = 0; i < n; i++) {
         g_ws_workers[i].id = i;
         g_ws_workers[i].active = 1;
@@ -9657,6 +9689,8 @@ int64_t nova_rt_ws_init(int64_t num_workers) {
 }
 
 int64_t nova_rt_ws_spawn(int64_t closure) {
+    nova_ws_ensure_started();   /* see nova_ws_ensure_started: without this, an uninitialised pool
+                                   made the very next line a division by zero. */
     NovaSchedTask* t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
     if (!t) return 0;
     t->fiber = nova_rt_fiber_create(closure);
@@ -9678,6 +9712,12 @@ int64_t nova_rt_ws_spawn(int64_t closure) {
     int target = (int)(g_ws_total_tasks % g_ws_worker_count);
     ws_deque_push(&g_ws_workers[target].deque, t);
     return (int64_t)(uintptr_t)t;
+}
+
+static int64_t nova_ws_outstanding(void) { return g_ws_total_tasks; }
+
+int64_t nova_rt_ws_steal_count(void) {
+    return g_ws_steals;
 }
 
 int64_t nova_rt_ws_task_count(void) {
@@ -18077,21 +18117,57 @@ int64_t nova_rt_pbkdf2_sha256(int64_t pw_val, int64_t salt_val, int64_t iters, i
 
 /* ── Security primitives (LOCK-7: constant-time + secure wipe) ────────────── */
 
-int64_t nova_rt_secure_zero(int64_t str_handle) {
-    const char* s = (const char*)(uintptr_t)str_handle;
-    if (!s) return 0;
-    size_t len = strlen(s);
-    if (len == 0) return 0;
-#ifdef _WIN32
-    SecureZeroMemory((void*)(uintptr_t)str_handle, len);
-#elif defined(__STDC_LIB_EXT1__)
-    memset_s((void*)(uintptr_t)str_handle, len, 0, len);
-#else
-    volatile unsigned char* p = (volatile unsigned char*)(uintptr_t)str_handle;
-    for (size_t i = 0; i < len; i++) p[i] = 0;
-    __asm__ __volatile__("" ::: "memory");
-#endif
+/* Resolve the TRUE byte span of a secret-bearing value.
+   `strlen` is WRONG for both of these primitives: key material and MAC tags are binary and
+   routinely contain 0x00. Truncating at the first NUL means secure_zero leaves most of a key
+   in memory, and ct_eq compares only a prefix -- an authentication BYPASS (two tags that both
+   begin with 0x00 compare "equal"). So dispatch on the tag and use the real length.
+   `writable` = the caller intends to MUTATE the span. In that mode a non-heap value (a string
+   literal living in .rdata) must be REFUSED: wiping it would either fault or corrupt the
+   program's constant pool. Read-only callers may still fall back to a plain C string. */
+static int nova_secret_span(int64_t h, unsigned char** out, size_t* len, int writable) {
+    *out = NULL; *len = 0;
+    if (!h) return 0;
+    void* ptr = (void*)(uintptr_t)h;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_BYTES) {
+        NovaBytes* b = (NovaBytes*)ptr;
+        if (!b->data && b->size) return 0;
+        *out = b->data; *len = (size_t)b->size; return 1;
+    }
+    if (tag == NOVA_MEM_FAT_STR) {
+        int64_t n = NOVA_FAT_LEN((const char*)ptr);
+        if (n < 0) return 0;
+        *out = (unsigned char*)ptr; *len = (size_t)n; return 1;
+    }
+    if (tag == NOVA_MEM_RAW) {            /* heap C string: strlen IS its length */
+        *out = (unsigned char*)ptr; *len = strlen((const char*)ptr); return 1;
+    }
+    if (!writable && nova_is_readable_str(ptr)) {   /* literal / static: compare-only */
+        *out = (unsigned char*)ptr; *len = strlen((const char*)ptr); return 1;
+    }
     return 0;
+}
+
+int64_t nova_rt_secure_zero(int64_t str_handle) {
+    unsigned char* p; size_t len;
+    /* writable=1: refuse anything not proven to be heap-owned rather than issuing a wild
+       write through an unvalidated handle (an `any`-typed int would otherwise be a
+       write-what-where primitive -- strictly worse than the wild READ class already fixed). */
+    if (!nova_secret_span(str_handle, &p, &len, 1)) return 0;
+    if (len == 0) return 1;
+#ifdef _WIN32
+    SecureZeroMemory(p, len);
+#elif defined(__STDC_LIB_EXT1__)
+    memset_s(p, len, 0, len);
+#else
+    {
+        volatile unsigned char* v = (volatile unsigned char*)p;
+        for (size_t i = 0; i < len; i++) v[i] = 0;
+        __asm__ __volatile__("" ::: "memory");
+    }
+#endif
+    return 1;   /* 1 = actually wiped, 0 = refused. No NOVA caller read the old constant 0. */
 }
 
 #ifdef __clang__
@@ -18100,15 +18176,20 @@ __attribute__((optnone, noinline))
 __attribute__((optimize("O0"), noinline))
 #endif
 int64_t nova_rt_ct_eq(int64_t a_handle, int64_t b_handle) {
-    const char* a = (const char*)(uintptr_t)a_handle;
-    const char* b = (const char*)(uintptr_t)b_handle;
-    if (!a) a = "";
-    if (!b) b = "";
-    size_t la = strlen(a), lb = strlen(b);
+    unsigned char* a; unsigned char* b; size_t la, lb;
+    if (!nova_secret_span(a_handle, &a, &la, 0)) { a = (unsigned char*)""; la = 0; }
+    if (!nova_secret_span(b_handle, &b, &lb, 0)) { b = (unsigned char*)""; lb = 0; }
     volatile uint8_t diff = (la != lb) ? 1 : 0;
-    size_t len = la < lb ? la : lb;
-    for (size_t i = 0; i < len; i++) {
-        diff |= ((uint8_t)a[i] ^ (uint8_t)b[i]);
+    /* Sweep the LONGER span, substituting 0 past each end. The old loop ran min(la,lb) and so
+       skipped every byte beyond the shorter operand; combined with strlen truncation that let a
+       prefix match stand in for a full-tag match. The bounds here depend only on LENGTHS -- never
+       on secret CONTENT -- so no branch is secret-dependent. (Leaking length is the same trade
+       Go's subtle.ConstantTimeCompare and Python's hmac.compare_digest accept.) */
+    size_t n = la > lb ? la : lb;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t av = (i < la) ? a[i] : 0;
+        uint8_t bv = (i < lb) ? b[i] : 0;
+        diff |= (uint8_t)(av ^ bv);
     }
     return diff == 0 ? 1 : 0;
 }

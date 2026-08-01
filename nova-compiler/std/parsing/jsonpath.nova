@@ -8,6 +8,7 @@
 //   .key      — child key
 //   ['key']   — bracket child key (single-quoted)
 //   [n]       — index (negative = from end)
+//   [a:b]     — slice, half-open; either side omittable; negative = from end
 //   [*]       — all children wildcard
 //   ..*       — recursive wildcard (all descendants)
 //   ..key     — recursive descent then child key
@@ -15,7 +16,7 @@
 //
 // TOKEN STREAM (produced by _jp_lex):
 //   {k:"root"}  {k:"dot"}  {k:"dotdot"}  {k:"key",v:<s>}
-//   {k:"idx",v:<int>}  {k:"star"}  {k:"end"}
+//   {k:"idx",v:<int>}  {k:"slice",a,b,ha,hb}  {k:"star"}  {k:"end"}
 //
 // EVALUATION:
 //   _jp_eval(nodes, toks, ti) applies toks[ti..] to the current node-set.
@@ -170,13 +171,20 @@ fn _jp_lex(path)
                     if i < n
                         if slice(path, i, i+1) == "]"
                             i = i + 1
-                else if ch2 == "'"
+                else if ch2 == "'" or ch2 == "\""
+                    // Bracket key, EITHER quote style. JSONPath permits both `['k']` and
+                    // `["k"]`; only the single-quoted form was handled, so a double-quoted
+                    // key fell through to the integer branch, parsed no digits, and was
+                    // skipped entirely -- the whole selector silently matched nothing.
+                    // Close on the SAME quote char that opened, so a `'` inside a
+                    // double-quoted key (and vice versa) is data, not a terminator.
+                    let qch = ch2
                     i = i + 1
                     let acc = ""
                     let going = 1
                     while i < n and going == 1
                         let kch = slice(path, i, i+1)
-                        if kch == "'"
+                        if kch == qch
                             going = 0
                         else
                             acc = acc + kch
@@ -192,7 +200,41 @@ fn _jp_lex(path)
                     let iv = pret[0]
                     let ni = pret[1]
                     let got = pret[2]
+                    // SLICE `[a:b]` (either side omittable, negative allowed). std/data/jsonpath
+                    // has ADVERTISED slices in its header since it shipped, but this engine never
+                    // implemented them: after reading `0` from `[0:2]` it emitted a plain idx and
+                    // left `:2]` to be re-scanned as garbage, so `[0:2]` matched ONE element.
+                    // A ':' here (with or without a preceding int) means slice, not index.
+                    let is_slice = 0
                     if got == 1
+                        if ni < n
+                            if slice(path, ni, ni+1) == ":"
+                                is_slice = 1
+                    else
+                        if slice(path, i, i+1) == ":"
+                            is_slice = 1
+                    if is_slice == 1
+                        let has_a = got
+                        let a_val = iv
+                        if got == 1
+                            i = ni
+                        i = i + 1                      // consume ':'
+                        let eret = _jp_parse_int(path, i)
+                        let b_val = eret[0]
+                        let has_b = eret[2]
+                        if has_b == 1
+                            i = eret[1]
+                        if i < n
+                            if slice(path, i, i+1) == "]"
+                                i = i + 1
+                        let sld = {}
+                        sld["k"] = "slice"
+                        sld["a"] = a_val
+                        sld["b"] = b_val
+                        sld["ha"] = has_a
+                        sld["hb"] = has_b
+                        push(toks, sld)
+                    else if got == 1
                         i = ni
                         if i < n
                             if slice(path, i, i+1) == "]"
@@ -293,6 +335,31 @@ fn _jp_step(node, tok)
             if real >= 0
                 if real < sz
                     push(result, node[real])
+    else if tk == "slice"
+        // Half-open [a,b) with Python/JSONPath clamping: omitted start = 0, omitted end = len,
+        // negatives count from the end, and out-of-range ends are clamped rather than erroring
+        // (a slice past the end yields fewer elements, never a fault).
+        if type_of(node) == "list"
+            let sz = len(node)
+            let a = 0
+            if tok["ha"] == 1
+                a = tok["a"]
+                if a < 0
+                    a = sz + a
+            let b = sz
+            if tok["hb"] == 1
+                b = tok["b"]
+                if b < 0
+                    b = sz + b
+            if a < 0
+                a = 0
+            if b > sz
+                b = sz
+            let si2 = a
+            while si2 < b
+                if si2 >= 0
+                    push(result, node[si2])
+                si2 = si2 + 1
     else if tk == "star"
         let kind = type_of(node)
         if kind == "list"
@@ -358,6 +425,17 @@ fn _jp_eval(nodes, toks, ti, depth)
             ni = ni + 1
         result = _jp_eval(next_nodes, toks, ti+1, depth+1)
     else if tk == "idx"
+        let next_nodes = []
+        let ni = 0
+        while ni < len(nodes)
+            let sub = _jp_step(nodes[ni], tok)
+            let si = 0
+            while si < len(sub)
+                push(next_nodes, sub[si])
+                si = si + 1
+            ni = ni + 1
+        result = _jp_eval(next_nodes, toks, ti+1, depth+1)
+    else if tk == "slice"
         let next_nodes = []
         let ni = 0
         while ni < len(nodes)
