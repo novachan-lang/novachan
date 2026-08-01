@@ -10540,6 +10540,21 @@ fn ir_mark_move_sends(b: IrBuilder, stmts: list)
 
 // ── Lambda Lifting ──────────────────────────────────────────────────────────
 
+// CYCLE 2: is `name` an ELEMENT-WISE HOF, i.e. one whose callback takes a single list element as
+// its FIRST parameter? Those are the ones where the receiver's element struct type can be pushed
+// onto the lambda's param. Deliberately EXCLUDES reduce/fold — their callback is (acc, elem), so
+// the element is the SECOND parameter and a first-param hint would type the accumulator wrongly.
+fn _ir_is_elem_hof(name: string) -> bool
+    if name == "map" or name == "filter" or name == "each" or name == "find"
+        return true
+    if name == "any" or name == "all" or name == "sort_by" or name == "count_where"
+        return true
+    if name == "take_while" or name == "drop_while" or name == "flat_map"
+        return true
+    if name == "group_by" or name == "min_by" or name == "max_by" or name == "partition"
+        return true
+    false
+
 fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) -> string
     let lname = "__lambda_" + str(b.ir_lamc)
     let tname = "__tramp_" + str(b.ir_lamc)
@@ -10549,12 +10564,29 @@ fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) ->
     let all_params = []
     for fv in captures
         push(all_params, Param(fv, "", null_expr()))
+    // CYCLE 2 — HOF LAMBDA PARAM TYPING. A lambda param is normally untyped, so in
+    // `items.map(fn(x) x.price)` the field read `x.price` lowers as a typ="any" field_get and the
+    // lambda's analyzed return type is "any" — which means the box-at-trampoline gate (frt=="float")
+    // never fires and the raw IEEE-754 bits leak into the result list.
+    // When the callback is being passed to an element-wise HOF over a list whose element struct type
+    // is known, the caller parks that type in a reserved key and we type the FIRST lambda param with
+    // it, so `x.price` resolves to the real float field. The hint is consumed here (single-shot) so a
+    // nested/unrelated lambda can never pick it up.
+    let _lp_hint = ""
+    if contains(b.ir_list_elem_stype, "@lambda_param_hint@")
+        _lp_hint = b.ir_list_elem_stype["@lambda_param_hint@"]
+        b.ir_list_elem_stype["@lambda_param_hint@"] = ""
     let lam_pnames = []
+    let _lp_i = 0
     for p in lam_params
         match p
             Expr(pt, pv, pn, pc, pf, pln3) =>
-                push(all_params, Param(pv, "", null_expr()))
+                let _lp_t = ""
+                if _lp_i == 0 and _lp_hint != ""
+                    _lp_t = _lp_hint
+                push(all_params, Param(pv, _lp_t, null_expr()))
                 push(lam_pnames, pv)
+        _lp_i = _lp_i + 1
 
     // Save builder state
     let save_insts = b.ir_insts
@@ -11331,6 +11363,11 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     for oi in b.ir_extern_out_idx[fn_name]
                         out_set[str(oi)] = 1
                 let ci = 0
+                // CYCLE 2: `map(xs, fn(e) ...)` — the plain-call twin of the method form. Park the
+                // element struct type so ir_lift_lambda can type the callback's first param.
+                let _chof_elem = ""
+                if len(children) > 0 and _ir_is_elem_hof(fn_name)
+                    _chof_elem = ir_list_elem_struct(b, children[0])
                 for child in children
                     if contains(out_set, str(ci))
                         match child
@@ -11342,7 +11379,10 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                     ir_emit_inst(b, "slot_addr", dest, ir_type_int(), [], "__bad_out", 0)
                                 push(arg_regs, dest)
                     else
+                        if ci == 1 and _chof_elem != ""
+                            b.ir_list_elem_stype["@lambda_param_hint@"] = _chof_elem
                         push(arg_regs, ir_lower_expr(b, child))
+                        b.ir_list_elem_stype["@lambda_param_hint@"] = ""
                     ci = ci + 1
                 // variadic call: if the callee's last param is a rest param (`T...`),
                 // pack the trailing args into a single list and pass it as that param.
@@ -11601,9 +11641,19 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                     let dest = ir_fresh_reg(b)
                                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
                                     return dest
+                // CYCLE 2: for `xs.map(fn(e) ...)` park the receiver's element struct type so
+                // ir_lift_lambda can type the callback's first param (see the note there).
+                let _hof_elem = ""
+                if len(children) > 0 and _ir_is_elem_hof(value)
+                    _hof_elem = ir_list_elem_struct(b, children[0])
                 let arg_regs = []
+                let _hof_ai = 0
                 for child in children
+                    if _hof_ai == 1 and _hof_elem != ""
+                        b.ir_list_elem_stype["@lambda_param_hint@"] = _hof_elem
                     push(arg_regs, ir_lower_expr(b, child))
+                    b.ir_list_elem_stype["@lambda_param_hint@"] = ""
+                    _hof_ai = _hof_ai + 1
                 let dest = ir_fresh_reg(b)
                 let resolved_method = ""
                 if len(children) > 0
@@ -24765,7 +24815,23 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             pi2 = pi2 + 1
         call_str = call_str + ")"
         ire_indent(e, "%result = " + call_str)
-        ire_indent(e, "ret i64 %result")
+        // CYCLE 2 — BOX AT THE TRAMPOLINE. A float-returning callback returns RAW IEEE-754 bits
+        // (the raw-float ABI), but every HOF (map/filter/reduce/sort_by) stores the trampoline's
+        // result into an `any` container. Storing raw bits there means the value is later read back
+        // as an int: `map(get_price)` yielded 4617878467915022336 instead of 20.25.
+        // The trampoline is the single any-widen point every callback flows through, so boxing here
+        // covers named fns, lambdas and the `xs.map(f)` method path uniformly.
+        // Gated on the TARGET's analyzed return type being exactly "float": an "any" return is
+        // already boxed by its own producer, so this never double-boxes.
+        let _tr_boxes = 0
+        if contains(frt, target)
+            if frt[target] == "float"
+                _tr_boxes = 1
+        if _tr_boxes == 1
+            ire_indent(e, "%boxed = call i64 @nova_rt_box_float(i64 %result)")
+            ire_indent(e, "ret i64 %boxed")
+        else
+            ire_indent(e, "ret i64 %result")
         ire_line(e, "}")
         ire_line(e, "")
 
