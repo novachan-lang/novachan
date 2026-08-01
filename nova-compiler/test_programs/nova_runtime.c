@@ -5402,6 +5402,7 @@ static void jbuf_char(JsonBuf* b, char c) { jbuf_append(b, &c, 1); }
    without needing the NovaStructMeta definition this early in the file. */
 static int nova_struct_meta_fcount(int64_t hash);
 static const char* nova_struct_meta_fname(int64_t hash, int idx);
+static int nova_struct_meta_redacted(int64_t hash, int idx);   /* LOCK-7 @redact */
 static const char* nova_struct_meta_ftype(int64_t hash, int idx);
 static const char* nova_struct_meta_name(int64_t hash);
 
@@ -5518,6 +5519,11 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
                 jbuf_char(b, ':');
                 int64_t _fv = slots[_si + 1];   /* slot 0 = type hash */
                 const char* _ft = nova_struct_meta_ftype(_shash, _si);
+                if (nova_struct_meta_redacted(_shash, _si)) {
+                    /* KEY is kept, VALUE masked: the payload shape stays valid for consumers. */
+                    json_stringify_str(b, "***");
+                    continue;
+                }
                 /* Struct fields are stored RAW per their declared type, so bool/float must
                    be rendered type-aware (a raw bool is 0/1, a raw float is double bits) --
                    matching the compile-time <T>__to_json. int/string/struct/list/dict and
@@ -5644,6 +5650,10 @@ static void json_pretty_value(JsonBuf* b, int64_t val, int depth, int indent) {
                 jbuf_append(b, ": ", 2);
                 int64_t _fv = slots[_si + 1];
                 const char* _ft = nova_struct_meta_ftype(_shash, _si);
+                if (nova_struct_meta_redacted(_shash, _si)) {
+                    json_stringify_str(b, "***");
+                    continue;
+                }
                 if (_ft && strcmp(_ft, "bool") == 0) {
                     if (_fv) jbuf_append(b, "true", 4); else jbuf_append(b, "false", 5);
                 } else if (_ft && strcmp(_ft, "float") == 0 &&
@@ -5967,6 +5977,10 @@ static int64_t nova_struct_to_str(int64_t val) {
         const char* fn = nova_struct_meta_fname(h, i);
         if (fn) jbuf_append(&b, fn, (int64_t)strlen(fn));
         jbuf_append(&b, ": ", 2);
+        if (nova_struct_meta_redacted(h, i)) {
+            jbuf_append(&b, "\"***\"", 5);
+            continue;
+        }
         int64_t fv = slots[i + 1];   /* slot 0 = type hash */
         const char* ft = nova_struct_meta_ftype(h, i);
         /* Raw bool/float fields rendered type-aware (matches the compile-time __show);
@@ -18697,6 +18711,10 @@ typedef struct {
     const char**  fnames;
     const char**  ftypes;
     int32_t       fcount;
+    /* LOCK-7 @redact: bit i set => field i is a SECRET. Rendering paths substitute a mask
+       so a password/token cannot ride along in a log line or a serialized payload. A 64-bit
+       mask covers every struct in practice; fields past 63 are simply not redactable. */
+    uint64_t      redact_mask;
 } NovaStructMeta;
 static NovaStructMeta g_struct_meta[NOVA_MAX_STRUCT_TYPES];
 static int            g_struct_meta_count = 0;
@@ -18717,6 +18735,7 @@ void nova_rt_register_struct_meta(int64_t hash, int64_t name_val, int64_t fcount
     g_struct_meta[idx].fnames = fn;
     g_struct_meta[idx].ftypes = ft;
     g_struct_meta[idx].fcount = (int32_t)n;
+    g_struct_meta[idx].redact_mask = 0;
 }
 void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val, int64_t ftype_val) {
     for (int i = 0; i < g_struct_meta_count; i++) {
@@ -18730,6 +18749,11 @@ void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val,
         }
     }
 }
+void nova_rt_register_struct_redact(int64_t hash, int64_t mask) {
+    for (int i = 0; i < g_struct_meta_count; i++) {
+        if (g_struct_meta[i].hash == hash) { g_struct_meta[i].redact_mask = (uint64_t)mask; return; }
+    }
+}
 static const NovaStructMeta* nova_struct_meta_for_hash(int64_t hash) {
     for (int i = 0; i < g_struct_meta_count; i++)
         if (g_struct_meta[i].hash == hash) return &g_struct_meta[i];
@@ -18740,6 +18764,11 @@ static const NovaStructMeta* nova_struct_meta_for_hash(int64_t hash) {
 static int nova_struct_meta_fcount(int64_t hash) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
     return m ? (int)m->fcount : 0;
+}
+static int nova_struct_meta_redacted(int64_t hash, int idx) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    if (!m || idx < 0 || idx > 63) return 0;
+    return (m->redact_mask >> idx) & 1u;
 }
 static const char* nova_struct_meta_fname(int64_t hash, int idx) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);

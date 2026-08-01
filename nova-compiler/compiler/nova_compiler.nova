@@ -2967,6 +2967,8 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             p = p + 1
     let p2 = skip_nl(tokens, p)
     let fields = []
+    let redact_idx = []          // LOCK-7 @redact: indices of secret fields
+    let redact_pending = 0
     while tk(tokens, p2) != "EOF"
         let cur_tok = tokens[p2]
         match cur_tok
@@ -3009,10 +3011,21 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                             // closing )'. ti_ann_to_type_g maps the "?" suffix to nt_sum(T, unit).
                             ftype = ftype + "?"
                             p2 = p2 + 1
+                        if redact_pending == 1
+                            push(redact_idx, len(fields))
+                            redact_pending = 0
                         push(fields, Param(fname, ftype, null_expr()))
                         p2 = skip_nl(tokens, p2)
                     else
                         break
+                else if k == "AT" and p2 + 1 < len(tokens) and tv(tokens, p2 + 1) == "redact"
+                    // LOCK-7 @redact: the NEXT field is a secret. Only a FLAG is set -- `fields`
+                    // must stay a clean list of real Params, because the TYPE CHECKER reads
+                    // Stmt.params directly for constructor arity, so a marker Param would
+                    // silently add a phantom constructor argument.
+                    redact_pending = 1
+                    p2 = p2 + 2
+                    p2 = skip_nl(tokens, p2)
                 else if k == "IDENT" or (k == "KW" and p2 + 1 < len(tokens) and tk(tokens, p2 + 1) == "COLON")
                     // A field name may be a KEYWORD (e.g. `type`, `value`) when followed by `:`
                     // — without this, an indented keyword-named field silently TRUNCATED the
@@ -3054,6 +3067,9 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                             // closing )'. ti_ann_to_type_g maps the "?" suffix to nt_sum(T, unit).
                             ftype = ftype + "?"
                             p2 = p2 + 1
+                        if redact_pending == 1
+                            push(redact_idx, len(fields))
+                            redact_pending = 0
                         push(fields, Param(fname, ftype, null_expr()))
                     p2 = skip_nl(tokens, p2)
                 else
@@ -3066,6 +3082,8 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         push(type_annotations, Expr("generics", "", 0, tg_children, [], ln))
     for it in impl_traits
         push(type_annotations, Expr("impl_trait", it, 0, [], [], ln))
+    for ri in redact_idx
+        push(type_annotations, Expr("redact", str(ri), 0, [], [], ln))
     StmtParseResult(Stmt("type", name, null_expr(), [], fields, [], type_annotations, ln), p2)
 
 fn parse_trait_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
@@ -3663,7 +3681,7 @@ fn _is_valid_struct_name(s: string) -> int
         return 1
     return 0
 
-fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stmt
+fn _make_show_method(tname: string, fields: list, derived: dict, redacted: dict, ln: int) -> Stmt
     let acc = Expr("str", tname + " \{", 0, [], [], ln)
     let i = 0
     let n = len(fields)
@@ -3676,7 +3694,11 @@ fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stm
                 acc = Expr("binop", "+", 0, [acc, Expr("str", sep + fname + ": ", 0, [], [], ln)], [], ln)
                 let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
                 let rendered = Expr("call", "str", 0, [memb], [], ln)
-                if ftype == "bool"
+                // LOCK-7 @redact: a secret field renders as a MASK. The field is never read,
+                // so the value cannot reach a log line even via a partial render.
+                if contains(redacted, str(i))
+                    rendered = Expr("str", chr(34) + "***" + chr(34), 0, [], [], ln)
+                else if ftype == "bool"
                     // bool field accesses are i64 0/1 at the IR level (bool-ness is
                     // erased on member load); index a {false,true} table by the value
                     // so it renders true/false robustly.
@@ -3698,7 +3720,7 @@ fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stm
 // Field VALUES go through json_stringify (handles int/float/string-escaping/list/dict);
 // nested struct fields recurse via self.f.to_json(). Keys are built with chr(34) (literal
 // quote) so no string-escape ambiguity. The DB/HTTP serialize keystone — zero annotation.
-fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> Stmt
+fn _make_to_json_method(tname: string, fields: list, jsonset: dict, redacted: dict, ln: int) -> Stmt
     let acc = Expr("str", "\{", 0, [], [], ln)
     let i = 0
     let n = len(fields)
@@ -3711,7 +3733,11 @@ fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> 
                 acc = Expr("binop", "+", 0, [acc, Expr("str", key, 0, [], [], ln)], [], ln)
                 let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
                 let jval = Expr("call", "json_stringify", 0, [memb], [], ln)
-                if ftype == "bool"
+                // LOCK-7 @redact: mask the VALUE, keep the KEY -- consumers still get a
+                // well-formed object of the expected shape.
+                if contains(redacted, str(i))
+                    jval = Expr("str", chr(34) + "***" + chr(34), 0, [], [], ln)
+                else if ftype == "bool"
                     // bool erases to i64 0/1 on member load; index a {false,true}
                     // table -> a valid JSON true/false token.
                     jval = Expr("index", "", 0, [Expr("list", "", 0, [Expr("str", "false", 0, [], [], ln), Expr("str", "true", 0, [], [], ln)], [], ln), memb], [], ln)
@@ -4466,10 +4492,19 @@ fn expand_derives(stmts: list) -> list
             Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
                 if stag == "type"
                     if _is_valid_struct_name(sname) == 1
+                        // LOCK-7 @redact: field indices carried on the type's annotations.
+                        // from_json is deliberately NOT redacted -- it PARSES input rather
+                        // than disclosing a stored secret.
+                        let _redset = {}
+                        for _ra in sanns
+                            match _ra
+                                Expr(_rat, _rav, _ran, _rac, _raf, _ral) =>
+                                    if _rat == "redact"
+                                        _redset[_rav] = 1
                         if contains(user_fns, sname + "__show") == 0
-                            push(generated, _make_show_method(sname, sparams, showset, sln))
+                            push(generated, _make_show_method(sname, sparams, showset, _redset, sln))
                         if contains(user_fns, sname + "__to_json") == 0
-                            push(generated, _make_to_json_method(sname, sparams, jsonset, sln))
+                            push(generated, _make_to_json_method(sname, sparams, jsonset, _redset, sln))
                         if contains(user_fns, sname + "__from_json") == 0
                             push(generated, _make_from_json_method(sname, sparams, jsonset, sln))
                         // __from_json_safe is built from the `ok`/`err` Result constructors. If THIS
@@ -11004,9 +11039,10 @@ type IrBuilder
     ir_result_elem_stype: dict
     ir_label_hdrs: dict
     ir_label_exits: dict
+    ir_sredact: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {}, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {}, {}, {}, {}, {})
 
 // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
 // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
@@ -23182,6 +23218,16 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             Expr(at, av, an2, ac, af, al) =>
                                 if at == "ann" and av == "opaque"
                                     b.ir_opaque_types[name] = 1
+                                if at == "redact"
+                                    // LOCK-7: bit i => field i is a secret. The runtime indexes
+                                    // fields from 0 (slot 0 is the type hash), so no shift here --
+                                    // unlike ir_repr's bitmap, which is SLOT-based and shifts by 1.
+                                    let _ridx = int(av)
+                                    if _ridx >= 0 and _ridx < 63
+                                        if contains(b.ir_sredact, name)
+                                            b.ir_sredact[name] = b.ir_sredact[name] + (1 << _ridx)
+                                        else
+                                            b.ir_sredact[name] = 1 << _ridx
                                 if at == "ann_with_arg" and av == "repr" and len(ac) > 0
                                     match ac[0]
                                         Expr(stg, sav, sn2, sac2, saf2, sal2) =>
@@ -23449,6 +23495,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare void @nova_rc_inc(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_field_set(i64, i64, i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_register_struct_bitmap(i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_register_struct_redact(i64, i64) nounwind")
     // BEAT C: LLVM hardware math intrinsics (sqrtsd / native libm, no errno branch) used to
     // inline the float math builtins when the arg is a PROVEN raw double (ire_proven_float).
     ire_line(e, "declare double @llvm.sqrt.f64(double)")
@@ -25458,6 +25505,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             _bfi = _bfi + 1
                 if _bmask != 0
                     ire_indent(e, "call void @nova_rt_register_struct_bitmap(i64 " + st_hash + ", i64 " + fmt_i64_decimal(_bmask) + ")")
+                if contains(b.ir_sredact, st_name)
+                    ire_indent(e, "call void @nova_rt_register_struct_redact(i64 " + st_hash + ", i64 " + fmt_i64_decimal(b.ir_sredact[st_name]) + ")")
                 let _fi = 0
                 for _fp in _flds
                     match _fp
