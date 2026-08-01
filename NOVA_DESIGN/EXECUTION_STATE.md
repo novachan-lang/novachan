@@ -200,7 +200,34 @@ function call. Closing it needs the producer whitelist to cover user fns, which 
 a callee returns a fresh allocation rather than a borrow (a borrow would be CORE_GAP 0.10). Not
 guessed at.
 
-**NEXT (resume here):** insert-of-user-call-result (the `call` column), then the XL backlog — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
+- ✅ `c9659065` (certified `046943b4`) **Wave-B #6 part 4 — fresh-return PROOF. The last column falls:
+  `call` 2001 -> 2. ALL THREE columns now read `concat=2 call=2 dictset=2`.**
+  To MOVE a user call's result the caller must know the callee returned a +1 it OWNS, not a BORROW
+  (a fn returning `xs[0]`/`self.name` hands back a pointer its container still owns — dropping that
+  is CORE_GAP 0.10 UAF). So it is PROVEN, whole-program and fail-closed, exactly like the existing
+  `_s1` struct-return prover: a fn qualifies ONLY if EVERY return hands back a register whose
+  defining instruction is itself a proven fresh allocation. Param / slot_load / index_get /
+  field_get / unproven call / constant all disqualify. No fixpoint over call chains.
+  **Why it silently didn't fire at first:** `all_fns` holds PRE-INFERENCE IR, where a string `+` is
+  an untyped `add` — the str type that marks it fresh is assigned by `ir_infer_types`. So
+  `return "item-" + str(i)` looked like a plain add and was rejected. The prover now types each fn
+  first. The failure mode was SAFE (fail-closed -> no drops emitted, leak simply stayed), which is
+  exactly why it was invisible without a diagnostic.
+  **Safety pinned by `_kat_w6_fresh_proof`:** PROVEN = make_fresh; REJECTED = borrow_elem (`xs[0]`),
+  borrow_field (`bx.b_name`), borrow_param, mixed (one fresh path + one borrow path). After
+  inserting those borrowed values the originals are verified intact. ASAN-clean, 18 KATs green.
+
+**WAVE-B #6 FINAL SCOREBOARD (per 1000 iterations) — CLOSED:**
+| part | class | before | after |
+|---|---|---|---|
+| 1 `c6ca9ad7` | temp-arg | 2000 | 1000 |
+| 2 `23af36ca` | slot-rebind strings | 1000 | 1 |
+| 3 `f74454c1` | MOVE-on-insert | 2001 | 2 |
+| 4 `c9659065` | insert of user call | 2001 | 2 |
+
+**NEXT (resume here):** the XL backlog — LOCK-4 inc3d (packed sized arrays, completes LOCK-4) ·
+LOCK-1 full `@mod__fn` mangling · const generics · RC cycle collector · monotonic type-id vtables ·
+explicit SIMD · ARM aarch64 fibers · GPU lowering — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
 LOCK-6 Phase 2 (`@cdecl`, XL ABI) · LOCK-5 (safepoint+kill, XL scheduler) · L8 deferred-constraint
 fix · CYCLE 2 map/HOF float boxing (explicitly "needs a focused session").

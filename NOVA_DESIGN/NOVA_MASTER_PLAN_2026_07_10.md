@@ -73,8 +73,11 @@
 > dictset 2001 -> 2, ASAN-clean. Safe because inserts universally RETAIN (the `no_rc` elision was
 > already disabled as unsound by CORE_GAP 0.10), so the temp's un-released original +1 IS the leak
 > and dropping it restores the RC invariant. Only the retained VALUE position is ever a candidate.
-> Remaining: inserting the result of a USER call (the `call` column) needs a producer proof for
-> user fns.
+>  **✅ AND THAT LAST COLUMN IS NOW CLOSED TOO** — `c9659065` (certified `046943b4`): a whole-program,
+> fail-closed prover establishes that a user fn returns a FRESH allocation on every path before its
+> result may be MOVEd. All three columns read `concat=2 call=2 dictset=2` (from 2001 each).
+> A fn returning `xs[0]`, `self.name`, its own param, or having any borrow path is REJECTED — pinned
+> by `_kat_w6_fresh_proof`, which also verifies the originals are unharmed. **Wave-B #6 CLOSED.**
 >
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
