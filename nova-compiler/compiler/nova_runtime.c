@@ -7923,9 +7923,20 @@ static void nova_rq_push(NovaSchedTask* t) {
     nova_sched_unlock();
 }
 static NovaSchedTask* nova_rq_pop(void) {
-    /* M:N Stage A: at N>1, a carrier drains its OWN deque first (locality, no global lock). Empty until
-       Stage B pushes to it, so today this always falls through to the global injector below -> behavior
-       unchanged. At N=1 the deque path is skipped entirely (the existing linked-list pop, byte-identical). */
+    /* M:N: at N>1 a carrier drains its OWN deque first (locality, no global lock).
+       STALE-COMMENT FIX (2026-08-02): this used to claim the local deque is "empty until Stage B
+       pushes to it, so today this always falls through to the global injector". That has NOT been
+       true for some time and the note actively misleads a reader into thinking every dispatch takes
+       g_sched_lock. Stage B IS live: nova_sched_enqueue_task() routes a task with a home carrier to
+       that carrier's deque and "REPLACES the bare nova_rq_push in every WAKE / yield_runnable site",
+       and spawn does the same (S-c) for an already-pinned task. So the local deque is the normal path
+       for WAKES; the global injector below is reached only by a task with no home yet — a fresh spawn
+       awaiting its claim — which is exactly what it is for.
+       Still genuinely absent: WORK-STEALING (an idle carrier taking from a busy carrier's deque, the
+       Stage-2b design at the bottom of this file). Without it an unlucky pinning distribution leaves a
+       carrier idle while another has a backlog. Measured impact today is nil on the perf gate:
+       best-of-5 on 4 physical cores gives 3.21x at N=4 (~80% efficiency) vs the >1.8x requirement.
+       At N=1 the deque path is skipped entirely (the existing linked-list pop, byte-identical). */
     if (g_carrier_count > 1) {
         NovaSchedTask* lt = nova_deque_pop_local();
         if (lt) return lt;
