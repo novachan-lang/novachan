@@ -9979,10 +9979,37 @@ void nova_rt_init(void) {
     srand((unsigned int)time(NULL));
 }
 
+/* LOCK-6 Phase 2 — idempotent, thread-safe global init.
+   nova_rt_init() is NOT idempotent: it initializes critical sections and installs signal
+   handlers, so calling it twice re-inits a LIVE critical section. That is fine while the only
+   entry point is main(), but an @cdecl callback is entered FROM C — possibly before any NOVA
+   code ran, possibly on a foreign thread, and possibly many times. Route every entry through a
+   once-guard so the first caller (whoever it is) initializes and everyone else proceeds.
+   Per-thread task state needs no guard: nova_cur() already lazily binds nova_current_task to
+   the thread's own nova_tls_task on first use, so a foreign thread self-initializes. */
+#ifdef _WIN32
+static INIT_ONCE g_nova_rt_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK nova_rt_init_once_cb(PINIT_ONCE o, PVOID param, PVOID* ctx) {
+    (void)o; (void)param; (void)ctx;
+    nova_rt_init();
+    return TRUE;
+}
+void nova_rt_ensure_init(void) {
+    InitOnceExecuteOnce(&g_nova_rt_once, nova_rt_init_once_cb, NULL, NULL);
+}
+#else
+static pthread_once_t g_nova_rt_once = PTHREAD_ONCE_INIT;
+void nova_rt_ensure_init(void) {
+    pthread_once(&g_nova_rt_once, nova_rt_init);
+}
+#endif
+
 void nova_rt_init_args(int64_t argc, int64_t argv_ptr) {
     nova_argc = (int)argc;
     nova_argv = (char**)(uintptr_t)argv_ptr;
-    nova_rt_init();
+    /* Through the once-guard so a program that ALSO exposes @cdecl callbacks cannot double-init
+       (main runs first here; a later callback's ensure_init becomes a no-op, and vice versa). */
+    nova_rt_ensure_init();
 }
 
 /* ── args() — returns list of CLI argument strings ───────────────────────── */

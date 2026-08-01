@@ -9543,6 +9543,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_shell(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_create_string(ptr) nounwind")
     emit(cg, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    emit(cg, "declare void @nova_rt_ensure_init() nounwind")
     emit(cg, "declare void @nova_rt_wait_all() nounwind")
     emit(cg, "declare void @nova_rt_main_dispatch(i64) nounwind")
     emit(cg, "declare void @nova_rt_cleanup() nounwind")
@@ -23078,6 +23079,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_field_get(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_create_string(ptr) nounwind")
     ire_line(e, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_ensure_init() nounwind")
     ire_line(e, "declare void @nova_rt_wait_all() nounwind")
     ire_line(e, "declare void @nova_rt_main_dispatch(i64) nounwind")
     ire_line(e, "declare void @nova_rt_cleanup() nounwind")
@@ -24854,6 +24856,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // uniform ABI is already C-compatible for int-typed exports). Exported fns emit as plain
     // external `@<name>` (verified: `@novalib_add` etc.). With NO @export this is byte-identical.
     let _has_c_export = false
+    // LOCK-6 Phase 2: names of fns carrying @cdecl (C-callback entry points).
+    let _cdecl_fns = []
+    let _cdecl_arity = {}
     for _xfs in stmts
         match _xfs
             Stmt(_xt, _xn, _xe, _xb, _xp, _xeb, _xanns, _xsl) =>
@@ -24863,6 +24868,52 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             Expr(_xat, _xav, _xan, _xac, _xaf, _xal) =>
                                 if _xat == "ann" and _xav == "export"
                                     _has_c_export = true
+                                if _xat == "ann" and _xav == "cdecl"
+                                    push(_cdecl_fns, _xn)
+                                    _cdecl_arity[_xn] = len(_xp)
+
+    // LOCK-6 Phase 2 — @cdecl C-CALLBACK ENTRY POINTS.
+    // A NOVA fn marked @cdecl is meant to be handed to C as a function pointer (qsort's
+    // comparator, a Win32 WNDPROC, a signal/thread proc, any C library callback). Two things make
+    // that unsafe without a wrapper:
+    //   1. C may invoke it BEFORE any NOVA code has run, and on a FOREIGN thread, so the runtime
+    //      may be uninitialized. nova_rt_ensure_init() is the idempotent once-guard for that
+    //      (nova_rt_init itself is NOT idempotent — it initializes critical sections).
+    //   2. The callback must be a STABLE external symbol; the NOVA fn itself may be internal.
+    // The value ABI already lines up: a NOVA `int` param/return is i64 == C int64_t, and on
+    // x86-64 a pointer argument is passed exactly like an i64 — the same equivalence @export
+    // already documents and relies on. So the wrapper is a pure pass-through plus the init guard.
+    //
+    // KNOWN LIMITATION (owner's call, deliberately NOT invented here): a C callback whose
+    // prototype returns 32-bit `int` gets an i64 return. On x86-64 the low 32 bits are what the
+    // caller reads, so it works in practice, but it is not ABI-correct in general. Expressing an
+    // exact C prototype needs a signature on the annotation (e.g. @cdecl("i32(ptr,ptr)")), which
+    // is a public-API design decision, not an implementation detail.
+    for _cdn in _cdecl_fns
+        let _cda = _cdecl_arity[_cdn]
+        let _cdh = "define i64 @" + _cdn + "__cdecl("
+        let _cdi = 0
+        while _cdi < _cda
+            if _cdi > 0
+                _cdh = _cdh + ", "
+            _cdh = _cdh + "i64 %a" + str(_cdi)
+            _cdi = _cdi + 1
+        _cdh = _cdh + ") nounwind uwtable \{"
+        ire_line(e, _cdh)
+        ire_line(e, "entry:")
+        ire_indent(e, "call void @nova_rt_ensure_init()")
+        let _cdc = "call i64 @" + _cdn + "("
+        let _cdj = 0
+        while _cdj < _cda
+            if _cdj > 0
+                _cdc = _cdc + ", "
+            _cdc = _cdc + "i64 %a" + str(_cdj)
+            _cdj = _cdj + 1
+        _cdc = _cdc + ")"
+        ire_indent(e, "%r = " + _cdc)
+        ire_indent(e, "ret i64 %r")
+        ire_line(e, "}")
+        ire_line(e, "")
     let _entry_name = "main"
     if _has_c_export
         _entry_name = "__nova_export_init"
