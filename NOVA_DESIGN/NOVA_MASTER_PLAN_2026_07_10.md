@@ -86,6 +86,13 @@
 > so a partial implementation is silent corruption. Needs a width-guard audit or a no-unguarded-access
 > proof; deliberately not attempted.
 >
+> **✅ monotonic type-id vtables CLOSED `789a4246`** — as a MEASURED hybrid. Dynamic dispatch was
+> O(N) in the implementation count (23 ns at 2 impls -> 146 ns at 24). A blanket binary search would
+> have regressed the common 2-4 impl case by 16-24%, so the crossover sits at >= 8 impls: the shipped
+> form is faster at every width with -37% at N=24 and no regression. Needed no new IR op, no runtime
+> change and no dense type-id scheme. Plus `b6debe3e`: `IsBadReadPtr` removed from the `find_tag`
+> hot path (~10%) — it was redundant given the existing non-dereferencing range check.
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*

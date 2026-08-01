@@ -271,7 +271,29 @@ instead of a linear chain, using only the existing `eq`/`lt`/`branch` ops -> O(l
 that is ~5 compares instead of 24. A true jump-table vtable would need DENSE type ids, which means
 changing what struct slot 0 holds — a much wider change for a smaller marginal gain over O(log N).
 
-**NEXT (resume here):** dispatch binary-search tree (specified above) · LOCK-4 inc3d (BLOCKED) ·
+- ✅ `789a4246` + `b6debe3e` (certified) **"monotonic type-id vtables" CLOSED — as a MEASURED HYBRID,
+  not the framing the item assumed.** Shipped result is faster at EVERY width with no regression:
+
+  | impls | linear (was) | tree-only | **hybrid (shipped)** |
+  |---|---|---|---|
+  | 2 | 55.8 ms | 69.3 ms | **53.4 ms** |
+  | 4 | 89.6 ms | 104.2 ms | **82.4 ms** |
+  | 12 | 176.9 ms | 171.7 ms | **167.9 ms** |
+  | 24 | 350.2 ms | 209.6 ms | **218.9 ms (-37%)** |
+
+  **A blanket binary search would have REGRESSED the common case 16-24%** — it costs an extra `lt`
+  + branch per level, and most methods have 2-4 impls. So the crossover sits where the data puts it
+  (>= 8 impls). Uses ONLY existing eq/lt/branch ops: no new IR op, no runtime change, and NO dense
+  type-id scheme (that would mean changing what struct slot 0 holds — far wider, smaller marginal
+  gain over log N). Both paths converge on one `dyn_miss`, so the #8 S8.0 loud-panic fallback is
+  unchanged. Correctness pinned by `_kat_dispatch` (7 types, each must reach ITS OWN impl + a sum
+  check, since a mis-built tree would silently call the wrong method).
+  Also `b6debe3e`: `find_tag` — the soundness backbone behind every checked accessor and RC op —
+  was calling Windows `IsBadReadPtr` (deprecated, drives exception machinery) on every call. It is
+  redundant when the heap extent is known, since the range check above already proves the bound
+  without dereferencing. ~10% win; soundness gate PASS.
+
+**NEXT (resume here):** LOCK-4 inc3d (BLOCKED, see above) ·
 LOCK-1 full `@mod__fn` mangling · const generics · RC cycle collector · monotonic type-id vtables ·
 explicit SIMD · ARM aarch64 fibers · GPU lowering — **ATTENDED ONLY** (XL RC-lifetime work; a mistake
 introduces a UAF, and the leak itself is memory-SAFE, so it is not an overnight task) ·
