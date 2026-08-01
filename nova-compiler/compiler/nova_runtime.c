@@ -12069,6 +12069,123 @@ int64_t nova_rt_rc_drop_temp(int64_t v) {
     return 0;
 }
 
+/* ── EXPLICIT SIMD PATH ─────────────────────────────────────────────────────────────────────
+   Elementwise kernels over NOVA float lists. A float list in raw mode (elem_kind == 2) stores
+   IEEE-754 double BITS inline and CONTIGUOUSLY in ->data, which is exactly a double[] — so these
+   loops are directly vectorizable and clang -O2 lowers them to SSE/AVX (and to NEON on ARM). That
+   is deliberately better than hand-written intrinsics here: one portable source, no per-ISA
+   #ifdef, and the vector width follows the -march the user builds with.
+
+   SOUNDNESS: every kernel refuses unless BOTH operands are genuine NOVA_MEM_LIST objects in raw
+   double mode. A boxed/heterogeneous list (elem_kind 0) holds POINTERS, and reading those as
+   doubles would be a type-confusion — so the guard is a hard precondition, not an optimization.
+   Mismatched lengths use the shorter one rather than over-reading. On any refusal the result is
+   an empty list (or 0.0), never a partial/garbage buffer.
+   `restrict` tells the optimizer the source and destination cannot alias, which is what unlocks
+   the vectorized form; it is honest here because the destination is a FRESH allocation. */
+
+/* A raw-double view of a list, or NULL if it is not a genuine raw float list. */
+static double* nova_simd_view(int64_t handle, int64_t* out_n) {
+    NovaList* l = nova_as_list(handle);
+    if (!l || l->elem_kind != 2) return NULL;
+    *out_n = l->size;
+    return (double*)(void*)l->data;
+}
+
+/* Build a fresh raw-double list of n elements (elem_kind 2), uninitialized. */
+static int64_t nova_simd_new(int64_t n, double** out_p) {
+    int64_t h = nova_rt_list_create();
+    NovaList* l = nova_as_list(h);
+    if (!l) return 0;
+    if (n > 0) {
+        if (n > l->cap) {
+            int64_t old_cap = l->cap;
+            l->cap = n;
+            l->data = (int64_t*)nova_back_grow((void*)l,
+                (size_t)old_cap * sizeof(int64_t), (size_t)l->cap * sizeof(int64_t), l->data);
+            if (!l->data) return h;
+        }
+        l->size = n;
+        l->elem_kind = 2;
+    }
+    *out_p = (double*)(void*)l->data;
+    return h;
+}
+
+#define NOVA_SIMD_BINOP(NAME, OP)                                                        \
+int64_t NAME(int64_t ah, int64_t bh) {                                                   \
+    int64_t na = 0, nb = 0;                                                              \
+    const double* a = nova_simd_view(ah, &na);                                           \
+    const double* b = nova_simd_view(bh, &nb);                                           \
+    if (!a || !b) return nova_rt_list_create();                                          \
+    int64_t n = na < nb ? na : nb;                                                       \
+    double* out = NULL;                                                                  \
+    int64_t h = nova_simd_new(n, &out);                                                  \
+    if (!out) return h;                                                                  \
+    const double* __restrict pa = a;                                                     \
+    const double* __restrict pb = b;                                                     \
+    double* __restrict po = out;                                                         \
+    for (int64_t i = 0; i < n; i++) po[i] = pa[i] OP pb[i];                              \
+    return h;                                                                            \
+}
+NOVA_SIMD_BINOP(nova_rt_simd_add, +)
+NOVA_SIMD_BINOP(nova_rt_simd_sub, -)
+NOVA_SIMD_BINOP(nova_rt_simd_mul, *)
+#undef NOVA_SIMD_BINOP
+
+/* Multiply every element by a scalar (raw double bits in). */
+int64_t nova_rt_simd_scale(int64_t ah, int64_t kbits) {
+    int64_t na = 0;
+    const double* a = nova_simd_view(ah, &na);
+    if (!a) return nova_rt_list_create();
+    double k; memcpy(&k, &kbits, 8);
+    double* out = NULL;
+    int64_t h = nova_simd_new(na, &out);
+    if (!out) return h;
+    const double* __restrict pa = a;
+    double* __restrict po = out;
+    for (int64_t i = 0; i < na; i++) po[i] = pa[i] * k;
+    return h;
+}
+
+/* Dot product -> raw double bits (the compiler types this float). */
+int64_t nova_rt_simd_dot(int64_t ah, int64_t bh) {
+    int64_t na = 0, nb = 0;
+    const double* a = nova_simd_view(ah, &na);
+    const double* b = nova_simd_view(bh, &nb);
+    double acc = 0.0;
+    int64_t r;
+    if (a && b) {
+        int64_t n = na < nb ? na : nb;
+        const double* __restrict pa = a;
+        const double* __restrict pb = b;
+        for (int64_t i = 0; i < n; i++) acc += pa[i] * pb[i];
+    }
+    memcpy(&r, &acc, 8);
+    return r;
+}
+
+/* Horizontal sum -> raw double bits. */
+int64_t nova_rt_simd_sum(int64_t ah) {
+    int64_t na = 0;
+    const double* a = nova_simd_view(ah, &na);
+    double acc = 0.0;
+    int64_t r;
+    if (a) {
+        const double* __restrict pa = a;
+        for (int64_t i = 0; i < na; i++) acc += pa[i];
+    }
+    memcpy(&r, &acc, 8);
+    return r;
+}
+
+/* 1 if this handle is a raw-double list the SIMD kernels can accelerate; 0 otherwise.
+   Lets NOVA code check before relying on the fast path. */
+int64_t nova_rt_simd_ready(int64_t ah) {
+    int64_t n = 0;
+    return nova_simd_view(ah, &n) != NULL ? 1 : 0;
+}
+
 /* ── Memory Cleanup ─────────────────────────────────────────────────────── */
 
 int64_t nova_rt_alloc_count(void) {
