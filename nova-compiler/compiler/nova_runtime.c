@@ -7686,6 +7686,12 @@ typedef struct NovaSchedTask {
                                       in effect (the lone carrier re-pushes it next iteration). */
     int      home_carrier;         /* M:N: carrier this task is bound to (-1 = unbound); used in later steps */
     volatile int in_rq;            /* M:N detector: 1 while linked in the run-queue (guarded by g_sched_lock) */
+    /* LOCK-5: kill request. Set by nova_rt_kill() from ANY task/thread; observed by the TARGET
+       task itself at a safepoint, which then unwinds via its own fault_buf. Deliberately
+       cooperative — asynchronously tearing a task down mid-operation would free RC objects it is
+       still using and could leave a channel/scheduler lock held. `volatile` because the writer and
+       the observing carrier are different threads at N>1. */
+    volatile int kill_requested;
     int64_t  mailbox;              /* Erlang frontier Stage-0: this task's inbound mailbox (a NovaChannel handle,
                                       created at spawn). PID = the task ptr (never freed -> UAF-safe); pid_send routes
                                       here; receive() reads it; drained+closed at finish (post-finish sends no-op). */
@@ -8052,9 +8058,63 @@ static void nova_sched_yield_runnable(void) {
    task that hits none of those should call reschedule() periodically (or stay <=
    carrier count, or use pmap on the OS pool). Involuntary (signal-based) preemption
    is post-v1 (see IMPLICIT_ASYNC_DESIGN.md). */
+/* LOCK-5 — SAFEPOINT. The single place a task observes a pending kill and terminates itself.
+   Unwinding goes through the task's OWN fault_buf, i.e. the exact path a panic/failed-assert
+   already takes, so teardown is the proven one: the fiber entry's setjmp returns non-zero, the
+   body is skipped, and normal fiber teardown runs (RC release, slot reclaim, monitors notified).
+   longjmp value 2 distinguishes kill from a fault (1) for anyone who needs to tell them apart.
+
+   Called from cooperative yield points ONLY. That is a deliberate design choice, not an
+   omission: killing a task asynchronously mid-operation would free RC objects it is still
+   using and could abandon a held channel or scheduler lock. Erlang's BEAM makes the same
+   trade — a process dies at a reduction boundary, not at an arbitrary instruction. */
+static NovaSchedTask* nova_task_deref(int64_t handle);   /* fwd: defined with the slot map below */
+
+static void nova_sched_safepoint(void) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t || !t->kill_requested) return;
+    t->kill_requested = 0;                 /* consume, so teardown paths cannot re-trigger */
+    /* Unwind through the RUNNING task's own fault boundary. nova_current_task is this thread's
+       TLS pointer to the executing task's NovaTaskState, which is where the fiber entry's
+       setjmp(f->task.fault_buf) lives — so this lands exactly where a panic would. */
+    NovaTaskState* ts = nova_cur();
+    if (!ts->fault_active) return;         /* no boundary installed (not on a fiber) -> ignore */
+    longjmp(ts->fault_buf, 2);
+}
+
 int64_t nova_rt_reschedule(void) {
-    if (nova_sched_in_task()) nova_sched_yield_runnable();
+    if (nova_sched_in_task()) {
+        nova_sched_safepoint();            /* observe a pending kill before giving up the carrier */
+        nova_sched_yield_runnable();
+        nova_sched_safepoint();            /* ...and again on resume, so a kill issued while we
+                                              were descheduled takes effect immediately */
+    }
     return 0;
+}
+
+/* nova_rt_kill(pid): request termination of a green task (LOCK-5).
+   Returns 1 if the request was recorded, 0 if the PID is stale/invalid (a finished task's
+   handle derefs to NULL by generation check -> graceful no-op, never a wrong task).
+
+   COOPERATIVE, and honestly so: the target dies at its next safepoint. A task spinning in pure
+   compute with no yield point will not observe it until it calls reschedule() or hits a
+   channel/park operation — the same contract nova_rt_reschedule already documents for v1
+   scheduling. A task parked forever on a channel is likewise not force-unlinked from its waiter
+   list here; doing that safely is a separate increment (it must be removed from the exact list
+   it is linked into, under that list's lock, or the scheduler corrupts).
+   Killing yourself is allowed and takes effect at the next safepoint. */
+int64_t nova_rt_kill(int64_t pid) {
+    NovaSchedTask* t = nova_task_deref(pid);
+    if (!t) return 0;
+    t->kill_requested = 1;
+    return 1;
+}
+
+/* nova_rt_kill_pending(): 1 if THIS task has a kill request outstanding. Lets a task with a
+   cleanup obligation notice and exit its own loop cleanly instead of being unwound. */
+int64_t nova_rt_kill_pending(void) {
+    NovaSchedTask* t = nova_sched_current;
+    return (t && t->kill_requested) ? 1 : 0;
 }
 
 static void nova_sched_wake_one(NovaChannel* ch) {
