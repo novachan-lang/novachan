@@ -313,6 +313,355 @@ static void nova_track_heap_bounds(uintptr_t base_addr, uintptr_t end_addr) {
     }
 }
 
+/* ── NOVA OBJECT SPACE — exact-ownership segregated allocator ─────────────────
+   WHY THIS EXISTS (soundness, not performance):
+
+   nova_mem_find_tag must decide "is this i64 a managed pointer?" for ARBITRARY
+   values — NOVA's uniform-i64 model means an FFI handle, or an integer that merely
+   LOOKS like an address, reaches it. It used to decide by range-checking a min/max
+   ENVELOPE of NOVA's allocations and then READING the RC header at ptr-8.
+
+   That envelope is not EXCLUSIVE. Foreign allocations (sqlite, OpenSSL, any FFI
+   library sharing the process allocator) land inside it, so the header read went
+   OUT OF BOUNDS of a foreign block. ASAN caught exactly that: a 792-byte sqlite3
+   db handle from openDatabase, reaching channel_send -> deep_copy -> find_tag,
+   reported as `heap-buffer-overflow READ of size 4` four bytes before the block.
+
+   The permanent fix is OWNERSHIP, not a wider guard. Every RC-headered object is
+   carved from a NOVA-OWNED, NOVA_OA_ARENA_SIZE-aligned arena; arenas are recorded
+   in a table keyed by (addr >> NOVA_OA_ARENA_SHIFT); find_tag consults that table
+   BEFORE dereferencing anything. This is what every serious runtime converges on
+   for this exact problem — Go's arena index, Boehm's page table, jemalloc's rtree.
+
+   THE INVARIANT that makes the header read provably in-bounds:
+
+       every block body starts at least NOVA_OA_MIN_OFFSET bytes past its arena
+       base, and find_tag rejects any address below that offset outright.
+
+   So for ANY pointer p the table accepts, p[-1] (tag) and p[-2] (refcount) lie
+   inside NOVA-owned memory. A pointer the table rejects is never dereferenced.
+   Both halves are required: ownership alone would still permit a read before an
+   arena's first object.
+
+   WHY A CLASS-WORD PREFIX. Several free sites cannot know the allocation size
+   (`free(ptr - NOVA_RC_HDR_SIZE)` on a C string, for one), but a size-classed
+   allocator needs it. So each block carries a 16-byte prefix holding its class and span,
+   which makes the conversion mechanical and impossible to get wrong at the call
+   sites: calloc(1,N) -> nova_oa_alloc(N), free(p) -> nova_oa_free(p), with no size
+   threaded through and no caller-visible layout change. The prefix also carries a
+   magic so a mismatched free (an OA pointer freed with free(), or vice versa) trips
+   an assert in debug rather than corrupting the heap silently.
+
+   Raw DATA buffers (NovaList.data, NovaDict.keys/vals/hashes/idx, channel rings,
+   string builders) deliberately STAY on plain malloc. They carry no RC header and
+   are never valid find_tag targets, so keeping them OUTSIDE the object space makes
+   find_tag reject them outright — strictly more precise than the old envelope,
+   which accepted them and leaned on the magic/rc checks to sort it out.
+
+   A false POSITIVE remains possible in principle (arena bytes that happen to look
+   like a valid magic+rc); the existing structural validation still handles that.
+   The difference is that it is now purely a correctness question with NO undefined
+   behaviour underneath it, which is the entire point of this change. */
+
+#define NOVA_OA_ARENA_SHIFT   20
+#define NOVA_OA_ARENA_SIZE    ((size_t)1 << NOVA_OA_ARENA_SHIFT)   /* 1 MiB */
+#define NOVA_OA_PREFIX        16      /* [magic u32][class i32][bytes u64] before the block */
+/* find_tag may be handed ANY address inside an arena, including one within 8 bytes
+   of the base, and it reads addr-8. No real block body ever starts below this
+   offset, so rejecting a smaller offset is both sound and what keeps that read
+   inside the arena. This is the second half of the invariant; ownership alone is
+   not enough. */
+#define NOVA_OA_MIN_OFFSET    (NOVA_OA_PREFIX + 8)
+#define NOVA_OA_SMALL_MAX     1024
+#define NOVA_OA_SMALL_STEP    16
+#define NOVA_OA_SMALL_CLASSES (NOVA_OA_SMALL_MAX / NOVA_OA_SMALL_STEP)   /* 64 */
+#define NOVA_OA_BIG_MAX       ((size_t)1 << 19)   /* 512 KiB; above -> dedicated */
+#define NOVA_OA_BIG_CLASSES   9       /* ceil_log2 11..19 */
+#define NOVA_OA_CLASSES       (NOVA_OA_SMALL_CLASSES + NOVA_OA_BIG_CLASSES)
+#define NOVA_OA_HUGE_CLASS    (-1)
+#define NOVA_OA_MAGIC         0x4E4F5641u          /* 'NOVA' */
+
+/* ASAN VISIBILITY. Carving objects out of our own arenas means ASAN sees one big
+   region instead of individual objects, so it would no longer catch a use-after-free
+   on a NOVA object — exactly the bug class that motivated this work (see the
+   str()/temp-drop UAF). Manual poisoning restores it: a freed block is poisoned, so
+   touching it after free is reported with the same precision as before.
+   The free-list link occupies the block's first word, so that word stays unpoisoned
+   and everything past it is poisoned. */
+#if defined(__SANITIZE_ADDRESS__)
+#  define NOVA_OA_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define NOVA_OA_ASAN 1
+#  endif
+#endif
+#ifdef NOVA_OA_ASAN
+void __asan_poison_memory_region(void const volatile* addr, size_t size);
+void __asan_unpoison_memory_region(void const volatile* addr, size_t size);
+#  define NOVA_OA_POISON(p, n)   __asan_poison_memory_region((p), (n))
+#  define NOVA_OA_UNPOISON(p, n) __asan_unpoison_memory_region((p), (n))
+#else
+#  define NOVA_OA_POISON(p, n)   ((void)0)
+#  define NOVA_OA_UNPOISON(p, n) ((void)0)
+#endif
+
+static uintptr_t nova_fs_heap_lo = 0, nova_fs_heap_hi = 0;   /* freestanding static heap extent */
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_oa_lock;
+#else
+static pthread_mutex_t  g_oa_lock;
+#endif
+static volatile int g_oa_ready  = 0;
+static volatile int g_oa_initing = 0;
+static char*  g_oa_bump = NULL;
+static size_t g_oa_bump_left = 0;
+typedef struct NovaOaRun { struct NovaOaRun* next; size_t bytes; } NovaOaRun;
+static NovaOaRun* g_oa_runs = NULL;   /* freed multi-arena runs, reusable */
+static void*  g_oa_free_list[NOVA_OA_CLASSES];
+static size_t g_oa_class_size[NOVA_OA_CLASSES];
+
+static void nova_track_heap_bounds(uintptr_t base_addr, uintptr_t end_addr);
+
+static int nova_oa_ceil_log2(size_t v) {
+    int n = 0; size_t x = 1;
+    while (x < v && n < 63) { x <<= 1; n++; }
+    return n;
+}
+
+static void nova_oa_do_init(void) {
+#ifdef _WIN32
+    InitializeCriticalSection(&g_oa_lock);
+#else
+    pthread_mutex_init(&g_oa_lock, NULL);
+#endif
+    for (int i = 0; i < NOVA_OA_SMALL_CLASSES; i++) {
+        g_oa_free_list[i] = NULL;
+        g_oa_class_size[i] = (size_t)(i + 1) * NOVA_OA_SMALL_STEP;
+    }
+    for (int i = 0; i < NOVA_OA_BIG_CLASSES; i++) {
+        g_oa_free_list[NOVA_OA_SMALL_CLASSES + i] = NULL;
+        g_oa_class_size[NOVA_OA_SMALL_CLASSES + i] = ((size_t)1) << (11 + i);
+    }
+}
+
+/* One-time init that is safe before nova_rt_init: allocation can be reached from a
+   @cdecl callback on a foreign thread with no prior NOVA entry. */
+static void nova_oa_ensure_init(void) {
+    if (__atomic_load_n(&g_oa_ready, __ATOMIC_ACQUIRE)) return;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&g_oa_initing, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        nova_oa_do_init();
+        __atomic_store_n(&g_oa_ready, 1, __ATOMIC_RELEASE);
+    } else {
+        while (!__atomic_load_n(&g_oa_ready, __ATOMIC_ACQUIRE)) { /* brief spin */ }
+    }
+}
+
+#ifdef _WIN32
+#define NOVA_OA_LOCK()   EnterCriticalSection(&g_oa_lock)
+#define NOVA_OA_UNLOCK() LeaveCriticalSection(&g_oa_lock)
+#else
+#define NOVA_OA_LOCK()   pthread_mutex_lock(&g_oa_lock)
+#define NOVA_OA_UNLOCK() pthread_mutex_unlock(&g_oa_lock)
+#endif
+
+#define NOVA_OA_RESERVE_BYTES ((size_t)16 << 30)   /* 16 GiB of ADDRESS SPACE */
+static uintptr_t g_oa_region_base = 0;
+static volatile uintptr_t g_oa_region_end = 0;     /* base + committed */
+static uintptr_t g_oa_region_cap  = 0;
+
+/* EXACT and essentially free: the object space is ONE interval, so this is a
+   subtract and a compare — the same shape as the unsound envelope check it
+   replaces. Committed memory only grows, so an ACQUIRE read of the end is all the
+   synchronisation a reader needs. */
+static int nova_oa_owns(uintptr_t addr) {
+    uintptr_t base = g_oa_region_base;
+    uintptr_t end  = __atomic_load_n(&g_oa_region_end, __ATOMIC_ACQUIRE);
+    return addr >= base && addr < end;
+}
+
+/* ONE CONTIGUOUS RESERVATION.
+   Reserving address space up front (not memory — nothing is committed until used)
+   is what makes ownership FREE: the object space becomes a single interval, so
+   "is this pointer ours?" is one subtract and one compare, and find_tag ALREADY
+   performed an envelope compare, so the exact test costs nothing over the unsound
+   one it replaces.
+   MEASURED, and the reason this design won: with a hash table the ownership test
+   cost ~10% on an allocation-heavy crypto workload; an 8-entry per-thread cache
+   left ~11%, a 4-entry global hot array ~4%, a 2-entry range cache ~5%. None of
+   them beat simply making the interval exact.
+   Committed memory only ever GROWS, so a reader needs no lock: it observes some
+   prefix of the committed region, and any pointer it can legitimately hold lies
+   inside that prefix. */
+
+static int nova_oa_reserve(void) {
+    if (g_oa_region_base) return 1;
+#ifdef _WIN32
+    void* p = VirtualAlloc(NULL, NOVA_OA_RESERVE_BYTES, MEM_RESERVE, PAGE_READWRITE);
+    if (!p) return 0;
+#else
+    void* p = mmap(NULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return 0;
+#endif
+    /* Align the usable base up to an arena boundary so arena ids stay exact. */
+    uintptr_t b = ((uintptr_t)p + NOVA_OA_ARENA_SIZE - 1) & ~(uintptr_t)(NOVA_OA_ARENA_SIZE - 1);
+    g_oa_region_base = b;
+    g_oa_region_end  = b;
+    g_oa_region_cap  = (uintptr_t)p + NOVA_OA_RESERVE_BYTES;
+    return 1;
+}
+
+/* Commit the next `bytes` (arena-multiple) of the reservation. Caller holds the lock. */
+static void* nova_oa_commit(size_t bytes) {
+    if (!nova_oa_reserve()) return NULL;
+    uintptr_t start = g_oa_region_end;
+    if (start + bytes > g_oa_region_cap) return NULL;   /* reservation exhausted -> OOM */
+#ifdef _WIN32
+    if (!VirtualAlloc((void*)start, bytes, MEM_COMMIT, PAGE_READWRITE)) return NULL;
+#else
+    if (mprotect((void*)start, bytes, PROT_READ | PROT_WRITE) != 0) return NULL;
+#endif
+    /* Publish AFTER the pages exist, so a concurrent reader never accepts an
+       address whose memory is not yet committed. */
+    __atomic_store_n(&g_oa_region_end, start + bytes, __ATOMIC_RELEASE);
+    nova_track_heap_bounds(start, start + bytes);
+    return (void*)start;
+}
+
+static int nova_oa_class_of(size_t size, size_t* out_sz) {
+    if (size <= NOVA_OA_SMALL_MAX) {
+        size_t s = (size + (NOVA_OA_SMALL_STEP - 1)) & ~(size_t)(NOVA_OA_SMALL_STEP - 1);
+        if (s == 0) s = NOVA_OA_SMALL_STEP;
+        *out_sz = s;
+        return (int)(s / NOVA_OA_SMALL_STEP) - 1;
+    }
+    if (size <= NOVA_OA_BIG_MAX) {
+        int lg = nova_oa_ceil_log2(size);
+        if (lg < 11) lg = 11;
+        *out_sz = ((size_t)1) << lg;
+        return NOVA_OA_SMALL_CLASSES + (lg - 11);
+    }
+    *out_sz = size;
+    return NOVA_OA_HUGE_CLASS;
+}
+
+/* The block header sits in the PREFIX word, immediately before the returned pointer:
+     [-8] uint32 magic | [-4] int32 class      (class = -1 for a dedicated huge block)
+   `align` is the required alignment OF THE RETURNED POINTER (16 for everything except
+   @repr(align(N)) structs). Alignments above 16 are served from a dedicated arena,
+   whose base is NOVA_OA_ARENA_SIZE-aligned, so base+align is align-aligned. */
+static void* nova_oa_alloc_aligned(size_t size, size_t align, size_t* huge_bytes_out) {
+    if (size == 0) size = 1;
+    if (align < 16) align = 16;
+    size_t csz = 0;
+    int cls = nova_oa_class_of(size, &csz);
+    char* blk = NULL;
+
+    if (cls == NOVA_OA_HUGE_CLASS || align > 16) {
+        size_t lead = (align > NOVA_OA_MIN_OFFSET) ? align : (size_t)NOVA_OA_MIN_OFFSET;
+        /* round `lead` up to a multiple of align so base+lead stays align-aligned */
+        lead = ((lead + align - 1) / align) * align;
+        size_t bytes = ((lead + csz + NOVA_OA_ARENA_SIZE - 1) / NOVA_OA_ARENA_SIZE) * NOVA_OA_ARENA_SIZE;
+        void* base = NULL;
+        NovaOaRun** pp = &g_oa_runs;                 /* reuse a freed run that fits */
+        while (*pp) {
+            if ((*pp)->bytes >= bytes) { base = (void*)(*pp); bytes = (*pp)->bytes; *pp = (*pp)->next; break; }
+            pp = &(*pp)->next;
+        }
+        if (!base) base = nova_oa_commit(bytes);
+        if (!base) return NULL;
+        blk = (char*)base + lead;
+        ((uint32_t*)blk)[-4] = NOVA_OA_MAGIC;
+        ((int32_t*)blk)[-3]  = NOVA_OA_HUGE_CLASS;
+        ((uint64_t*)blk)[-1] = (uint64_t)bytes;   /* exact span, so free never guesses */
+        memset(blk, 0, csz);
+        if (huge_bytes_out) *huge_bytes_out = bytes;
+        return blk;
+    }
+
+    if (g_oa_free_list[cls]) {
+        blk = (char*)g_oa_free_list[cls];
+        g_oa_free_list[cls] = *(void**)blk;
+    } else {
+        size_t need = NOVA_OA_PREFIX + csz;
+        if (g_oa_bump_left < need) {
+            void* base = nova_oa_commit(NOVA_OA_ARENA_SIZE);
+            if (!base) return NULL;
+            /* The first body lands at base+NOVA_OA_PREFIX, so its prefix and the
+               caller's RC header are both inside this arena. The abandoned tail of
+               the previous arena is < need bytes and is never handed out. */
+            g_oa_bump = (char*)base;
+            g_oa_bump_left = NOVA_OA_ARENA_SIZE;
+        }
+        blk = g_oa_bump + NOVA_OA_PREFIX;
+        g_oa_bump += need;
+        g_oa_bump_left -= need;
+    }
+    NOVA_OA_UNPOISON(blk, csz);
+    ((uint32_t*)blk)[-4] = NOVA_OA_MAGIC;
+    ((int32_t*)blk)[-3]  = cls;
+    ((uint64_t*)blk)[-1] = 0;
+    memset(blk, 0, csz);
+    return blk;
+}
+
+/* Returns ZEROED memory, matching the calloc semantics the old paths relied on. */
+static void* nova_oa_alloc(size_t size) {
+    nova_oa_ensure_init();
+    NOVA_OA_LOCK();
+    void* p = nova_oa_alloc_aligned(size, 16, NULL);
+    NOVA_OA_UNLOCK();
+    return p;
+}
+
+static void* nova_oa_alloc_align(size_t size, size_t align) {
+    nova_oa_ensure_init();
+    NOVA_OA_LOCK();
+    void* p = nova_oa_alloc_aligned(size, align, NULL);
+    NOVA_OA_UNLOCK();
+    return p;
+}
+
+static int nova_oa_is_oa_ptr(const void* p) {
+    if (!p) return 0;
+    if (!nova_oa_owns((uintptr_t)p)) return 0;
+    return ((const uint32_t*)p)[-4] == NOVA_OA_MAGIC;
+}
+
+static void nova_oa_free(void* ptr) {
+    if (!ptr) return;
+    nova_oa_ensure_init();
+    NOVA_OA_LOCK();
+    int cls = ((int32_t*)ptr)[-3];
+    if (cls == NOVA_OA_HUGE_CLASS) {
+        /* Arena base is the arena-aligned address at or below ptr (lead < arena size),
+           and the span was RECORDED at allocation. Walking adjacent arenas to infer it
+           would be wrong: a neighbouring arena can be contiguous and would be freed. */
+        uintptr_t base = (uintptr_t)ptr & ~(uintptr_t)(NOVA_OA_ARENA_SIZE - 1);
+        size_t bytes = (size_t)((uint64_t*)ptr)[-1];
+        if (bytes < NOVA_OA_ARENA_SIZE) bytes = NOVA_OA_ARENA_SIZE;
+        /* Kept, not returned to the OS: the reservation is ours for the process
+           lifetime, so a freed run goes on the reuse list. This also means an
+           address that was ever ours STAYS ours, which is exactly what lets the
+           ownership test be a single monotonic interval. */
+        NovaOaRun* r = (NovaOaRun*)base;
+        r->bytes = bytes;
+        r->next = g_oa_runs;
+        g_oa_runs = r;
+        NOVA_OA_UNLOCK();
+        return;
+    }
+    if (cls < 0 || cls >= NOVA_OA_CLASSES) { NOVA_OA_UNLOCK(); return; }  /* corrupt: drop, never crash */
+    *(void**)ptr = g_oa_free_list[cls];   /* link lives in the dead block's first word */
+    g_oa_free_list[cls] = ptr;
+    if (g_oa_class_size[cls] > sizeof(void*))
+        NOVA_OA_POISON((char*)ptr + sizeof(void*), g_oa_class_size[cls] - sizeof(void*));
+    NOVA_OA_UNLOCK();
+}
+
 typedef struct NovaSlabPage {
     struct NovaSlabPage* next;
     char data[1]; /* flexible: SLAB_PAGE_OBJECTS * obj_size bytes follow */
@@ -407,19 +756,10 @@ static void nova_slab_free(NovaSlabPool* pool, void* ptr) {
 #endif
 }
 
-static void* nova_fast_alloc(size_t size) {
-    if (!nova_slab_inited) nova_slab_init();
-    if (size <= SLAB_32_OBJ_SIZE) return nova_slab_alloc(&nova_slab_32);
-    if (size <= SLAB_64_OBJ_SIZE) return nova_slab_alloc(&nova_slab_64);
-    return calloc(1, size);
-}
-
-static void nova_fast_free(void* ptr, size_t size) {
-    if (!ptr) return;
-    if (size <= SLAB_32_OBJ_SIZE) { nova_slab_free(&nova_slab_32, ptr); return; }
-    if (size <= SLAB_64_OBJ_SIZE) { nova_slab_free(&nova_slab_64, ptr); return; }
-    free(ptr);
-}
+/* Both now route to the object space. The size argument is retained at the call
+   sites but no longer needed: the block's own prefix carries its class. */
+static void* nova_fast_alloc(size_t size) { return nova_oa_alloc(size); }
+static void nova_fast_free(void* ptr, size_t size) { (void)size; nova_oa_free(ptr); }
 
 /* ── String Pool (ultra-fast alloc/free for short strings, bypasses HT) ─── */
 
@@ -679,6 +1019,8 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
         if (nova_fs_off + fa > sizeof(nova_fs_heap)) return NULL;   /* freestanding OOM */
         base = (char*)&nova_fs_heap[nova_fs_off];
         nova_fs_off += fa;
+        nova_fs_heap_lo = (uintptr_t)&nova_fs_heap[0];
+        nova_fs_heap_hi = (uintptr_t)&nova_fs_heap[0] + sizeof(nova_fs_heap);
         ((int32_t*)base)[0] = NOVA_RC_ARENA_BIT;   /* no individual free (bump) */
         ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
         nova_mem_total++;
@@ -698,15 +1040,9 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
         nova_mem_total++;
         return base + NOVA_RC_HDR_SIZE;
     }
-    if (!nova_slab_inited) nova_slab_init();
-    if (tag == NOVA_MEM_LIST && total <= SLAB_32_OBJ_SIZE)
-        base = (char*)nova_slab_alloc(&nova_slab_32);
-    else if (tag == NOVA_MEM_DICT && total <= SLAB_64_OBJ_SIZE)
-        base = (char*)nova_slab_alloc(&nova_slab_64);
-    else {
-        base = (char*)calloc(1, total);
-        if (base) nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + total);
-    }
+    /* Object space: registers the arena, tracks bounds and returns ZEROED memory,
+       so this subsumes the old slab/calloc split AND the separate bounds call. */
+    base = (char*)nova_oa_alloc(total);
     if (!base) return NULL;
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
@@ -745,13 +1081,10 @@ void* nova_rt_aligned_struct_alloc(int64_t size, int64_t alignment) {
     if (nslots > 0x1FFF) nslots = 0x1FFF;
     size_t total = (size_t)size + NOVA_RC_HDR_SIZE;
     size_t aligned_total = (total + (size_t)alignment - 1) & ~((size_t)alignment - 1);
-#ifdef _WIN32
-    char* base = (char*)_aligned_malloc(aligned_total, (size_t)alignment);
-#else
-    char* base = NULL;
-    if (posix_memalign((void**)&base, (size_t)alignment, aligned_total) != 0)
-        base = NULL;
-#endif
+    /* Object space with an explicit alignment. This ALSO fixes a latent Windows bug:
+       the matching free was plain free(), which is UB for _aligned_malloc memory —
+       there is no _aligned_free anywhere in this file. Both sides now agree. */
+    char* base = (char*)nova_oa_alloc_align(aligned_total, (size_t)alignment);
     if (!base) return NULL;
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(((int32_t)nslots << 3) | NOVA_MEM_STRUCT);
@@ -788,10 +1121,27 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
         (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
         return (NovaMemTag)-1;
     if (nova_strpool_contains(ptr)) return NOVA_MEM_RAW;
-    /* Range-bound to the tracked managed-heap extent BEFORE any dereference. A value
-       outside [heap_base, heap_top) cannot be a NOVA heap object (it's a raw int or
-       float-bit pattern), so reject it without touching memory — safe on every OS. */
+    /* Cheap envelope pre-reject: outside the tracked extent nothing can be ours, and
+       this rejects the overwhelming majority of non-pointer values with two compares. */
     if (nova_heap_base && (addr < nova_heap_base || addr >= nova_heap_top)) return (NovaMemTag)-1;
+#ifdef NOVA_FREESTANDING
+    /* Freestanding builds bump-allocate from a static array rather than the object
+       space, so accept that range explicitly (it is exact — a single static extent). */
+    if (nova_fs_heap_lo && addr >= nova_fs_heap_lo && addr < nova_fs_heap_hi) {
+        /* fall through to the header checks: this extent is exclusively ours */
+    } else
+#endif
+    /* EXACT OWNERSHIP — the soundness fix. The envelope above is NOT exclusive: foreign
+       allocations (sqlite, OpenSSL, any FFI library on the process allocator) land inside
+       it, and the header read below would then go OUT OF BOUNDS of a foreign block. ASAN
+       caught exactly that on a sqlite3 db handle. Every managed object now lives in a
+       NOVA-owned arena, so ask the ownership table BEFORE dereferencing anything. */
+    if (!nova_oa_owns(addr)) return (NovaMemTag)-1;
+    /* Second half of the invariant: find_tag is handed ARBITRARY addresses, including
+       ones near an arena base, and it reads addr-8 below. No real block body starts
+       below NOVA_OA_MIN_OFFSET into its arena, so rejecting a smaller offset is both
+       correct and what keeps that read inside the arena. */
+    if ((addr & (NOVA_OA_ARENA_SIZE - 1)) < (uintptr_t)NOVA_OA_MIN_OFFSET) return (NovaMemTag)-1;
     /* Sound fast-reject: every NOVA managed pointer is 8-aligned — an 8-byte RC
        header sits on a >=16-aligned base (calloc / slab page / _aligned_malloc /
        fat-string), so the returned pointer is always a multiple of 8. A candidate
@@ -1256,7 +1606,7 @@ static char* nova_fat_str_create(const char* src, size_t len) {
         base = (char*)nova_arena_bump(_fsa, fs_total);
         if (!base) return NULL;
     } else {
-        base = (char*)malloc(fs_total);
+        base = (char*)nova_oa_alloc(fs_total);
         if (!base) return NULL;
     }
     char* str = base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE;
@@ -1282,7 +1632,7 @@ static char* nova_fat_str_create(const char* src, size_t len) {
 static char* nova_fat_str_concat(const char* sa, size_t la,
                                   const char* sb, size_t lb) {
     size_t total = la + lb;
-    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + total + 1);
+    char* base = (char*)nova_oa_alloc(NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + total + 1);
     if (!base) return NULL;
     char* str = base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE;
     uint64_t h = 14695981039346656037ULL;
@@ -11944,7 +12294,7 @@ static void nova_rc_free(void* ptr) {
                         nova_rc_dec_internal(slots[i]);
             }
         }
-        free((char*)ptr - NOVA_RC_HDR_SIZE);
+        nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
         return;
     }
     switch (tag) {
@@ -12002,11 +12352,11 @@ static void nova_rc_free(void* ptr) {
             pthread_mutex_destroy(&ch->lock);
             pthread_cond_destroy(&ch->not_empty);
 #endif
-            free((char*)ptr - NOVA_RC_HDR_SIZE);
+            nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
         }
         case NOVA_MEM_FAT_STR:
-            free((char*)ptr - NOVA_FAT_HDR_SIZE - NOVA_RC_HDR_SIZE);
+            nova_oa_free((char*)ptr - NOVA_FAT_HDR_SIZE - NOVA_RC_HDR_SIZE);
             break;
         case NOVA_MEM_BYTES: {
             /* Free the separately-calloc'd data buffer FIRST (while the struct is valid),
@@ -12015,7 +12365,7 @@ static void nova_rc_free(void* ptr) {
                bytes data is always plain calloc, so an unconditional free(b->data) is correct. */
             NovaBytes* bb = (NovaBytes*)ptr;
             if (bb->data) free(bb->data);
-            free((char*)ptr - NOVA_RC_HDR_SIZE);
+            nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
         }
         /* CORE_GAP 0.8 CLOSED: struct/closure objects (low-3-bit kind == NOVA_MEM_STRUCT) are now
@@ -12023,7 +12373,7 @@ static void nova_rc_free(void* ptr) {
            structs; header-only free for closures/repr_c). This case is therefore unreachable for every
            struct tag and is intentionally omitted here — the pre-switch `return` handles them all. */
         default:
-            free((char*)ptr - NOVA_RC_HDR_SIZE);
+            nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
     }
 }
@@ -20248,7 +20598,7 @@ struct NovaArena {
 };
 
 static NovaArenaChunk* nova_arena_new_chunk(size_t cap) {
-    NovaArenaChunk* c = (NovaArenaChunk*)malloc(sizeof(NovaArenaChunk) + cap);
+    NovaArenaChunk* c = (NovaArenaChunk*)nova_oa_alloc(sizeof(NovaArenaChunk) + cap);
     if (!c) return NULL;
     c->next = NULL; c->used = 0; c->cap = cap;
     /* CRITICAL (arena correctness, iter-99): track the chunk's bump region in the heap
@@ -20321,7 +20671,7 @@ void nova_rt_arena_free(int64_t handle) {
     NovaArena* a = (NovaArena*)(uintptr_t)handle;
     if (!a) return;
     NovaArenaChunk* c = a->all;
-    while (c) { NovaArenaChunk* nx = c->next; free(c); c = nx; }
+    while (c) { NovaArenaChunk* nx = c->next; nova_oa_free(c); c = nx; }
     free(a);
 }
 
