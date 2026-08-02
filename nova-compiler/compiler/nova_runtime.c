@@ -1,3 +1,10 @@
+/* _GNU_SOURCE must be defined BEFORE any libc header, or <link.h> will not expose
+   dl_iterate_phdr / struct dl_phdr_info — which nova_addr_in_module needs to answer
+   "is this a static string literal?" EXACTLY on Linux instead of scanning for a NUL
+   and overrunning foreign blocks. glibc-only; harmless elsewhere. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 /* #27 wasm/freestanding: split into TWO flags:
    - NOVA_FREESTANDING  = use the static-buffer value allocator (set by both _s27 native gate AND wasm).
    - NOVA_NO_SYSHEADERS = gate system headers (set ONLY by nova_runtime_wasm.c, which provides its own
@@ -1428,6 +1435,48 @@ static int nova_probe_cstr(const char* p) {
     }
     return 0;
 }
+
+/* EXACT module ranges on Linux — the POSIX counterpart of the Windows PE check.
+   Windows has always answered "is this a static literal?" with an exact module-range
+   test, but POSIX had no such capture and fell back to nova_probe_cstr, which SCANS
+   for a NUL terminator. On a pointer we do not own that walks straight off the end of
+   the block: Linux ASAN reported heap-buffer-overflow in nova_probe_cstr, reading 1
+   byte past a 792-byte foreign malloc (the sqlite-handle shape) reached via
+   any_to_str. The page-granular readability check cannot help — the overrun stays
+   inside a mapped page.
+   dl_iterate_phdr gives the loaded segments exactly, so membership needs no probing
+   and cannot overrun. Only NON-WRITABLE PT_LOAD segments are accepted: string
+   literals live in .rodata, so this is also STRICTER than the Windows check, which
+   accepts the whole module including .data/.bss. */
+#if defined(__linux__) && !defined(NOVA_FREESTANDING)
+#include <link.h>
+#define NOVA_MOD_MAX 64
+static uintptr_t g_mod_lo[NOVA_MOD_MAX], g_mod_hi[NOVA_MOD_MAX];
+static int g_mod_n = 0;
+static volatile int g_mod_ready = 0;
+static int nova_mod_cb(struct dl_phdr_info* info, size_t sz, void* data) {
+    (void)sz; (void)data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_flags & PF_W) continue;              /* read-only only: .rodata/.text */
+        if (g_mod_n >= NOVA_MOD_MAX) return 1;
+        g_mod_lo[g_mod_n] = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)ph->p_memsz;
+        g_mod_n++;
+    }
+    return 0;
+}
+static int nova_addr_in_module(uintptr_t a) {
+    if (!__atomic_load_n(&g_mod_ready, __ATOMIC_ACQUIRE)) {
+        dl_iterate_phdr(nova_mod_cb, NULL);            /* idempotent; re-running is harmless */
+        __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
+    }
+    for (int i = 0; i < g_mod_n; i++)
+        if (a >= g_mod_lo[i] && a < g_mod_hi[i]) return 1;
+    return 0;
+}
+#endif
 #endif
 
 /* SOUND int-vs-string discrimination. Every runtime-created string now carries an RC
@@ -1447,7 +1496,11 @@ static int nova_is_readable_str(const void* ptr) {
     return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
 #elif defined(NOVA_FREESTANDING)
     return nova_addr_in_module(a);                             /* wasm: data-segment literal (below __heap_base) */
+#elif defined(__linux__)
+    return nova_addr_in_module(a);                             /* EXACT: dl_iterate_phdr ranges, no scanning */
 #else
+    /* Other POSIX (macOS): module capture not implemented yet, so the bounded scan
+       remains. It can still overrun a non-NUL-terminated foreign block — tracked. */
     return nova_probe_cstr((const char*)ptr);
 #endif
 }
@@ -7671,6 +7724,17 @@ static void nova_ensure_carrier(void) {
 }
 
 /* ── Windows Fibers ──────────────────────────────────────────────────── */
+/* PLATFORM-INDEPENDENT: this was defined INSIDE the #ifdef _WIN32 below while the POSIX
+   fiber trampoline and the pool worker both CALL it, so the runtime did not LINK on Linux
+   at all (undefined reference). Moved out of the guard -- it only touches nova_cur() and
+   nova_rt_arena_free, neither of which is Windows-specific. */
+void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
+static void nova_task_arena_cleanup(void) {
+    NovaTaskState* t = nova_cur();
+    NovaArena* a = t->active_arena;
+    if (a) { t->active_arena = NULL; nova_rt_arena_free((int64_t)(uintptr_t)a); }
+}
+
 #ifdef _WIN32
 
 int _resetstkoflw(void);
@@ -7703,12 +7767,6 @@ static void nova_install_fiber_veh(void) {
    cross-task corruption (reachable in normal "let it crash" operation, not just pathological nesting).
    NULL on the clean path -> no-op. Frees the innermost arena; a rare nested-arena panic leaks the outer
    scopes (acceptable on an exceptional path) but never corrupts -- active_arena=NULL is the safe baseline. */
-void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
-static void nova_task_arena_cleanup(void) {
-    NovaTaskState* t = nova_cur();
-    NovaArena* a = t->active_arena;
-    if (a) { t->active_arena = NULL; nova_rt_arena_free((int64_t)(uintptr_t)a); }
-}
 
 static void CALLBACK nova_fiber_entry(LPVOID param) {
     NovaFiber* f = (NovaFiber*)param;
