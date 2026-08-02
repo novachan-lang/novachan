@@ -1088,9 +1088,9 @@ file:line-grounded backlog. These are NOT stale ledger claims; every one has evi
 | # | Gap | Area | Sev | Effort | Status |
 |---|---|---|---|---|---|
 | 1 ✅ | **Float-return reads an UNINIT float slot → silent garbage (0.11)** — DONE `bfc55fba`+`29e380c1` | Runtime/Perf/Type | High | XL | The one remaining silent-wrong-answer bug. `sqrt(variance)`→3e-156. Layout-dependent Heisenbug; same class as geo_bearing/atan2. |
-| 2 | No ARM/aarch64 fiber context switch — concurrency compiled OUT on ARM | Platform | High | L | `nova_asm_switch` has no aarch64 branch and no `#else`. `spawn`/generators silently no-op on ARM. |
+| 2 | No ARM/aarch64 fiber context switch — concurrency compiled OUT on ARM | Platform | High | L | `nova_asm_switch` has no aarch64 branch and no `#else`. `spawn`/generators silently no-op on ARM. ⚠️ **ENV-PARTIAL (probed 2026-08-02):** aarch64 CODEGEN works here (`clang --target=aarch64-unknown-linux-gnu`), so the switch can be written and compile-checked — but there is NO QEMU and NO ARM hardware, so it cannot be RUN. A context switch that merely compiles is worthless; gate the merge on a real aarch64 execution. |
 | 3 | N>1 I/O throughput regresses (0.76–0.82× single-core) | Concurrency | High | L | Single global `nova_io_waiters` under `g_sched_lock`; per-carrier sharding absent. More cores = slower I/O. |
-| 4 🔄 | HTTP/2 & gRPC over TLS impossible — ALPN missing | Forge-core | High | L | **Client ALPN ✅ `69c74b27`**: `tls_connect_alpn`/`tls_alpn` builtins across SChannel+OpenSSL+fallback; reconverged; live-h2 test PENDING (sandbox network down, KAT `_alpn_test` auto-verifies). REMAIN: wire `forge_h2`/`forge_grpc_h2` over the ALPN transport + server-side ALPN (`SSL_CTX_set_alpn_select_cb` on `tls_accept`). |
+| 4 🔄 | HTTP/2 & gRPC over TLS impossible — ALPN missing | Forge-core | High | L | **Client ALPN ✅ `69c74b27`**: `tls_connect_alpn`/`tls_alpn` builtins across SChannel+OpenSSL+fallback; reconverged; live-h2 test PENDING — ✅ **"sandbox network down" is STALE (probed 2026-08-02: outbound HTTPS returns 200)**; re-attempt this. KAT `_alpn_test` auto-verifies. REMAIN: wire `forge_h2`/`forge_grpc_h2` over the ALPN transport + server-side ALPN (`SSL_CTX_set_alpn_select_cb` on `tls_accept`). |
 | 5 | Windows TLS *server* is a hard stub | Forge-core | High | L | `nova_rt_tls_listen/accept` return 0. TLS server only on Linux/macOS. The dev is on Windows. |
 | 6 | gRPC-from-types (`service` marquee) not built | Forge-core | High | XL | Depends on interfaces + `chan T` returns. gRPC today = manual string-path register. |
 | 7 ✅ | `orm_exec` returns wrong affected-row count for PG/MySQL — DONE `c44508a1` | Forge-lib | High | M | PG: parse CommandComplete ('C') tag via `pg_cmd_affected` (libpq PQcmdTuples) + `pg_exec_params`; MySQL: OK-packet lenenc via `mysql_ok_affected`. orm_exec returns the driver count for all 3 backends. Offline KATs both modes; live-DB e2e pending a server. |
@@ -1467,7 +1467,7 @@ Context propagates via the process's channel-carried TraceContext.
 every signature; OTel-Python's monkey-patching + GIL.
 *Unlocks:* the third observability pillar (metrics + logs already ship), enterprise readiness. **high, cheap.**
 
-**F7 — GPU kernel lowering (NOVA → SPIR-V/PTX).** [lang/tool] **XL** (hardware-gated).
+**F7 — GPU kernel lowering (NOVA → SPIR-V/PTX).** [lang/tool] **XL** — 🚫 **ENV-BLOCKED on the current dev machine (probed 2026-08-02).** Not merely "hardware-gated": the installed clang 22.1.0 has NEITHER `spirv64-unknown-unknown` NOR `nvptx64-nvidia-cuda` registered (both fail to compile a trivial TU), and the only GPU present is an integrated **Intel Iris Xe** — so PTX is permanently N/A here (no NVIDIA part) and SPIR-V would additionally need an oneAPI/Level Zero toolchain that is not installed. Nothing about this item can be verified on this box; it needs a different toolchain, and PTX needs different hardware.
 *NOVA way:* a pure data-parallel `Value -> Value` function over arrays IS a GPU kernel. The compiler verifies
 purity (capability inference) + supported ops, lowers the body via LLVM's `nvptx`/`spirv` backends (same
 pipeline, different triple), and generates host dispatch. Buffer transfer = a channel send. `@gpu` annotation
@@ -1602,7 +1602,7 @@ verified backlog from §3.2, ordered as the mandatory foundation.
 
 ### Wave C — Platform + Forge-transport last-mile (unblocks reach + the deploy story). Parallel with Wave B.
 
-10. **ARM/aarch64 fiber context switch (L)** — add the `nova_asm_switch` aarch64 branch. Concurrency silently
+10. **ARM/aarch64 fiber context switch (L)** — ⚠️ **ENV-PARTIAL: writable + compile-verifiable here, NOT runnable (no QEMU, no ARM hw; probed 2026-08-02).** Add the `nova_asm_switch` aarch64 branch. Concurrency silently
     no-ops on ARM today (blocks Apple Silicon + mobile + macOS CI).
 11. **N>1 per-carrier I/O + work-stealing (L)** — shard `nova_io_waiters` into per-carrier queues; eliminate
     the global `g_sched_lock` on the hot path. (Beats Go's goroutine runtime.)

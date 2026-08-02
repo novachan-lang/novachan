@@ -7,6 +7,44 @@
 > **The gate (every change):** edit → precheck → build → **reconverge gen5==gen6 (compiler changes)** →
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
+
+## ENVIRONMENT CAPABILITY MATRIX — what this machine can and cannot verify (PROBED 2026-08-02)
+
+Every line below was **probed, not assumed**. Two long-standing assumptions turned out to be WRONG,
+so re-probe before treating anything here as permanent.
+
+| Capability | State | Evidence |
+|---|---|---|
+| Host | x86-64 Windows 10, i7-1165G7, **4 physical / 8 logical** | `Win32_Processor`. Divide by 4, not 8, when judging parallel efficiency. |
+| clang | 22.1.0, target `x86_64-pc-windows-msvc` | `clang --version` |
+| aarch64 **codegen** | ✅ works | `clang --target=aarch64-unknown-linux-gnu -c` compiles |
+| aarch64 **execution** | 🚫 impossible | no `qemu-aarch64`/`qemu-system-aarch64`; no ARM hardware |
+| thumbv7em (MCU) codegen | ✅ works | `--target=thumbv7em-none-eabi -c` compiles |
+| riscv32 codegen | ✅ works | `--target=riscv32-unknown-elf -c` compiles |
+| wasm32 codegen | ✅ works | `--target=wasm32-unknown-unknown -c` compiles |
+| **SPIR-V codegen** | 🚫 **not in this clang** | `--target=spirv64-unknown-unknown` fails |
+| **PTX codegen** | 🚫 **not in this clang** | `--target=nvptx64-nvidia-cuda` fails |
+| GPU hardware | Intel Iris Xe (integrated). **No NVIDIA** | `Win32_VideoController`. PTX is permanently N/A here; SPIR-V would need oneAPI/Level Zero, absent. |
+| CUDA / OpenCL tooling | 🚫 absent | no `nvcc`, no `clinfo` |
+| **Linux** | ✅ **AVAILABLE** — WSL2 Ubuntu + Kali installed | `wsl -d Ubuntu -e uname -m` -> `x86_64` |
+| Docker | ⚠️ installed, **daemon not running** | `docker info` fails on the named pipe |
+| **Outbound network** | ✅ **UP** | `Invoke-WebRequest https://example.com` -> **200** |
+| ALPN-h2 negotiation probe | ⚠️ unverified *by this probe* | Windows PowerShell 5.1 lacks `SslClientAuthenticationOptions`; this is a PROBE limitation, **not** a network one |
+
+### Two corrections this probe forced
+
+1. **"Sandbox network is down" is STALE.** Outbound HTTPS returns 200. Items parked on that premise
+   (the live h2/ALPN test) are **not** environment-blocked and should be re-attempted.
+2. **Linux was never unavailable.** WSL2 Ubuntu is installed and runs. The Linux track (FD_SETSIZE,
+   POSIX paths, `posix_memalign`/`mprotect` in the object space, multi-platform CI) is **testable here
+   today** — it had been treated as out of reach.
+
+### Legend used on the rows below
+- 🚫 **ENV-BLOCKED** — cannot be done on this machine at all; needs other hardware or another toolchain.
+- ⚠️ **ENV-PARTIAL** — the *code* can be written and COMPILE-verified here; only runtime proof needs elsewhere.
+- ✅ **ENV-OK** — previously assumed blocked, actually available now.
+
+
 ## Two streams
 - **Stream 1 — Opus (compiler/runtime foundation)** — `nova_compiler.nova` + `nova_runtime.c`. Sequential,
   reconverge-gated. Soundness FIRST, then language ceilings, runtime builtins, backend/FFI.
@@ -379,7 +417,7 @@ param #11). **STRATEGIC (owner's call): LOCK-4 sized/unsigned + f32/f16** — st
 - **STRATEGIC (the plan's real heart — LOCK-NOW, blocks frameworks):** **LOCK-4 sized/unsigned + f32/f16** (the
   "#1 risk", unblocks 6 frameworks — the widest ABI/type change, do before the frameworks need it) · LOCK-5
   safepoint preemption+kill · LOCK-7 constant-time crypto · LOCK-1 full `@mod__fn` mangling (detection done).
-- **TACTICAL 0-C leftovers:** ALPN server · FD_SETSIZE (Linux) · ARM fibers · TLS netpoller-for-concurrency.
+- **TACTICAL 0-C leftovers:** ALPN server (✅ **network is UP — the "sandbox down" premise is stale**) · FD_SETSIZE (✅ **Linux IS testable — WSL2 Ubuntu installed**) · ARM fibers (⚠️ **ENV-PARTIAL: compiles here, cannot run — no QEMU/ARM hw**) · TLS netpoller-for-concurrency. See the ENVIRONMENT CAPABILITY MATRIX at the top.
 - **0-B RC completeness:** Wave-B #6/#7/#8 leaks — memory-SAFE, so lower urgency; UAF-adjacent = attended/supervised cycle.
 
 **RECOMMENDATION:** the plan's foundation-first doctrine says do the **LOCK-NOW** decisions before more breadth —
@@ -415,7 +453,7 @@ but not the strategic bottleneck.
 | lexer: `\u{}` escapes / labeled break | 0-A | C | ⏸ DEFERRED (low-value: `from_codepoint` covers `\u`; labeled-break is involved, not a quick win) | |
 | RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ✅ **CLOSED 2026-08-01** — all 3 columns 2001->2 (`c6ca9ad7`+`23af36ca`+`f74454c1`+`c9659065`, certified `046943b4`); ASAN-clean; the gated test itself prints CONCAT/DICTSET INSERT LEAK CLOSED. (was: leak CONFIRMED 2001; gated `_move6_insert_leak_test` 83650843; design=MOVE owned-temps only, borrow-builtins stay rc-inc=the 0.10 UAF) | |
 | RC cycle collector | 0-B | A(XL) | ⬜ **MEASURED + DESIGN CORRECTED 2026-08-01.** Cycles DO leak and it is reproducible: two mutually-referencing structs over 1000 iterations leak 2000 objects (`_kat_rc_cycle_leak`, delta = 2000). **The plan's premise is only half-right:** it says the collector can reuse "the existing per-type child enumeration" — that part IS there (`nova_struct_bitmap_for_hash` gives a managed-slot bitmap and `rc_free` already walks only pointer slots). But trial deletion ALSO needs to enumerate EVERY LIVE OBJECT to form the candidate set, and **no such registry exists** — the runtime has only counters (`nova_mem_live`) and range bounds (`heap_base`/`heap_top`, `g_box_lo`/`g_box_hi`); `nova_mem_find_tag` is a pointer VALIDATOR (range/align/magic/structural), not an iterable index. Adding object tracking touches the hottest path in the runtime (every alloc AND free), which directly conflicts with the C-level perf promise. **Refined design:** make tracking OPT-IN (`NOVA_GC=1`) so the default path costs at most one predictable branch, and track only CYCLE-CAPABLE objects (structs with managed slots, lists, dicts — never strings/bytes/boxes, which cannot form cycles), which also shrinks the candidate set. Then: gc_refs = rc, subtract internal refs via the child enumeration, mark from the externally-reachable roots, free the unmarked set. **Do the DETECTION half first** (report the unreachable set, free nothing) — it is the bulk of the algorithm with ZERO risk of freeing a live object, which is the failure mode that matters here. Plan rates this XL + SUPERVISED; the free half should stay supervised. | |
-| ARM aarch64 fibers | 0-C | B | ⬜ | |
+| ARM aarch64 fibers | 0-C | B | ⚠️ **ENV-PARTIAL (probed 2026-08-02)** — the `nova_asm_switch` aarch64 branch CAN be written and compile-verified here (`clang --target=aarch64-unknown-linux-gnu` works), but it CANNOT be executed: no QEMU and no ARM hardware. So it is writable-but-unprovable on this box; a context switch that compiles is not a context switch that works. Do the codegen here, gate the merge on a real aarch64 run. | |
 | N>1 per-carrier I/O | 0-C | B | 🔄 **MEASURED 2026-08-02 — the "goal met" claim is CORRECT; the perf gate PASSES.** Correctness: an 8-worker spawn+channel workload gives an IDENTICAL total at N=1/2/4/8 and under FULLRC (deterministic, no races). Scaling (`_bench_mn_scaling`, best-of-5 — this is a 15W mobile i7-1165G7 with **4 PHYSICAL cores** / 8 logical, so single runs swing widely with turbo/thermal): N=1 52.12 ms → N=2 29.05 (1.79x) → **N=4 16.25 (3.21x)** → N=8 16.19 (3.22x). **3.21x on 4 physical cores is ~80% efficiency and clears the plan's >1.8x @ 4-worker gate comfortably.** N=8 adding nothing over N=4 is expected — hyperthreading does not help a purely CPU-bound loop. *(Correction: an earlier entry today reported ~37% efficiency and a gate miss. That was WRONG — it divided by LOGICAL cores and used single noisy runs on a throttling mobile part. Recorded here because the mistake is instructive: always check physical vs logical before judging parallel efficiency.)* **Stage B turned out to be DONE** — and the code comment that said otherwise was STALE and misled this very analysis. `nova_sched_enqueue_task()` routes a homed task to its carrier's deque and "REPLACES the bare nova_rq_push in every WAKE / yield_runnable site"; spawn does the same (S-c) for an already-pinned task. So the local deque IS the normal wake path and the global injector is reached only by a fresh, unclaimed spawn — exactly its purpose. Stale comment corrected in `nova_rq_pop`. **What genuinely REMAINS is WORK-STEALING** (Stage 2b, designed at the bottom of nova_runtime.c): an idle carrier cannot take from a busy carrier's deque, so an unlucky pinning distribution leaves a carrier idle while another has a backlog. **WORK-STEALING: FOUND ALREADY BUILT, AND FOUND BROKEN AT THE ENTRY POINT.** A complete Chase-Lev-style stealing pool already exists in `nova_runtime.c` (`NovaWSDeque`, `ws_deque_push/pop/steal`, `ws_worker_loop` with random-victim stealing) and was already exposed as `ws_spawn`/`ws_task_count`/`ws_shutdown`. But `ws_spawn` indexes with `g_ws_total_tasks % g_ws_worker_count`, so calling it WITHOUT a prior `ws_init` was **an integer DIVISION BY ZERO**. Verified: a one-line probe calling `ws_spawn` died before its next `print`. Nothing in the type system or docs forced the init call first, so the documented-looking usage crashed. FIXED: `nova_ws_ensure_started()` lazily starts a pool sized to `nova_rt_cpu_count()` on first spawn (idempotent; an explicit `ws_init(n)` before any spawn still wins); `ws_steal_count` added and wired in all 4 places (`924c705b`). *(Correction: I first recorded this as "`ws_init` had a name mapping but no type scheme, so the pool was unstartable". That was an unverified inference — `ws_init` DID already have a type scheme. The crash was real and the fix is right; the stated cause was not. Grep before asserting an absence.)* **THEN A SECOND, DEEPER BUG — and a correction to my own first verdict.** I initially recorded both KATs as PASS on SINGLE runs. Repeating them exposed the truth: the ws KAT passed only **3 of 8 runs**, silently exiting 0 with NO output the rest of the time. (Same mistake class as the N>1 efficiency error above: a single run is not evidence for anything concurrent. Re-run before believing a green.) Root cause: ws tasks live in the per-worker deques, which `nova_rq_pop()` cannot see, and outstanding ws work was not one of the carrier loop's 'work still pending' categories. So with the root task parked on `recv` and the run queue empty, the scheduler concluded USER DEADLOCK and bailed out — dropping every message the ws tasks were about to send. FIXED by adding `nova_ws_outstanding()` to the pending-work test on BOTH carrier paths (single-carrier bail-out and the N>1 `live<=0` exit), gated exactly like the existing sleep/offload/io waiters so Go-style root-exit semantics are untouched and non-ws programs see a constant 0. NOW PROVEN OVER REPEATED RUNS: `_kat_workstealing` **12/12** (was 3/8) and `_kat_ws_steal` **8/8** with 28-50 steals per run — the deque genuinely load-balances rather than round-robins. Remaining and deliberately NOT done: merging this pool into the main M:N carrier scheduler is scheduler-deep RED surgery with **nil measured benefit** — the gate already passes at 3.21x. | |
 | **Windows TLS server** (of "ALPN + Windows TLS server") | 0-C | B | ✅ DONE `3c1f746d` — SChannel server: PFX cert load (dyn crypt32) + INBOUND cred + AcceptSecurityContext handshake + encrypted I/O; `tls_connect_insecure` (curl -k). Verified encrypted round-trip (gate [CI 2e3]). FOLLOW-ON: netpoller integration for concurrent HTTPS (blocking I/O today = sequential). | 3c1f746d |
 | **ALPN server** (of "ALPN + Windows TLS server") | 0-C | B | ✅ **CLOSED 2026-08-01** `58a7a6a3` — `tls_listen_alpn` on BOTH SChannel and OpenSSL, fail-open by design. (was: pass SEC_APPLICATION_PROTOCOLS into AcceptSecurityContext + query negotiated proto (client ALPN already done `69c74b27`). Low-leverage until an h2 server consumes it. | |
@@ -443,7 +481,7 @@ but not the strategic bottleneck.
 | runtime builtins: PRNG (D8) | rt | C | ✅ DONE (xoshiro256** seedable: rng_new/next/int/float; reconverge pending) | (batch 2) |
 | runtime builtins: signals/sockets/glob/sync/pack | rt | B/C | ✅ MOSTLY DONE (signals=builtins; sync=std/sync/; pack=std/encoding/pack; glob=std/os/glob; sockets=TCP builtins) | |
 | regex capture-group engine (D3) | rt | B | ✅ DONE (regex_captures + regex_named_captures + regex_find_all + regex_replace_all — all wired) | (pre-existing) |
-| GPU lowering (SPIR-V/PTX) · MCU triples | backend | A(XL) | ⬜ | |
+| GPU lowering (SPIR-V/PTX) · MCU triples | backend | A(XL) | 🚫/⚠️ **SPLIT (probed 2026-08-02)** — **GPU = ENV-BLOCKED**: this clang has NEITHER `spirv64` nor `nvptx64` registered, and the only GPU is an integrated Intel Iris Xe, so PTX is permanently N/A on this machine and SPIR-V would need an absent oneAPI/Level Zero toolchain. Not an effort question — the target does not exist here. **MCU = ENV-PARTIAL**: `thumbv7em-none-eabi` (and `riscv32-unknown-elf`) codegen WORKS, so freestanding MCU triples are compile-verifiable here today; only on-device execution needs hardware. | |
 
 ## Stream 2 — std/ stdlib (Sonnet fleet) — status
 | Module | Category | Needs (Stream 1) | Status | Commit |

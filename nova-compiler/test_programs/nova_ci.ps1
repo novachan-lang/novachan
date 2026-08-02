@@ -1,5 +1,8 @@
 # NOVA one-command CI gate (#3). This repo's authoritative pre-commit gate.
-# (The repo lives on Bitbucket and the bootstrap trust-root is a Windows binary, so there is no cloud
+# (PROBED 2026-08-02: WSL2 Ubuntu IS installed and runs (`wsl -d Ubuntu -e uname -m` -> x86_64), so the
+#  LINUX track is testable on this machine TODAY -- it had been treated as out of reach. Outbound network
+#  is also UP (https GET -> 200), so anything parked on "sandbox network down" should be re-attempted.
+#  The repo lives on Bitbucket and the bootstrap trust-root is a Windows binary, so there is still no cloud
 #  runner today; cloud + multi-platform CI is item #23 on the Linux track. Until then THIS is "CI": run it
 #  before every commit that touches the compiler or runtime.)
 #
