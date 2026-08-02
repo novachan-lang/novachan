@@ -40,9 +40,16 @@
 > a direct Python-parity failure found by dogfooding. Comparisons and logical ops now yield a bool on BOTH
 > paths (inference for runtime values, const-fold for literals); `neg`/`bitnot` deliberately stay ints.
 > Also cleared a latent LOCK-4 interaction where a comparison result inherited the operand's sized width.
-> **L8 call-overload 🔄** — works when the callee's type is already resolved; the
-> `let d = Doubler(3)` case needs DEFERRED call constraints (measured: callee is still a type var at
-> constrain time). *Dev-mode: compile-checked + KAT-gated; full both-mode regression batched.*
+> **L8 call-overload ✅ CLOSED 2026-08-02** — the `let d = Doubler(3)` case now works. The diagnosis
+> here was exactly right (the callee is still a type VAR at constrain time because `ti_constrain` only
+> DEFERS), but it did not need a new deferred-constraint mechanism: `ti_solve` already binds + clears
+> deferred constraints, and the `match` paths already call it for the same reason (resolve the subject
+> so a Result/Option is a concrete Sum). Calling it at the call site resolves the callee so the existing
+> `Struct__call` redirect can fire. Gated twice so nothing else moves: only when the callee is genuinely
+> still a var (a normal `foo(1)` callee already has a fn type), and only when the unit declares a struct
+> with a `call` method — so a program without call-overload is unaffected and pays nothing. KAT
+> `_kat_call_overload` 8/8; reconverged gen5==gen6; regression 2840 PASS / 1 FAIL (the 1 is the
+> pre-existing `real_http_api` UAF, unrelated).
 >
 > **✅ 2026-08-01 BATCH 2 — TWO LOCK-NOW ITEMS MOVED** (certified `gen5==gen6`, `721e5369`):
 > **LOCK-6 Phase 2 `@cdecl` ✅ `808342ca`** — NOVA functions are now callable FROM C. Proven from a real
