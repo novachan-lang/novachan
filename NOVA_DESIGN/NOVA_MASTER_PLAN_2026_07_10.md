@@ -1669,7 +1669,7 @@ gap is open.**
 - **[lang]** L12 + L13 ✅ DONE (2026-07-22) (S each) — parser gotchas, do anytime.
 - **[lang]** L6 enforced immutability (M) — ✅ DONE `1a65d7c0` (`let` vs `let mut` syntax).
 - **[lang]** L7 sized numerics + f32 (M) — 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE; inc3c-part2+inc3d OPEN.
-- **[lang]** L8 custom operators (M) — 🔄 index+iter DONE `49f28f4f`; call-overload `42e9c73f` source-level DONE (type inference + IR dispatch in nova_compiler.nova), blocked by gen3 truncation until reconverge.
+- **[lang]** L8 custom operators (M) — ✅ **CLOSED `27c9bb49`**: index+iter `49f28f4f`, and call-overload now resolves the `let d = Doubler(3); d(7)` case too (ti_solve at the call site so the callee's type var is bound before the Struct__call redirect). KAT `_kat_call_overload` 8/8.
 - **[lang]** L3 variance (L) — after the trait-conformance fix.
 - **[lang]** **L1 annotations + codegen (XL)** — ✅ Phase-1 DONE: 15 annotation types across 5 batches (`1a65d7c0`..`e099c1ac`). Phase-2 (user-extensible) = OPEN.
 - **[lang]** **L2 macros/comptime (XL)** — ✅ Phase-1 DONE: comptime-fn `55d3fb7e` + value propagation `b7a5e1ca`. Phase-2 (hygienic macros) = OPEN.
