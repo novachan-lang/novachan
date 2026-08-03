@@ -2032,6 +2032,26 @@ fn parse_pattern(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let kind = tk(tokens, pos)
     let val = tv(tokens, pos)
+    // TUPLE PATTERN (p1, p2, ...). Tuples already work everywhere else -- literal,
+    // index and let-destructure -- only match arms lacked them, which is what stops
+    // GATE 1 FizzBuzz (match on a two-element tuple) from compiling.
+    if kind == "DELIM" and val == "("
+        let _tp = pos + 1
+        let _tsub = []
+        while not (tk(tokens, _tp) == "DELIM" and tv(tokens, _tp) == ")") and tk(tokens, _tp) != "EOF"
+            if len(_tsub) > 0
+                if tk(tokens, _tp) == "COMMA"
+                    _tp = _tp + 1
+                else
+                    break
+            let _tr = parse_pattern(tokens, _tp, pe)
+            if _tr.pos <= _tp
+                break
+            push(_tsub, _tr.expr)
+            _tp = _tr.pos
+        if tk(tokens, _tp) == "DELIM" and tv(tokens, _tp) == ")"
+            _tp = _tp + 1
+        return ParseResult(Expr("pat_tuple", "", 0, _tsub, [], ln), _tp)
     if kind == "IDENT"
         if pos + 1 < len(tokens) and tv(tokens, pos + 1) == "("
             // Constructor pattern: Name(field1, field2, ...)
@@ -3461,7 +3481,82 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         push(arms, Stmt("arm", "", pat_r.expr, arm_body, [], [], [arm_guard], ln))
     if len(arms) == 0
         syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm", pe)
-    StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], [], ln), p2)
+    // TUPLE PATTERNS desugar HERE, in ONE place, instead of in each of the ~10 match
+    // lowering sites. A tuple arm becomes a WILDCARD arm whose GUARD compares the literal
+    // elements, with variable sub-patterns turned into bindings prefixed onto the body.
+    // The match is wrapped in a block that binds the subject to a temp FIRST, so the
+    // subject is evaluated exactly ONCE -- referencing the subject expression inside each
+    // guard would re-evaluate it and break anything with side effects.
+    // The binding tag is "assign": that is what a let-binding parses to, and what ti
+    // defines variables under. Emitting Stmt("let", ...) is silently IGNORED by ti, which
+    // is why the first attempt failed with "unknown identifier".
+    let _mt_any = false
+    for _ma in arms
+        match _ma
+            Stmt(_mat, _man, _mapat, _mab, _map, _mae, _maann, _mal) =>
+                match _mapat
+                    Expr(_mpt, _mpv, _mpn, _mpc, _mpf, _mpl) =>
+                        if _mpt == "pat_tuple"
+                            _mt_any = true
+    if not _mt_any
+        return StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], [], ln), p2)
+    let _mt_name = "__mtup" + str(ln)
+    let _mt_ref = Expr("ident", _mt_name, 0, [], [], ln)
+    let _mt_arms = []
+    for _ma2 in arms
+        match _ma2
+            Stmt(_mat2, _man2, _mapat2, _mab2, _map2, _mae2, _maann2, _mal2) =>
+                let _newpat = _mapat2
+                let _newbody = _mab2
+                let _newguard = null_expr()
+                if len(_maann2) > 0
+                    _newguard = _maann2[0]
+                match _mapat2
+                    Expr(_mpt2, _mpv2, _mpn2, _mpc2, _mpf2, _mpl2) =>
+                        if _mpt2 == "pat_tuple"
+                            _newpat = Expr("pat_wild", "_", 0, [], [], ln)
+                            let _binds = []
+                            let _conds = []
+                            let _tj = 0
+                            for _sub in _mpc2
+                                let _elem = Expr("index", "", 0, [_mt_ref, Expr("int", "", _tj, [], [], ln)], [], ln)
+                                match _sub
+                                    Expr(_st, _sv, _sn, _sc, _sf, _sl) =>
+                                        if _st == "pat_lit"
+                                            push(_conds, Expr("binop", "==", 0, [_elem, Expr("int", "", _sn, [], [], ln)], [], ln))
+                                        else if _st == "pat_str"
+                                            push(_conds, Expr("binop", "==", 0, [_elem, Expr("str", _sv, 0, [], [], ln)], [], ln))
+                                        else if _st == "pat_var" and _sv != "_"
+                                            push(_binds, Stmt("assign", _sv, _elem, [], [], [], [], ln))
+                                _tj = _tj + 1
+                            let _cond = null_expr()
+                            for _c in _conds
+                                match _cond
+                                    Expr(_ct, _cv, _cn, _cc, _cf, _cl) =>
+                                        if _ct == "null"
+                                            _cond = _c
+                                        else
+                                            _cond = Expr("binop", "and", 0, [_cond, _c], [], ln)
+                            match _cond
+                                Expr(_ct2, _cv2, _cn2, _cc2, _cf2, _cl2) =>
+                                    if _ct2 != "null"
+                                        match _newguard
+                                            Expr(_gt, _gv, _gn, _gc, _gf, _gl) =>
+                                                if _gt == "null"
+                                                    _newguard = _cond
+                                                else
+                                                    _newguard = Expr("binop", "and", 0, [_cond, _newguard], [], ln)
+                            if len(_binds) > 0
+                                let _mergedb = []
+                                for _bb in _binds
+                                    push(_mergedb, _bb)
+                                for _ob in _mab2
+                                    push(_mergedb, _ob)
+                                _newbody = _mergedb
+                push(_mt_arms, Stmt("arm", "", _newpat, _newbody, [], [], [_newguard], ln))
+    let _mt_let = Stmt("assign", _mt_name, subject_r.expr, [], [], [], [], ln)
+    let _mt_match = Stmt("match", "", _mt_ref, _mt_arms, [], [], [], ln)
+    StmtParseResult(Stmt("block", "", null_expr(), [_mt_let, _mt_match], [], [], [], ln), p2)
 
 // Erlang frontier Stage-1: selective receive. `receive <pat => body ...>` (column-aligned arms like
 // match, no subject) DESUGARS to a poll loop that reuses the proven match codegen + a per-task
@@ -13498,7 +13593,21 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
 fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
     match stmt
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
-            if tag == "expr" and b.ir_clabel != ""
+            // A block in VALUE position yields the value of its LAST statement. Without this
+            // a desugaring that returns a block (tuple-pattern match, `receive`) worked as a
+            // statement but silently produced no value when it was the last statement of a
+            // function -- the plain block lowering runs ir_lower_stmt on every child, so the
+            // final one never takes the value-returning path.
+            if tag == "block" or tag == "unsafe_block"
+                let _blast = len(body) - 1
+                let _bi = 0
+                for _bs in body
+                    if _bi == _blast
+                        ir_lower_last_stmt(b, _bs)
+                    else
+                        ir_lower_stmt(b, _bs)
+                    _bi = _bi + 1
+            else if tag == "expr" and b.ir_clabel != ""
                 let val = ir_lower_expr(b, expr)
                 ir_emit_defers(b)
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), [val], "", 0, "pure", b.ir_cur_line))
@@ -17876,6 +17985,21 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
                 ti_define(st, value, ti_mono(expected))
             else if tag == "pat_wild"
                 return
+            else if tag == "pat_tuple"
+                let _tw = ti_walk(st, expected)
+                let _telems = []
+                match _tw
+                    NType(_twk, _twn, _twp, _twi) =>
+                        if _twk == "tuple"
+                            for _te in _twp
+                                push(_telems, _te)
+                let _ti = 0
+                for _tsp in children
+                    if _ti < len(_telems)
+                        ti_infer_pattern(st, _tsp, _telems[_ti])
+                    else
+                        ti_infer_pattern(st, _tsp, ti_fresh(st))
+                    _ti = _ti + 1
             else if tag == "pat_lit"
                 ti_constrain(st, expected, nt_int(), eline)
             else if tag == "pat_str"
