@@ -3391,7 +3391,7 @@ registering and become declarative:
 26. ✅ **Comptime** (L2a) — **Phase 1+2 DONE** `55d3fb7e`+`b7a5e1ca` (compile-time fn evaluation + value propagation + `\\u{XXXX}` unicode escapes). Phase 3 general quasi-quote AST = L2b (XL).
 27. 🔄 **Sized numeric types + `f32` + unsigned** (L7) — **inc1-inc3b DONE** (width types + width-mismatch + wrapping arithmetic). inc3c/inc3d OPEN.
 28. **Const generics** (L5) + **variance** (L3) + **associated types** (L4) — NOT STARTED.
-29. ✅/🔄 **L6 `let mut`** ✅ DONE `1a65d7c0` + **L8 custom index/iter** ✅ DONE `49f28f4f` + **L10 weak-ref/Drop** NOT STARTED.
+29. ✅/🔄 **L6 `let mut`** ✅ DONE `1a65d7c0` + **L8 custom index/iter** ✅ DONE `49f28f4f` + **L10 weak-ref/Drop** 🔄 **HALF DONE (verified 2026-08-03, this row was wrong):** weak refs ARE implemented and wired end-to-end — `nova_rt_weak_create` / `_upgrade` / `_alive` / `_invalidate` in the runtime plus the compiler builtins. **`Drop` is the part that is genuinely missing** — there is no `Drop` trait, `__drop` or `on_drop` hook anywhere, so there is no deterministic destructor / RAII cleanup.
 
 ### Phase 6 — Domain libraries: presentation layer (the frontend half of NOVA's own identity)
 
