@@ -8,6 +8,23 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## FORGE PRODUCTION GAPS — 4 items that are OURS (compiler/runtime), not Forge's
+
+Canonical audit: [`FORGE_PRODUCTION_GAPS_2026_08_03.md`](FORGE_PRODUCTION_GAPS_2026_08_03.md). It supersedes
+the completion percentages in FORGE_STATUS / FORGE_BUILD_PLAN / FORGE_DEV_TRACK / FORGE_FEATURE_AUDIT (3-6
+weeks stale). **Read its FIX STATUS section first** — the tables below it are the original findings kept as
+evidence and do not reflect current code state on their own.
+
+~38 FIXED/MITIGATED · ~16 OPEN · 1 PARTIAL · 2 N/A. Of the open ones, exactly **4 need compiler/runtime
+surface and therefore belong to THIS tracker**:
+
+| # | Item | Sev | Status |
+|---|---|---|---|
+| F-1 | **Real TCP peer address is exposed nowhere.** `tcp_accept` populates then DISCARDS `sockaddr`, so `mw_rate_limit` can only key on attacker-controlled `X-Forwarded-For` — a fresh random XFF per request defeats the limiter entirely AND forces unlimited PBKDF2 (CPU-exhaustion DoS). | **BLOCKER / security** | ⬜ OPEN — **cheapest high-value item on this list**: `nova_rt_udp_recv_from` already returns the peer for UDP, so the pattern exists; this is a missing builtin, not an architectural gap. |
+| F-2 | **No POSIX stack-overflow containment.** Hardware guard is Windows-only (`__except(EXCEPTION_STACK_OVERFLOW)`); POSIX has no `sigaltstack`/`SIGSEGV` handler (grep = 0 hits). Defeats even `serve_safe_req` on Linux, the dominant deploy target. | HIGH | ⬜ OPEN — genuine `nova_runtime.c` work. Note this is now MORE testable than when filed: WSL2 + Docker give us real Linux. |
+| F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
+| F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
+
 ## OPEN — `forge_h2c_test` hangs (NOT a regression; bisected 2026-08-03)
 
 Hangs with no output at all, before any print, i.e. inside the h2c server/client handshake.

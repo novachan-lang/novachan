@@ -4,6 +4,27 @@
 > [`EXECUTION_STATE.md`](EXECUTION_STATE.md)** (updated every commit). This banner is refreshed as backlog
 > items land, so the plan stays an accurate picture. Execution began **2026-07-11**.
 >
+> **📋 FORGE PRODUCTION-READINESS — canonical audit:
+> [`FORGE_PRODUCTION_GAPS_2026_08_03.md`](FORGE_PRODUCTION_GAPS_2026_08_03.md)** (2026-08-03).
+> This is the ground-truth "what is actually wrong with Forge" record and it **SUPERSEDES the completion
+> percentages in `FORGE_STATUS.md` / `FORGE_BUILD_PLAN.md` / `FORGE_DEV_TRACK.md` / `FORGE_FEATURE_AUDIT.md`**,
+> which are 3-6 weeks stale relative to 83+ commits. Read its **FIX STATUS section first, every time** — the
+> tables below it are the ORIGINAL findings kept as the evidence record (file:line + failure scenarios) and do
+> NOT reflect current code state on their own.
+>
+> Standing count at time of writing: **~38 FIXED/MITIGATED** (each compile-checked against a real test),
+> **~16 NOT ATTEMPTED/OPEN**, **1 PARTIAL** (name-collision hygiene), **2 N/A**. Of the open items only
+> **4 genuinely require compiler/runtime surface** — i.e. they are OURS, not Forge's, and belong in this plan:
+>
+> | # | Item | Why it needs the compiler/runtime |
+> |---|---|---|
+> | 1 | **`mw_rate_limit` is bypassable — BLOCKER, security.** `tcp_accept` populates then DISCARDS `sockaddr`, so the real TCP peer address is exposed NOWHERE; rate limiting keys on attacker-controlled `X-Forwarded-For`. A fresh random XFF per request gets a fresh bucket, and also forces unlimited PBKDF2 → CPU-exhaustion DoS. | Needs a `nova_runtime.c` builtin returning the peer address. **Cheap, not architectural** — `nova_rt_udp_recv_from` ALREADY returns the peer for UDP, so the pattern exists. |
+> | 2 | **No POSIX stack-overflow containment — HIGH.** Hardware guard is Windows-only (`__except(EXCEPTION_STACK_OVERFLOW)`); POSIX has no `sigaltstack`/`SIGSEGV` handler (grep = zero hits). Defeats even `serve_safe_req`, Forge's flagship crash-isolated path, on Linux — the dominant deploy target. | Genuine C runtime work in `nova_runtime.c`. |
+> | 3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` are declared as builtins but have **zero emitted call sites**, so the software fallback for (2) does not exist either. | Compiler must auto-emit the guard at call sites. |
+> | 4 | **DB pool leak on crash** is only MITIGATED (`pool_acquire_to` turns a hang into a fast `err()`); the underlying crash-triggered leak needs runtime panic-recovery integrated with `defer`. | Runtime panic/`defer` integration. |
+>
+> Everything else in that file is Forge-side and correctly scoped away from this plan.
+>
 > **✅ BUILTIN SOUNDNESS CAMPAIGN DONE (2026-08-01)** — the mass-produced builtins were NOT
 > production-grade, and the fix is landed. Three defect classes, each *measured*, not argued:
 > **(1)** `08b03d37` dense-dict — 59 builtins iterated `i < d->cap` with `hashes[i]!=0` as an occupancy
