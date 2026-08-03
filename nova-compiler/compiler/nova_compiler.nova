@@ -14428,6 +14428,7 @@ type TiState
     ti_type_method_ptypes: dict    // LOCK-3: impl type -> {method -> [self-excluded param type annotations]}
     ti_type_method_rtype: dict     // LOCK-3: impl type -> {method -> return type annotation}
     ti_variant_ptypes: dict        // enum payload typing: variant name -> [ordered payload field type annotations] so match binders take the DECLARED type (not a fresh var)
+    ti_fn_pnames: dict             // NAMED ARGS: fn -> declared [param names], so an out-of-order call is reordered BEFORE unification
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -14555,7 +14556,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     // self-compiles the compiler with 0 errors. Opt OUT with NOVA_TI_STRICT=0 (the old fail-open path).
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = not (len(_ti_strict_env) > 0 and _ti_strict_env[0] == "0")
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -16958,6 +16959,40 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     else if _is_unsafe_builtin(value)
                         ti_error(st, "calling raw-memory primitive '" + value + "' requires an enclosing 'unsafe' block/expression (it can read or write arbitrary memory -- outside NOVA's safety envelope; wrap it as 'unsafe " + value + "(...)' or put it inside an `unsafe` block)", eline)
                 let fn_t = ti_lookup(st, value, eline)
+                // NAMED ARGS: reorder to the DECLARED parameter order before inferring, so
+                // `f(b: 2, a: 1)` checks against the right parameters. Mirrors what the IR
+                // lowering already does; without it the checker compared positionally and
+                // rejected a correct call whenever the reordered params had different types.
+                if contains(st.ti_fn_pnames, value)
+                    let _tna_has = false
+                    for _tnc in children
+                        match _tnc
+                            Expr(_tnt, _, _, _, _, _) =>
+                                if _tnt == "named_arg"
+                                    _tna_has = true
+                    if _tna_has
+                        let _tna_map = {}
+                        let _tna_pos = []
+                        for _tnc2 in children
+                            match _tnc2
+                                Expr(_tnt2, _tnv2, _, _tnch2, _, _) =>
+                                    if _tnt2 == "named_arg" and len(_tnch2) > 0
+                                        _tna_map[_tnv2] = _tnch2[0]
+                                    else
+                                        push(_tna_pos, _tnc2)
+                        let _tna_out = []
+                        let _tna_pi = 0
+                        for _tnpn in st.ti_fn_pnames[value]
+                            if contains(_tna_map, _tnpn)
+                                push(_tna_out, _tna_map[_tnpn])
+                            else if _tna_pi < len(_tna_pos)
+                                push(_tna_out, _tna_pos[_tna_pi])
+                                _tna_pi = _tna_pi + 1
+                        // Only adopt the reordering when every argument was placed; a
+                        // misspelled name would otherwise silently DROP an argument and
+                        // turn a clear error into a confusing arity mismatch.
+                        if len(_tna_out) == len(children)
+                            children = _tna_out
                 let arg_types = []
                 let ai = 0
                 while ai < len(children)
@@ -17481,6 +17516,19 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                     if mdt == "null"
                                         min_ar = min_ar + 1
                 st.ti_min_arity[name] = min_ar
+                // NAMED ARGS: record the declared parameter ORDER so an out-of-order
+                // call can be reordered BEFORE unification. The IR lowering already
+                // reorders (via ir_fn_defaults) but the type checker did NOT, so
+                // `f(b: 2, a: 1)` was type-checked POSITIONALLY and reported a bogus
+                // mismatch whenever the two params had different types. With SAME-typed
+                // params it type-checked and then ran correctly, which is why the gap
+                // looked like it did not exist.
+                let _pn_list = []
+                for _pnp in params
+                    match _pnp
+                        Param(_pnn, _pnt, _pnd) =>
+                            push(_pn_list, _pnn)
+                st.ti_fn_pnames[name] = _pn_list
                 // variadic fn: last param `T...` -> rest is optional, so min = fixed count
                 if len(params) > 0
                     match params[len(params) - 1]

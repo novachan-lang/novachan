@@ -8,6 +8,37 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## GATE 1 RE-VALIDATION vs the AS-BUILT compiler (2026-08-03) — the honest answer to "is NOVA simpler than Python?"
+
+GATE 1 **was** properly validated in Phase 0: 10 programs written side-by-side against Python,
+adversarial review, 22 keywords (vs Python 35), and GATE 2 measured a **2.9% annotation rate**
+(8/278 tokens). That work is real and it passed.
+
+**But it was validated on PAPER, at design time.** Re-running those same 10 programs against the
+compiler that exists today: **only 3 of 10 still compile.** The implementation drifted from its own
+spec, and that — not any doubt about the design — is why the "simpler than Python" claim cannot be
+made about NOVA as built.
+
+| Feature the founding programs use | Designed | Status (measured 2026-08-03) |
+|---|---|---|
+| Named arguments | step 0.1.20 | ✅ **FIXED** — see below. *(spec wrote `f(a = 1)`; the implementation uses `f(a: 1)`. One syntax should win — flagging rather than adding a second, since "one obvious way" is a NOVA principle.)* |
+| Tuple patterns in `match` | Program 3 | ❌ missing — tuples themselves EXIST (literal, index, `let` destructure all work); only `match` arms lack them |
+| Multi-line lambda body in call position | Programs 5, 8 | ❌ missing |
+| `ai` module | Program 7 | ❌ missing (stdlib, not language) |
+
+Two things that were *assumed* broken and are actually fine: the inline `if c a else b` expression
+works, and multi-line dict/list literals work (the "no multi-line list/dict literals" note in several
+stdlib headers is STALE).
+
+**Named arguments — half-implemented, now fixed.** The parser accepted `f(name: v)` and the IR
+lowering reordered to the declared parameter order, but the TYPE CHECKER compared arguments
+POSITIONALLY. So `f(b: 2, a: 1)` was rejected with a bogus type error whenever the swapped
+parameters had different types — while same-typed parameters type-checked *and ran correctly*, which
+is exactly why the gap looked like it did not exist. Fixed by giving the checker the declared
+parameter names (`ti_fn_pnames`) and reordering before unification, mirroring the IR. The reordering
+is only adopted when every argument is placed, so a misspelled name still reports a clear error
+instead of silently dropping an argument. KAT `_kat_named_args` (4 cases incl. positional+named mix).
+
 ## ENVIRONMENT CAPABILITY MATRIX — what this machine can and cannot verify (PROBED 2026-08-02)
 
 Every line below was **probed, not assumed**. Two long-standing assumptions turned out to be WRONG,
