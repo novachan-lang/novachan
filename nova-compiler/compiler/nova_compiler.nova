@@ -1912,7 +1912,15 @@ fn parse_call_args(tokens: list, pos: int, callee: Expr, pe: list) -> ParseResul
             p = expect(tokens, p, ",", pe)
             if tk(tokens, p) == "EOF"
                 break
-        if tk(tokens, p) == "IDENT" and p + 1 < len(tokens) and tk(tokens, p + 1) == "COLON" and p + 2 < len(tokens) and tk(tokens, p + 2) != "NEWLINE" and tk(tokens, p + 2) != "EOF"
+        // NAMED ARGUMENT. Two spellings are accepted because the spec and the
+        // implementation drifted apart: the spec's ten founding programs write
+        // `supervise(w, restart = "always")` while the implementation only ever
+        // parsed `restart: "always"`. Both are unambiguous here -- NOVA has no
+        // assignment-EXPRESSION, so an IDENT followed by `=` inside an argument
+        // list cannot be anything but a named argument -- so rather than break
+        // one side, accept both and let usage settle the canonical spelling.
+        let _na_sep = tk(tokens, p + 1) == "COLON" or tk(tokens, p + 1) == "ASSIGN"
+        if tk(tokens, p) == "IDENT" and p + 1 < len(tokens) and _na_sep and p + 2 < len(tokens) and tk(tokens, p + 2) != "NEWLINE" and tk(tokens, p + 2) != "EOF"
             let _na_name = tv(tokens, p)
             let _na_p = p + 2
             let _na_r = parse_expr(tokens, _na_p, 0, pe)
@@ -2509,7 +2517,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                 if tk(tokens, expr_r.pos) == "KW" and tv(tokens, expr_r.pos) == "fn"
                     _parse_trail_fn(tokens, expr_r.pos, tok_col(tokens, pos), pe, "trail_fn_let", name, expr_r.expr, ln)
                 else
-                    _maybe_where(tokens, StmtParseResult(Stmt("assign", name, expr_r.expr, [], let_params, [], [], ln), expr_r.pos), pe)
+                    _maybe_where(tokens, _parse_else_tail(tokens, expr_r.pos, expr_r.expr, name, let_params, [], ln, pe), pe)
         else
             StmtParseResult(Stmt("assign", name, null_expr(), [], let_params, [], [], ln), p)
     else if kind == "IDENT"
@@ -2544,7 +2552,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             if tk(tokens, p) == "ASSIGN"
                 p = p + 1
                 let rhs_r = parse_expr(tokens, p, 0, pe)
-                _maybe_where(tokens, StmtParseResult(Stmt("assign", "", rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos), pe)
+                _maybe_where(tokens, _parse_else_tail(tokens, rhs_r.pos, rhs_r.expr, "", [], [expr_r.expr], ln, pe), pe)
             else if tk(tokens, p) == "COMMA"
                 let _ma_lhs = [expr_r.expr]
                 while tk(tokens, p) == "COMMA"
@@ -2822,6 +2830,15 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             if tk(tokens, p) == "QUESTION"
                 ret_ann = ret_ann + "?"
                 p = p + 1
+            // `-> T or E` -- the spec's spelling for a fallible return (GATE 1 program 9
+            // declares `fn push(rb: RingBuffer, val: byte) -> bool or Error`). It desugars
+            // to Result<T, E>, which the annotation resolver already handles, so this is
+            // purely a nicer surface: the failure type stays visible at the declaration
+            // without generic-bracket ceremony. Placed AFTER the generic capture and the
+            // `?` suffix so `-> list<int> or Error` and `-> int? or Error` both work.
+            if tk(tokens, p) == "KW" and tv(tokens, p) == "or" and tk(tokens, p + 1) == "IDENT"
+                ret_ann = "Result<" + ret_ann + "," + tv(tokens, p + 1) + ">"
+                p = p + 2
     // Optional clause guard: `fn f(params) when <expr>` (contextual, not a keyword).
     // Multiple same-name/arity heads with guards are fused post-parse into one fn
     // whose body is a guard if/else chain (Elixir/Erlang-style clause dispatch).
@@ -3229,6 +3246,42 @@ fn parse_enum_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                     break
     StmtParseResult(Stmt("enum", enum_name, null_expr(), variant_stmts, [], [], [], ln), p2)
 
+// `EXPR else FALLBACK` -- NOVA's one-word error handling, on the RHS of an assignment.
+// `let x = f() else d` and `x = f() else d` both land here (a `let` parses to the same
+// "assign" statement). Two forms:
+//
+//   value  : `port = parse_int(env("PORT")) else 8080`
+//              -> port = unwrap_or(parse_int(...), 8080)
+//   escape : `user = parse_json(j) else return Error("bad json")`
+//              -> bind once, return on Err, otherwise unwrap
+//
+// The escape form is real control flow and so cannot be an expression; it lowers to a
+// TRANSPARENT block (see ti_infer_stmt) that binds the subject to a temp first. Both
+// forms evaluate the subject EXACTLY ONCE. That is why neither reuses the `??` shape
+// is_some(x) ? unwrap(x) : d -- that mentions x twice, so `read_file(p) else d` would
+// read the file twice.
+//
+// Disambiguation against `if c then x = a else y = b`, whose `else` also follows a
+// complete assignment RHS: it is told apart by what comes AFTER the fallback expression.
+// An ASSIGN there means the `else` opened another assignment and therefore belongs to the
+// `if`, so the fallback is abandoned and the tokens are handed back untouched.
+fn _parse_else_tail(tokens: list, rpos: int, rhs: Expr, aname: string, aparams: list, atargets: list, ln: int, pe: list) -> StmtParseResult
+    if not (tk(tokens, rpos) == "KW" and tv(tokens, rpos) == "else")
+        return StmtParseResult(Stmt("assign", aname, rhs, [], aparams, [], atargets, ln), rpos)
+    if tk(tokens, rpos + 1) == "KW" and tv(tokens, rpos + 1) == "return"
+        let _er = parse_expr(tokens, rpos + 2, 0, pe)
+        let _etmp = "__els" + str(ln)
+        let _eref = Expr("ident", _etmp, 0, [], [], ln)
+        let _ebind = Stmt("assign", _etmp, rhs, [], [], [], [], ln)
+        let _eret = Stmt("return", "", _er.expr, [], [], [], [], ln)
+        let _eguard = Stmt("if", "", Expr("call", "is_err", 0, [_eref], [], ln), [_eret], [], [], [], ln)
+        let _efin = Stmt("assign", aname, Expr("call", "unwrap", 0, [_eref], [], ln), [], aparams, [], atargets, ln)
+        return StmtParseResult(Stmt("block", "transparent", null_expr(), [_ebind, _eguard, _efin], [], [], [], ln), _er.pos)
+    let _fb = parse_expr(tokens, rpos + 1, 0, pe)
+    if tk(tokens, _fb.pos) == "ASSIGN"
+        return StmtParseResult(Stmt("assign", aname, rhs, [], aparams, [], atargets, ln), rpos)
+    StmtParseResult(Stmt("assign", aname, Expr("call", "unwrap_or", 0, [rhs, _fb.expr], [], ln), [], aparams, [], atargets, ln), _fb.pos)
+
 fn parse_if_chain(tokens: list, pos: int, base_col: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
@@ -3269,6 +3322,20 @@ fn parse_if_chain(tokens: list, pos: int, base_col: int, pe: list) -> StmtParseR
     // `then` is not a keyword — it lexes as a bare IDENT sitting immediately after the
     // condition (SAME line: a newline would put an NL token here instead, so the block
     // form below is unaffected). Only an exact `then` IDENT triggers this branch.
+    // Inline if-EXPRESSION in statement position: `if a > b a else b`, the form GATE 1
+    // program 3 uses for max(). It already worked after `=` and after `return` (both are
+    // expression contexts); a statement STARTING with `if` was always parsed as an if
+    // STATEMENT, so the `a else b` tail produced "unexpected KW 'else' in expression".
+    // Detect it by speculation: the next token is on the SAME line (a newline would put an
+    // NL token here and mean the block form), it is not the `then` sugar, and an `else`
+    // follows the branch expression. Only commit if that `else` is actually there, so a
+    // malformed one-liner still falls through to the existing block path and its error.
+    if tk(tokens, cond_r.pos) != "NEWLINE" and tk(tokens, cond_r.pos) != "EOF" and not (tk(tokens, cond_r.pos) == "IDENT" and tv(tokens, cond_r.pos) == "then")
+        let _ie_then = parse_expr(tokens, cond_r.pos, 0, pe)
+        if _ie_then.pos > cond_r.pos and tk(tokens, _ie_then.pos) == "KW" and tv(tokens, _ie_then.pos) == "else"
+            let _ie_else = parse_expr(tokens, _ie_then.pos + 1, 0, pe)
+            let _ie_expr = Expr("if", "", 0, [cond_r.expr, _ie_then.expr, _ie_else.expr], [], ln)
+            return StmtParseResult(Stmt("expr", "", _ie_expr, [], [], [], [], ln), _ie_else.pos)
     if tk(tokens, cond_r.pos) == "IDENT" and tv(tokens, cond_r.pos) == "then"
         let tsr = parse_stmt(tokens, cond_r.pos + 1, pe)
         let sthen = [tsr.stmt]
@@ -17956,11 +18023,22 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
             if tag == "import"
                 return nt_unit()
             if tag == "block"
-                ti_push_scope(st)
+                // A block normally opens a SCOPE. A desugaring that has to emit several
+                // statements as one Stmt but whose bindings must stay visible to the code
+                // AFTER it marks itself "transparent" in the (otherwise unused) name field.
+                // Without this, `x = f() else return E` -- which lowers to bind/guard/assign
+                // -- would define x inside the block and every later use of x would be
+                // rejected as an unknown identifier. IR lowering is already transparent
+                // (it shares the enclosing scope and opens no basic block), so inference
+                // was the only place that needed to agree.
+                let _blk_scoped = name != "transparent"
+                if _blk_scoped
+                    ti_push_scope(st)
                 let last_t = nt_unit()
                 for s in body
                     last_t = ti_infer_stmt(st, s)
-                ti_pop_scope(st)
+                if _blk_scoped
+                    ti_pop_scope(st)
                 return last_t
             return nt_unit()
     nt_unit()

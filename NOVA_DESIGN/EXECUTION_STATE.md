@@ -117,26 +117,37 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
-## OPEN — `forge_h2c_test` hangs (NOT a regression; bisected 2026-08-03)
+## FIXED — `forge_h2c_test` hung forever; now passes in 0.47 s (2026-08-04)
 
-Hangs with no output at all, before any print, i.e. inside the h2c server/client handshake.
-Reproduces at **`140f215b`, `44e32ae9` and `2d108113`** — i.e. BEFORE the object-space allocator,
-BEFORE the aarch64 fiber change and BEFORE `Drop` — so none of today's runtime work caused it.
-Yet it reported PASS in three CI runs earlier the same day on that same code.
+Root-caused by instrumenting both sides rather than by theorising about the `sleep(300)` startup
+window, which the earlier note guessed at and which turned out to be **irrelevant**.
 
-Ruled out by measurement, not assumption: port 19457 is FREE; ~2 GB physical memory available;
-Docker Desktop stopped and its VM shut down; and the control `real_http_api` — also `spawn` +
-loopback + HTTP — passes in **227 ms**. So sockets, green tasks and the netpoller are all healthy.
+**What was actually happening.** Every assertion the test makes had already succeeded before it hung.
+Traced end to end: the server binds, accepts, reads the 24-byte connection preface, parses SETTINGS
+then HEADERS, HPACK-decodes the header block, routes through `forge.dispatch_safe`, builds 63 bytes
+of HEADERS+DATA, sends them, closes the connection and closes the listener. The client receives the
+complete 72-byte response (9-byte SETTINGS + the 63-byte reply). It then issues **one more**
+`tcp_recv_bytes` — and that call never returns.
 
-That leaves the test's own timing: it `spawn`s the server, waits a FIXED `sleep(300)`, then connects.
-A fixed startup window is exactly the shape that passes repeatedly and then wedges once the machine
-state shifts. Treat as a FLAKY test to be made deterministic (have the server signal readiness over a
-channel instead of sleeping), not as a runtime defect — but it is unproven either way, so it stays
-OPEN rather than being written off.
+**The fix is a protocol correction, not a workaround.** The client was reading until EOF. HTTP/2
+connections are multiplexed and long-lived, so a real h2 client terminates on **END_STREAM**, never
+on socket close; waiting for EOF is wrong even when it happens to work. `h2_decode_response` already
+reports `status == 0` until a `:status` header has been decoded, so it doubles as the completeness
+test. The loop now stops as soon as the response decodes, bounded by a 64-read budget.
 
-**Method note worth keeping:** my first bisect "proved" this was not mine by testing `2d108113` — which
-ALREADY CONTAINED the change I was trying to exonerate. Always bisect to a commit strictly BEFORE the
-suspect change.
+**Honest residue — one thing is still unexplained.** Why that final read never observed the peer's
+close is NOT root-caused. Two minimal probes were written and BOTH pass: a green-task client blocked
+in `tcp_recv_bytes` does observe EOF when the server closes, including when the client sends first
+and the server closes immediately after replying — the exact shape here. `defer` in a spawned task
+was also probed and runs correctly. So this is not a blanket EOF or `defer` bug, and the test is now
+deterministic, but a netpoller/close interaction specific to this path may still exist. Recorded here
+rather than closed silently.
+
+**Two method notes worth keeping:**
+* My first bisect "proved" this was not mine by testing `2d108113` — which ALREADY CONTAINED the
+  change I was trying to exonerate. Always bisect to a commit strictly BEFORE the suspect change.
+* I read print ordering from piped output, which is block-buffered and can reorder what looks like a
+  timeline. Re-run unpiped before drawing conclusions from the order of prints.
 
 ## GATE 1 RE-VALIDATION vs the AS-BUILT compiler (2026-08-03) — the honest answer to "is NOVA simpler than Python?"
 
@@ -145,20 +156,87 @@ adversarial review, 22 keywords (vs Python 35), and GATE 2 measured a **2.9% ann
 (8/278 tokens). That work is real and it passed.
 
 **But it was validated on PAPER, at design time.** Re-running those same 10 programs against the
-compiler that exists today: **only 3 of 10 still compile.** The implementation drifted from its own
-spec, and that — not any doubt about the design — is why the "simpler than Python" claim cannot be
-made about NOVA as built.
+compiler that exists today found **only 3 of 10 still compiled.** The implementation had drifted from
+its own spec, and that — not any doubt about the design — was why the "simpler than Python" claim
+could not be made about NOVA as built.
 
-| Feature the founding programs use | Designed | Status (measured 2026-08-03) |
+**Closing that drift is what the 2026-08-03/04 batch did.** Measured against the batch compiler:
+
+| Feature the founding programs use | Designed | Status (measured 2026-08-04) |
 |---|---|---|
-| Named arguments | step 0.1.20 | ✅ **FIXED** — see below. *(spec wrote `f(a = 1)`; the implementation uses `f(a: 1)`. One syntax should win — flagging rather than adding a second, since "one obvious way" is a NOVA principle.)* |
-| Tuple patterns in `match` | Program 3 | ❌ missing — tuples themselves EXIST (literal, index, `let` destructure all work); only `match` arms lack them |
-| Multi-line lambda body in call position | Programs 5, 8 | ❌ missing |
-| `ai` module | Program 7 | ❌ missing (stdlib, not language) |
+| Named arguments | step 0.1.20 | ✅ **DONE** — checker fix (`2d108113`) + both spellings accepted (below) |
+| Tuple patterns in `match` | Program 3 | ✅ **DONE** `828ecd6f` — single-site desugar to a guarded wildcard arm |
+| Inline `if c a else b` as a **function body** | Program 3 | ✅ **DONE** — it worked after `=` and after `return`, but a statement STARTING with `if` was parsed as an if-STATEMENT, so the `a else b` tail failed |
+| `EXPR else FALLBACK` — one-word error handling | Programs 4, 10 | ✅ **DONE** — value form and `else return X` escape form |
+| `-> T or E` fallible return type | Program 9 | ✅ **DONE** — desugars to `Result<T,E>` |
+| Multi-line lambda body in call position | Programs 5, 8, 10 | ❌ **OPEN** — see the plan below |
+| `ai` / `http` / `log` modules, `supervise`, `@low_level` | Programs 7, 9, 10 | ❌ library, not language — out of scope while frameworks are paused |
 
-Two things that were *assumed* broken and are actually fine: the inline `if c a else b` expression
-works, and multi-line dict/list literals work (the "no multi-line list/dict literals" note in several
-stdlib headers is STALE).
+**How to read the score.** Programs 9 and 10 are aspirational sketches that call whole subsystems
+which do not exist (`http.serve`, `supervise`, `alloc`, `@low_level`); they can never "compile" and
+counting them as language failures is misleading. The measurement that means something is *does the
+spec's SYNTAX parse* — errors by class, not programs by pass/fail:
+
+* **p01, p02, p03, p06** — compile end to end.
+* **p04, p07** — **zero syntax errors**; only undefined helper functions remain (`process_csv`,
+  the `ai` module). p04 also surfaces a real API question, recorded below.
+* **p05, p08, p10** — blocked solely on the multi-line lambda.
+* **p09** — blocked on `@low_level` + low-level primitives that were never built.
+
+So the **language** surface the founding programs exercise is now supported everywhere except
+multi-line lambda bodies. The residue is library and a deliberate scope pause.
+
+**`EXPR else FALLBACK` — the headline feature that was never built.** CLAUDE.md has promised
+"one-word error handling" since day one and the founding programs use it (`config = read_file(p)
+else "{}"`, `user = parse_json(j) else return Error("Invalid JSON")`), but nothing in the compiler
+implemented it — only the `unwrap_or` / `or_else` *functions* existed. Now both forms work:
+
+* value form → `unwrap_or(subject, fallback)`
+* escape form → a **transparent block** that binds the subject once, returns on `Err`, else unwraps
+
+Three things this design got right that the obvious implementation gets wrong:
+
+1. **The subject is evaluated exactly ONCE.** The existing `??` operator lowers to
+   `is_some(x) ? unwrap(x) : d`, which mentions `x` twice — `read_file(p) else d` would have read
+   the file twice. `else` never uses that shape.
+2. **Inference had to be taught a transparent block.** The escape form must emit three statements as
+   one `Stmt`, and `block` opens a SCOPE in `ti_infer_stmt` — so `x` would have been defined inside
+   the block and every later use rejected as an unknown identifier. A `block` named `"transparent"`
+   skips the push/pop. IR lowering was already transparent, so inference was the only disagreement.
+3. **The grammar conflict is real and is resolved locally.** `else` after a complete assignment RHS
+   is also what `if c then x = a else y = b` looks like. They are told apart by what follows the
+   fallback expression: an `ASSIGN` there means the `else` opened another assignment and belongs to
+   the `if`, so the fallback is abandoned and the tokens handed back. (Corpus check first: only 2
+   uses of `then … else` exist in 280k lines, both assignments, both in that sugar's own KAT — which
+   still passes.)
+
+**Runtime soundness found on the way.** `nova_rt_unwrap_or` cast ANY i64 straight to `NovaResult*`
+and read `r->tag` — a wild dereference for every non-Result value reaching it. That was survivable
+only while callers were statically known to hold a Result, which stops being true the moment `else`
+can be applied to an arbitrary expression. Replaced with `nova_result_probe`: a Result is an
+UNHASHED 2-slot struct with slot 0 ∈ {0,1}, and every other shape (hashed user struct, list, dict,
+string, bytes, box, plain integer, foreign pointer) is rejected by `find_tag` with no dereference.
+A non-Result is now *its own answer* — `x else d` is total.
+
+**Named arguments — both spellings now accepted.** The earlier note here proposed picking one
+spelling on "one obvious way" grounds. That was the wrong call: the spec writes `f(a = 1)` and the
+implementation only ever parsed `f(a: 1)`, so choosing either one breaks the other side, and inside
+an argument list the two are equally unambiguous (NOVA has no assignment-EXPRESSION, so `IDENT =`
+there can only be a named argument). Both are accepted; usage decides the canonical spelling.
+
+**Still assumed-broken-but-fine:** multi-line dict/list literals work (the "no multi-line list/dict
+literals" note in several stdlib headers is STALE).
+
+**OPEN — multi-line lambda body in call position** (`http.serve(8080, routes =>` + indented block).
+This is the one remaining *language* gap from the founding programs. It is NOT a small parser fix:
+a lambda's body is a single `Expr` (`children[0]`) and NOVA has **no block-EXPRESSION node** — only
+`Stmt("block")`. Doing it properly means adding an Expr that carries `Stmt` children, then teaching
+`ti_infer_stmt`, `ir_lower_expr`, closure-capture analysis, and the `s4` alpha-renamer (which today
+deliberately REJECTS Stmt-bearing Expr nodes so it cannot mis-walk a Stmt as an Expr) about it.
+That is a full RED arc of its own, not a batch item. Competitive position meanwhile: NOVA ties
+Python (which has no multi-line lambda either) and loses to Rust/Go/JS closures — but NOVA already
+has trailing-`fn` blocks (`_parse_trail_fn`) covering the same need at statement level, which is why
+this is a gap in *spec conformance* rather than in expressive power.
 
 **Named arguments — half-implemented, now fixed.** The parser accepted `f(name: v)` and the IR
 lowering reordered to the declared parameter order, but the TYPE CHECKER compared arguments

@@ -17255,8 +17255,43 @@ int64_t nova_rt_unwrap_err(int64_t handle) {
     return r->value;
 }
 
+/* Is `handle` REALLY a Result/Option cell? nova_result_pack builds one as an
+   UNHASHED 2-slot struct whose slot 0 is the tag (0 or 1). Everything else is
+   distinguishable: a normal user struct carries the HASHED bit (slot 0 = type
+   hash), lists/dicts/strings/bytes/boxes have their own kinds, and a plain
+   integer or a foreign pointer is not owned by the object space at all, so
+   find_tag rejects it without a dereference.
+
+   This exists because the accessors below used to cast ANY i64 straight to
+   NovaResult* and read r->tag -- a wild dereference for every non-Result value
+   that reaches them. That is only safe while the caller is statically known to
+   hold a Result, which stops being true the moment a value-level fallback
+   operator (`x else d`) can be applied to an arbitrary expression.
+
+   Residual imprecision: a 2-field @repr(C) struct whose first field happens to
+   be 0 or 1 probes as a Result. @repr(C) is FFI-only and never flows into these
+   accessors from NOVA code; accepting that is far better than the unconditional
+   out-of-bounds read it replaces. */
+static int nova_result_probe(int64_t handle, NovaResult** out) {
+    if (handle == 0) return 0;
+    void* p = (void*)(uintptr_t)handle;
+    NovaMemTag t = nova_mem_find_tag(p);
+    if ((int32_t)t < 0) return 0;
+    if (((int32_t)t & 0x7) != NOVA_MEM_STRUCT) return 0;
+    if (NOVA_STRUCT_NSLOTS(p) != 2) return 0;
+    if (NOVA_STRUCT_HASHED(p)) return 0;
+    NovaResult* r = (NovaResult*)p;
+    if (r->tag != 0 && r->tag != 1) return 0;
+    *out = r;
+    return 1;
+}
+
+/* `x else d` and unwrap_or(x, d). A NON-Result x is not an error, so it is its
+   own answer -- that totality is what lets `else` be applied to any expression
+   without the caller having to know whether the callee returns a Result. */
 int64_t nova_rt_unwrap_or(int64_t handle, int64_t default_val) {
-    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    NovaResult* r = NULL;
+    if (!nova_result_probe(handle, &r)) return handle;
     if (r->tag == 0) return r->value;
     return default_val;
 }
