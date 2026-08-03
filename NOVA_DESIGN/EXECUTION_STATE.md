@@ -8,6 +8,45 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## LOCK-11 struct-by-value FFI — ATTEMPTED, REVERTED, and the plan's sizing was RIGHT (2026-08-03)
+
+**The bug is real and now MEASURED on two ABIs.** A `@repr(C)` struct used as an extern param lowers
+to `ptr`, so NOVA hands C a POINTER where C takes the struct BY VALUE and the callee reads the
+pointer's bits as its first field. Reproduced with a C host (`_ffi_byval_host.c`) taking
+`Vec2{double,double}` and `Pair{int64,int64}` by value:
+
+| Target | `vec2_sum(1.5, 2.25)` (want 3.75) | `pair_diff(10, 3)` (want 7) |
+|---|---|---|
+| Windows (Win64) | returns 3.75's BITS but renders as an int — a *separate* bug, below | 7 — correct **by accident** |
+| Linux (SysV) | `129504125136932` (a pointer value) | `<struct>` — garbage |
+
+Windows accidentally works for these because Win64 passes >8-byte structs BY REFERENCE, which is what
+`ptr` happens to mean. SysV and AAPCS64 pass a <=16-byte struct in REGISTERS, so it is simply wrong
+there — and a <=8-byte struct would be wrong on Windows too.
+
+**MY ATTEMPT FAILED, and the reason is worth recording so nobody repeats it.** I emitted a real LLVM
+aggregate type (`declare double @vec2_sum({ double, double })`) and passed it by value, on the premise
+that *LLVM's backend would apply the target ABI for us* — which would have reduced three ABIs to a
+marshalling exercise. **That premise is FALSE.** LLVM IR is NOT ABI-aware for aggregates: **clang does
+C ABI lowering in the FRONTEND** (coercing structs into register pairs, adding `byval`/`sret`) before
+it ever emits IR. A bare `{i64,i64}` parameter in hand-written IR does not acquire C's struct-passing
+convention. The generated IR looked perfect and **segfaulted on Windows** and returned garbage on Linux.
+Reverted — a crash is strictly worse than the status quo, which at least works on Win64.
+
+Two real sub-findings kept from the attempt:
+1. `@repr(C)` structs carry **NO leading type-hash slot** (raw C layout — field j is at slot j, not
+   j+1). `get_ir_field_index_for` already encodes this distinction; any marshaller must match it.
+2. **A separate, simpler bug:** an extern declared `-> float` returns its raw double bits correctly,
+   but the call site does not carry the float type, so `str()` renders it as an integer
+   (`vec2_sum` printed `4615626668101337088`, which IS 3.75's bit pattern). That one is a
+   type-propagation fix, independent of the ABI work, and is worth doing on its own.
+
+**Correct sizing (the plan had it right all along): LOCK-11 requires implementing per-target struct
+classification in the compiler** — Win64 (<=8 bytes in one integer register, larger by reference),
+SysV (eightbyte INTEGER/SSE classification, <=16 bytes in up to two registers), AAPCS64 (<=16 bytes in
+registers, HFAs in up to four SIMD registers) — and emitting the same lowered signature clang would.
+It is genuinely target-specific codegen, not a marshalling shortcut.
+
 ## FORGE PRODUCTION GAPS — 4 items that are OURS (compiler/runtime), not Forge's
 
 Canonical audit: [`FORGE_PRODUCTION_GAPS_2026_08_03.md`](FORGE_PRODUCTION_GAPS_2026_08_03.md). It supersedes
