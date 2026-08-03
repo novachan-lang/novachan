@@ -117,6 +117,46 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
+## LOCK-4 inc3c-part2 — sized numerics are now REACHABLE (2026-08-04)
+
+Sized integers existed but only through the one spelling almost nobody writes. Probed, not
+assumed: `255u8 + 1` gave 0, but `let y: u8 = 255; y + 1` gave **256** and `u8(255) + 1` gave
+**256**. So a developer had to suffix every literal; the annotation and the explicit conversion
+— the two spellings anyone actually reaches for — both silently produced a plain i64.
+
+Both closed. `let y: u8 = 255` wraps, `let a: u8 = 300` is genuinely **narrowed to 44** (const and
+runtime initialisers alike), and `u8(x)` now returns a u8-TYPED value instead of performing a
+one-shot mask whose result forgot its width. Default `255 + 1` is still 256 and the perf gate is
+still fully native.
+
+**A bridge already existed and was dead — survey by CONCEPT, not by type name.** `_lock4_ann_width`
+plus a width-typed `copy` were already in the IR builder. Grepping `"u8"` did not surface it. It
+failed for two independent reasons, both now fixed: **const_fold runs BEFORE ir_infer_types**, so
+the width-typed copy was folded away for any constant initialiser; and it only width-TAGGED the
+slot, never masked, so `let a: u8 = 300` would have claimed u8 while holding 300.
+
+**The negative gate caught a soundness regression I introduced — this is why it exists.** My first
+attempt put the bridge in the PARSER, lowering `let y: u8 = <e>` to `u8(<e>)`. That works, and it
+also silently destroyed the inc3a width-mismatch rule: `let b: i32 = a` (with `a: u8`) must be
+rejected as "numeric width mismatch: convert explicitly", and rewriting it into an explicit
+conversion made it legal. Stage 2k reported it as a WEAK-FAIL — still rejected, but by an
+unrelated unused-variable error rather than the width rule. Reverted; the bridge belongs at the IR
+layer where widths are known and the type checker's view of the source is untouched.
+
+**A second, subtler bug the KAT caught.** With the mask emitted in the backend but constants folded
+in const_fold, the two disagreed: `let a: u8 = 300` stored 44, `str(a)` printed 44, and `a == 44`
+was **false** — the comparison folded against the unmasked 300. `_l7_mask_const` is now the
+compile-time twin of `ire_emit_width_wrap`, defined immediately beside it so they cannot drift.
+
+**Still OPEN — f32.** `16777217.0f32` still evaluates as f64 (prints 16777217.0; a real f32 is
+16777216.0). Deliberately NOT half-done: an earlier attempt made the annotation parse while still
+storing f64 and was reverted as WORSE than an unsupported width, because a width that silently lies
+is worse than one that errors. Doing it properly needs the parser to stop dropping the `f32` suffix
+(encode it in the float Expr's **`num`** field — verified free; NOT `fields`, which the s4 pass
+walks generically as Exprs and which caused the inc3b segfault), compile-time rounding of the
+literal, width propagation through float arithmetic, and `fptrunc`/`fpext` in the backend. There is
+no f32 rounding primitive yet. Its own RED arc.
+
 ## FIXED — `forge_h2c_test` hung forever; now passes in 0.47 s (2026-08-04)
 
 Root-caused by instrumenting both sides rather than by theorising about the `sleep(300)` startup
