@@ -5806,6 +5806,7 @@ static void jbuf_char(JsonBuf* b, char c) { jbuf_append(b, &c, 1); }
 static int nova_struct_meta_fcount(int64_t hash);
 static const char* nova_struct_meta_fname(int64_t hash, int idx);
 static int nova_struct_meta_redacted(int64_t hash, int idx);   /* LOCK-7 @redact */
+static int64_t nova_struct_meta_drop(int64_t hash);              /* L10 Drop */
 static const char* nova_struct_meta_ftype(int64_t hash, int idx);
 static const char* nova_struct_meta_name(int64_t hash);
 
@@ -12408,6 +12409,21 @@ static void nova_rc_free(void* ptr) {
         if (NOVA_STRUCT_HASHED(ptr)) {
             int64_t nslots = NOVA_STRUCT_NSLOTS(ptr);
             int64_t* slots = (int64_t*)ptr;
+            /* L10 Drop: run the user destructor BEFORE releasing the fields, so it can
+               still read them. The refcount is PINNED across the call: the destructor is
+               ordinary NOVA code that may take and release transient references to self,
+               and without the pin the matching rc_dec would drive the count back to 0 and
+               re-enter rc_free on an object already being destroyed. Restored to 0
+               afterwards so the field release and the free below proceed normally. */
+            {
+                int64_t _dropfn = nova_struct_meta_drop(slots[0]);
+                if (_dropfn) {
+                    int32_t _saved_rc = NOVA_RC_COUNT(ptr);
+                    NOVA_RC_COUNT(ptr) = 0x40000000;
+                    ((void (*)(int64_t))(uintptr_t)_dropfn)((int64_t)(uintptr_t)ptr);
+                    NOVA_RC_COUNT(ptr) = _saved_rc;
+                }
+            }
             uint64_t mask = nova_struct_bitmap_for_hash(slots[0]);
             if (mask) {
                 int64_t lim = nslots < 64 ? nslots : 64;   /* bitmap caps at 64 slots */
@@ -19183,6 +19199,9 @@ typedef struct {
     const char**  fnames;
     const char**  ftypes;
     int32_t       fcount;
+    /* L10 Drop: address of <Type>__drop, or 0. Called by rc_free BEFORE the fields are
+       released, so the destructor can still read them -- the same order Rust uses. */
+    int64_t       drop_fn;
     /* LOCK-7 @redact: bit i set => field i is a SECRET. Rendering paths substitute a mask
        so a password/token cannot ride along in a log line or a serialized payload. A 64-bit
        mask covers every struct in practice; fields past 63 are simply not redactable. */
@@ -19208,6 +19227,7 @@ void nova_rt_register_struct_meta(int64_t hash, int64_t name_val, int64_t fcount
     g_struct_meta[idx].ftypes = ft;
     g_struct_meta[idx].fcount = (int32_t)n;
     g_struct_meta[idx].redact_mask = 0;
+    g_struct_meta[idx].drop_fn = 0;
 }
 void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val, int64_t ftype_val) {
     for (int i = 0; i < g_struct_meta_count; i++) {
@@ -19219,6 +19239,11 @@ void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val,
             }
             return;
         }
+    }
+}
+void nova_rt_register_struct_drop(int64_t hash, int64_t fnptr) {
+    for (int i = 0; i < g_struct_meta_count; i++) {
+        if (g_struct_meta[i].hash == hash) { g_struct_meta[i].drop_fn = fnptr; return; }
     }
 }
 void nova_rt_register_struct_redact(int64_t hash, int64_t mask) {
@@ -19236,6 +19261,10 @@ static const NovaStructMeta* nova_struct_meta_for_hash(int64_t hash) {
 static int nova_struct_meta_fcount(int64_t hash) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
     return m ? (int)m->fcount : 0;
+}
+static int64_t nova_struct_meta_drop(int64_t hash) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    return m ? m->drop_fn : 0;
 }
 static int nova_struct_meta_redacted(int64_t hash, int idx) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);

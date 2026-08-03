@@ -8,6 +8,27 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## OPEN — `forge_h2c_test` hangs (NOT a regression; bisected 2026-08-03)
+
+Hangs with no output at all, before any print, i.e. inside the h2c server/client handshake.
+Reproduces at **`140f215b`, `44e32ae9` and `2d108113`** — i.e. BEFORE the object-space allocator,
+BEFORE the aarch64 fiber change and BEFORE `Drop` — so none of today's runtime work caused it.
+Yet it reported PASS in three CI runs earlier the same day on that same code.
+
+Ruled out by measurement, not assumption: port 19457 is FREE; ~2 GB physical memory available;
+Docker Desktop stopped and its VM shut down; and the control `real_http_api` — also `spawn` +
+loopback + HTTP — passes in **227 ms**. So sockets, green tasks and the netpoller are all healthy.
+
+That leaves the test's own timing: it `spawn`s the server, waits a FIXED `sleep(300)`, then connects.
+A fixed startup window is exactly the shape that passes repeatedly and then wedges once the machine
+state shifts. Treat as a FLAKY test to be made deterministic (have the server signal readiness over a
+channel instead of sleeping), not as a runtime defect — but it is unproven either way, so it stays
+OPEN rather than being written off.
+
+**Method note worth keeping:** my first bisect "proved" this was not mine by testing `2d108113` — which
+ALREADY CONTAINED the change I was trying to exonerate. Always bisect to a commit strictly BEFORE the
+suspect change.
+
 ## GATE 1 RE-VALIDATION vs the AS-BUILT compiler (2026-08-03) — the honest answer to "is NOVA simpler than Python?"
 
 GATE 1 **was** properly validated in Phase 0: 10 programs written side-by-side against Python,
