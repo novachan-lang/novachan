@@ -7918,9 +7918,62 @@ int64_t nova_rt_gen_collect(int64_t handle) {
     return list;
 }
 
-/* ── POSIX x86_64 asm context switch ──────────────────────────────────── */
-#elif defined(__x86_64__)
+/* ── POSIX asm context switch (x86_64 + aarch64) ──────────────────────────
+   Everything here except nova_asm_switch and the INITIAL FRAME is architecture-
+   independent: the mmap'd stack + guard page, the trampoline, and resume/yield are
+   shared. Previously only __x86_64__ was handled and aarch64 fell through to the
+   #else, which STUBS fibers -- measured on real ARM64: fiber_create returned 0 with
+   "fibers not supported on this platform", fiber_resume returned 1 ("already done"),
+   so spawn bodies never ran and generators yielded nothing. */
+#elif defined(__x86_64__) || defined(__aarch64__)
 
+#if defined(__aarch64__)
+/* AAPCS64 callee-saved set: x19-x28, x29(FP), x30(LR), and the LOW 64 bits of v8-v15
+   (d8-d15) -- the upper halves are caller-saved, so d8-d15 is the correct and
+   sufficient set. 160 bytes keeps sp 16-byte aligned, which AAPCS64 requires at every
+   instruction boundary. x0=from_sp, x1=to_sp; x9 is a caller-saved scratch because sp
+   cannot be the operand of str/ldr directly.
+   FILE-SCOPE asm rather than __attribute__((naked)): GCC does not support naked on
+   aarch64 across the versions we target, and file-scope asm emits the symbol with no
+   compiler-generated prologue at all. */
+#define NOVA_A64_FRAME  160
+#define NOVA_A64_LR_OFF 88        /* x30 slot -- the initial frame seeds the trampoline here */
+__asm__(
+    ".text\n"
+    ".globl nova_asm_switch\n"
+    ".type nova_asm_switch,%function\n"
+    "nova_asm_switch:\n"
+    "   sub  sp, sp, #160\n"
+    "   stp  x19, x20, [sp, #0]\n"
+    "   stp  x21, x22, [sp, #16]\n"
+    "   stp  x23, x24, [sp, #32]\n"
+    "   stp  x25, x26, [sp, #48]\n"
+    "   stp  x27, x28, [sp, #64]\n"
+    "   stp  x29, x30, [sp, #80]\n"
+    "   stp  d8,  d9,  [sp, #96]\n"
+    "   stp  d10, d11, [sp, #112]\n"
+    "   stp  d12, d13, [sp, #128]\n"
+    "   stp  d14, d15, [sp, #144]\n"
+    "   mov  x9, sp\n"
+    "   str  x9, [x0]\n"
+    "   ldr  x9, [x1]\n"
+    "   mov  sp, x9\n"
+    "   ldp  x19, x20, [sp, #0]\n"
+    "   ldp  x21, x22, [sp, #16]\n"
+    "   ldp  x23, x24, [sp, #32]\n"
+    "   ldp  x25, x26, [sp, #48]\n"
+    "   ldp  x27, x28, [sp, #64]\n"
+    "   ldp  x29, x30, [sp, #80]\n"
+    "   ldp  d8,  d9,  [sp, #96]\n"
+    "   ldp  d10, d11, [sp, #112]\n"
+    "   ldp  d12, d13, [sp, #128]\n"
+    "   ldp  d14, d15, [sp, #144]\n"
+    "   add  sp, sp, #160\n"
+    "   ret\n"
+    ".size nova_asm_switch,.-nova_asm_switch\n"
+);
+void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp);   /* body is the asm above */
+#else
 __attribute__((naked, noinline))
 void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
     /* Basic asm in a naked function: single-% register syntax (the %% form is for
@@ -7945,6 +7998,7 @@ void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
         "retq\n\t"
     );
 }
+#endif
 
 static void nova_posix_fiber_trampoline(void) {
     NovaFiber* f = nova_current_fiber;
@@ -7991,6 +8045,16 @@ int64_t nova_rt_fiber_create(int64_t closure) {
 
     uint64_t* sp = (uint64_t*)(f->stack_mem + total);
     sp = (uint64_t*)((uintptr_t)sp & ~0xFULL);
+#if defined(__aarch64__)
+    /* Seed the frame that nova_asm_switch's RESTORE half unwinds: it reloads x30 from
+       NOVA_A64_LR_OFF then `ret`s, so the trampoline goes there and the first switch
+       lands in it with a 16-byte-aligned sp. */
+    sp = (uint64_t*)((char*)sp - NOVA_A64_FRAME);
+    memset(sp, 0, NOVA_A64_FRAME);
+    *(uint64_t*)((char*)sp + NOVA_A64_LR_OFF) = (uint64_t)(uintptr_t)nova_posix_fiber_trampoline;
+    f->saved_sp = (uint64_t)(uintptr_t)sp;
+    return (int64_t)(uintptr_t)f;
+#endif
     *(--sp) = 0;
     *(--sp) = (uint64_t)nova_posix_fiber_trampoline;
     *(--sp) = 0;  /* r15 */
