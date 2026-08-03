@@ -8,6 +8,59 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## BATCH ATTEMPT 2026-08-03 (late) — three items probed, ALL REVERTED, findings kept
+
+Attempted as one batch. Every one produced a real finding; none produced code I was willing to
+ship. Recording precisely so the next attempt starts ahead of where I did.
+
+### 1. Tuple patterns in `match` arms — REVERTED
+Parser (`pat_tuple`) and `ti_infer_pattern` support were straightforward. The lowering is the
+problem: `pat_ctor` is handled at **~10 separate match-lowering sites** with their own
+label/branch plumbing, and duplicating tuple logic across all of them is error-prone.
+
+I tried to avoid that by desugaring ONCE in `parse_match_stmt`: rewrite a tuple arm to a WILDCARD
+arm + a guard comparing elements + let-bindings for binders, wrapped in a `block` that binds the
+subject to a temp so it is evaluated **exactly once** (referencing the subject expression inside
+each guard would re-evaluate it — a side-effect bug). Blocks are an established desugar target
+(`while` does it).
+
+**It failed with `unknown identifier '__mtupN'`** — the block's `let` was not visible to the
+`match` beside it, even though `ti_infer_stmt_inner` handles `block` by pushing a scope and
+inferring statements in order. My model of parse-time block scoping is wrong somewhere; that is
+the thing to understand BEFORE writing any more of this.
+
+Also learned: **match-as-EXPRESSION is parsed by a different path** (`Expr("arm", ...)` around
+line 2027) than `parse_match_stmt`, so any fix must cover both.
+
+### 2. Multi-line lambda body in call position — REVERTED as NOT A PYTHON-PARITY GAP
+`run(x =>` + newline fails, and so does `let f = fn(x)` + newline. Only statement contexts
+(`spawn fn()` + indented body) accept a multi-line lambda body.
+
+**But Python does not support multi-line lambdas either** — `lambda` is single-expression only;
+you use a named `def`. NOVA is in the SAME position, and named functions passed as values work
+(verified: `run(helper)` returns 7). So GATE 1 programs 5/8 are asking for something Python
+itself cannot express, and this should NOT be counted against the "simpler than Python" claim.
+Inline multi-line lambdas remain a nice-to-have, not a parity gap.
+
+### 3. Sized numerics (LOCK-4 inc3c-part2) — REVERTED, and the gap is bigger than the plan implies
+`nt_float_w()` exists in the source but is **never called**, and `ti_ann_to_type` has no `f32`/`f64`
+case, so `let x: f32 = 1.5` fails with "expected f32, found float". Adding the two annotation cases
+makes it compile — **and that is exactly why I reverted it.**
+
+Measured after the change: `let a: f32 = 16777217.0` prints **16777217**, but true f32 gives
+**16777216** (2^24+1 is the classic f32 integer-precision cliff), and `f32 0.1` prints `0.1` rather
+than f32's `0.100000001490116`. So the annotation was ACCEPTED while storage stayed f64 —
+**silently giving f64 semantics to code that asked for f32**, which is worse than the compile error
+it replaced. Anyone doing DSP/GPU/graphics work would get wrong results with no signal.
+
+**inc3c-part2 is f32 STORAGE, not f32 annotations.** The annotation is a ~6-line prerequisite; the
+work is the storage/ABI/elem_kind path behind it.
+
+Separately measured, still open (this is inc3c-part2's other half): **wrapping does not fire for
+let-bound sized vars.** `let a: u8 = 250; let b: u8 = 10; let c = a + b` gives **260**, not 4; and
+`i32` max+1 gives 2147483648, not -2147483648. The width is not propagated into the arithmetic when
+the destination is unannotated.
+
 ## LOCK-11 struct-by-value FFI — ATTEMPTED, REVERTED, and the plan's sizing was RIGHT (2026-08-03)
 
 **The bug is real and now MEASURED on two ABIs.** A `@repr(C)` struct used as an extern param lowers
