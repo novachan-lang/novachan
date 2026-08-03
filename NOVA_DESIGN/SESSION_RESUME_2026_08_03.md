@@ -21,6 +21,16 @@ grep -E "ALL GREEN|CI FAILED|RESULTS:" _ci_ffiret2.log | tail -4
 * **If it FAILS** → the change is `git checkout -- nova-compiler/compiler/nova_compiler.nova`
   away from a clean tree. Do not agonise; it is a self-contained ~25-line seeding block.
 
+**The gate finished OFFLINE.** It runs entirely locally — no external URLs in any gate script, the
+reconverge is clang + local binaries, and every network test uses loopback — so it kept running after
+the session ended and its result in `_ci_ffiret2.log` is valid.
+
+**ONE caveat when reading that result:** `https_client_test` does a real `http_get("https://example.com")`
+and is NOT in the skip list. If the machine was offline when the run reached it, expect it to appear as a
+FAIL that is purely a connectivity artifact, not a regression. A result of "2840 PASS, 1 FAIL —
+https_client_test" (or that plus the known `forge_h2c_test` hang) should be read as GREEN for the change
+under test. Re-run those two individually once online to confirm.
+
 **Do not touch the compiler/runtime while a gate runs.** Four "failures" today were caused by me
 killing processes or editing sources mid-gate; they evaporated on a clean re-run.
 
