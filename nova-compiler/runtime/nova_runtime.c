@@ -14100,6 +14100,46 @@ int64_t nova_rt_tcp_listen(int64_t port_val) {
     return (int64_t)sock;
 }
 
+/* F-1 (Forge production gaps, BLOCKER): the real TCP peer address was exposed NOWHERE.
+   tcp_accept fills a sockaddr_in and DISCARDS it, so mw_rate_limit could only key on the
+   client-supplied X-Forwarded-For header — a fresh random XFF per request gets a fresh
+   bucket, so the limiter never engages AND the attacker forces unlimited PBKDF2 work
+   (CPU-exhaustion DoS from a one-line curl loop).
+
+   getpeername() recovers it from the ACCEPTED socket, so no accept-path signature has to
+   change and every existing caller keeps working. Returns the dotted-quad as a NOVA string,
+   or "" when unavailable — never an error, so a caller can always fall back to XFF. */
+int64_t nova_rt_tcp_peer_addr(int64_t sock_val) {
+    NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
+    struct sockaddr_in pa;
+    memset(&pa, 0, sizeof(pa));
+#ifdef _WIN32
+    int pl = (int)sizeof(pa);
+#else
+    socklen_t pl = (socklen_t)sizeof(pa);
+#endif
+    if (getpeername(s, (struct sockaddr*)&pa, &pl) != 0)
+        return nova_rt_create_string((void*)"");
+    char host[64];
+    host[0] = 0;
+    if (!inet_ntop(AF_INET, &pa.sin_addr, host, sizeof(host)))
+        host[0] = 0;
+    return nova_rt_create_string((void*)host);
+}
+
+int64_t nova_rt_tcp_peer_port(int64_t sock_val) {
+    NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
+    struct sockaddr_in pa;
+    memset(&pa, 0, sizeof(pa));
+#ifdef _WIN32
+    int pl = (int)sizeof(pa);
+#else
+    socklen_t pl = (socklen_t)sizeof(pa);
+#endif
+    if (getpeername(s, (struct sockaddr*)&pa, &pl) != 0) return 0;
+    return (int64_t)ntohs(pa.sin_port);
+}
+
 int64_t nova_rt_tcp_accept(int64_t server_val) {
     NOVA_SOCKET server = (NOVA_SOCKET)server_val;
     if (nova_sched_in_task()) {
