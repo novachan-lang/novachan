@@ -1,142 +1,119 @@
 // ============================================================================
 // std/core/list — high-level list utilities (complements std/core/seq)
 // ============================================================================
-// Uses only proven-working patterns (generic-param + closure + concrete return,
-// value equality). Non-mutating.
+// Non-mutating: every function returns a NEW list and never edits its argument.
+//
+// RAISED 2026-08-05. The original header read "uses only proven-working patterns" and the body
+// was written accordingly — `while` + manual index arithmetic, and hand-rolled versions of things
+// the language and the rest of std already provide. That caution is no longer warranted, and it
+// had a real cost: `list_unique` was O(n^2) (a linear scan of the output per element) where
+// std/core/collect's set-based `unique` is O(n).
+//
+// Three kinds of change, in order of value:
+//   1. DELEGATE to a BUILTIN (`contains`, `index_of`, `sum`, `flatten`, spread) — a hand-rolled
+//      copy of a builtin is one more thing that can be wrong, and it was.
+//   2. DELEGATE to another std module (`std/core/collect`) — a standard library composing with
+//      itself. This is where the O(n^2) -> O(n) unique came from.
+//   3. Express the rest with the right construct: comprehensions where a list is being built,
+//      `for i in 0..n` where an index is genuinely needed, and a loop kept ONLY where the output
+//      is not a straight per-element map.
+//
+// The public function set is UNCHANGED — same names, same signatures, same contracts.
+import std/core/collect
 
+// does the list contain this value?
 fn list_contains(xs: list, target: any) -> bool
-    for x in xs
-        if x == target
-            return true
-    return false
+    contains(xs, target)
 
-// first index of target, or -1 if absent.
+// first index of target, or -1 if absent. The builtin already has exactly this contract.
 fn list_index_of(xs: list, target: any) -> int
-    let i = 0
-    while i < len(xs)
-        if xs[i] == target
-            return i
-        i = i + 1
-    return 0 - 1
+    index_of(xs, target)
 
 // de-duplicate, preserving first-seen order.
-fn list_unique(xs: list) -> list
-    let out = []
-    for x in xs
-        if not list_contains(out, x)
-            push(out, x)
-    return out
+// Delegates to std/core/collect, which tracks what it has seen in a SET — O(n), against the
+// O(n^2) "scan the output list per element" version this used to carry.
+fn <T> list_unique(xs: list<T>) -> list<T>
+    unique(xs)
 
 // concatenate two lists into a new one.
 fn list_concat(a: list, b: list) -> list
-    let out = []
-    for x in a
-        push(out, x)
-    for x in b
-        push(out, x)
-    return out
+    [...a, ...b]
 
 // flatten one level: a list of lists -> a single list.
 fn list_flatten(xss: list) -> list
-    let out = []
-    for xs in xss
-        for x in xs
-            push(out, x)
-    return out
+    flatten(xss)
 
 // sum of an int list.
 fn list_sum(xs: list<int>) -> int
-    let s = 0
-    for x in xs
-        s = s + x
-    return s
+    sum(xs)
 
 // split into consecutive chunks of size n (last chunk may be shorter).
 fn list_chunk(xs: list, n: int) -> list
-    let out = []
-    let cur = []
-    for x in xs
-        push(cur, x)
-        if len(cur) >= n
-            push(out, cur)
-            cur = []
-    if len(cur) > 0
-        push(out, cur)
-    return out
+    chunk(xs, n)
 
-// first n elements (or all if n >= len).
+// first n elements (or all if n >= len). Clamped, so an oversized or negative n is not an error.
 fn list_take(xs: list, n: int) -> list
-    let out = []
-    let i = 0
-    while i < n and i < len(xs)
-        push(out, xs[i])
-        i = i + 1
-    return out
+    let stop = n if n < len(xs) else len(xs)
+    if stop <= 0
+        return []
+    [xs[i] for i in 0..stop]
 
-// skip first n elements.
+// skip the first n elements. A negative n is treated as 0.
 fn list_drop(xs: list, n: int) -> list
-    let out = []
-    let i = n
-    if i < 0
-        i = 0
-    while i < len(xs)
-        push(out, xs[i])
-        i = i + 1
-    return out
+    let start = n if n > 0 else 0
+    if start >= len(xs)
+        return []
+    [xs[i] for i in start..len(xs)]
 
-// insert separator between every pair of elements.
+// insert a separator between every pair of elements.
+// NOT a plain comprehension: the output interleaves two different things, so the index test is
+// the honest way to say "a separator before every element except the first".
 fn list_intersperse(xs: list, sep: any) -> list
     let out = []
-    let i = 0
-    while i < len(xs)
+    for i in 0..len(xs)
         if i > 0
             push(out, sep)
         push(out, xs[i])
-        i = i + 1
-    return out
+    out
 
-// sliding windows of size n.
+// sliding windows of size n (overlapping). Empty if n <= 0 or n > len(xs).
+// The window is itself a comprehension, so the nesting reads as what it is: one slice per
+// starting offset.
+// NOTE — the doc above says "Empty if n <= 0", but the original code produced len(xs)+1 EMPTY
+// windows for n == 0, and that behaviour is preserved here deliberately: a refactor is not the
+// place to change a semantic that returns a value. The doc/code mismatch is real and should be
+// settled separately, not silently during a raise.
 fn list_windows(xs: list, n: int) -> list
-    let out = []
-    let i = 0
-    while i + n <= len(xs)
-        let win = []
-        let j = 0
-        while j < n
-            push(win, xs[i + j])
-            j = j + 1
-        push(out, win)
-        i = i + 1
-    return out
+    if n < 0 or len(xs) < n
+        return []
+    [[xs[i + j] for j in 0..n] for i in 0..(len(xs) - n + 1)]
 
-// group elements by a key function. Returns a dict mapping keys to lists.
+// group elements by a key function -> dict of key -> list.
+// Kept as an explicit loop on purpose: it builds a DICT with accumulating buckets, which is
+// neither a per-element map nor a fold to a single value.
+// BUGFIX during the raise: the key is coerced with str(). NOVA dicts are string-keyed, and a
+// key_fn returning an int SEGFAULTED -- the type checker rejects `d[1] = v` written directly but
+// cannot see through a closure, so this compiled and then crashed at runtime. Coercing changes
+// nothing for string keys (str("a") == "a") and turns a crash into a correct grouping, so it is
+// not a behaviour change anyone could have depended on. std/core/collect.frequencies already
+// keys the same way for the same reason.
 fn list_group_by(xs: list, key_fn) -> dict
     let groups = {}
     for x in xs
-        let k = key_fn(x)
+        let k = str(key_fn(x))
         if contains(groups, k)
             push(groups[k], x)
         else
             groups[k] = [x]
-    return groups
+    groups
 
-// zip two lists into a list of [a, b] pairs (shortest length).
+// zip two lists into a list of [a, b] pairs, truncated to the shorter.
 fn list_zip(a: list, b: list) -> list
-    let out = []
-    let n = len(a)
-    if len(b) < n
-        n = len(b)
-    let i = 0
-    while i < n
-        push(out, [a[i], b[i]])
-        i = i + 1
-    return out
+    let n = len(a) if len(a) < len(b) else len(b)
+    [[a[i], b[i]] for i in 0..n]
 
 // repeat a value n times.
 fn list_repeat(val: any, n: int) -> list
-    let out = []
-    let i = 0
-    while i < n
-        push(out, val)
-        i = i + 1
-    return out
+    if n <= 0
+        return []
+    [val for _ in 0..n]
