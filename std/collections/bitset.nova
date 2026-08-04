@@ -5,8 +5,16 @@
 //   bs[1..]    = the backing words, ceil(nbits/64) of them, each holding bits 0..63
 //
 // Bit i lives in word index (i/64)+1 of the list, at bit position (i%64).
-// Lists are immutable (no in-place element assignment), so any mutator
-// (bs_set / bs_clear) RETURNS a brand-new bitset built by rebuild.
+// Any mutator (bs_set / bs_clear) RETURNS a brand-new bitset rather than editing in
+// place. That is the CONTRACT the tests below assert, and it is preserved exactly.
+// (The old header justified it as "lists are immutable"; that is no longer true of
+// NOVA lists, so the value-semantics story is now a deliberate choice, not a limitation.)
+//
+// RAISED 2026-08-05. All five `out = out + [x]` rebuild loops are gone. Each of them
+// reallocated and copied the whole accumulating list per word; every one is now a single
+// comprehension that states the rule directly. The word count is small (ceil(nbits/64)),
+// so this is a readability and correctness win more than a throughput one -- but
+// bs_with_word is called on EVERY set/clear, so it is on the hot path of any real use.
 
 // Number of backing words needed for nbits bits: ceil(nbits/64).
 fn bs_nwords(nbits: int) -> int
@@ -19,28 +27,16 @@ fn bs_nbits(bs) -> int
 // Create a fresh bitset of nbits bits, all clear.
 // Element 0 is nbits; elements 1.. are ceil(nbits/64) zero words.
 fn bitset_new(nbits)
-    let nw = bs_nwords(nbits)
-    let bs = [nbits]
-    let w = 0
-    while w < nw
-        bs = bs + [0]
-        w = w + 1
-    return bs
+    [nbits, ...[0 for _ in 0..bs_nwords(nbits)]]
 
 // Rebuild a bitset replacing the word at list-index `wi` (1-based into words)
 // with `val`, keeping every other word identical. This is the immutable-list
 // "store" primitive that bs_set / bs_clear are built on.
+//
+// One comprehension states the whole rule: "every slot as it was, except wi".
+// Index 0 (the nbits header) is preserved automatically because wi is always >= 1.
 fn bs_with_word(bs, wi, val)
-    let n = len(bs)
-    let out = [bs[0]]
-    let k = 1
-    while k < n
-        if k == wi
-            out = out + [val]
-        else
-            out = out + [bs[k]]
-        k = k + 1
-    return out
+    [val if k == wi else bs[k] for k in 0..len(bs)]
 
 // Return a NEW bitset with bit i set (word = i/64, bit = i%64, OR in (1<<bit)).
 fn bs_set(bs, i)
@@ -70,34 +66,17 @@ fn bs_test(bs, i) -> int
     return 0
 
 // Total number of set bits across all words (sum of popcount over words).
+// Word 1 onwards: index 0 is the nbits header, not a word.
 fn bs_count(bs) -> int
-    let n = len(bs)
-    let total = 0
-    let k = 1
-    while k < n
-        total = total + popcount(bs[k])
-        k = k + 1
-    return total
+    sum([popcount(bs[k]) for k in 1..len(bs)])
 
-// Elementwise OR of two equal-nbits bitsets.
+// Elementwise OR of two equal-nbits bitsets. The nbits header is carried through unchanged.
 fn bs_union(a, b)
-    let n = len(a)
-    let out = [a[0]]
-    let k = 1
-    while k < n
-        out = out + [a[k] | b[k]]
-        k = k + 1
-    return out
+    [a[0], ...[a[k] | b[k] for k in 1..len(a)]]
 
 // Elementwise AND of two equal-nbits bitsets.
 fn bs_intersect(a, b)
-    let n = len(a)
-    let out = [a[0]]
-    let k = 1
-    while k < n
-        out = out + [a[k] & b[k]]
-        k = k + 1
-    return out
+    [a[0], ...[a[k] & b[k] for k in 1..len(a)]]
 
 fn main()
     // ---- bs_nwords: ceil(nbits/64) boundaries ----
@@ -115,10 +94,8 @@ fn main()
     assert_eq(len(a), 3)           // [nbits, word0, word1]
     assert_eq(bs_count(a), 0)
     // every bit reads 0 initially
-    let i = 0
-    while i < 100
+    for i in 0..100
         assert_eq(bs_test(a, i), 0)
-        i = i + 1
 
     // ---- bs_set(.,5) and bs_set(.,70): cross-word, immutability ----
     let b = bs_set(a, 5)
@@ -131,13 +108,11 @@ fn main()
     assert_eq(bs_test(c, 70), 1)
     assert_eq(bs_count(c), 2)
     // every OTHER bit is 0
-    let j = 0
-    while j < 100
+    for j in 0..100
         if j == 5 or j == 70
             assert_eq(bs_test(c, j), 1)
         else
             assert_eq(bs_test(c, j), 0)
-        j = j + 1
 
     // setting an already-set bit is idempotent (count unchanged)
     let c2 = bs_set(c, 5)
@@ -217,11 +192,7 @@ fn main()
 
     // ---- popcount-based count matches a manual bit-by-bit scan ----
     let big = bs_set(bs_set(bs_set(bs_set(bitset_new(100), 0), 31), 64), 99)
-    let manual = 0
-    let p = 0
-    while p < 100
-        manual = manual + bs_test(big, p)
-        p = p + 1
+    let manual = sum([bs_test(big, p) for p in 0..100])
     assert_eq(bs_count(big), manual)
     assert_eq(bs_count(big), 4)
 
