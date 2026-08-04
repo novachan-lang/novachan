@@ -10972,14 +10972,32 @@ fn collect_free_vars_stmt(stmt: Stmt, bound: list, free: list)
             for a in annotations
                 collect_free_vars_inner(a, bound, free)
 
-fn filter_captures(free: list, fnames: list, sdefs: dict, baked: dict) -> list
+fn filter_captures(free: list, fnames: list, sdefs: dict, baked: dict, lvars: dict) -> list
     let result = []
     for v in free
-        // Exclude module-scope BAKED vars: a closure loads them via const_get (line ~8194),
-        // never captures them. Capturing one would slot_load a non-existent slot (garbage) and
-        // make_closure would ref-count that garbage handle -> heap corruption / scheduler hang
-        // (the exact green_scale_test race). So they must not enter the capture list.
-        if not list_contains(fnames, v) and resolve_runtime_fn(v) == v and not contains(sdefs, v) and not contains(baked, v)
+        // A LOCAL SHADOWS A GLOBAL. This case must be tested FIRST.
+        //
+        // The `resolve_runtime_fn(v) == v` test below drops any free name that matches a
+        // registered builtin -- correct for `map`/`filter` being CALLED inside a closure body,
+        // but catastrophic for a local variable that merely happens to share a builtin's name.
+        // There are 1328 registered builtins including ordinary nouns (`items`, `args`,
+        // `chars`, `buffer`, `fields`, `line`, `value`, `key`, `data`, `text`, `count`...), so
+        // `let items = ["a","b","c"]` followed by `[items[i] for i in 0..3]` dropped `items`
+        // from the capture list; the closure body then resolved the name to the BUILTIN and the
+        // comprehension silently produced [0, 0, 0] instead of ["a","b","c"]. No error, no
+        // crash -- just wrong data. It reached std/textlayout/textcolumns.nova, where every
+        // laid-out column came out blank.
+        //
+        // Comprehensions desugar to lambdas, so this hits ANY comprehension over a local whose
+        // name collides with a builtin -- which is why it surfaced now, while raising the
+        // standard library onto comprehensions.
+        //
+        // Baked module-scope vars still take precedence: a closure loads those via const_get,
+        // and capturing one would slot_load a non-existent slot (garbage), which make_closure
+        // would then ref-count -> heap corruption / scheduler hang (the green_scale_test race).
+        if contains(lvars, v) and not contains(baked, v)
+            push(result, v)
+        else if not list_contains(fnames, v) and resolve_runtime_fn(v) == v and not contains(sdefs, v) and not contains(baked, v)
             push(result, v)
     result
 
@@ -12298,7 +12316,7 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                             push(bound, pv)
                 let free = []
                 collect_free_vars_inner(body_expr, bound, free)
-                let captures = filter_captures(free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked)
+                let captures = filter_captures(free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked, b.ir_locals)
                 let tramp_name = ir_lift_lambda(b, lam_params, body_expr, captures)
                 let capture_regs = []
                 for cap in captures
@@ -12683,7 +12701,7 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     let sp_free = []
                     for sp_s in sp_call_body
                         collect_free_vars_stmt(sp_s, sp_bound, sp_free)
-                    let sp_caps = filter_captures(sp_free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked)
+                    let sp_caps = filter_captures(sp_free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked, b.ir_locals)
                     let sp_tramp = ir_lift_nested_fn(b, "__spawn_call", [], sp_call_body, sp_caps)
                     let sp_cap_regs = []
                     for sp_cap in sp_caps
@@ -13940,7 +13958,7 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let sp_free = []
                 for sp_s in body
                     collect_free_vars_stmt(sp_s, sp_bound, sp_free)
-                let sp_caps = filter_captures(sp_free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked)
+                let sp_caps = filter_captures(sp_free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked, b.ir_locals)
                 let sp_tramp = ir_lift_nested_fn(b, "__spawn", params, body, sp_caps)
                 let sp_cap_regs = []
                 for sp_cap in sp_caps
@@ -13980,7 +13998,7 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let free = []
                 for s in body
                     collect_free_vars_stmt(s, fn_bound, free)
-                let captures = filter_captures(free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked)
+                let captures = filter_captures(free, b.ir_fnames, b.ir_sdefs, b.ir_const_baked, b.ir_locals)
                 let tramp_name = ir_lift_nested_fn(b, name, params, body, captures)
                 let capture_regs = []
                 for cap in captures

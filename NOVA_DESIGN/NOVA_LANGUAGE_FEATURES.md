@@ -1427,6 +1427,33 @@ fn f(n: int) -> int
 
 ## 7. TRAPS — verified, each cost real debugging time
 
+### Trap 0 — A LOCAL NAMED AFTER A BUILTIN, USED IN A COMPREHENSION  (FIXED 2026-08-05)
+
+```nova
+let items = ["a", "b", "c"]
+print([items[i] for i in 0..3])     // was: [0, 0, 0]   -- NOT ["a","b","c"]
+```
+
+A comprehension DESUGARS TO A LAMBDA. Lambda capture used to drop any free variable whose name
+matched one of NOVA's ~1328 registered builtins — and those include ordinary nouns you would
+naturally pick for a variable: `items`, `args`, `chars`, `buffer`, `fields`, `line`, `value`,
+`key`, `data`, `text`, `count`, `input`, `output`, `index`, `total`. The closure body then
+resolved the name to the BUILTIN, and the comprehension silently produced zeros. No error, no
+crash, wrong data. It shipped into `std/textlayout/textcolumns.nova` and blanked every column.
+
+FIXED in `filter_captures` (nova_compiler.nova): a LOCAL now shadows a global, as it always
+should have. If you are on an older compiler, rename the local.
+
+To list the reserved-in-practice names:
+```
+grep -oE 'reg\["[a-z_0-9]+"\]' nova-compiler/compiler/nova_compiler.nova | sed 's/reg\["//;s/"\]//' | sort -u
+```
+
+WHY IT MATTERS BEYOND THIS BUG: `_hlcheck.sh` compiled the broken file clean, because the
+affected function's parameters were untyped (`any`) so the checker never saw a mismatch. Only a
+BEHAVIOUR DIFF caught it. **Compiling is not passing.**
+
+
 1. **`fn name<T>(...)` does not parse.** Type parameters come **first**: `fn <T> name(...)`.
    Inside a MODULE the wrong form fails **silently and truncates that module's exports** — every
    function defined after it becomes invisible to importers, with no error naming the cause.
