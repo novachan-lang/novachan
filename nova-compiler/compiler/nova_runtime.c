@@ -917,8 +917,28 @@ typedef enum {
        kind sets bits above the low 3 except struct -> 8 is collision-free. This gives bytes
        a distinct identity WITHOUT widening the kind field (the struct slot-count encoding
        stays untouched). See nova_mem_find_tag's load-bearing pre-mask interception. */
-    NOVA_MEM_BYTES   = 8
+    NOVA_MEM_BYTES   = 8,
+    /* LOCK-4 inc3d: packed typed array (NovaTypedArray{data,size,cap,kind}). Like BYTES this
+       is a FULL 16-bit tag, not a 3-bit kind: 16&0x7==0 (RAW), so find_tag intercepts it with
+       a pre-mask check exactly as it does for 8. No struct tag can equal 16 -- structs are
+       (nslots<<3)|5, i.e. always ==5 mod 8 -- so the value is collision-free. */
+    NOVA_MEM_TARRAY  = 16
 } NovaMemTag;
+
+/* Element kinds for the packed typed array (object defined further down, beside NovaBytes).
+   Declared HERE because find_tag validates `kind` against NOVA_TA_KINDS and runs well before
+   that definition. */
+#define NOVA_TA_I8   0
+#define NOVA_TA_U8   1
+#define NOVA_TA_I16  2
+#define NOVA_TA_U16  3
+#define NOVA_TA_I32  4
+#define NOVA_TA_U32  5
+#define NOVA_TA_I64  6
+#define NOVA_TA_U64  7
+#define NOVA_TA_F32  8
+#define NOVA_TA_F64  9
+#define NOVA_TA_KINDS 10
 
 static int64_t      nova_mem_live    = 0;
 /* C2: nova_mem_live is on the alloc/free hot path; the plain ++/-- was a real (benign-count) TSAN data
@@ -1224,6 +1244,20 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
                 if (bsz < 0 || bcp < bsz || (uint64_t)bcp > (1ULL << 40)) return (NovaMemTag)-1;
             }
             return NOVA_MEM_BYTES;
+        }
+        /* Same pre-mask interception and the same structural validation as BYTES above, plus a
+           range check on `kind` -- an out-of-range kind means this is not one of ours, and the
+           width table is indexed by it further down. */
+        if (NOVA_RC_TAG(ptr) == NOVA_MEM_TARRAY) {
+            if (nova_heap_base) {
+                if ((uintptr_t)((const char*)ptr + 32) > nova_heap_top) return (NovaMemTag)-1;
+                int64_t tsz = ((const int64_t*)ptr)[1];
+                int64_t tcp = ((const int64_t*)ptr)[2];
+                int64_t tkd = ((const int64_t*)ptr)[3];
+                if (tsz < 0 || tcp < tsz || (uint64_t)tcp > (1ULL << 40)) return (NovaMemTag)-1;
+                if (tkd < 0 || tkd >= NOVA_TA_KINDS) return (NovaMemTag)-1;
+            }
+            return NOVA_MEM_TARRAY;
         }
         /* Mask to the low 3 kind bits: structs pack a slot count above them. */
         NovaMemTag kind = (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
@@ -1861,6 +1895,183 @@ typedef struct {
     int64_t  size;
     int64_t  cap;
 } NovaBytes;
+
+/* ── LOCK-4 inc3d: PACKED TYPED ARRAYS ────────────────────────────────────────
+   A u8[]/i32[]/f32[] stored PACKED at its element width -- 1 MB for a million u8, not 8 MB.
+
+   WHY THIS IS A SEPARATE OBJECT RATHER THAN A WIDTH FLAG ON NovaList.
+   NovaList already has an unboxed fast path (elem_kind 0/1/2), and its soundness rests on one
+   invariant: the SLOT SIZE never changes, only its interpretation. A conflicting append just
+   flips elem_kind to 0 and every alias immediately observes the deopt, because the buffer
+   layout is identical either way. Adding a width would break exactly that -- a u8[] receiving
+   a float would have to REALLOCATE from 1-byte to 8-byte slots, and every existing alias would
+   be left pointing at the old buffer. That is not a flag flip, it is a representation change
+   under aliases, and it is where silent corruption lives.
+
+   So a packed array is homogeneous BY CONTRACT (its element type is fixed at creation and a
+   type mismatch is a compile-time error now that sized widths exist) while a NovaList is
+   heterogeneous-by-default with an optimization. Conflating them forces the runtime to support
+   a transition that cannot be made sound cheaply. Every mature system draws this same line:
+   NumPy's ndarray is not a Python list, Java's int[] is not an ArrayList<Integer>.
+
+   Shares the {data,size,cap} prefix with NovaList/NovaBytes so find_tag's structural predicate
+   applies unchanged; `kind` is appended in the tail slot, exactly as NovaList did for
+   elem_kind. */
+
+typedef struct {
+    uint8_t* data;
+    int64_t  size;
+    int64_t  cap;
+    int64_t  kind;
+} NovaTypedArray;
+
+static const int8_t nova_ta_width[NOVA_TA_KINDS] = { 1, 1, 2, 2, 4, 4, 8, 8, 4, 8 };
+
+static int nova_ta_is_float(int64_t k) { return k == NOVA_TA_F32 || k == NOVA_TA_F64; }
+
+static int64_t nova_ta_elem_size(int64_t k) {
+    if (k < 0 || k >= NOVA_TA_KINDS) return 0;
+    return (int64_t)nova_ta_width[k];
+}
+
+int64_t nova_rt_tarray_new(int64_t kind, int64_t n);
+int64_t nova_rt_tarray_get(int64_t h, int64_t i);
+int64_t nova_rt_tarray_set(int64_t h, int64_t i, int64_t v);
+
+static NovaTypedArray* nova_ta_of(int64_t h) {
+    if (!h) return NULL;
+    if (nova_mem_find_tag((void*)(uintptr_t)h) != NOVA_MEM_TARRAY) return NULL;
+    return (NovaTypedArray*)(uintptr_t)h;
+}
+
+/* Allocate a zero-filled packed array of `n` elements. Overflow in n*width is checked BEFORE
+   the multiply reaches calloc -- a 2^61-element i64 array would otherwise wrap to a small
+   allocation and every later write would be an out-of-bounds store. */
+int64_t nova_rt_tarray_new(int64_t kind, int64_t n) {
+    if (kind < 0 || kind >= NOVA_TA_KINDS || n < 0) return 0;
+    int64_t w = nova_ta_elem_size(kind);
+    if (n > 0 && n > (int64_t)((1LL << 40) / w)) return 0;
+    NovaTypedArray* a = (NovaTypedArray*)nova_heap_alloc(sizeof(NovaTypedArray), (NovaMemTag)NOVA_MEM_TARRAY);
+    if (!a) return 0;
+    a->size = n;
+    a->cap = n;
+    a->kind = kind;
+    a->data = NULL;
+    if (n > 0) {
+        a->data = (uint8_t*)calloc((size_t)n, (size_t)w);
+        if (!a->data) { a->size = 0; a->cap = 0; return (int64_t)(uintptr_t)a; }
+    }
+    return (int64_t)(uintptr_t)a;
+}
+
+int64_t nova_rt_tarray_len(int64_t h) {
+    NovaTypedArray* a = nova_ta_of(h);
+    return a ? a->size : 0;
+}
+
+int64_t nova_rt_tarray_kind(int64_t h) {
+    NovaTypedArray* a = nova_ta_of(h);
+    return a ? a->kind : -1;
+}
+
+/* Read element `i`. Integer kinds sign- or zero-extend to i64 per their signedness; float kinds
+   return the value's raw double BITS, which is NOVA's float representation in an i64 slot.
+   Out of range yields 0, matching what list indexing already does -- a new container that
+   panicked where the existing one returns 0 would make the language less coherent, not safer.
+   The checked accessor lives in the NOVA-level module and returns a Result. */
+int64_t nova_rt_tarray_get(int64_t h, int64_t i) {
+    NovaTypedArray* a = nova_ta_of(h);
+    if (!a || i < 0 || i >= a->size || !a->data) return 0;
+    switch (a->kind) {
+        case NOVA_TA_I8:  return (int64_t)((int8_t*)a->data)[i];
+        case NOVA_TA_U8:  return (int64_t)((uint8_t*)a->data)[i];
+        case NOVA_TA_I16: return (int64_t)((int16_t*)a->data)[i];
+        case NOVA_TA_U16: return (int64_t)((uint16_t*)a->data)[i];
+        case NOVA_TA_I32: return (int64_t)((int32_t*)a->data)[i];
+        case NOVA_TA_U32: return (int64_t)((uint32_t*)a->data)[i];
+        case NOVA_TA_I64: return ((int64_t*)a->data)[i];
+        case NOVA_TA_U64: return (int64_t)((uint64_t*)a->data)[i];
+        case NOVA_TA_F32: { float f; memcpy(&f, a->data + (size_t)i * 4, 4); double d = (double)f;
+                            int64_t o; memcpy(&o, &d, 8); return o; }
+        case NOVA_TA_F64: { double d; memcpy(&d, a->data + (size_t)i * 8, 8);
+                            int64_t o; memcpy(&o, &d, 8); return o; }
+    }
+    return 0;
+}
+
+/* Write element `i`. Integer kinds TRUNCATE to the element width with defined wrapping -- the
+   same semantics the sized-integer arithmetic uses, so `u8[] = 300` stores 44 rather than
+   silently corrupting the neighbouring element. Float kinds take raw double bits and narrow. */
+int64_t nova_rt_tarray_set(int64_t h, int64_t i, int64_t v) {
+    NovaTypedArray* a = nova_ta_of(h);
+    if (!a || i < 0 || i >= a->size || !a->data) return 0;
+    /* UNBOX FIRST. A float argument crossing into an i64-typed builtin slot is WIDENED TO A BOX
+       by the compiler (the emitted call passes %wbox, not the raw bits), so interpreting `v`
+       directly as double bits stores a pointer. The f64 kind hid this beautifully: it round-
+       tripped the pointer byte-for-byte and str() unboxed it on the way out, so the value
+       printed correctly while nothing had actually been stored as a double. The f32 kind, which
+       narrows through `float`, is what exposed it. Integer kinds are unaffected -- unbox is the
+       identity on a non-box. */
+    v = nova_rt_unbox(v);
+    switch (a->kind) {
+        case NOVA_TA_I8:  ((int8_t*)a->data)[i]   = (int8_t)v; break;
+        case NOVA_TA_U8:  ((uint8_t*)a->data)[i]  = (uint8_t)v; break;
+        case NOVA_TA_I16: ((int16_t*)a->data)[i]  = (int16_t)v; break;
+        case NOVA_TA_U16: ((uint16_t*)a->data)[i] = (uint16_t)v; break;
+        case NOVA_TA_I32: ((int32_t*)a->data)[i]  = (int32_t)v; break;
+        case NOVA_TA_U32: ((uint32_t*)a->data)[i] = (uint32_t)v; break;
+        case NOVA_TA_I64: ((int64_t*)a->data)[i]  = v; break;
+        case NOVA_TA_U64: ((uint64_t*)a->data)[i] = (uint64_t)v; break;
+        case NOVA_TA_F32: { double d; memcpy(&d, &v, 8); float f = (float)d;
+                            memcpy(a->data + (size_t)i * 4, &f, 4); break; }
+        case NOVA_TA_F64: { memcpy(a->data + (size_t)i * 8, &v, 8); break; }
+    }
+    return 0;
+}
+
+/* Append, growing geometrically. Returns the new length, or the old one if the growth failed --
+   never a partial write. */
+int64_t nova_rt_tarray_push(int64_t h, int64_t v) {
+    NovaTypedArray* a = nova_ta_of(h);
+    if (!a) return 0;
+    int64_t w = nova_ta_elem_size(a->kind);
+    if (a->size >= a->cap) {
+        int64_t ncap = a->cap ? a->cap * 2 : 8;
+        if (ncap > (int64_t)((1LL << 40) / w)) return a->size;
+        uint8_t* nd = (uint8_t*)realloc(a->data, (size_t)ncap * (size_t)w);
+        if (!nd) return a->size;
+        memset(nd + (size_t)a->cap * (size_t)w, 0, (size_t)(ncap - a->cap) * (size_t)w);
+        a->data = nd;
+        a->cap = ncap;
+    }
+    a->size++;
+    nova_rt_tarray_set(h, a->size - 1, v);
+    return a->size;
+}
+
+/* FLOAT-typed views of the same three primitives. They exist as DISTINCT SYMBOLS, not just
+   distinct NOVA type schemes over one symbol, because the register type that decides whether
+   str() lowers to int_to_str or float_to_str is assigned per CALLEE NAME in ir_infer_one -- one
+   shared symbol cannot be typed two ways. Bodies are trivial forwarders; the whole content is
+   the name. */
+int64_t nova_rt_tarray_getf(int64_t h, int64_t i) { return nova_rt_tarray_get(h, i); }
+int64_t nova_rt_tarray_setf(int64_t h, int64_t i, int64_t v) { return nova_rt_tarray_set(h, i, v); }
+int64_t nova_rt_tarray_pushf(int64_t h, int64_t v) { return nova_rt_tarray_push(h, v); }
+
+int64_t nova_rt_tarray_fill(int64_t h, int64_t v) {
+    NovaTypedArray* a = nova_ta_of(h);
+    if (!a) return 0;
+    for (int64_t i = 0; i < a->size; i++) nova_rt_tarray_set(h, i, v);
+    return a->size;
+}
+
+/* Bytes actually occupied by the elements -- the whole point of the type, and what a test
+   asserts against the equivalent boxed list to prove the packing is real. */
+int64_t nova_rt_tarray_bytes(int64_t h) {
+    NovaTypedArray* a = nova_ta_of(h);
+    if (!a) return 0;
+    return a->size * nova_ta_elem_size(a->kind);
+}
 int64_t nova_rt_bytes_create(int64_t size_val);  /* fwd: deep_copy(BYTES) calls it above its definition */
 
 /* ── Arena-aware backing storage for containers (iter-91) ──────────────────────
@@ -2279,6 +2490,7 @@ int64_t nova_rt_len_any(int64_t handle) {
     if (tag == NOVA_MEM_LIST) return ((NovaList*)ptr)->size;
     if (tag == NOVA_MEM_DICT) return ((NovaDict*)ptr)->size;
     if (tag == NOVA_MEM_BYTES) return ((NovaBytes*)ptr)->size;  /* true binary length, not strlen on the struct */
+    if (tag == NOVA_MEM_TARRAY) return ((NovaTypedArray*)ptr)->size;  /* ELEMENT count, not bytes */
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN((const char*)ptr);
     /* SOUNDNESS: only a genuine string may be strlen'd. A non-measurable scalar (int/float/bool -- e.g.
        len(json_decode("5")), or for-in over a non-list which lowers to len + index_get) would otherwise be
@@ -4809,6 +5021,18 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
             dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
         return (int64_t)(uintptr_t)dst;
     }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Mutable, exactly like bytes -- a spawned task or channel receiver must own an
+           independent buffer or a set on one side corrupts the other. Absent this case the tag
+           falls through to the bare `return v` below with NO rc_inc, which is a use-after-free
+           the moment the sender drops it. */
+        NovaTypedArray* src = (NovaTypedArray*)(uintptr_t)v;
+        int64_t dst = nova_rt_tarray_new(src->kind, src->size);
+        NovaTypedArray* d = (NovaTypedArray*)(uintptr_t)dst;
+        if (d && d->data && src->data)
+            memcpy(d->data, src->data, (size_t)src->size * (size_t)nova_ta_elem_size(src->kind));
+        return dst;
+    }
     if (tag == NOVA_MEM_BYTES) {
         /* Bytes are MUTABLE, so deep-copy (NOT rc_inc-share like immutable strings):
            process isolation requires the spawned/channel-sent process own an independent
@@ -4930,6 +5154,15 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_keys(obj);
+    }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Materialize the elements as a list, same reason as bytes below: the generic iterator
+           would otherwise read the packed buffer at 8 bytes per element. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        int64_t result = nova_rt_list_create();
+        for (int64_t i = 0; i < ta->size; i++)
+            nova_rt_list_append(result, nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i));
+        return result;
     }
     if (tag == NOVA_MEM_BYTES) {
         /* Materialize the byte values as an int64 list (0..255) so iteration is safe. Else the iterator
@@ -6393,6 +6626,13 @@ int64_t nova_rt_elem_to_str(int64_t val) {
     if (tag == NOVA_MEM_BYTES) {
         NovaBytes* bb = (NovaBytes*)ptr;
         char tmp[48]; snprintf(tmp, sizeof(tmp), "<bytes:%lld>", (long long)bb->size);
+        return nova_rt_create_string((void*)tmp);
+    }
+    if (tag == NOVA_MEM_TARRAY) {
+        static const char* kn[NOVA_TA_KINDS] = { "i8","u8","i16","u16","i32","u32","i64","u64","f32","f64" };
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        const char* k = (ta->kind >= 0 && ta->kind < NOVA_TA_KINDS) ? kn[ta->kind] : "?";
+        char tmp[64]; snprintf(tmp, sizeof(tmp), "<%s[%lld]>", k, (long long)ta->size);
         return nova_rt_create_string((void*)tmp);
     }
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
@@ -12731,6 +12971,17 @@ static void nova_rc_free(void* ptr) {
         return;
     }
     switch (tag) {
+        case NOVA_MEM_TARRAY: {
+            /* Free the packed element buffer. Elements are RAW SCALARS by construction -- a
+               typed array can never hold a heap handle -- so unlike a list there is nothing to
+               rc_dec, only the one malloc'd buffer. Without this case the buffer leaks on every
+               array death, which for a million-element array is a megabyte a time. */
+            NovaTypedArray* ta = (NovaTypedArray*)ptr;
+            if (ta->data) { free(ta->data); ta->data = NULL; }
+            ta->size = 0;
+            ta->cap = 0;
+            break;
+        }
         case NOVA_MEM_LIST: {
             NovaList* l = (NovaList*)ptr;
             /* S4 Stage-0: kind=2 (raw inline doubles) elements are scalars, NEVER heap refs.
@@ -15971,6 +16222,15 @@ int64_t nova_rt_hash(int64_t val) {
         }
         return (int64_t)h;
     }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Content hash over the RAW BYTES, plus the kind so a u8[] and an i8[] holding the same
+           bytes do not collide. Consistent with the element-wise equality below. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        uint64_t h = 14695981039346656037ULL ^ (uint64_t)ta->kind;
+        int64_t nb = ta->size * nova_ta_elem_size(ta->kind);
+        for (int64_t i = 0; i < nb && ta->data; i++) { h ^= (uint64_t)ta->data[i]; h *= 1099511628211ULL; }
+        return (int64_t)h;
+    }
     if (tag == NOVA_MEM_BYTES) {
         /* Content hash (FNV-1a over the bytes) so equal-content bytes hash equal --
            consistent with nova_rt_eq's memcmp, required for bytes-as-dict-key correctness. */
@@ -17254,6 +17514,12 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_get(obj, index);  /* size-bounded; else str_char_at would strlen the struct (wild read) */
     }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Element-width aware. Without this case a packed array reaching the dynamic index path
+           would be read as a NovaList -- 8 bytes per element against a possibly 1-byte-per-element
+           buffer, i.e. a heap over-read. */
+        return nova_rt_tarray_get(obj, index);
+    }
     if (tag == NOVA_MEM_STRUCT) {
         /* L8: a struct reached the dynamic index path -> the compiler could not statically resolve its
            type to dispatch `obj[i]` to <Struct>__index (e.g. an unannotated parameter used only via []).
@@ -17339,6 +17605,10 @@ int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
     }
     if (tag == NOVA_MEM_BYTES) {
         nova_rt_bytes_set(obj, index, value);  /* else silent no-op = data loss on any-typed bytes */
+        return 0;
+    }
+    if (tag == NOVA_MEM_TARRAY) {
+        nova_rt_tarray_set(obj, index, value);
         return 0;
     }
     if (tag == NOVA_MEM_STRUCT) {

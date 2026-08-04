@@ -117,6 +117,85 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
+## LOCK-4 inc3d — PACKED TYPED ARRAYS (2026-08-04)
+
+`u8[]`/`i16[]`/`i32[]`/`f32[]` stored at their true element width. A thousand-element u8 array
+occupies **1000 bytes**, not the 8000 a boxed list needs; the KAT asserts the byte count, not
+just the values, because a test that only checked values would pass equally against an
+implementation that stored everything as i64 and called it packed.
+
+### The architectural decision, and why it is not a flag on NovaList
+
+The plan allowed either "a new elem_kind per width" or "a width tag" on NovaList. Both are
+wrong, for one specific reason:
+
+> **NovaList's unboxed fast path is sound because the SLOT SIZE never changes — only its
+> interpretation.** A conflicting append flips `elem_kind` to 0 and every alias immediately
+> agrees, because the buffer layout is byte-identical either way.
+
+Add a width and that invariant breaks. A `u8[]` receiving a float would have to **reallocate**
+from 1-byte to 8-byte slots while other references still point at the old buffer. That is a
+representation change under aliases, not a flag flip, and it is exactly where silent corruption
+lives. The deopt path — the thing that makes the existing design safe — becomes the thing that
+makes a width-carrying design unsafe.
+
+So a packed array is **homogeneous by contract**: its element kind is fixed at creation, a type
+mismatch is a compile-time error now that sized widths exist, and no deopt path exists at all.
+A NovaList stays heterogeneous-by-default with an optimization. Every mature system draws the
+same line — NumPy's `ndarray` is not a Python list, Java's `int[]` is not an `ArrayList`.
+
+Cost of that choice, stated plainly: a new object kind means touching every tag dispatcher.
+There are 14 of them. The load-bearing ones are all handled — `len_any`, `index_get`,
+`index_set`, `elem_to_str`, `deep_copy`, `for_iter_init`, `hash`, and `rc_free`. Tag 16 is
+collision-free (struct tags are always ≡5 mod 8; BYTES already took 8) and is intercepted
+before the `&0x7` mask exactly as BYTES is, with the same structural validation plus a range
+check on `kind`.
+
+### Two bugs found while building it, both of which a value-only test would have missed
+
+**1. Floats crossing into a builtin are BOXED.** The emitted call passes `%wbox`, not raw double
+bits, so interpreting the argument as a double stored a pointer. The f64 kind hid this
+perfectly: it round-tripped the pointer byte-for-byte and `str()` unboxed it on the way out, so
+the value printed correctly while nothing had actually been stored as a double. Only f32 —
+which narrows through `float` — exposed it. `tarray_set` now unboxes first.
+
+**2. One C symbol cannot be typed two ways.** The float accessors were initially just a second
+NOVA type scheme over the same symbol. That does not work: the register type deciding whether
+`str()` lowers to `int_to_str` or `float_to_str` is assigned per CALLEE NAME in `ir_infer_one`.
+They are now distinct symbols (trivial forwarders whose entire content is the name).
+
+### A GENERIC-SYNTAX finding worth recording
+
+`fn name<T>(...)` does not parse — NOVA's generic syntax puts the type parameters **before** the
+name: `fn <T> name(...)`, as `std/core/collect.nova` has been doing all along. In a MODULE the
+wrong form failed silently and truncated that module's exports: every function defined after it
+became invisible to importers, with no error pointing at the cause. That is almost certainly why
+the memory note claimed generics were "0x used in 280k lines" — that note is stale, and the real
+obstacle was a silent failure mode rather than a missing feature.
+
+### The NOVA-level surface is deliberately high-level
+
+`std/collections/typedarray.nova` is not a thin `any`-typed wrapper. It uses a generic
+(`fn <T> ta_of_list`), returns `Result` from every fallible operation (`ta_new`, `ta_at`,
+`ta_put`, `ta_map`, `ta_filter`, `ta_find_index`, the reductions), and takes CLOSURES for
+`map`/`filter`/`fold`/`any`/`all`/`find_index` so callers compose instead of hand-rolling index
+loops. The raw builtins keep list convention (out-of-range reads 0) so the language stays
+coherent; anything that can fail says so in its type. `ta_sum` on a float kind returns `err()`
+rather than a plausible wrong number.
+
+## `stack_enter` for WASM/freestanding — SCOPED, deliberately not shipped
+
+Native targets are correct as-is (see the analysis below): hardware containment exists on both
+platforms and auto-emitting a depth counter would tax every function prologue and epilogue.
+
+The residual case is wasm32/freestanding, which has neither signals nor SEH. It is NOT
+implemented here, and the reason is verification rather than difficulty: emitting matched
+`stack_enter`/`stack_exit` pairs is a bounded backend change, but exercising it needs WASM
+execution tooling the harness does not have today (node is present; a runner is not). Shipping
+an unverified guard for a target that cannot be tested is the half-done pattern this campaign
+has been avoiding. Correct scope for whoever picks it up: emit the pair ONLY for
+wasm32/freestanding, and build the WASM runner FIRST so the guard can be proven to fire.
+
 ## LOCK-11 COMPLETE + Forge blocker #3 ACTUALLY FIXED (2026-08-04)
 
 ### Struct-by-value RETURNS — LOCK-11 is now whole
