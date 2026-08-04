@@ -1,0 +1,93 @@
+// LOCK-11: passing a @repr(C) struct to an extern BY VALUE, lowered for the target's ABI.
+//
+// By-value is spelled `byval:T` and is OPT-IN. A plain @repr(C) parameter keeps its existing
+// meaning -- pass the heap data POINTER, so C can write through it and NOVA reads the result
+// back (ffi_repr_c_test relies on exactly that, against `int c_test_fill_triple(Triple*)`).
+// Those are two different C signatures; NOVA has to be able to say which one it is meeting.
+//
+// It used to be handed over as a POINTER. That is right only by accident on Win64 (where a
+// >8-byte struct really is passed by reference) and silently wrong everywhere else -- on
+// SysV this same program printed vec2_sum = 0.0 and pair_diff = 127173144871208, because
+// the callee read the pointer's own bits as its first field.
+//
+// The compiler now emits the same LOWERED signature clang does, per target:
+//   Win64    double @abi_vec2_sum(ptr)              i64 @abi_pair_diff(ptr)
+//   SysV     double @abi_vec2_sum(double, double)   i64 @abi_pair_diff(i64, i64)
+//   AAPCS64  double @abi_vec2_sum([2 x double])     i64 @abi_pair_diff([2 x i64])
+// This has to happen in the COMPILER because LLVM IR is not ABI-aware for aggregates --
+// clang does C ABI lowering in its frontend.
+
+@repr("C")
+type Vec2
+    x: float
+    y: float
+
+@repr("C")
+type Pair
+    a: int
+    b: int
+
+@repr("C")
+type One
+    v: float
+
+@repr("C")
+type OneI
+    n: int
+
+@link_source("abi_byval.c")
+extern fn abi_vec2_sum(v: byval<Vec2>) -> float
+extern fn abi_pair_diff(p: byval<Pair>) -> int
+extern fn abi_one_d(o: byval<One>) -> float
+extern fn abi_one_i(o: byval<OneI>) -> int
+extern fn abi_pair_and_scalar(p: byval<Pair>, k: int) -> int
+
+@repr("C")
+type I3
+    a: int
+    b: int
+    c: int
+
+@repr("C")
+type F3
+    a: float
+    b: float
+    c: float
+
+extern fn abi_i3_sum(v: byval<I3>) -> int
+extern fn abi_f3_sum(v: byval<F3>) -> float
+extern fn abi_i3_mutate(v: byval<I3>) -> int
+
+fn main()
+    // two-eightbyte SSE struct
+    let s = unsafe abi_vec2_sum(Vec2(1.5, 2.25))
+    assert(s == 3.75, "by-value 2-double struct sums to 3.75")
+
+    // two-eightbyte INTEGER struct
+    let d = unsafe abi_pair_diff(Pair(10, 3))
+    assert_eq(d, 7)
+
+    // single-eightbyte structs: the case Win64 passes IN A REGISTER rather than by reference,
+    // so this is the one that would break if the Win64 <=8-byte rule were missing.
+    let o = unsafe abi_one_d(One(21.5))
+    assert(o == 43.0, "by-value 1-double struct doubles to 43.0")
+    assert_eq(unsafe abi_one_i(OneI(41)), 42)
+
+    // a struct followed by an ordinary scalar: the lowered struct must consume the right
+    // number of parameter slots or the scalar lands in the wrong register.
+    assert_eq(unsafe abi_pair_and_scalar(Pair(3, 4), 5), 35)
+
+    // ── larger than two eightbytes: BY REFERENCE on Win64/AAPCS64, on the STACK
+    //    (`ptr byval`) on SysV. A plain `ptr` here would hand the callee the pointer
+    //    itself rather than the data -- the same defect, one size class up.
+    assert_eq(unsafe abi_i3_sum(I3(1, 2, 3)), 6)
+    let f3 = unsafe abi_f3_sum(F3(1.5, 2.25, 0.25))
+    assert(f3 == 4.0, "by-value 3-double struct sums to 4.0")
+
+    // the callee writes to its parameter; NOVA's struct must be UNTOUCHED, which is what
+    // the caller-owned copy (Win64/AAPCS64) and byval (SysV) both guarantee.
+    let mine = I3(7, 8, 9)
+    assert_eq(unsafe abi_i3_mutate(mine), 17)
+    assert_eq(mine.a, 7)
+
+    print("ffi_byval_abi_test passed")

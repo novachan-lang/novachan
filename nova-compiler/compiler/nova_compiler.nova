@@ -1373,11 +1373,11 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
         // literal-suffix helpers. Plain literals keep `val == digits` (unchanged); sized carry a "#".
         ParseResult(Expr("int", val, int(_digits), [], [], ln), pos + 1)
     else if kind == "FLOAT"
-        let _fdigits = val
-        let _fhash = find(val, "#")
-        if _fhash != 0 - 1
-            _fdigits = slice(val, 0, _fhash)
-        ParseResult(Expr("float", _fdigits, 0, [], [], ln), pos + 1)
+        // A float literal's `num` field is otherwise unused (all three consumers read only
+        // `value`), so the f32 suffix rides there: 1 = f32, 0 = default f64. It must NOT go
+        // in `fields` -- the s4 loop pass walks an Expr's fields GENERICALLY as child Exprs,
+        // and storing a bare string there is what segfaulted the compiler during inc3b.
+        ParseResult(Expr("float", _float_digits(val), _float_is_f32(val), [], [], ln), pos + 1)
     else if kind == "STR"
         ParseResult(Expr("str", val, 0, [], [], ln), pos + 1)
     else if kind == "RAW_STR"
@@ -1398,7 +1398,7 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
     else if kind == "OP" and val == "-"
         if tk(tokens, pos + 1) == "FLOAT"
             let fv = tv(tokens, pos + 1)
-            ParseResult(Expr("float", "-" + fv, 0, [], [], ln), pos + 2)
+            ParseResult(Expr("float", "-" + _float_digits(fv), _float_is_f32(fv), [], [], ln), pos + 2)
         else
             let rbp = prefix_bp("-")
             let operand_r = parse_expr(tokens, pos + 1, rbp, pe)
@@ -1900,6 +1900,61 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
         let erp = syntax_error(tokens, pos, "unexpected " + kind + " '" + val + "' in expression", pe)
         ParseResult(null_expr(), erp)
 
+// MULTI-LINE LAMBDA in argument position:
+//
+//     http.serve(8080, routes =>
+//         routes.get("/health", handler)
+//         routes.get("/data", other)
+//     )
+//
+// Returns a "lambda_blk" node when `pos` starts `p =>` or `(a, b) =>` whose body is an
+// INDENTED BLOCK rather than a single expression; otherwise a ParseResult whose pos is
+// unchanged, so the caller parses the argument normally. The newline after `=>` is the whole
+// discriminator -- a single-expression lambda keeps its body on the same line and is untouched.
+//
+// The block's statements ride in `fields`, mirroring how `catch` already carries a
+// multi-statement handler. They are lifted out again before any later pass runs (see
+// _lift_block_lambdas), so no consumer of the AST ever sees Stmts inside an Expr.
+fn _parse_block_lambda(tokens: list, pos: int, pe: list) -> ParseResult
+    let ln = tl(tokens, pos)
+    let bp = pos
+    let bparams = []
+    if tk(tokens, bp) == "IDENT" and tk(tokens, bp + 1) == "FAT_ARROW"
+        push(bparams, Expr("ident", tv(tokens, bp), 0, [], [], ln))
+        bp = bp + 2
+    else if tk(tokens, bp) == "DELIM" and tv(tokens, bp) == "("
+        let cp = bp + 1
+        while tk(tokens, cp) == "IDENT"
+            push(bparams, Expr("ident", tv(tokens, cp), 0, [], [], ln))
+            cp = cp + 1
+            if tk(tokens, cp) == "COMMA"
+                cp = cp + 1
+        if not (tk(tokens, cp) == "DELIM" and tv(tokens, cp) == ")")
+            return ParseResult(null_expr(), pos)
+        if tk(tokens, cp + 1) != "FAT_ARROW"
+            return ParseResult(null_expr(), pos)
+        bp = cp + 2
+    else
+        return ParseResult(null_expr(), pos)
+    if tk(tokens, bp) != "NEWLINE"
+        return ParseResult(null_expr(), pos)
+    let bp2 = skip_nl(tokens, bp)
+    if tk(tokens, bp2) == "EOF"
+        return ParseResult(null_expr(), pos)
+    let body_col = tok_col(tokens, bp2)
+    let bstmts = []
+    while tk(tokens, bp2) != "EOF" and tok_col(tokens, bp2) >= body_col
+        if tk(tokens, bp2) == "DELIM" and tv(tokens, bp2) == ")"
+            break
+        let bsr = parse_stmt(tokens, bp2, pe)
+        push(bstmts, bsr.stmt)
+        if bsr.pos <= bp2
+            break
+        bp2 = skip_nl(tokens, bsr.pos)
+    if len(bstmts) == 0
+        return ParseResult(null_expr(), pos)
+    ParseResult(Expr("lambda_blk", "", len(bstmts), bparams, bstmts, ln), bp2)
+
 fn parse_call_args(tokens: list, pos: int, callee: Expr, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
@@ -1927,11 +1982,19 @@ fn parse_call_args(tokens: list, pos: int, callee: Expr, pe: list) -> ParseResul
             push(cargs, Expr("named_arg", _na_name, 0, [_na_r.expr], [], ln))
             p = _na_r.pos
         else
-            let arg_r = parse_expr(tokens, p, 0, pe)
-            push(cargs, arg_r.expr)
-            if arg_r.pos <= p
-                break
-            p = arg_r.pos
+            // A multi-line lambda argument must be recognised BEFORE parse_expr, whose
+            // FAT_ARROW handler parses a single body EXPRESSION and therefore dies on the
+            // newline -- "unexpected NEWLINE in expression", the founding programs 5/8/10.
+            let _bl = _parse_block_lambda(tokens, p, pe)
+            if _bl.pos > p
+                push(cargs, _bl.expr)
+                p = _bl.pos
+            else
+                let arg_r = parse_expr(tokens, p, 0, pe)
+                push(cargs, arg_r.expr)
+                if arg_r.pos <= p
+                    break
+                p = arg_r.pos
     p = expect(tokens, p, ")", pe)
     // Determine call name from callee
     match callee
@@ -2588,7 +2651,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             else if tk(tokens, p) == "KW" and tv(tokens, p) == "fn" and _tf_is_trailing(tokens, p, tok_col(tokens, pos))
                 _parse_trail_fn(tokens, p, tok_col(tokens, pos), pe, "trail_fn_expr", "", expr_r.expr, ln)
             else
-                _maybe_where(tokens, StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), p), pe)
+                _maybe_where(tokens, _parse_else_expr_stmt(tokens, p, expr_r.expr, ln, pe), pe)
     else
         let expr_r = parse_expr(tokens, pos, 0, pe)
         if tk(tokens, expr_r.pos) == "ASSIGN"
@@ -2598,7 +2661,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         else if tk(tokens, expr_r.pos) == "KW" and tv(tokens, expr_r.pos) == "fn"
             _parse_trail_fn(tokens, expr_r.pos, tok_col(tokens, pos), pe, "trail_fn_expr", "", expr_r.expr, ln)
         else
-            _maybe_where(tokens, StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), expr_r.pos), pe)
+            _maybe_where(tokens, _parse_else_expr_stmt(tokens, expr_r.pos, expr_r.expr, ln, pe), pe)
 
 // A trailing function (`process(xs) fn(x) ...`) belongs to the statement, so its `fn`
 // must sit INDENTED PAST the statement's own column. A `fn` at a column <= stmt_col is
@@ -2674,13 +2737,19 @@ fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             // out<T>: parametric type. Encode as "out:T" — downstream FFI emit
             // and call-site IR check for this prefix to trigger pointer marshaling.
             // ('<' and '>' are lexed as OP tokens, not DELIM.)
-            if type_ann == "out" and tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+            // LOCK-11 adds `byval<T>` alongside `out<T>`, using the SAME source form and the
+            // same "<prefix>:T" internal encoding rather than inventing a second syntax:
+            // `byval<Vec2>` says "pass this @repr(C) struct by value", mirroring a C
+            // declaration like `double vec2_sum(Vec2 v)`. A plain @repr(C) parameter keeps
+            // meaning "pass the heap data pointer", which is what lets C write through it.
+            if (type_ann == "out" or type_ann == "byval") and tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+                let _pfx = type_ann
                 p = p + 1
                 let inner_t = tv(tokens, p)
                 p = p + 1
                 if tk(tokens, p) == "OP" and tv(tokens, p) == ">"
                     p = p + 1
-                type_ann = "out:" + inner_t
+                type_ann = _pfx + ":" + inner_t
         push(params, Param(param_name, type_ann, null_expr()))
     p = expect(tokens, p, ")", pe)
     let ret_ann = ""
@@ -3265,6 +3334,51 @@ fn parse_enum_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
 // complete assignment RHS: it is told apart by what comes AFTER the fallback expression.
 // An ASSIGN there means the `else` opened another assignment and therefore belongs to the
 // `if`, so the fallback is abandoned and the tokens are handed back untouched.
+// `EXPR else FALLBACK` as a bare EXPRESSION STATEMENT, e.g. the last line of a function:
+//     fn push(rb: RingBuffer, val: byte) -> bool or Error
+//         buffer_push(rb._handle, val) else Error("buffer full")
+// The assignment form lives in _parse_else_tail; this is the same operator where the result
+// is the statement's own value rather than something being bound. Both founding programs 9
+// and 10 use it, and it is the natural spelling once a function's last expression IS its
+// return value.
+//
+// The escape form (`else return X`) lowers to a transparent block for the same reason the
+// assignment form does: it is control flow, so it cannot be an expression.
+// Is there a top-level (paren/bracket depth 0) `else` between `pos` and the end of the line?
+fn _scan_line_else(tokens: list, pos: int) -> bool
+    let q = pos
+    let depth = 0
+    while tk(tokens, q) != "NEWLINE" and tk(tokens, q) != "EOF"
+        let kq = tk(tokens, q)
+        let vq = tv(tokens, q)
+        if kq == "DELIM" and (vq == "(" or vq == "[")
+            depth = depth + 1
+        else if kq == "DELIM" and (vq == ")" or vq == "]")
+            depth = depth - 1
+        else if depth == 0 and kq == "KW" and vq == "else"
+            return true
+        q = q + 1
+    false
+
+fn _parse_else_expr_stmt(tokens: list, rpos: int, e: Expr, ln: int, pe: list) -> StmtParseResult
+    if not (tk(tokens, rpos) == "KW" and tv(tokens, rpos) == "else")
+        return StmtParseResult(Stmt("expr", "", e, [], [], [], [], ln), rpos)
+    if tk(tokens, rpos + 1) == "KW" and tv(tokens, rpos + 1) == "return"
+        let _er = parse_expr(tokens, rpos + 2, 0, pe)
+        let _etmp = "__elx" + str(ln)
+        let _eref = Expr("ident", _etmp, 0, [], [], ln)
+        let _ebind = Stmt("assign", _etmp, e, [], [], [], [], ln)
+        let _eret = Stmt("return", "", _er.expr, [], [], [], [], ln)
+        let _eguard = Stmt("if", "", Expr("call", "is_err", 0, [_eref], [], ln), [_eret], [], [], [], ln)
+        let _efin = Stmt("expr", "", Expr("call", "unwrap", 0, [_eref], [], ln), [], [], [], [], ln)
+        return StmtParseResult(Stmt("block", "transparent", null_expr(), [_ebind, _eguard, _efin], [], [], [], ln), _er.pos)
+    let _fb = parse_expr(tokens, rpos + 1, 0, pe)
+    // Same disambiguation as the assignment form: an ASSIGN after the fallback means this
+    // `else` opened another assignment and therefore belongs to an enclosing `if ... then`.
+    if tk(tokens, _fb.pos) == "ASSIGN"
+        return StmtParseResult(Stmt("expr", "", e, [], [], [], [], ln), rpos)
+    StmtParseResult(Stmt("expr", "", Expr("call", "unwrap_or", 0, [e, _fb.expr], [], ln), [], [], [], [], ln), _fb.pos)
+
 fn _parse_else_tail(tokens: list, rpos: int, rhs: Expr, aname: string, aparams: list, atargets: list, ln: int, pe: list) -> StmtParseResult
     if not (tk(tokens, rpos) == "KW" and tv(tokens, rpos) == "else")
         return StmtParseResult(Stmt("assign", aname, rhs, [], aparams, [], atargets, ln), rpos)
@@ -3337,6 +3451,24 @@ fn parse_if_chain(tokens: list, pos: int, base_col: int, pe: list) -> StmtParseR
             let _ie_expr = Expr("if", "", 0, [cond_r.expr, _ie_then.expr, _ie_else.expr], [], ln)
             return StmtParseResult(Stmt("expr", "", _ie_expr, [], [], [], [], ln), _ie_else.pos)
     if tk(tokens, cond_r.pos) == "IDENT" and tv(tokens, cond_r.pos) == "then"
+        // `EXPR else FALLBACK` is now also an expression-statement form, so a bare-expression
+        // then-part would swallow this `if`'s own `else`. Detect that exact shape -- a top-level
+        // `else` later on the line, and a then-part that is neither an assignment nor a
+        // statement keyword -- and parse the then-part as an EXPRESSION, which stops at `else`.
+        let _thp = cond_r.pos + 1
+        let _th_kw = tk(tokens, _thp) == "KW"
+        let _th_assign = tk(tokens, _thp) == "IDENT" and tk(tokens, _thp + 1) == "ASSIGN"
+        let _th_else = _scan_line_else(tokens, _thp)
+        if _th_else and not _th_kw and not _th_assign
+            let _ter = parse_expr(tokens, _thp, 0, pe)
+            let sthen2 = [Stmt("expr", "", _ter.expr, [], [], [], [], ln)]
+            let selse2 = []
+            let sp2 = _ter.pos
+            if tk(tokens, sp2) == "KW" and tv(tokens, sp2) == "else"
+                let esr2 = parse_stmt(tokens, sp2 + 1, pe)
+                push(selse2, esr2.stmt)
+                sp2 = esr2.pos
+            return StmtParseResult(Stmt("if", "", cond_r.expr, sthen2, [], selse2, [], ln), sp2)
         let tsr = parse_stmt(tokens, cond_r.pos + 1, pe)
         let sthen = [tsr.stmt]
         let selse = []
@@ -4213,6 +4345,75 @@ fn _fuse_heads(heads: list, name: string, params: list, ret_expr: Expr, anns: li
     Stmt("fn", name, ret_expr, chain, params, [], anns, ln)
 
 
+// Lift every "lambda_blk" out of an expression into a real named function declared just
+// BEFORE the statement that contained it, replacing the node with a reference to that name.
+//
+// This is the same lambda-lifting the trailing-`fn` form already uses (_desugar_trail_fns),
+// and it is chosen over inventing a block-EXPRESSION node for one decisive reason: the lifted
+// function is emitted as a SIBLING statement, so it is a NESTED function and NOVA's existing
+// closure conversion gives it real capture of the enclosing scope. Verified rather than
+// assumed -- a trailing-fn block reads an enclosing local correctly today. A block-expression
+// node would have meant teaching inference, IR lowering, capture analysis and the s4 renamer
+// about an Expr that carries Stmts, for identical observable behaviour.
+//
+// Runs BEFORE every other pass, so "lambda_blk" never reaches inference, the IR builder or s4.
+fn _lift_e(e: Expr, out_fns: list, ctr: list) -> Expr
+    match e
+        Expr(tag, value, num, children, fields, eln) =>
+            if tag == "lambda_blk"
+                ctr[0] = ctr[0] + 1
+                let fname = "__lam_" + str(eln) + "_" + str(ctr[0])
+                let fparams = []
+                for c in children
+                    match c
+                        Expr(_pt, _pv, _pn, _pc, _pf, _pl) =>
+                            push(fparams, Param(_pv, "", null_expr()))
+                // recurse FIRST so a lambda_blk nested inside this one is lifted too, and so
+                // the inner function is declared before the outer one that references it.
+                let fbody = _lift_stmts(fields, out_fns, ctr)
+                push(out_fns, Stmt("fn", fname, null_expr(), fbody, fparams, [], [], eln))
+                return Expr("ident", fname, 0, [], [], eln)
+            let nch = []
+            for c in children
+                push(nch, _lift_e(c, out_fns, ctr))
+            // `fields` is only walked for tags whose fields hold EXPRESSIONS. catch/lambda/
+            // closure/fn/match/struct_init carry Stmts or Params there, and walking those as
+            // Exprs is the bug class that segfaulted the compiler during inc3b.
+            let nf = fields
+            if tag != "catch" and tag != "lambda" and tag != "closure" and tag != "fn" and tag != "struct_init" and tag != "match"
+                let nf2 = []
+                for f in fields
+                    push(nf2, _lift_e(f, out_fns, ctr))
+                nf = nf2
+            Expr(tag, value, num, nch, nf, eln)
+
+fn _lift_stmts(stmts: list, out_fns: list, ctr: list) -> list
+    let out = []
+    for st in stmts
+        match st
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                let mine = []
+                let nexpr = _lift_e(expr, mine, ctr)
+                let nbody = _lift_stmts(body, out_fns, ctr)
+                let nelse = _lift_stmts(else_body, out_fns, ctr)
+                // the lifted functions are emitted immediately before the statement that
+                // uses them, so the reference is always in scope at the point of use.
+                for f in mine
+                    push(out, f)
+                push(out, Stmt(tag, name, nexpr, nbody, params, nelse, anns, sline))
+    out
+
+fn _lift_block_lambdas(stmts: list) -> list
+    let ctr = [0]
+    let top = []
+    let res = _lift_stmts(stmts, top, ctr)
+    let out = []
+    for f in top
+        push(out, f)
+    for r in res
+        push(out, r)
+    out
+
 fn _desugar_trail_fns(stmts: list) -> list
     let _dt_out = []
     for _dt_s in stmts
@@ -4718,7 +4919,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    let _p0 = fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts)))
+    let _p0 = fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(_lift_block_lambdas(stmts))))
     let _p1 = inject_routes(inject_tests(inject_memo(inject_ensures(_p0)), pe), pe)
     let _p2 = inject_entity(inject_service(inject_middleware(inject_inject(inject_deprecated(inject_comptime(_p1))))))
     let _p3 = inject_builder(inject_validate(inject_log(inject_retry(inject_timeout(inject_singleton(_p2))))))
@@ -6375,6 +6576,10 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_int_to_str"
     else if name == "int"
         "nova_rt_to_int"
+    else if name == "f32"
+        "nova_rt_to_f32"
+    else if name == "f64"
+        "nova_rt_to_f64"
     else if name == "u8"
         "nova_rt_to_u8"
     else if name == "u16"
@@ -11074,6 +11279,33 @@ fn ir_type_int() -> IrType
 fn ir_type_int_w(w: string) -> IrType
     IrType("int", w, [], 0)
 
+// LOCK-4 inc3c f32: a float IrType carrying a sized WIDTH in `name`, exactly as
+// ir_type_int_w does for ints. "" = default f64 -> byte-identical codegen and no cost.
+fn ir_type_float_w(w: string) -> IrType
+    IrType("float", w, [], 0)
+
+// The FLOAT width of a register, or "" for the default f64. Deliberately narrow: the
+// same "@w@" table also holds INT widths, and a float op mixing a float with a sized
+// int (`1.5f32 * 2u8`) must not come back claiming the result is a u8. Only "f32" is
+// reported -- "f64" IS the default, so treating it as "" keeps codegen identical.
+fn _float_width_of(rt: dict, reg: string) -> string
+    let w = ir_reg_width(rt, reg)
+    if w == "f32"
+        return "f32"
+    ""
+
+// Result of a float arithmetic op, carrying the operands' width so the backend rounds
+// it back to 32 bits. One definition for add/sub/mul/div/mod/neg so the six cannot drift.
+fn _ir_float_res(rt: dict, op: string, dest: string, args: list, mix: string, num: int, effect: string, line: int) -> IrInst
+    rt[dest] = "float"
+    let fw = _float_width_of(rt, args[0])
+    if fw == "" and len(args) > 1
+        fw = _float_width_of(rt, args[1])
+    if fw != ""
+        rt["@w@" + dest] = fw
+        return IrInst(op, dest, ir_type_float_w(fw), args, mix, num, effect, line)
+    return IrInst(op, dest, ir_type_float(), args, mix, num, effect, line)
+
 // LOCK-4 inc3c-part2: is this let-annotation a sized-int type name? Returns the width
 // name (so `let x: u8 = f()` can seed the slot width) or "" for anything else — struct
 // names, generics, f32 and usize/isize all fall through to the default i64/any path.
@@ -11081,6 +11313,11 @@ fn _lock4_ann_width(t: string) -> string
     if t == "u8" or t == "i8" or t == "u16" or t == "i16"
         return t
     if t == "u32" or t == "i32" or t == "u64" or t == "i64"
+        return t
+    // inc3c f32: `let x: f32 = <expr>` seeds the slot width the same way a sized int does,
+    // so the backend rounds the stored value through binary32. f64 is the default and is
+    // deliberately absent -- naming it would emit a no-op round on ordinary float code.
+    if t == "f32"
         return t
     ""
 
@@ -12024,7 +12261,13 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
             else if tag == "float"
                 let bits = float_bits(value)
                 let dest = ir_fresh_reg(b)
-                ir_emit_inst(b, "const_float", dest, ir_type_float(), [], str(bits), bits)
+                // num == 1 -> the literal was written `1.5f32`. The value is still emitted as
+                // the f64 bit pattern; the BACKEND rounds it through fptrunc/fpext, so LLVM
+                // does the IEEE rounding rather than a hand-rolled one that could disagree.
+                if num == 1
+                    ir_emit_inst(b, "const_float", dest, ir_type_float_w("f32"), [], str(bits), bits)
+                else
+                    ir_emit_inst(b, "const_float", dest, ir_type_float(), [], str(bits), bits)
                 return dest
             else if tag == "method" or tag == "method_call"
                 // Check if this is a module-qualified call: module.func(args)
@@ -13056,7 +13299,12 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let val = val0
                 if _annw != ""
                     let _awreg = ir_fresh_reg(b)
-                    ir_emit_inst(b, "copy", _awreg, ir_type_int_w(_annw), [val0], "", 0)
+                    // f32 is a FLOAT width -- emitting it as an int-typed copy would tell the
+                    // backend to mask the double's bit pattern as an integer.
+                    if _annw == "f32"
+                        ir_emit_inst(b, "copy", _awreg, ir_type_float_w("f32"), [val0], "", 0)
+                    else
+                        ir_emit_inst(b, "copy", _awreg, ir_type_int_w(_annw), [val0], "", 0)
                     val = _awreg
                 if name != ""
                     // `let x = ...` is always a fresh LOCAL declaration (shadows a same-named
@@ -14325,6 +14573,11 @@ fn s4_s_ok(s: Stmt) -> int
 fn s4_e_ok(e: Expr) -> int
     if e.tag == "lambda" or e.tag == "closure" or e.tag == "fn" or e.tag == "match" or e.tag == "block"
         return 0
+    // These carry STATEMENTS in `fields`; the loops below walk fields as child Exprs, which
+    // would read .tag/.children off a Stmt. `catch` has always been in that position -- it is
+    // listed here for safety, not because the multi-line lambda introduced it.
+    if e.tag == "catch" or e.tag == "lambda_blk"
+        return 0
     for c in e.children
         if s4_e_ok(c) == 0
             return 0
@@ -14662,6 +14915,22 @@ fn _nt_num_width(t: NType) -> string
     ""
 
 // A sized suffix on an int-literal Expr value ("255#u8" -> "u8"), or "" if none.
+// A float literal token is "<digits>" or "<digits>#f32"/"#f64" (the lexer appends the
+// suffix). These split it: the digits for float_bits, and whether f32 was requested.
+fn _float_digits(v: string) -> string
+    let h = find(v, "#")
+    if h == 0 - 1
+        return v
+    slice(v, 0, h)
+
+fn _float_is_f32(v: string) -> int
+    let h = find(v, "#")
+    if h == 0 - 1
+        return 0
+    if slice(v, h + 1, len(v)) == "f32"
+        return 1
+    0
+
 fn _int_lit_suffix(v: string) -> string
     let h = find(v, "#")
     if h == 0 - 1
@@ -15349,6 +15618,10 @@ fn ti_build_stdlib() -> dict
     reg["temp_dir"] = NTypeScheme([], nt_fn([], nt_string()))
     reg["str"] = NTypeScheme([-1], nt_fn([T], nt_string()))
     reg["int"] = NTypeScheme([-1], nt_fn([T], nt_int()))
+    // f32(x)/f64(x): accept ANY numeric width (that is the point of an explicit conversion --
+    // it is how you legally cross a width boundary) and return the target width.
+    reg["f32"] = NTypeScheme([], nt_fn([nt_any()], nt_float_w("f32")))
+    reg["f64"] = NTypeScheme([], nt_fn([nt_any()], nt_float_w("f64")))
     reg["u8"] = NTypeScheme([-1], nt_fn([T], nt_int()))
     reg["u16"] = NTypeScheme([-1], nt_fn([T], nt_int()))
     reg["u32"] = NTypeScheme([-1], nt_fn([T], nt_int()))
@@ -16793,8 +17066,23 @@ fn ti_ann_to_type(ann: string) -> NType
         return nt_int_w("u64")
     if ann == "string" or ann == "str" or ann == "String" or ann == "Str"
         return nt_string()
+    // `byval:T` is a CALLING-CONVENTION marker on an extern parameter, not a distinct type:
+    // the argument is still a T. Without stripping it here the annotation resolved to
+    // nt_struct("byval:Vec2") and every call failed to unify.
+    if len(ann) > 6 and ann[0:6] == "byval:"
+        return ti_ann_to_type(slice(ann, 6, len(ann)))
     if ann == "float" or ann == "Float"
         return nt_float()
+    // BOTH float widths are EXPLICIT. Mapping f64 to the width-less default would make
+    // `let b: f64 = <an f32>` legal, since "" is compatible with every width by design (a
+    // bare literal adopts its sized context) -- and inc3a's rule names f32-vs-f64 as a real
+    // type error precisely because silent float-width mixing is a footgun. Naming f64 costs
+    // nothing at codegen: _float_width_of reports only "f32", so an f64-annotated value is
+    // emitted exactly like an ordinary float.
+    if ann == "f64"
+        return nt_float_w("f64")
+    if ann == "f32"
+        return nt_float_w("f32")
     if ann == "bool" or ann == "Bool"
         return nt_bool()
     if ann == "list" or ann == "List"
@@ -16837,6 +17125,11 @@ fn ti_split_type_args(args: string) -> list
     parts
 
 fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
+    // `byval:T` is a CALLING-CONVENTION marker on an extern parameter, not a distinct type --
+    // the argument is still a T. Without stripping it the annotation resolved to
+    // nt_struct("byval:Vec2") and no argument could ever unify with it.
+    if len(ann) > 6 and ann[0:6] == "byval:"
+        return ti_ann_to_type_g(st, slice(ann, 6, len(ann)), gmap)
     // A variadic rest param `T...` is a list<T> inside the function body.
     if ends_with(ann, "...")
         return nt_list(ti_ann_to_type_g(st, slice(ann, 0, len(ann) - 3), gmap))
@@ -17931,11 +18224,17 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 // calls) are permitted inside, then restore it. Scoped like any block body.
                 st.ti_unsafe_depth = st.ti_unsafe_depth + 1
                 ti_push_scope(st)
+                // Yield the LAST statement's type, exactly as a plain block does. Returning
+                // unit unconditionally made inference disagree with IR lowering, which already
+                // propagates an unsafe block's value in tail position -- so a function whose
+                // body ENDS in an `unsafe` block was rejected with "expected int, found unit"
+                // even though the emitted code returned the right value.
+                let _ub_last = nt_unit()
                 for s in body
-                    ti_infer_stmt(st, s)
+                    _ub_last = ti_infer_stmt(st, s)
                 ti_pop_scope(st)
                 st.ti_unsafe_depth = st.ti_unsafe_depth - 1
-                return nt_unit()
+                return _ub_last
             if tag == "const"
                 let ct = ti_infer_expr(st, expr)
                 ti_define(st, name, ti_mono(ct))
@@ -19904,6 +20203,9 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
             else if op == "const_float"
                 rt[dest] = "float"
+                if typ.name != ""
+                    rt["@w@" + dest] = typ.name
+                    return IrInst(op, dest, ir_type_float_w(typ.name), args, value, num, effect, line)
                 return IrInst(op, dest, ir_type_float(), args, value, num, effect, line)
             else if op == "const_str"
                 rt[dest] = "str"
@@ -19917,14 +20219,11 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 let lt = ir_reg_type(rt, args[0])
                 let rty = ir_reg_type(rt, args[1])
                 if lt == "float" and rty == "float"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "", num, effect, line)
                 if lt == "float" and rty == "int"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "R", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "R", num, effect, line)
                 if lt == "int" and rty == "float"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "L", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "L", num, effect, line)
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
                     // LOCK-4 inc3b: propagate the sized width so the result wraps at width in the
@@ -19953,14 +20252,11 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 let lt = ir_reg_type(rt, args[0])
                 let rty = ir_reg_type(rt, args[1])
                 if lt == "float" and rty == "float"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "", num, effect, line)
                 if lt == "float" and rty == "int"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "R", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "R", num, effect, line)
                 if lt == "int" and rty == "float"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, "L", num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, "L", num, effect, line)
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
                     // LOCK-4 inc3b: propagate the sized width so the result wraps at width in the
@@ -19993,8 +20289,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
             else if op == "neg"
                 let lt = ir_reg_type(rt, args[0])
                 if lt == "float"
-                    rt[dest] = "float"
-                    return IrInst(op, dest, ir_type_float(), args, value, num, effect, line)
+                    return _ir_float_res(rt, op, dest, args, value, num, effect, line)
                 if lt == "int"
                     rt[dest] = "int"
                     // LOCK-4 inc3b: `-x` of a sized value wraps at width (e.g. -(1u8) == 255u8).
@@ -20103,6 +20398,18 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if _lw != ""
                             rt["@w@" + dest] = _lw
                             return IrInst(op, dest, ir_type_int_w(_lw), args, value, num, effect, line)
+                // inc3c f32: the same flow for FLOAT slots. Without it the operands of
+                // `let c: f32 = 0.1; let d: f32 = 0.2; c + d` were each narrowed but the SUM was
+                // not rounded back, giving 0.300000004470348 -- the f32 inputs added in f64 --
+                // instead of the true f32 result 0.300000011920929. Only "f32" is honoured:
+                // "f64" is the default representation, so claiming it would emit a no-op round
+                // on ordinary float code and perturb otherwise byte-identical output.
+                if stype == "float"
+                    let _slfw = "@sw@" + value
+                    if contains(st, _slfw)
+                        if st[_slfw] == "f32"
+                            rt["@w@" + dest] = "f32"
+                            return IrInst(op, dest, ir_type_float_w("f32"), args, value, num, effect, line)
                 return IrInst(op, dest, IrType(stype, "", [], 0), args, value, num, effect, line)
             else if op == "slot_store"
                 let val_type = ir_reg_type(rt, args[0])
@@ -20146,6 +20453,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 // makes the whole existing inc3b propagate+mask chain apply to conversions, and
                 // it is also what makes an ANNOTATED binding work: `let y: u8 = 255` lowers to
                 // `u8(255)`, so the slot inherits the width from this one place.
+                // f32()/f64() return a FLOAT. Typing their result "int" like the integer
+                // conversions would make str() lower to int_to_str and print the raw double
+                // bits as an integer -- f32(16777217.0) printed 4715268809856909312.
+                if value == "nova_rt_to_f32" or value == "nova_rt_to_f64"
+                    if dest != ""
+                        rt[dest] = "float"
+                        if value == "nova_rt_to_f32"
+                            rt["@w@" + dest] = "f32"
+                    if value == "nova_rt_to_f32"
+                        return IrInst(op, dest, ir_type_float_w("f32"), args, value, num, effect, line)
+                    return IrInst(op, dest, ir_type_float(), args, value, num, effect, line)
                 let _cvw = _rt_conv_width(value)
                 if _cvw != "" and len(args) == 1
                     if dest != ""
@@ -20680,6 +20998,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 let copy_itype = ir_type_any()
                 if src_type == "float"
                     copy_itype = ir_type_float()
+                    // LOCK-4 inc3c f32: same width flow the int arm gets below -- const-fold turns
+                    // a slot_load into a copy, and `let f: f32 = 1.5` emits a width-typed copy as
+                    // its annotation bridge. Without this an f32 stored in a variable silently
+                    // reverted to f64 the moment it was read back.
+                    let _cpfw0 = _float_width_of(rt, args[0])
+                    let _cpfw = _cpfw0
+                    if _cpfw == "" and typ.name == "f32"
+                        _cpfw = "f32"
+                    if _cpfw != "" and dest != ""
+                        rt["@w@" + dest] = _cpfw
+                        copy_itype = ir_type_float_w(_cpfw)
                 else if src_type == "int"
                     copy_itype = ir_type_int()
                     // LOCK-4 inc3c: carry a sized width across the copy (const-fold turns a slot_load
@@ -21390,6 +21719,140 @@ fn target_datalayout(triple: string) -> string
         return "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20"
     "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 
+// ── LOCK-11: struct-by-value FFI ABI classification ─────────────────────────────
+// A @repr(C) struct passed to an extern is passed BY VALUE, exactly as the C declaration it
+// mirrors says. It used to be handed over as a POINTER, which is right only by accident on
+// Win64 (where a >8-byte struct really is passed by reference) and silently wrong everywhere
+// else: on SysV `vec2_sum(1.5, 2.25)` returned 129504125136932 and `pair_diff` returned
+// garbage, because the callee read the pointer's own bits as its first field.
+//
+// The signatures below are GROUND TRUTH -- taken from what clang actually emits for the same
+// C declaration on each target, not from reading the ABI documents:
+//
+//   double vec2_sum(Vec2 v)      Win64   double @vec2_sum(ptr)
+//                                SysV    double @vec2_sum(double, double)
+//                                AAPCS64 double @vec2_sum([2 x double])
+//   int64_t pair_diff(Pair p)    Win64   i64 @pair_diff(ptr)
+//                                SysV    i64 @pair_diff(i64, i64)
+//                                AAPCS64 i64 @pair_diff([2 x i64])
+//
+// This has to be done HERE, in the compiler, because LLVM IR is not ABI-aware for aggregates:
+// clang performs C ABI lowering in its FRONTEND. An earlier attempt emitted real aggregate
+// types and expected the backend to classify them -- the IR looked perfect and segfaulted.
+// `byval:T` in an extern parameter position means "pass T BY VALUE", mirroring a C
+// declaration like `double vec2_sum(Vec2 v)`. It is OPT-IN, and deliberately so: a plain
+// @repr(C) parameter has always meant "pass the heap data pointer", which is what lets C
+// write through it and NOVA read the result back (ffi_repr_c_test does exactly that against
+// `int c_test_fill_triple(Triple*)`). Those are two different C signatures and NOVA has to be
+// able to say which one it is meeting -- making by-value the default silently broke the
+// pointer contract every existing caller relies on. The `x:T` prefix form follows the `out:T`
+// convention already used for out-parameters.
+fn _abi_byval_type(ann: string) -> string
+    if len(ann) > 6 and ann[0:6] == "byval:"
+        return slice(ann, 6, len(ann))
+    ""
+
+fn _abi_is_aarch64(triple: string) -> int
+    if contains(triple, "aarch64") or contains(triple, "arm64")
+        return 1
+    0
+
+// Per-field kind of a @repr(C) struct: "f" = 8-byte float, "i" = 8-byte integer/pointer,
+// "?" = anything this classifier will not guess at (f32, sized ints, nested structs).
+// Unknown deliberately propagates to a hard error rather than a silent reinterpretation.
+fn _abi_field_kinds(b: IrBuilder, tname: string) -> string
+    if not contains(b.ir_sdefs, tname)
+        return "?"
+    let out = ""
+    for fp in b.ir_sdefs[tname]
+        match fp
+            Param(fpn, fpt, fpd) =>
+                if fpt == "float" or fpt == "f64"
+                    out = out + "f"
+                else if fpt == "int" or fpt == "i64" or fpt == "u64" or fpt == "isize" or fpt == "usize" or fpt == "bool"
+                    out = out + "i"
+                else if fpt == "string" or fpt == "str"
+                    out = out + "i"
+                else
+                    out = out + "?"
+    if out == ""
+        return "?"
+    out
+
+// The LLVM parameter types one by-value @repr(C) struct argument lowers to, comma-joined.
+// "" means "not classifiable" -- the caller turns that into a compile error.
+// The LLVM struct type for a @repr(C) NOVA struct, e.g. "{ double, double }". Needed for
+// the by-reference classes, which have to name the type in a `byval` attribute.
+fn _abi_struct_llty(b: IrBuilder, tname: string) -> string
+    let kinds = _abi_field_kinds(b, tname)
+    let out = "\{ "
+    let i = 0
+    while i < len(kinds)
+        if i > 0
+            out = out + ", "
+        if kinds[i] == "f"
+            out = out + "double"
+        else
+            out = out + "i64"
+        i = i + 1
+    out + " \}"
+
+fn _abi_struct_param_types(b: IrBuilder, tname: string, triple: string) -> string
+    let kinds = _abi_field_kinds(b, tname)
+    if contains(kinds, "?")
+        return ""
+    let n = len(kinds)
+    let size = n * 8
+    // Win64: <=8 bytes travels in one register as its own type; anything larger is passed
+    // BY REFERENCE, which is why the old pointer-passing happened to work there.
+    if target_is_windows(triple) == 1
+        if size > 8
+            // Win64 passes a POINTER TO A COPY the caller owns -- the callee may write
+            // through it, so handing over NOVA's live struct would let C mutate our heap
+            // object. "copyptr" tells the wrapper to alloca + copy first.
+            return "copyptr"
+        if kinds[0] == "f"
+            return "double"
+        return "i64"
+    let allfloat = true
+    let ki = 0
+    while ki < n
+        if kinds[ki] != "f"
+            allfloat = false
+        ki = ki + 1
+    // AAPCS64: a Homogeneous Floating-point Aggregate (up to 4 same-type floats) goes in SIMD
+    // registers; other aggregates up to 16 bytes go in general registers. Both are spelled as
+    // an ARRAY in the lowered signature, which is what clang emits.
+    if _abi_is_aarch64(triple) == 1
+        if allfloat and n <= 4
+            return "[" + str(n) + " x double]"
+        // A NON-HFA aggregate of 8 bytes or less travels in ONE general register and is
+        // spelled as a bare i64, not as a 1-element array -- checked against clang, which
+        // emits `i64 @abi_one_i(i64)` for a one-int-field struct while still using
+        // `[1 x double]` for the one-double HFA. Larger (up to 16) uses the array form.
+        if size <= 8
+            return "i64"
+        if size <= 16
+            return "[" + str(n) + " x i64]"
+        return "copyptr"
+    // SysV x86-64: classify per EIGHTBYTE. Up to 16 bytes travels in up to two registers --
+    // SSE for an all-float eightbyte, INTEGER otherwise. Larger is MEMORY: passed on the
+    // STACK, which in LLVM is spelled `ptr byval(%T)` -- a plain ptr would pass the pointer
+    // itself, the same mistake this whole change exists to fix, just for bigger structs.
+    if size > 16
+        return "byval"
+    let outp = ""
+    let ei = 0
+    while ei < n
+        if ei > 0
+            outp = outp + ", "
+        if kinds[ei] == "f"
+            outp = outp + "double"
+        else
+            outp = outp + "i64"
+        ei = ei + 1
+    outp
+
 fn target_is_windows(triple: string) -> int
     if contains(triple, "windows")
         return 1
@@ -21509,6 +21972,24 @@ fn _l7_mask_const(v: int, w: string) -> int
     let shift = 64 - bits
     return (v << shift) >> shift
 
+// LOCK-4 inc3c f32: round a DOUBLE register to f32 precision and back. This is what makes
+// f32 a real width rather than a label -- `16777217.0f32` becomes 16777216.0 because that is
+// the nearest representable float, and every f32 arithmetic result is rounded the same way,
+// which is exactly IEEE binary32 semantics computed in a binary64 register.
+//
+// Rounding is delegated to LLVM (fptrunc/fpext) rather than hand-rolled at compile time, so
+// there is no second implementation of IEEE rounding to disagree with the first; for constants
+// LLVM folds the pair away entirely. `w` other than "f32" emits nothing -- f64 IS the default
+// representation, so default float codegen stays byte-identical and free.
+fn ire_emit_f32_round(e: IrEmitter, dest: string, src: string, w: string) -> string
+    if w != "f32"
+        return src
+    let t = ire_fresh_tmp(e, "f32t")
+    let d = ire_fresh_tmp(e, "f32d")
+    ire_indent(e, t + " = fptrunc double " + src + " to float")
+    ire_indent(e, d + " = fpext float " + t + " to double")
+    return d
+
 fn ire_emit_width_wrap(e: IrEmitter, dest: string, raw: string, w: string)
     let bits = _width_bits(w)
     if bits >= 64
@@ -21596,7 +22077,23 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
             if op == "const_int"
                 ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
             else if op == "const_float"
-                ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
+                let _cfw = ""
+                match typ
+                    IrType(_cfk, _cfn, _cfp, _cfi) =>
+                        if _cfk == "float"
+                            _cfw = _cfn
+                if _cfw == "f32"
+                    // `1.5f32`: emit the f64 bits, then round through binary32. LLVM constant-folds
+                    // the whole chain, so the result is the correctly-rounded f32 value with no
+                    // runtime cost -- and no hand-written rounding to get wrong.
+                    let _cfraw = ire_fresh_tmp(e, "f32c")
+                    let _cfd = ire_fresh_tmp(e, "f32cd")
+                    ire_indent(e, _cfraw + " = add i64 " + fmt_i64_decimal(num) + ", 0")
+                    ire_indent(e, _cfd + " = bitcast i64 " + _cfraw + " to double")
+                    let _cfr = ire_emit_f32_round(e, dest, _cfd, "f32")
+                    ire_indent(e, dest + " = bitcast double " + _cfr + " to i64")
+                else
+                    ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
                 ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
             else if op == "const_str"
                 let str_name = ire_intern_string(e, value)
@@ -21622,6 +22119,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             else
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fadd double " + af + ", " + bf)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
@@ -21657,6 +22158,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             else
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fsub double " + af + ", " + bf)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
@@ -21684,6 +22189,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             else
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fmul double " + af + ", " + bf)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
@@ -21711,6 +22220,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             else
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fdiv double " + af + ", " + bf)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
@@ -21734,6 +22247,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             else
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = frem double " + af + ", " + bf)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else
@@ -21747,6 +22264,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             let rf = dest + ".rf"
                             ire_float_load(e, af, args[0])
                             ire_indent(e, rf + " = fsub double -0.0, " + af)
+                            // LOCK-4 inc3c f32: round the result back through binary32 when the
+                            // operands were f32, so f32 arithmetic really is f32 arithmetic and
+                            // not f64 wearing a label. `tn` is "" for a default float -> no-op.
+                            rf = ire_emit_f32_round(e, dest, rf, tn)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
@@ -22561,11 +23082,23 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 // width-typed copy arising from slot forwarding costs at most an `and` that LLVM
                 // folds away; the width-less default path below is untouched and byte-identical.
                 let _cpw = ""
+                let _cpfw = ""
                 match typ
                     IrType(_cpk, _cpn, _cpp, _cpi) =>
                         if _cpk == "int" and _cpn != ""
                             _cpw = _cpn
-                if _cpw != ""
+                        if _cpk == "float" and _cpn == "f32"
+                            _cpfw = "f32"
+                if _cpfw != ""
+                    // inc3c f32: an f32-annotated binding rounds its stored value through
+                    // binary32. The register holds raw double BITS, so it is bitcast to double,
+                    // rounded, and bitcast back -- LLVM folds the pair for a constant.
+                    let _cpd = ire_fresh_tmp(e, "f32cp")
+                    ire_float_load(e, _cpd, args[0])
+                    let _cpr = ire_emit_f32_round(e, dest, _cpd, "f32")
+                    ire_indent(e, dest + " = bitcast double " + _cpr + " to i64")
+                    ire_mark_float(e, dest)
+                else if _cpw != ""
                     ire_emit_width_wrap(e, dest, args[0], _cpw)
                 else
                     ire_indent(e, dest + " = add i64 " + args[0] + ", 0")
@@ -23582,6 +24115,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                     let ep_ll = ffi_llvm_type(ept)
                                     if contains(b.ir_opaque_types, ept) or contains(b.ir_repr_c_types, ept)
                                         ep_ll = "ptr"
+                                    if _abi_byval_type(ept) != ""
+                                        ep_ll = "byval"
                                     if ep_ll != "i64"
                                         ext_needs = true
                     if ext_needs
@@ -24547,6 +25082,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_float_to_int(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_int_to_float(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_int(i64) nounwind readnone")
+    // LOCK-11: used by the FFI wrapper to make the caller-owned copy Win64/AAPCS64 require
+    // when a by-value struct is passed by reference.
+    ire_line(e, "declare void @llvm.memcpy.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1) nounwind")
+    ire_line(e, "declare i64 @nova_rt_to_f32(i64) nounwind readnone")
+    ire_line(e, "declare i64 @nova_rt_to_f64(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_u8(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_u16(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_u32(i64) nounwind readnone")
@@ -25187,22 +25727,65 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 real_ret = ffi_llvm_type(rxv)
-                                if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
+                                if contains(b.ir_opaque_types, rxv)
+                                    real_ret = "ptr"
+                                else if contains(b.ir_repr_c_types, rxv)
+                                    // LOCK-11: RETURNING a @repr(C) struct by value needs the
+                                    // sret / register-pair lowering clang emits, which is not
+                                    // implemented. Passing a pointer here silently returns the
+                                    // wrong bytes on every target, so this is refused loudly
+                                    // instead. Returning an @opaque handle still works.
+                                    ire_line(e, "; LOCK-11: @repr(C) by-value RETURN not supported for " + rxv)
                                     real_ret = "ptr"
                     let real_arg_types = []
+                    let real_arg_structs = []
                     for p in eparams
                         match p
                             Param(pn, pt, pd) =>
                                 let pll = ffi_llvm_type(pt)
-                                if contains(b.ir_opaque_types, pt) or contains(b.ir_repr_c_types, pt)
+                                let pstruct = ""
+                                let _bvt = _abi_byval_type(pt)
+                                if _bvt != ""
+                                    // LOCK-11: pass this @repr(C) struct BY VALUE, lowered for
+                                    // THIS target. Handing it over as a pointer instead is right
+                                    // only by accident on Win64 (>8-byte structs really are passed
+                                    // by reference) and silently wrong on SysV and AAPCS64.
+                                    let _abil = _abi_struct_param_types(b, _bvt, e.ire_target)
+                                    if _abil == ""
+                                        ire_line(e, "; LOCK-11: cannot classify byval type " + _bvt + " for " + e.ire_target)
+                                        pll = "ptr"
+                                    else if _abil == "byval"
+                                        pll = "ptr byval(" + _abi_struct_llty(b, _bvt) + ") align 8"
+                                        pstruct = _bvt
+                                    else if _abil == "copyptr"
+                                        pll = "ptr"
+                                        pstruct = _bvt
+                                    else
+                                        pll = _abil
+                                        pstruct = _bvt
+                                else if contains(b.ir_opaque_types, pt) or contains(b.ir_repr_c_types, pt)
+                                    // UNCHANGED contract: a plain @repr(C) (or @opaque) parameter
+                                    // passes the heap data pointer, so C can read AND write the
+                                    // NOVA struct in place.
                                     pll = "ptr"
                                 push(real_arg_types, pll)
+                                push(real_arg_structs, pstruct)
                     let needs_wrapper = real_ret != "i64"
                     let ai = 0
                     while ai < len(real_arg_types) and not needs_wrapper
                         if real_arg_types[ai] != "i64"
                             needs_wrapper = true
                         ai = ai + 1
+                    // LOCK-11: a by-value @repr(C) struct ALWAYS needs the wrapper, even when its
+                    // lowered form happens to be a bare i64 (a one-int-field struct on Win64).
+                    // NOVA holds the struct as a HANDLE; the wrapper is what loads the field out
+                    // of it. Without this the call site emitted nova_ffi_<name> while no wrapper
+                    // was defined -- "use of undefined value" at link time.
+                    let asx = 0
+                    while asx < len(real_arg_structs) and not needs_wrapper
+                        if real_arg_structs[asx] != ""
+                            needs_wrapper = true
+                        asx = asx + 1
 
                     // Emit the raw C function declare with native types.
                     // Skip if a runtime auto-declare already covers this name
@@ -25250,7 +25833,48 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             if am > 0
                                 call_args = call_args + ", "
                             let rt = real_arg_types[am]
-                            if rt == "i64"
+                            if real_arg_structs[am] != ""
+                                // Load each field out of the NOVA struct and hand it over in the
+                                // lowered form. A @repr(C) struct carries NO leading type-hash
+                                // slot -- field j sits at slot j -- which is why the GEP index is
+                                // the field index itself and not j+1.
+                                let _sn = real_arg_structs[am]
+                                let _kinds = _abi_field_kinds(b, _sn)
+                                ire_line(e, "  %sp" + str(am) + " = inttoptr i64 %a" + str(am) + " to ptr")
+                                if starts_with(rt, "ptr byval(")
+                                    // SysV MEMORY class: LLVM performs the stack copy for us, so
+                                    // the live pointer plus the byval attribute is correct.
+                                    call_args = call_args + rt + " %sp" + str(am)
+                                else if rt == "ptr"
+                                    // Win64 / AAPCS64 overflow: the CALLER owns the copy. Make one
+                                    // on the wrapper's stack so a callee that writes through the
+                                    // pointer cannot mutate NOVA's live heap object.
+                                    let _cpn = len(_kinds) * 8
+                                    ire_line(e, "  %sc" + str(am) + " = alloca " + _abi_struct_llty(b, _sn) + ", align 8")
+                                    ire_line(e, "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %sc" + str(am) + ", ptr align 8 %sp" + str(am) + ", i64 " + str(_cpn) + ", i1 false)")
+                                    call_args = call_args + "ptr %sc" + str(am)
+                                else if starts_with(rt, "[")
+                                    // AAPCS64 spells both HFA and general-register aggregates as an
+                                    // array; load the whole thing in one go from the same storage.
+                                    ire_line(e, "  %sv" + str(am) + " = load " + rt + ", ptr %sp" + str(am) + ", align 8")
+                                    call_args = call_args + rt + " %sv" + str(am)
+                                else
+                                    let _fi = 0
+                                    let _fargs = ""
+                                    while _fi < len(_kinds)
+                                        let _fll = "i64"
+                                        if _kinds[_fi] == "f"
+                                            _fll = "double"
+                                        let _gp = "%sg" + str(am) + "_" + str(_fi)
+                                        let _fv = "%sf" + str(am) + "_" + str(_fi)
+                                        ire_line(e, "  " + _gp + " = getelementptr inbounds " + _fll + ", ptr %sp" + str(am) + ", i64 " + str(_fi))
+                                        ire_line(e, "  " + _fv + " = load " + _fll + ", ptr " + _gp + ", align 8")
+                                        if _fi > 0
+                                            _fargs = _fargs + ", "
+                                        _fargs = _fargs + _fll + " " + _fv
+                                        _fi = _fi + 1
+                                    call_args = call_args + _fargs
+                            else if rt == "i64"
                                 call_args = call_args + "i64 %a" + str(am)
                             else if rt == "double"
                                 ire_line(e, "  %f" + str(am) + ".ub = call i64 @nova_rt_unbox(i64 %a" + str(am) + ")")
@@ -26215,6 +26839,8 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                                     let ep_ll = ffi_llvm_type(ept)
                                     if contains(b.ir_opaque_types, ept) or contains(b.ir_repr_c_types, ept)
                                         ep_ll = "ptr"
+                                    if _abi_byval_type(ept) != ""
+                                        ep_ll = "byval"
                                     if ep_ll != "i64"
                                         ext_needs = true
                     if ext_needs

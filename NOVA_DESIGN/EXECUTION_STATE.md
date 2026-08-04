@@ -117,6 +117,127 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
+## THE LAST THREE LANGUAGE GAPS — ALL CLOSED (2026-08-04)
+
+f32, multi-line lambdas and struct-by-value FFI were the three items standing between NOVA and
+"as good as any other language" on its own terms. All three are done, each verified against
+something external rather than against my own expectations.
+
+### 1. f32 is a REAL width now, not a label
+
+`16777217.0f32` evaluates to **16777216.0** (the nearest binary32 value), `0.1f32 + 0.2f32` gives
+**0.300000011920929** where f64 gives 0.3, and `1.0f32/3.0f32` gives 0.333333343267441 where f64
+gives 0.333333333333333. Rounding happens after **every** operation, which is what makes it real
+IEEE binary32 arithmetic evaluated in a binary64 register rather than f64 wearing a label — the
+exact failure mode that got an earlier attempt reverted as *worse* than an unsupported width.
+
+Design choices that matter:
+
+* **LLVM does the rounding** (`fptrunc double -> float` + `fpext` back), never a hand-rolled
+  compile-time rounder. One implementation of IEEE rounding means no second one to disagree with
+  it; for constants LLVM folds the pair away entirely, so an f32 literal costs nothing.
+* **The f32 suffix rides in the float Expr's `num` field**, which was verified free (all three
+  float-Expr consumers read only `value`). NOT in `fields` — the s4 loop pass walks fields
+  generically as child Exprs, and putting a bare string there is what segfaulted the compiler
+  during inc3b.
+* **`f64` was made an EXPLICIT width.** Leaving it as the width-less default made
+  `let b: f64 = <an f32>` legal, because "" is compatible with every width by design. inc3a's own
+  rule names f32-vs-f64 a real type error, so both float widths are now explicit and the mismatch
+  is caught. It costs nothing at codegen: only "f32" is ever reported as a width, so f64-annotated
+  values compile exactly like ordinary floats.
+* `f32(x)` / `f64(x)` conversions exist so the error message's suggested fix ("convert explicitly,
+  e.g. f64(x)") names something real.
+
+Two bugs the KAT caught that a shallower test would have missed: the float conversions initially
+typed their result `int` like the integer conversions, so `f32(16777217.0)` printed
+**4715268809856909312** — the raw double bits as an integer; and float widths did not flow through
+a SLOT, so `let c: f32 = 0.1; let d: f32 = 0.2; c + d` narrowed both operands but added them in
+f64, giving 0.300000004470348 instead of 0.300000011920929.
+
+### 2. Multi-line lambdas — by LIFTING, not by a block-expression node
+
+The earlier scoping of this was wrong and is corrected here. It said a block-EXPRESSION node was
+required, which would have meant teaching inference, IR lowering, closure capture and the s4
+renamer about an Expr carrying Stmts. **The trailing-`fn` form already solves the same problem by
+lambda-lifting**, and the decisive question — does a lifted body capture its enclosing scope? —
+was answered by experiment: it does, because the lifted function is emitted as a SIBLING statement
+and is therefore a NESTED function that NOVA's existing closure conversion handles.
+
+So a multi-line lambda argument lifts into a nested named function and is replaced by a reference
+to it. Capture, nesting and two-parameter forms all work; single-expression lambdas are untouched.
+The `lambda_blk` node exists only between parsing and the lifting pass, so no later stage sees it.
+
+Also landed alongside, because programs 9 and 10 need them:
+
+* **`EXPR else FALLBACK` as a bare expression statement** (`buffer_push(h, v) else Error("full")`),
+  the natural spelling once a function's last expression is its return value. Disambiguated from
+  `if c then x = a else y = b` exactly as the assignment form is.
+* **An `unsafe` block now yields its last statement's type.** Inference returned unit
+  unconditionally while IR lowering already propagated the value, so a function whose body ENDS in
+  an `unsafe` block was rejected with "expected int, found unit" even though the emitted code
+  returned the right value.
+
+**GATE 1 status: 9 of 10 founding programs now parse with ZERO syntax errors.** p09's only
+remaining item is `@low_level`, which is the spec's name for what the implementation calls
+`unsafe`; `unsafe` won, and adding a second spelling for one construct would violate "one obvious
+way". p09 and p10 still cannot COMPILE because they call subsystems that were never built
+(`http.serve`, `supervise`, `alloc`) — library, not language.
+
+### 3. LOCK-11 — struct-by-value FFI, per-target, verified against clang
+
+A `@repr(C)` struct handed to an extern used to be passed as a POINTER. That is right only by
+accident on Win64, where a >8-byte struct really is passed by reference, and silently wrong
+everywhere else. Measured on real Linux with the same program against both compilers:
+
+| | `vec2_sum(1.5, 2.25)` want 3.75 | `pair_diff(10, 3)` want 7 |
+|---|---|---|
+| before | **0.0** | **127173144871208** |
+| after | 3.75 | 7 |
+
+The compiler now emits the same LOWERED signature clang emits, taken as ground truth by compiling
+the identical C on each target rather than by reading the ABI documents:
+
+| struct | Win64 | SysV | AAPCS64 |
+|---|---|---|---|
+| `{double,double}` | `ptr` (copy) | `double, double` | `[2 x double]` |
+| `{i64,i64}` | `ptr` (copy) | `i64, i64` | `[2 x i64]` |
+| `{double}` | `double` | `double` | `[1 x double]` |
+| `{i64}` | `i64` | `i64` | `i64` |
+| `{i64,i64,i64}` | `ptr` (copy) | `ptr byval` | `ptr` (copy) |
+| `{double,double,double}` | `ptr` (copy) | `ptr byval` | `[3 x double]` |
+
+Comparing against clang caught two rules I had wrong from memory: on AAPCS64 a non-HFA aggregate
+of ≤8 bytes is a bare `i64`, not `[1 x i64]`; and a SysV MEMORY-class struct needs
+`ptr byval(%T)`, because a plain `ptr` passes the pointer itself — the very defect being fixed,
+one size class up. For the by-reference classes that are NOT byval (Win64, AAPCS64 overflow) the
+wrapper allocas a copy and memcpys into it, so a callee that writes through its parameter cannot
+mutate NOVA's live heap object; the KAT asserts exactly that.
+
+This has to live in the compiler because **LLVM IR is not ABI-aware for aggregates** — clang does
+C ABI lowering in its FRONTEND. The previous attempt emitted real aggregate types and expected the
+backend to classify them; the IR looked perfect and segfaulted.
+
+**By-value is OPT-IN, spelled `byval<T>`.** The first attempt made it the default meaning of a
+@repr(C) parameter, and the gate caught the regression: `ffi_repr_c_test` passes a @repr(C) struct
+to `int c_test_fill_triple(Triple*)` precisely so C can WRITE through the pointer and NOVA can read
+the values back. That is a different C signature from `double vec2_sum(Vec2 v)`, and NOVA has to be
+able to express both — so `byval<T>` says by-value and a plain @repr(C) parameter keeps its existing
+pointer contract, unchanged. The spelling reuses the established `out<T>` form and its `prefix:T`
+internal encoding rather than inventing a second syntax.
+
+**Two process failures on my side worth recording:**
+* I surveyed for existing users by grepping `repr("C")` **with quotes**, and `ffi_repr_c_test.nova`
+  writes `@repr(C)` without them. Grep by CONCEPT and by every spelling, not by the one in front of me.
+* I read "ffi_byval_abi_test passed" from a **stale binary** whose source had failed to compile, and
+  briefly believed a broken build worked. Delete the artefact before re-running, or read the compile
+  step's own output first — the same lesson the stack-overflow test taught two commits earlier.
+
+**Verification honestly stated:** Win64 and SysV were EXECUTED (all 8 cases pass on both, including
+a mutation case proving a callee cannot write through to NOVA's live heap object).
+AAPCS64 was verified by signature equivalence with clang, not by execution — Docker was not
+running. Returning a struct BY VALUE is still unsupported and now says so in the IR rather than
+silently returning the wrong bytes.
+
 ## ★ LINUX-ONLY: `str(n)` for n < 10000 silently returned "" when CONCATENATED (2026-08-04)
 
 Found while building a Linux test for something else, which is the only reason it was found at all.
