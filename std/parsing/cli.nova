@@ -1,0 +1,371 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/cli.nova
+//
+// Command-line argument parser: flags, options (with values), positionals,
+// subcommands, a "--" separator, and a formatted --help renderer.
+//
+// SCHEMA (built with cli_schema() + cli_flag/cli_option/cli_positional/
+// cli_subcommand):
+//   schema["flags"]        list of {name, short, help}
+//   schema["options"]      list of {name, short, help, default}
+//                              default == null  ->  option is REQUIRED
+//                              default != null  ->  optional, falls back to
+//                                                    `default` when absent
+//   schema["positionals"]  list of {name, help, required}   (declaration order)
+//   schema["subcommands"]  list of {name, help}
+//
+// PARSED RESULT (the ok() payload of cli_parse()):
+//   parsed["values"]  dict: field name -> value
+//                        flags:       int 0/1
+//                        options:     string (given value or default)
+//                        positionals: string (given value; absent if optional
+//                                     and not supplied -- see cli_has)
+//   parsed["sub"]     string: matched subcommand name, or "" if none matched
+//   parsed["rest"]    list of string: extra positional args once every
+//                     declared positional has been filled, PLUS every arg
+//                     that came after a bare "--" separator
+//
+// SYNTAX SUPPORTED
+//   --name             long flag
+//   --name=value       long option, inline value
+//   --name value       long option, next-arg value
+//   -s                 short flag
+//   -s value            short option, next-arg value
+//   --                 everything after this is positional/rest, verbatim
+//                       (no further flag/option parsing)
+//   subcommand          if the schema declares subcommands and the FIRST
+//                       argument matches one of them, it is consumed as the
+//                       subcommand (parsed["sub"]); all remaining args are
+//                       still parsed against the SAME flag/option/positional
+//                       declarations (this module has no per-subcommand
+//                       sub-schema -- callers branch on cli_sub()).
+//
+// ERRORS (err(message) returned from cli_parse)
+//   "unknown option --x"                   / "unknown option -x"
+//   "flag --x does not take a value"
+//   "option --x requires a value"          / "option -x requires a value"
+//   "missing required option --x"
+//   "missing required positional <name>"
+//
+// Public API:
+//   cli_schema() -> dict
+//   cli_flag(schema, name, short, help) -> dict
+//   cli_option(schema, name, short, help, default_val) -> dict
+//   cli_positional(schema, name, help, required) -> dict
+//   cli_subcommand(schema, name, help) -> dict
+//   cli_parse(schema, args_list) -> Result      ok(parsed dict) / err(message)
+//   cli_help(schema) -> string
+//   cli_has(parsed, name) -> int                1/0
+//   cli_get(parsed, name) -> any                value, or null if absent
+//   cli_get_or(parsed, name, default) -> any
+//   cli_sub(parsed) -> string
+//   cli_rest(parsed) -> list
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// PRIVATE: linear-scan a list of field-dicts for the one whose `key` field
+// equals `val`. Returns its index, or -1 if none match.
+// ---------------------------------------------------------------------------
+fn _cli_find(fields: list, key: string, val: string) -> int
+    let n = len(fields)
+    let i = 0
+    while i < n
+        let f = fields[i]
+        if f[key] == val
+            return i
+        i = i + 1
+    return -1
+
+// ---------------------------------------------------------------------------
+// PRIVATE: index of the first "=" in s, or -1.
+// ---------------------------------------------------------------------------
+fn _cli_find_eq(s: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if char_at(s, i) == "="
+            return i
+        i = i + 1
+    return -1
+
+// ----------------------------------------------------------------------------
+// Schema builders
+// ----------------------------------------------------------------------------
+
+fn cli_schema() -> dict
+    let s = {}
+    s["flags"] = []
+    s["options"] = []
+    s["positionals"] = []
+    s["subcommands"] = []
+    s
+
+fn cli_flag(schema: dict, name: string, short: string, help: string) -> dict
+    let f = {}
+    f["name"] = name
+    f["short"] = short
+    f["help"] = help
+    let flags = schema["flags"]
+    flags.push(f)
+    schema
+
+fn cli_option(schema: dict, name: string, short: string, help: string, default_val: any) -> dict
+    let o = {}
+    o["name"] = name
+    o["short"] = short
+    o["help"] = help
+    o["default"] = default_val
+    let options = schema["options"]
+    options.push(o)
+    schema
+
+fn cli_positional(schema: dict, name: string, help: string, required: int) -> dict
+    let p = {}
+    p["name"] = name
+    p["help"] = help
+    if required
+        p["required"] = 1
+    else
+        p["required"] = 0
+    let positionals = schema["positionals"]
+    positionals.push(p)
+    schema
+
+fn cli_subcommand(schema: dict, name: string, help: string) -> dict
+    let c = {}
+    c["name"] = name
+    c["help"] = help
+    let subs = schema["subcommands"]
+    subs.push(c)
+    schema
+
+// ----------------------------------------------------------------------------
+// cli_parse: parse args_list against schema.
+// ----------------------------------------------------------------------------
+fn cli_parse(schema: dict, args: list) -> Result
+    let flags = schema["flags"]
+    let options = schema["options"]
+    let positionals = schema["positionals"]
+    let subs = schema["subcommands"]
+
+    let values = {}
+    let fi = 0
+    while fi < len(flags)
+        values[flags[fi]["name"]] = 0
+        fi = fi + 1
+
+    let n = len(args)
+    let i = 0
+    let sub_name = ""
+    if len(subs) > 0
+        if n > 0
+            let si = _cli_find(subs, "name", args[0])
+            if si >= 0
+                sub_name = args[0]
+                i = 1
+
+    let rest = []
+    let npos = len(positionals)
+    let pos_idx = 0
+    let sep_seen = 0
+    let got_option = {}
+
+    while i < n
+        let a = args[i]
+
+        if sep_seen == 0
+            if a == "--"
+                sep_seen = 1
+                i = i + 1
+                continue
+
+        if sep_seen == 0
+            if starts_with(a, "--") == 1
+                let body = slice(a, 2, len(a))
+                let eq_pos = _cli_find_eq(body)
+                let oname = body
+                let inline_val = ""
+                let has_inline = 0
+                if eq_pos >= 0
+                    oname = slice(body, 0, eq_pos)
+                    inline_val = slice(body, eq_pos + 1, len(body))
+                    has_inline = 1
+
+                let fidx = _cli_find(flags, "name", oname)
+                if fidx >= 0
+                    if has_inline == 1
+                        return err("flag --" + oname + " does not take a value")
+                    values[oname] = 1
+                    i = i + 1
+                    continue
+
+                let oidx = _cli_find(options, "name", oname)
+                if oidx >= 0
+                    if has_inline == 1
+                        values[oname] = inline_val
+                        got_option[oname] = 1
+                        i = i + 1
+                        continue
+                    else
+                        if i + 1 >= n
+                            return err("option --" + oname + " requires a value")
+                        values[oname] = args[i + 1]
+                        got_option[oname] = 1
+                        i = i + 2
+                        continue
+
+                return err("unknown option --" + oname)
+
+        if sep_seen == 0
+            if starts_with(a, "-") == 1
+                if len(a) > 1
+                    let sname = slice(a, 1, len(a))
+
+                    let sfidx = _cli_find(flags, "short", sname)
+                    if sfidx >= 0
+                        values[flags[sfidx]["name"]] = 1
+                        i = i + 1
+                        continue
+
+                    let soidx = _cli_find(options, "short", sname)
+                    if soidx >= 0
+                        if i + 1 >= n
+                            return err("option -" + sname + " requires a value")
+                        let real_name = options[soidx]["name"]
+                        values[real_name] = args[i + 1]
+                        got_option[real_name] = 1
+                        i = i + 2
+                        continue
+
+                    return err("unknown option -" + sname)
+
+        // positional (or rest, once declared positionals are exhausted)
+        if pos_idx < npos
+            let pname = positionals[pos_idx]["name"]
+            values[pname] = a
+            pos_idx = pos_idx + 1
+        else
+            rest.push(a)
+        i = i + 1
+
+    let pj = 0
+    while pj < npos
+        if pj >= pos_idx
+            let p = positionals[pj]
+            if p["required"] == 1
+                return err("missing required positional <" + p["name"] + ">")
+        pj = pj + 1
+
+    let oj = 0
+    while oj < len(options)
+        let o = options[oj]
+        let oname3 = o["name"]
+        if contains(got_option, oname3) == 0
+            let def = o["default"]
+            if def == null
+                return err("missing required option --" + oname3)
+            values[oname3] = def
+        oj = oj + 1
+
+    let parsed = {}
+    parsed["values"] = values
+    parsed["sub"] = sub_name
+    parsed["rest"] = rest
+    return ok(parsed)
+
+// ----------------------------------------------------------------------------
+// cli_help: formatted, human-readable usage text.
+// ----------------------------------------------------------------------------
+fn cli_help(schema: dict) -> string
+    let flags = schema["flags"]
+    let options = schema["options"]
+    let positionals = schema["positionals"]
+    let subs = schema["subcommands"]
+
+    let lines = []
+    let usage = "Usage:"
+    if len(subs) > 0
+        usage = usage + " <subcommand>"
+    usage = usage + " [options]"
+    let pi = 0
+    while pi < len(positionals)
+        let p = positionals[pi]
+        if p["required"] == 1
+            usage = usage + " <" + p["name"] + ">"
+        else
+            usage = usage + " [" + p["name"] + "]"
+        pi = pi + 1
+    lines.push(usage)
+
+    if len(subs) > 0
+        lines.push("")
+        lines.push("Subcommands:")
+        let si = 0
+        while si < len(subs)
+            let s = subs[si]
+            lines.push("  " + s["name"] + "  " + s["help"])
+            si = si + 1
+
+    if len(positionals) > 0
+        lines.push("")
+        lines.push("Positionals:")
+        let pj = 0
+        while pj < len(positionals)
+            let p2 = positionals[pj]
+            lines.push("  " + p2["name"] + "  " + p2["help"])
+            pj = pj + 1
+
+    if len(flags) > 0
+        lines.push("")
+        lines.push("Flags:")
+        let fi2 = 0
+        while fi2 < len(flags)
+            let f = flags[fi2]
+            lines.push("  --" + f["name"] + ", -" + f["short"] + "  " + f["help"])
+            fi2 = fi2 + 1
+
+    if len(options) > 0
+        lines.push("")
+        lines.push("Options:")
+        let oi = 0
+        while oi < len(options)
+            let o = options[oi]
+            let d = o["default"]
+            let dstr = "required"
+            if d != null
+                dstr = "default: " + str(d)
+            lines.push("  --" + o["name"] + ", -" + o["short"] + "  " + o["help"] + " (" + dstr + ")")
+            oi = oi + 1
+
+    return join(lines, "\n")
+
+// ----------------------------------------------------------------------------
+// Parsed-result accessors
+// ----------------------------------------------------------------------------
+
+fn cli_has(parsed: dict, name: string) -> int
+    let values = parsed["values"]
+    if contains(values, name)
+        return 1
+    return 0
+
+fn cli_get(parsed: dict, name: string) -> any
+    let values = parsed["values"]
+    if contains(values, name)
+        return values[name]
+    return null
+
+fn cli_get_or(parsed: dict, name: string, default_val: any) -> any
+    let values = parsed["values"]
+    if contains(values, name)
+        return values[name]
+    return default_val
+
+fn cli_sub(parsed: dict) -> string
+    return parsed["sub"]
+
+fn cli_rest(parsed: dict) -> list
+    return parsed["rest"]
+
+fn main()
+    print("cli module loaded")

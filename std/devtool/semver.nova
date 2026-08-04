@@ -1,0 +1,601 @@
+// std/devtool/semver — Semantic Versioning 2.0.0 (semver.org) parser, comparator
+// and range matcher.
+//
+// WHAT: implements the full precedence rule of the spec (semver.org section 11):
+// major.minor.patch compared numerically, then pre-release identifiers compared
+// dot-segment by dot-segment (numeric identifiers compare numerically and always
+// sort below alphanumeric identifiers; alphanumeric identifiers compare by ASCII;
+// a version WITH a pre-release has LOWER precedence than the same core version
+// WITHOUT one; a longer identifier list outranks a shared-prefix shorter one).
+// Build metadata (the "+..." suffix) is parsed and validated but never affects
+// precedence (per spec section 10) — sv_compare/sv_diff/sort ignore it entirely.
+//
+// Record shape (a dict, returned by sv_parse/sv_coerce):
+//   {"major": int, "minor": int, "patch": int, "pre": string, "build": string}
+// `pre` and `build` are "" when absent. major/minor/patch are capped at 18
+// decimal digits (an i64-safe bound no real version approaches) — sv_parse
+// rejects anything longer via err() rather than silently overflow-wrapping.
+//
+// Range syntax supported by sv_satisfies (npm/node-semver semantics):
+//   "*"        matches any valid version
+//   "1.2.x"    (also "1.x", "1.X.x", "1.2.*") — wildcard on trailing components
+//   ">=1.0.0"  ">" "<" "<=" ">=" "=" "==" plain comparison operators
+//   "~1.2.3"   same major.minor, patch >= 3            (>=1.2.3 <1.3.0)
+//   "^1.2.3"   same major (or same minor if major==0, or exact if major.minor==0)
+//              — the npm caret rule: ^1.2.3:=[1.2.3,2.0.0) ^0.2.3:=[0.2.3,0.3.0)
+//              ^0.0.3:=[0.0.3,0.0.4)
+//   "1.2.3"    (no operator) — exact match, same as "=1.2.3"
+// Compound ranges ("1.0.0 - 2.0.0", "||", multiple space-separated comparators)
+// are NOT supported — out of scope for this module.
+//
+// LEAF module: imports nothing (self-contained).
+//
+// PREFIX: sv_
+//
+// Public API:
+//   sv_parse(s)                 -> Result   ok(version dict) or err(msg)
+//   sv_valid(s)                 -> bool     1 if s is a strictly valid semver
+//   sv_to_string(ver)           -> string   version dict -> "M.N.P[-pre][+build]"
+//   sv_compare(a, b)            -> int      -1/0/1 by spec precedence (strings)
+//   sv_gt/sv_gte/sv_lt/sv_lte(a, b) -> bool thin wrappers over sv_compare
+//   sv_bump_major/minor/patch(ver)  -> string  increments, resets lower
+//                                                components to 0, clears pre
+//                                                and build; unparseable input
+//                                                is returned UNCHANGED (no
+//                                                Result in this signature —
+//                                                callers that need to detect
+//                                                failure should sv_valid(ver)
+//                                                first)
+//   sv_diff(a, b)                -> string  "major"/"minor"/"patch"/"pre"/"none";
+//                                             "none" also on unparseable input
+//   sv_satisfies(ver, range)     -> bool    see range syntax above
+//   sv_max_satisfying(versions, range) -> Result  ok(best string) or err(msg)
+//                                             if none in the list satisfy
+//   sv_sort(versions)            -> list    ascending by spec precedence;
+//                                             a fresh list, input untouched
+//   sv_coerce(s)                 -> Result  best-effort loose parse: on strict
+//                                             sv_parse failure, skips forward
+//                                             to the first digit character
+//                                             (dropping any "v"/"=" /junk
+//                                             prefix), then reads up to 3
+//                                             dot-separated leading-digit runs
+//                                             ("v1.2" -> {1,2,0}, "1" -> {1,0,0},
+//                                             "=v2.5.1" -> {2,5,1}); any
+//                                             pre-release/build suffix on the
+//                                             input is discarded, not parsed
+
+// ── character classification ────────────────────────────────────────────
+
+fn _sv_is_digit_char(c) -> bool
+    return c >= "0" and c <= "9"
+
+fn _sv_is_alpha_char(c) -> bool
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+
+fn _sv_all_digits(s) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let i = 0
+    while i < n
+        if not _sv_is_digit_char(slice(s, i, i + 1))
+            return false
+        i = i + 1
+    return true
+
+fn _sv_all_alnum_hyphen(s) -> bool
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = slice(s, i, i + 1)
+        let good = _sv_is_digit_char(c) or _sv_is_alpha_char(c) or c == "-"
+        if not good
+            return false
+        i = i + 1
+    return true
+
+fn _sv_has_leading_zero(s) -> bool
+    return len(s) > 1 and slice(s, 0, 1) == "0"
+
+// ── small string helpers ────────────────────────────────────────────────
+
+// _sv_find_char(s, ch) -> first index of the single-char string ch in s, or -1
+fn _sv_find_char(s, ch) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if slice(s, i, i + 1) == ch
+            return i
+        i = i + 1
+    return -1
+
+// _sv_leading_digits(s) -> the maximal leading run of digit chars in s ("" if none)
+fn _sv_leading_digits(s) -> string
+    let n = len(s)
+    let i = 0
+    while i < n and _sv_is_digit_char(slice(s, i, i + 1))
+        i = i + 1
+    return slice(s, 0, i)
+
+// _sv_str_to_int(s) -> parses a digit-only string (<=18 chars, caller-guaranteed)
+// into its integer value. Callers must validate digits-only + length first;
+// this never fails and never bounds-checks (private, internal-use-only).
+fn _sv_str_to_int(s) -> int
+    let n = len(s)
+    let v = 0
+    let i = 0
+    let zero = ord("0")
+    while i < n
+        let c = slice(s, i, i + 1)
+        v = v * 10 + (ord(c) - zero)
+        i = i + 1
+    return v
+
+// _sv_parse_uint(s) -> Result: ok(int) if s is a valid semver numeric
+// identifier (non-empty, digits only, no leading zero unless exactly "0",
+// at most 18 digits so the i64 conversion never overflows), else err(msg).
+fn _sv_parse_uint(s: string) -> Result
+    if not _sv_all_digits(s)
+        return err("not a non-negative integer: \"" + s + "\"")
+    if _sv_has_leading_zero(s)
+        return err("leading zero not allowed: \"" + s + "\"")
+    if len(s) > 18
+        return err("numeric component too large: \"" + s + "\"")
+    return ok(_sv_str_to_int(s))
+
+// _sv_validate_dotted(s, is_pre) -> bool: validates a dot-separated identifier
+// list (a pre-release or build-metadata body). Every identifier must be
+// non-empty and alnum-or-hyphen only. When is_pre is true, an all-digit
+// identifier additionally must not have a leading zero (per spec, this rule
+// applies to pre-release numeric identifiers but NOT to build identifiers).
+fn _sv_validate_dotted(s: string, is_pre: bool) -> bool
+    let parts = split(s, ".")
+    let n = len(parts)
+    if n == 0
+        return false
+    let i = 0
+    while i < n
+        let id = parts[i]
+        if len(id) == 0
+            return false
+        if not _sv_all_alnum_hyphen(id)
+            return false
+        if is_pre and _sv_all_digits(id) and _sv_has_leading_zero(id)
+            return false
+        i = i + 1
+    return true
+
+// ── core parse ───────────────────────────────────────────────────────────
+
+// sv_parse(s) -> Result: ok({"major","minor","patch","pre","build"}) on a
+// fully spec-valid "MAJOR.MINOR.PATCH[-PRE][+BUILD]" string, else err(msg).
+fn sv_parse(s: string) -> Result
+    if len(s) == 0
+        return err("sv_parse: empty version string")
+
+    // split off build metadata at the first "+"
+    let build = ""
+    let core_pre = s
+    let plus_i = _sv_find_char(s, "+")
+    if plus_i >= 0
+        build = slice(s, plus_i + 1, len(s))
+        core_pre = slice(s, 0, plus_i)
+        if len(build) == 0
+            return err("sv_parse: empty build metadata after '+'")
+        if not _sv_validate_dotted(build, false)
+            return err("sv_parse: invalid build metadata \"" + build + "\"")
+
+    // split off pre-release at the first "-" remaining
+    let pre = ""
+    let core = core_pre
+    let dash_i = _sv_find_char(core_pre, "-")
+    if dash_i >= 0
+        pre = slice(core_pre, dash_i + 1, len(core_pre))
+        core = slice(core_pre, 0, dash_i)
+        if len(pre) == 0
+            return err("sv_parse: empty pre-release after '-'")
+        if not _sv_validate_dotted(pre, true)
+            return err("sv_parse: invalid pre-release \"" + pre + "\"")
+
+    let parts = split(core, ".")
+    if len(parts) != 3
+        return err("sv_parse: version core must be MAJOR.MINOR.PATCH, got \"" + core + "\"")
+
+    let rmaj = _sv_parse_uint(parts[0])
+    if is_err(rmaj)
+        return err("sv_parse: invalid major version \"" + parts[0] + "\"")
+    let rmin = _sv_parse_uint(parts[1])
+    if is_err(rmin)
+        return err("sv_parse: invalid minor version \"" + parts[1] + "\"")
+    let rpat = _sv_parse_uint(parts[2])
+    if is_err(rpat)
+        return err("sv_parse: invalid patch version \"" + parts[2] + "\"")
+
+    return ok({"major": unwrap(rmaj), "minor": unwrap(rmin), "patch": unwrap(rpat), "pre": pre, "build": build})
+
+// sv_valid(s) -> bool: 1 if s parses as a fully spec-valid semver string.
+fn sv_valid(s: string) -> bool
+    return is_ok(sv_parse(s))
+
+// sv_to_string(ver) -> "MAJOR.MINOR.PATCH[-pre][+build]"
+fn sv_to_string(ver) -> string
+    let out = str(ver["major"]) + "." + str(ver["minor"]) + "." + str(ver["patch"])
+    if ver["pre"] != ""
+        out = out + "-" + ver["pre"]
+    if ver["build"] != ""
+        out = out + "+" + ver["build"]
+    return out
+
+// ── comparison ───────────────────────────────────────────────────────────
+
+// _sv_compare_pre(pa, pb) -> -1/0/1 comparing two pre-release bodies
+// identifier-by-identifier per spec section 11.4. Numeric identifiers are
+// compared by (length, then lexical) rather than converting to int — since
+// leading zeros are already rejected at parse time, a digit string's length
+// alone determines magnitude, so this stays correct even for identifiers
+// longer than 18 digits (unlike major/minor/patch, pre-release identifiers
+// are not length-capped by the spec).
+fn _sv_compare_pre(pa: string, pb: string) -> int
+    let la = split(pa, ".")
+    let lb = split(pb, ".")
+    let na = len(la)
+    let nb = len(lb)
+    let m = na
+    if nb < m
+        m = nb
+    let i = 0
+    while i < m
+        let ida = la[i]
+        let idb = lb[i]
+        let da_num = _sv_all_digits(ida)
+        let db_num = _sv_all_digits(idb)
+        if da_num and db_num
+            if len(ida) != len(idb)
+                if len(ida) < len(idb)
+                    return -1
+                return 1
+            if ida != idb
+                if ida < idb
+                    return -1
+                return 1
+        else
+            if da_num and not db_num
+                return -1
+            if not da_num and db_num
+                return 1
+            if ida != idb
+                if ida < idb
+                    return -1
+                return 1
+        i = i + 1
+    if na != nb
+        if na < nb
+            return -1
+        return 1
+    return 0
+
+// _sv_compare_dict(da, db) -> -1/0/1, full spec precedence (build ignored).
+fn _sv_compare_dict(da, db) -> int
+    if da["major"] != db["major"]
+        if da["major"] < db["major"]
+            return -1
+        return 1
+    if da["minor"] != db["minor"]
+        if da["minor"] < db["minor"]
+            return -1
+        return 1
+    if da["patch"] != db["patch"]
+        if da["patch"] < db["patch"]
+            return -1
+        return 1
+    let pa = da["pre"]
+    let pb = db["pre"]
+    if pa == "" and pb == ""
+        return 0
+    if pa == "" and pb != ""
+        return 1
+    if pa != "" and pb == ""
+        return -1
+    return _sv_compare_pre(pa, pb)
+
+// sv_compare(a, b) -> -1/0/1 by spec precedence. Defensive fallback when a
+// string fails to parse: an unparseable version sorts below every valid one
+// (both unparseable -> 0, "equal" since neither has a defined precedence).
+fn sv_compare(a: string, b: string) -> int
+    let ra = sv_parse(a)
+    let rb = sv_parse(b)
+    if is_err(ra) and is_err(rb)
+        return 0
+    if is_err(ra)
+        return -1
+    if is_err(rb)
+        return 1
+    return _sv_compare_dict(unwrap(ra), unwrap(rb))
+
+fn sv_gt(a: string, b: string) -> bool
+    return sv_compare(a, b) > 0
+
+fn sv_gte(a: string, b: string) -> bool
+    return sv_compare(a, b) >= 0
+
+fn sv_lt(a: string, b: string) -> bool
+    return sv_compare(a, b) < 0
+
+fn sv_lte(a: string, b: string) -> bool
+    return sv_compare(a, b) <= 0
+
+// ── bump / diff ──────────────────────────────────────────────────────────
+
+// sv_bump_major(ver) -> "M+1.0.0" (pre/build cleared). Unparseable input is
+// returned unchanged (see module header note on this signature's contract).
+fn sv_bump_major(ver: string) -> string
+    let r = sv_parse(ver)
+    if is_err(r)
+        return ver
+    let d = unwrap(r)
+    return sv_to_string({"major": d["major"] + 1, "minor": 0, "patch": 0, "pre": "", "build": ""})
+
+fn sv_bump_minor(ver: string) -> string
+    let r = sv_parse(ver)
+    if is_err(r)
+        return ver
+    let d = unwrap(r)
+    return sv_to_string({"major": d["major"], "minor": d["minor"] + 1, "patch": 0, "pre": "", "build": ""})
+
+fn sv_bump_patch(ver: string) -> string
+    let r = sv_parse(ver)
+    if is_err(r)
+        return ver
+    let d = unwrap(r)
+    return sv_to_string({"major": d["major"], "minor": d["minor"], "patch": d["patch"] + 1, "pre": "", "build": ""})
+
+// sv_diff(a, b) -> "major"/"minor"/"patch"/"pre"/"none" — the highest-order
+// component that differs between a and b (build metadata never counted).
+// Returns "none" if either string fails to parse (no component to report).
+fn sv_diff(a: string, b: string) -> string
+    let ra = sv_parse(a)
+    let rb = sv_parse(b)
+    if is_err(ra) or is_err(rb)
+        return "none"
+    let da = unwrap(ra)
+    let db = unwrap(rb)
+    if da["major"] != db["major"]
+        return "major"
+    if da["minor"] != db["minor"]
+        return "minor"
+    if da["patch"] != db["patch"]
+        return "patch"
+    if da["pre"] != db["pre"]
+        return "pre"
+    return "none"
+
+// ── ranges ───────────────────────────────────────────────────────────────
+
+// _sv_is_xrange(r) -> bool: true if r is a wildcard-form range, e.g. "1.2.x",
+// "1.x", "*", "1.2.*" — at least one of up to 3 dot-separated components is
+// "x"/"X"/"*" and every other component is a plain digit run.
+fn _sv_is_xrange(r: string) -> bool
+    if r == "*"
+        return true
+    let parts = split(r, ".")
+    let np = len(parts)
+    if np == 0 or np > 3
+        return false
+    let i = 0
+    let has_x = false
+    let all_ok = true
+    while i < np
+        let p = parts[i]
+        if p == "x" or p == "X" or p == "*"
+            has_x = true
+        else
+            if not _sv_all_digits(p)
+                all_ok = false
+        i = i + 1
+    return has_x and all_ok
+
+// _sv_satisfies_xrange(ver, r) -> bool: matches ver against a wildcard-form
+// range (see _sv_is_xrange). A wildcard component and everything after it is
+// unconstrained; components before it must match exactly.
+fn _sv_satisfies_xrange(ver: string, r: string) -> bool
+    if r == "*"
+        return sv_valid(ver)
+    let rv = sv_parse(ver)
+    if is_err(rv)
+        return false
+    let v = unwrap(rv)
+    let parts = split(r, ".")
+    let np = len(parts)
+
+    if parts[0] == "x" or parts[0] == "X" or parts[0] == "*"
+        return true
+    if v["major"] != _sv_str_to_int(parts[0])
+        return false
+    if np < 2
+        return true
+
+    if parts[1] == "x" or parts[1] == "X" or parts[1] == "*"
+        return true
+    if v["minor"] != _sv_str_to_int(parts[1])
+        return false
+    if np < 3
+        return true
+
+    if parts[2] == "x" or parts[2] == "X" or parts[2] == "*"
+        return true
+    return v["patch"] == _sv_str_to_int(parts[2])
+
+// _sv_op_prefix(r) -> [op: string, rest: string] splits a leading comparison
+// operator (">=", "<=", "^", "~", ">", "<", "==", "=") off r; an operator-less
+// range is treated as "=" (exact match).
+fn _sv_op_prefix(r: string) -> list
+    if starts_with(r, ">=")
+        return [">=", trim(slice(r, 2, len(r)))]
+    if starts_with(r, "<=")
+        return ["<=", trim(slice(r, 2, len(r)))]
+    if starts_with(r, "==")
+        return ["=", trim(slice(r, 2, len(r)))]
+    if starts_with(r, "^")
+        return ["^", trim(slice(r, 1, len(r)))]
+    if starts_with(r, "~")
+        return ["~", trim(slice(r, 1, len(r)))]
+    if starts_with(r, ">")
+        return [">", trim(slice(r, 1, len(r)))]
+    if starts_with(r, "<")
+        return ["<", trim(slice(r, 1, len(r)))]
+    if starts_with(r, "=")
+        return ["=", trim(slice(r, 1, len(r)))]
+    return ["=", r]
+
+// _sv_satisfies_caret(v, c) -> bool: npm's "^" rule.
+//   c.major > 0        -> v.major == c.major        and v >= c
+//   c.major == 0, c.minor > 0 -> v.major==0, v.minor==c.minor and v >= c
+//   c.major == 0, c.minor == 0 -> v.major==0, v.minor==0, v.patch == c.patch
+fn _sv_satisfies_caret(v, c) -> bool
+    if c["major"] > 0
+        if v["major"] != c["major"]
+            return false
+        return _sv_compare_dict(v, c) >= 0
+    if c["minor"] > 0
+        if v["major"] != 0 or v["minor"] != c["minor"]
+            return false
+        return _sv_compare_dict(v, c) >= 0
+    if v["major"] != 0 or v["minor"] != 0
+        return false
+    return v["patch"] == c["patch"]
+
+// sv_satisfies(ver, range) -> bool — see module header for supported syntax.
+fn sv_satisfies(ver: string, range: string) -> bool
+    let r = trim(range)
+    if len(r) == 0 or r == "*"
+        return sv_valid(ver)
+    if _sv_is_xrange(r)
+        return _sv_satisfies_xrange(ver, r)
+
+    let split_op = _sv_op_prefix(r)
+    let op = split_op[0]
+    let rest = split_op[1]
+
+    let rv = sv_parse(ver)
+    let rc = sv_parse(rest)
+    if is_err(rv) or is_err(rc)
+        return false
+    let v = unwrap(rv)
+    let c = unwrap(rc)
+    let cmp = _sv_compare_dict(v, c)
+
+    if op == ">="
+        return cmp >= 0
+    if op == "<="
+        return cmp <= 0
+    if op == ">"
+        return cmp > 0
+    if op == "<"
+        return cmp < 0
+    if op == "~"
+        if v["major"] != c["major"] or v["minor"] != c["minor"]
+            return false
+        return v["patch"] >= c["patch"]
+    if op == "^"
+        return _sv_satisfies_caret(v, c)
+    return cmp == 0
+
+// sv_max_satisfying(versions, range) -> Result: ok(highest-precedence string
+// among `versions` that both parses and satisfies `range`), or err(msg) if
+// none qualify.
+fn sv_max_satisfying(versions: list, range: string) -> Result
+    let best = ""
+    let have_best = false
+    let n = len(versions)
+    let i = 0
+    while i < n
+        let cand = versions[i]
+        if sv_valid(cand) and sv_satisfies(cand, range)
+            if not have_best
+                best = cand
+                have_best = true
+            else
+                if sv_compare(cand, best) > 0
+                    best = cand
+        i = i + 1
+    if not have_best
+        return err("sv_max_satisfying: no version satisfies \"" + range + "\"")
+    return ok(best)
+
+// sv_sort(versions) -> a fresh list, ascending by spec precedence
+// (insertion sort — versions lists are small; input list is not mutated).
+fn sv_sort(versions: list) -> list
+    let out = []
+    let n = len(versions)
+    let i = 0
+    while i < n
+        push(out, versions[i])
+        i = i + 1
+
+    let a = 1
+    while a < n
+        let key = out[a]
+        let b = a - 1
+        while b >= 0 and sv_compare(out[b], key) > 0
+            out[b + 1] = out[b]
+            b = b - 1
+        out[b + 1] = key
+        a = a + 1
+    return out
+
+// ── loose / best-effort coercion ────────────────────────────────────────
+
+// sv_coerce(s) -> Result: best-effort parse of a loose version string. Tries
+// a strict sv_parse first; on failure, skips forward past any non-digit
+// prefix ("v", "=", stray whitespace, ...) to the first digit character,
+// then reads up to 3 dot-separated leading-digit runs as major/minor/patch
+// (missing trailing components default to 0). Any pre-release/build suffix
+// on loose input is discarded, not parsed. err(msg) if no digit exists in
+// the string at all.
+fn sv_coerce(s: string) -> Result
+    let strict = sv_parse(s)
+    if is_ok(strict)
+        return strict
+
+    let n = len(s)
+    let start = 0
+    while start < n and not _sv_is_digit_char(slice(s, start, start + 1))
+        start = start + 1
+    if start >= n
+        return err("sv_coerce: no numeric version found in \"" + s + "\"")
+    let t = slice(s, start, n)
+
+    let raw_parts = split(t, ".")
+    let groups = []
+    let i = 0
+    let np = len(raw_parts)
+    let stop = false
+    while i < np and len(groups) < 3 and not stop
+        let seg = raw_parts[i]
+        let digits = _sv_leading_digits(seg)
+        if len(digits) == 0
+            stop = true
+        else
+            push(groups, digits)
+            if len(digits) < len(seg)
+                stop = true
+        i = i + 1
+
+    if len(groups) == 0
+        return err("sv_coerce: no numeric version found in \"" + s + "\"")
+
+    let gi = 0
+    while gi < len(groups)
+        if len(groups[gi]) > 18
+            return err("sv_coerce: numeric component too large in \"" + s + "\"")
+        gi = gi + 1
+
+    let major = _sv_str_to_int(groups[0])
+    let minor = 0
+    let patch = 0
+    if len(groups) > 1
+        minor = _sv_str_to_int(groups[1])
+    if len(groups) > 2
+        patch = _sv_str_to_int(groups[2])
+
+    return ok({"major": major, "minor": minor, "patch": patch, "pre": "", "build": ""})
