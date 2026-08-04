@@ -53,6 +53,8 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <signal.h>   /* hoisted: the fiber stack-overflow guard below needs sigaction/sigaltstack,
+                         and the pre-existing include sat ~2500 lines AFTER the fiber code */
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/socket.h>
@@ -1492,6 +1494,17 @@ static int nova_is_readable_str(const void* ptr) {
     NovaMemTag t = nova_mem_find_tag((void*)a);
     if (t == NOVA_MEM_RAW || t == NOVA_MEM_FAT_STR) return 1;  /* headered runtime string */
     if (t != (NovaMemTag)-1) return 0;                         /* list/dict/box/etc. -> not a string */
+    /* OUR OWN small-int string cache. nova_rt_int_to_str returns a pointer straight into this
+       static table for 0..9999, and find_tag deliberately reports -1 for it (it has no RC
+       header). It must be recognised HERE or it falls through to the module-range test below --
+       and on Linux that test accepts only NON-WRITABLE PT_LOAD segments, while this table lives
+       in .bss. The result was that `"n = " + str(42)` silently produced "n = " on Linux for
+       every value under 10000, while working on Windows, so the CI never saw it. The table is
+       static, always NUL-terminated by nova_int_str_cache_init, and never freed. */
+    if (nova_int_str_cache_inited &&
+        (const char*)ptr >= nova_int_str_cache[0] &&
+        (const char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
+        return 1;
 #ifdef _WIN32
     return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
 #elif defined(NOVA_FREESTANDING)
@@ -7646,6 +7659,11 @@ typedef struct NovaFiber {
     uint64_t          saved_sp;
     uint8_t*          stack_mem;
     size_t            stack_alloc;
+    /* POSIX hardware stack-overflow containment. `ovf_buf` is the landing point the SIGSEGV
+       handler siglongjmps to; `ovf_active` is what tells the handler this fiber is inside its
+       body and therefore that a fault in its guard page is recoverable rather than a real bug. */
+    sigjmp_buf        ovf_buf;
+    volatile int      ovf_active;
 #endif
 } NovaFiber;
 
@@ -8001,20 +8019,160 @@ void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
 }
 #endif
 
+/* ── POSIX hardware stack-overflow containment (Forge blocker #8) ─────────────
+   Windows already contains a fiber stack overflow: the __except in nova_fiber_entry turns
+   EXCEPTION_STACK_OVERFLOW into the same "contained crash" the software fault path produces,
+   so the carrier survives and keeps serving. POSIX had NOTHING. A fiber that recurses past
+   its 1MB stack hits the 64KB PROT_NONE guard, raises SIGSEGV, and the DEFAULT disposition
+   kills the entire process -- so unbounded recursion over attacker-controlled nested input
+   (a JSON body, a route tree) takes down the whole server on Linux, the dominant deploy
+   target. That contradicts Forge's "one poisoned request cannot take down others" claim, and
+   it defeated serve_safe_req too, since its spawn resolves to this same fiber machinery.
+
+   Three things make this correct rather than merely plausible:
+
+   1. SA_ONSTACK + a per-thread sigaltstack. The handler CANNOT run on the faulting stack --
+      that stack is exactly what is exhausted -- so without an alternate stack the handler
+      itself faults and the process dies anyway. The alt stack is per-THREAD (every carrier
+      and pool worker installs its own); the disposition is per-process and installed once.
+
+   2. The fault is only claimed when si_addr lands inside THIS fiber's guard region. Anything
+      else is a genuine memory bug and must keep crashing: swallowing it would convert a
+      loud, debuggable segfault into silent corruption, which is far worse than the gap being
+      closed. A frame large enough to leap the whole 64KB guard faults BELOW the region and is
+      therefore (correctly) not claimed.
+
+   3. A non-matching fault CHAINS to whatever handler was there before rather than resetting
+      to SIG_DFL. ASAN installs its own SIGSEGV handler and the CI runs ASAN builds; clobbering
+      it would silently destroy every ASAN report.
+
+   siglongjmp out of a signal handler is async-signal-safe and is the standard mechanism here;
+   the landing frame is the trampoline's, which sits at the TOP of the fiber stack and is
+   therefore always mapped, so there is stack to run on after the jump. Unlike Windows there is
+   no _resetstkoflw equivalent to call: the guard is a separate PROT_NONE mapping, not a moving
+   guard page, so it is still armed for the next use of this fiber. */
+
+/* ASAN detection. GCC has no __has_feature at all, so it cannot appear in the same #if as
+   __SANITIZE_ADDRESS__ (the preprocessor still parses the whole expression and errors out on
+   the call). Nested #ifs are the portable idiom for this. */
+#if defined(__SANITIZE_ADDRESS__)
+#  define NOVA_ASAN_BUILD 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define NOVA_ASAN_BUILD 1
+#  endif
+#endif
+
+#define NOVA_ALTSTACK_SIZE (64 * 1024)   /* fixed, not SIGSTKSZ: on modern glibc SIGSTKSZ is a
+                                            runtime sysconf value and not usable for a static */
+/* 64-byte aligned: ASAN's PlatformUnpoisonStacks queries the installed sigaltstack and CHECKs
+   that its address is shadow-granularity aligned. An unaligned __thread buffer aborted the
+   sanitizer runtime outright ("CHECK failed: asan_poisoning.cpp AddrIsAlignedByGranularity"). */
+static __thread uint8_t nova_altstack[NOVA_ALTSTACK_SIZE] __attribute__((aligned(64)));
+static __thread int     nova_altstack_ready = 0;
+static struct sigaction nova_prev_segv;
+static struct sigaction nova_prev_bus;
+static pthread_once_t   nova_segv_once = PTHREAD_ONCE_INIT;
+
+static void nova_chain_previous(int sig, siginfo_t* si, void* uctx) {
+    struct sigaction* prev = (sig == SIGBUS) ? &nova_prev_bus : &nova_prev_segv;
+    if ((prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
+        prev->sa_sigaction(sig, si, uctx);
+        return;
+    }
+    if (prev->sa_handler && prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    /* No prior handler: restore the default and re-raise so the process still dies with the
+       usual signal + core dump. sigaction/raise are both async-signal-safe. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+static void nova_stack_guard_handler(int sig, siginfo_t* si, void* uctx) {
+    NovaFiber* f = nova_current_fiber;
+    if (f && f != &nova_carrier_fiber && f->ovf_active && f->stack_mem && si) {
+        uintptr_t addr = (uintptr_t)si->si_addr;
+        uintptr_t lo   = (uintptr_t)f->stack_mem;
+        uintptr_t hi   = lo + (uintptr_t)NOVA_POSIX_GUARD_SIZE;
+        if (addr >= lo && addr < hi) {
+            f->ovf_active = 0;              /* one shot: a fault while unwinding is a real bug */
+            siglongjmp(f->ovf_buf, 1);
+        }
+    }
+    nova_chain_previous(sig, si, uctx);
+}
+
+static void nova_install_stack_guard_once(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = nova_stack_guard_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &nova_prev_segv);
+    /* Some platforms (macOS notably) report a guard-page hit as SIGBUS rather than SIGSEGV. */
+    sigaction(SIGBUS, &sa, &nova_prev_bus);
+}
+
+/* Per-THREAD half: every carrier/pool thread needs its own alternate stack, or the handler has
+   nowhere to run when THAT thread overflows. Cheap and idempotent, so it is safe to call on
+   every fiber entry. */
+static void nova_ensure_stack_guard(void) {
+#ifdef NOVA_ASAN_BUILD
+    /* Under AddressSanitizer, STAND DOWN. ASAN installs its own SIGSEGV handler and produces a
+       precise "stack-overflow" report with the full recursion backtrace, which is strictly more
+       useful in a debugging build than silently containing the fault -- containment would MASK
+       the very diagnostic the build exists to produce. Measured: with our handler installed,
+       ASAN aborted inside PlatformUnpoisonStacks instead of reporting, so this is also what
+       keeps the CI's ASAN output intact. Production (non-sanitized) builds get containment.
+       Verified: an ASAN build with this guard reports exactly what the pre-change runtime did. */
+    return;
+#else
+    if (!nova_altstack_ready) {
+        stack_t ss;
+        ss.ss_sp = nova_altstack;
+        ss.ss_size = NOVA_ALTSTACK_SIZE;
+        ss.ss_flags = 0;
+        if (sigaltstack(&ss, NULL) == 0)
+            nova_altstack_ready = 1;
+    }
+    pthread_once(&nova_segv_once, nova_install_stack_guard_once);
+#endif
+}
+
 static void nova_posix_fiber_trampoline(void) {
     NovaFiber* f = nova_current_fiber;
     nova_current_task = &f->task;
     f->status = 1;
 
     nova_fiber_limit_stack();
+    nova_ensure_stack_guard();
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
-    if (setjmp(f->task.fault_buf) == 0) {
-        int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
-        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
-        fn(f->entry_fn, 0);
+    /* Mirror of the Windows __try/__except. sigsetjmp lands here when the SIGSEGV handler
+       claims a guard-page fault; the inner setjmp keeps handling SOFTWARE faults (panic,
+       unwrap-on-Err, failed assert) exactly as before. Reported identically to nova_panic so
+       callers cannot tell which fault class occurred, then falls through to the normal fiber
+       exit so the carrier survives and runs the remaining tasks. */
+    f->ovf_active = 1;
+    if (sigsetjmp(f->ovf_buf, 1) == 0) {
+        if (setjmp(f->task.fault_buf) == 0) {
+            int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
+            nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+            fn(f->entry_fn, 0);
+        }
+    } else {
+        f->task.crashed = 1;
+        nova_set_error("stack overflow");
+        fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\"\n");
+        fflush(stderr);
     }
+    f->ovf_active = 0;
     f->task.fault_active = 0;
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 

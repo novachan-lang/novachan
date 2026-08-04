@@ -117,6 +117,63 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
+## ★ LINUX-ONLY: `str(n)` for n < 10000 silently returned "" when CONCATENATED (2026-08-04)
+
+Found while building a Linux test for something else, which is the only reason it was found at all.
+
+`"count = " + str(42)` printed **`count = `** on Linux. `str(2000000)` was fine. `print(str(42))`
+was fine. Only *concatenating* (and every other `nova_str_safe` consumer) lost the value, and only
+below 10000 — which is exactly `nova_int_str_cache`'s size.
+
+**Cause.** `nova_rt_int_to_str` serves 0..9999 straight out of a static table instead of allocating
+a heap string, so those pointers have no RC header and `nova_mem_find_tag` reports −1 for them by
+design. `nova_is_readable_str` then falls through to its module-range test — and on Linux that test
+accepts **only non-writable PT_LOAD segments** (the `dl_iterate_phdr` hardening from `44e32ae9`),
+while the cache lives in **.bss**, which is writable. So every cached small-int string was judged
+"not a string" and `nova_str_safe` substituted `""`.
+
+A soundness fix on POSIX introduced a silent correctness bug on the same platform. **The CI runs on
+Windows, which is why it survived.** The impact is not exotic: nearly every log line, error message
+and interpolated string containing a small number was silently losing it on Linux.
+
+Fixed by recognising the cache explicitly in `nova_is_readable_str` (it is our own static table,
+always NUL-terminated, never freed) before the module-range fallback. Swept the other two static
+char buffers in the runtime: `nova_strpool_data` is already claimed by `nova_strpool_contains`, and
+`g_hot_watch_paths` is copied through `nova_rt_create_string`, so this was the only instance.
+KAT `_kat_smallint_str` (6 cases incl. both sides of the 10000 boundary, len(), and non-concat
+string ops); verified to FAIL against the pre-fix runtime on Linux and pass after.
+
+## Forge blocker #8 CLOSED — POSIX hardware stack-overflow containment (2026-08-04)
+
+Windows contained a fiber stack overflow via `__except(EXCEPTION_STACK_OVERFLOW)`. **POSIX had no
+containment of any kind**, so unbounded recursion over attacker-controlled nested input killed the
+whole server process — and it defeated `serve_safe_req`, Forge's flagship crash-isolated path, since
+its `spawn` resolves to the same fiber machinery.
+
+Measured on real Linux, before and after, with the same binary against two runtimes:
+
+| runtime | result |
+|---|---|
+| pre-change | `Segmentation fault`, exit 139, **core dumped** — process gone |
+| with containment | `level=ERROR event=fault detail="stack overflow"` → next task runs → **exit 0** |
+
+Implementation: a `SIGSEGV`/`SIGBUS` handler with `SA_ONSTACK` plus a per-thread `sigaltstack`
+(the handler cannot run on the stack that is exhausted), which `siglongjmp`s to a `sigsetjmp` in
+the POSIX fiber trampoline — the mirror of the Windows `__except`. Three deliberate constraints:
+
+1. The fault is claimed **only** when `si_addr` lands in *this* fiber's 64KB guard region. Anything
+   else is a real memory bug and must keep crashing; swallowing it would turn a loud, debuggable
+   segfault into silent corruption.
+2. A non-matching fault **chains to the previous handler** rather than resetting to `SIG_DFL`.
+3. **Under ASAN the guard stands down entirely.** ASAN produces a precise `stack-overflow` report
+   with the full backtrace, which is more useful in a debug build than containment — and measured,
+   installing our alt stack made ASAN abort inside `PlatformUnpoisonStacks` instead of reporting.
+   Verified: ASAN builds now emit exactly the same report as the pre-change runtime.
+
+**Method note.** The first version of the test "passed" against the *unpatched* runtime — LLVM had
+rewritten the accumulator recursion into a loop, so it never overflowed. Always confirm a
+regression test FAILS against the unfixed code before believing it passes against the fixed code.
+
 ## LOCK-4 inc3c-part2 — sized numerics are now REACHABLE (2026-08-04)
 
 Sized integers existed but only through the one spelling almost nobody writes. Probed, not
