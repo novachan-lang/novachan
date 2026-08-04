@@ -109,7 +109,13 @@
 >
 > **✅ explicit SIMD path `6bd9416d`** (certified `f0421911`) — 7 vectorized kernels over raw float
 > lists; clang confirms 4-wide AVX. Refusal-guarded: a boxed list holds pointers, so non-raw operands
-> are rejected rather than misread as doubles. **LOCK-4 inc3d BLOCKED with evidence** — it changes
+> are rejected rather than misread as doubles. **LOCK-4 inc3d ✅ DONE `fa9e1f7d` — the block below was CORRECT and is what
+> chose the design.** Widening `NovaList.data` really is unsafe: 575 raw `->data[` reads against 34
+> `elem_kind` guards. The resolution was to NOT touch NovaList — a packed array is a SEPARATE object
+> kind (tag 16), so every one of those 575 reads is untouched and the hazard cannot arise. The deeper
+> reason is that NovaList's fast path is sound only because the slot SIZE never changes (a deopt flips
+> a flag and all aliases agree); a width would turn that deopt into a realloc under live aliases.
+> *(historical blocker text: it changes
 > `NovaList.data`'s layout, and the runtime has 575 raw `->data[` reads vs only 34 `elem_kind` guards,
 > so a partial implementation is silent corruption. Needs a width-guard audit or a no-unguarded-access
 > proof; deliberately not attempted.
@@ -182,12 +188,12 @@
 > | LOCK-1 | **Module symbol namespacing (`@mod__fn`)** | **9/9** | bare `@name` symbols collide across packages → ABI break if changed later. Do FIRST. |
 > | LOCK-2 | **Annotation → compile-time codegen hook (L1/L2)** | 8/9 | the imperative→declarative migration breaks every user if the hook shape changes. |
 > | LOCK-3 | **Trait-conformance signature type-check** | 7/9 | a live soundness hole gating every trait-based API. |
-> | LOCK-4 | **Sized/unsigned numerics + f32/f16 (NType width/signed + ABI + elem_kind)** 🔄 inc1+inc2+**inc3a+inc3b (+crash-fix `19810c05`)+inc3c-part1a `fe6177a6` DONE** (width types + width-mismatch + wrapping arithmetic for direct-expr AND let-bound sized vars); inc3c-part2 (runtime-valued sized vars + f32 storage) · inc3d (packed arrays) open | 6/9 | the widest representation change — **the #1 risk**; touches type system, ABI, arrays. |
+> | LOCK-4 | **Sized/unsigned numerics + f32/f16** ✅ **COMPLETE** — inc1+inc2+inc3a+inc3b+inc3c-part1a+**inc3c-part2 `7cab5c9f` (annotations/conversions carry width) + f32 `09f89046` (REAL binary32: rounds after every op) + inc3d `fa9e1f7d` (packed typed arrays as a SEPARATE object kind)** | 9/9 | the widest representation change — **the #1 risk**; touches type system, ABI, arrays. |
 > | LOCK-5 | **Safepoint preemption + `kill`** | 6/9 | Mesh supervision & Reactor frame-budget are fiction without it; scheduler-deep. |
 > | LOCK-6 | **`@cdecl` FFI callbacks** | 5/9 | Prism-desktop / Edge / Reactor are dead without it (also Forge-ALPN). |
 > | LOCK-7 | **Constant-time `@ct` + `secure_zero` + `@redact` (`Secret<T>`)** ✅ `secure_zero` + `ct_eq` DONE `bab9fa57`. **AUDITED + HARDENED 2026-08-02 — both primitives were UNSOUND and one CRASHED.** Both used `strlen()`, which stops at the first 0x00 — and key material and MAC tags are binary. Proven by a CONTROL run of `_kat_lock7_ct` against the pre-fix runtime: (a) two IDENTICAL binary secrets compared **UNEQUAL** (for a `bytes` handle the old code strlen'd the NovaBytes *struct*, i.e. a heap pointer, so the result varied with the allocation address — non-deterministic auth), and (b) `secure_zero` on a string literal **SEGFAULTED**, because it wrote through an unvalidated handle straight into read-only `.rdata` — a write-what-where primitive reachable from any `any`-typed value. FIXED via `nova_secret_span()`: resolves the real span by TAG (BYTES→data/size, FAT_STR→NOVA_FAT_LEN, heap RAW→strlen), refuses non-heap handles when the caller intends to WRITE, and still allows literals for read-only compare. `ct_eq` now sweeps max(la,lb) substituting 0 past each end — the old loop ran min(la,lb) and skipped every byte past the shorter operand; bounds depend only on lengths, never on secret content (the same length-leak trade Go's `subtle.ConstantTimeCompare` and Python's `hmac.compare_digest` accept). `secure_zero` now returns 1=wiped / 0=refused instead of a constant 0 (no NOVA caller read it). KAT `_kat_lock7_ct` 6/6, each case failing-or-crashing pre-fix where claimed. Live forge call sites were NOT exploitable — they compare hex digests — but the primitive is public API. **LOCK-7 IS NOW COMPLETE — `@redact` LANDED 2026-08-02.** `@redact` on a struct field masks that field's VALUE in `str()`/`print()` and `to_json()` while KEEPING the key, so a password or token cannot ride along in a debug log or a serialized payload and the payload shape stays valid for consumers. `field_get()` is deliberately NOT redacted — that is a named, deliberate read, not accidental bulk disclosure, and masking it would break legitimate reflection while adding no protection against the actual threat (a careless log line). Implementation spans BOTH render paths, which is the part that is easy to get half-right: a `redact_mask` on `NovaStructMeta` for the RUNTIME reflection fallback (used when the static type is lost to `any`), AND the COMPILE-TIME generated `<T>__show`/`<T>__to_json`, which is what a statically-typed struct actually calls — patching only the runtime side left every secret still visible. Parser records field indices as a FLAG (never a marker Param: the type checker reads `Stmt.params` for constructor arity, so a marker would add a phantom argument). KAT `_kat_redact` 5/5. `Secret<T>` remains Phase 3. | Sentinel + Forge | Forge's LIVE crypto is already `-O2`-vulnerable; can't be bolted onto crypto after the fact. |
 > | LOCK-8/9 | **IR pointer address-space + GPU-buffer-as-Value + autodiff adjoint-rule table** | Cortex/Reactor | the GPU + training substrate; design-lock now, implement later. |
-> | LOCK-10/11/12 | **Const generics · struct-by-value FFI · Mesh wire-protocol + NodeRef** | Cortex/Reactor/Prism/Mesh | shape-checked tensors, native GUI/physics FFI, distribution identity. |
+> | LOCK-10/11/12 | **Const generics · struct-by-value FFI ✅ DONE (`09f89046` params, `cb9132c2` returns — per-target Win64/SysV/AAPCS64, verified against clang's own lowering) · Mesh wire-protocol + NodeRef** | Cortex/Reactor/Prism/Mesh | shape-checked tensors, native GUI/physics FFI, distribution identity. |
 >
 > **Core-ready vs blocked (post Phase-0 hardening):** READY = **Forge** (its locks harden paths it already
 > has) and **Ops** (only shares LOCK-1). BLOCKED on their locks = **Cortex** (heaviest: L4+L5+L8+L9+L10),
@@ -1689,7 +1695,7 @@ gap is open.**
 - **[lang]** L11 module namespacing (M) — do first (hard link-error wall; prerequisite for L1).
 - **[lang]** L12 + L13 ✅ DONE (2026-07-22) (S each) — parser gotchas, do anytime.
 - **[lang]** L6 enforced immutability (M) — ✅ DONE `1a65d7c0` (`let` vs `let mut` syntax).
-- **[lang]** L7 sized numerics + f32 (M) — 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE; inc3c-part2+inc3d OPEN.
+- **[lang]** L7 sized numerics + f32 (M) — ✅ **DONE**: inc1..inc3d all landed. `let x: u8 = 300` narrows to 44; `16777217.0f32` is 16777216.0 and f32 arithmetic rounds every step; f32-vs-f64 is a type error; packed `u8[]`/`f32[]` via std/collections/typedarray.
 - **[lang]** L8 custom operators (M) — ✅ **CLOSED `27c9bb49`**: index+iter `49f28f4f`, and call-overload now resolves the `let d = Doubler(3); d(7)` case too (ti_solve at the call site so the callee's type var is bound before the Struct__call redirect). KAT `_kat_call_overload` 8/8.
 - **[lang]** L3 variance (L) — after the trait-conformance fix.
 - **[lang]** **L1 annotations + codegen (XL)** — ✅ Phase-1 DONE: 15 annotation types across 5 batches (`1a65d7c0`..`e099c1ac`). Phase-2 (user-extensible) = OPEN.
