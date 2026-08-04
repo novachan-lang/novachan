@@ -9,27 +9,23 @@
 // race if shared); the actors serialize all state mutation through one owning green task, so
 // they are race-free by construction. Wire mw_rate_limit (forge_auth) over rate_limiter for
 // per-request limiting; wire conn_guard at the accept loop for accept-storm backpressure (503).
+//
+// On the 0/1 return convention: these are PREDICATES ("is this within the cap", "is this request
+// allowed"), not failure sentinels — a rate-limited request is a normal, expected outcome carrying
+// no error payload, so 0/1 IS the whole answer and Result would add ceremony without information.
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── Request size caps (reject before allocating) ───────────────────────────────
 
 // 1 if a body of `content_length` bytes is within max_bytes (and non-negative).
 fn limit_body_ok(content_length: int, max_bytes: int) -> int
-    if content_length < 0
-        return 0
-    if content_length > max_bytes
-        return 0
-    1
+    1 if content_length >= 0 and content_length <= max_bytes else 0
 
 fn limit_line_ok(line: string, max_len: int) -> int
-    if len(line) > max_len
-        return 0
-    1
+    1 if len(line) <= max_len else 0
 
 fn limit_headers_ok(count: int, max_headers: int) -> int
-    if count > max_headers
-        return 0
-    1
+    1 if count <= max_headers else 0
 
 // ── Token-bucket rate limiter (pure; single-owner) ─────────────────────────────
 // capacity tokens, refilled at refill_per_ms tokens/ms. Each allowed request costs tokens; when
@@ -39,16 +35,16 @@ fn limit_headers_ok(count: int, max_headers: int) -> int
 fn rate_new(capacity: float, refill_per_ms: float) -> dict
     {"cap": capacity, "tokens": capacity, "refill": refill_per_ms, "last": 0}
 
+// Deliberately NOT delegated to a library min: `min()` is typed -> int (wrong for a float bucket),
+// and the `fmin` builtin is not resolvable without an import, which would break this module's
+// leaf-with-zero-imports property. It also differs on NaN (C fmin returns the non-NaN operand;
+// this returns b), and the bucket must keep its exact float behaviour.
 fn _rate_min(a: float, b: float) -> float
-    if a < b
-        return a
-    b
+    a if a < b else b
 
 // returns 1 if allowed (and deducts cost), 0 if rate-limited
 fn rate_allow(b: dict, now_ms: int, cost: float) -> int
-    let elapsed = now_ms - b["last"]
-    if elapsed < 0
-        elapsed = 0
+    let elapsed = (now_ms - b["last"]) if now_ms >= b["last"] else 0
     let refilled = b["tokens"] + (elapsed + 0.0) * b["refill"]
     let tokens = _rate_min(b["cap"], refilled)
     b["last"] = now_ms
@@ -70,14 +66,22 @@ fn conn_acquire(g: dict) -> int
     g["cur"] = g["cur"] + 1
     1
 
+// floors at 0 -- an over-release must never inflate capacity.
 fn conn_release(g: dict)
-    let c = g["cur"] - 1
-    if c < 0
-        c = 0
-    g["cur"] = c
+    g["cur"] = (g["cur"] - 1) if g["cur"] > 0 else 0
 
 fn conn_count(g: dict) -> int
     g["cur"]
+
+// ── Actor request/reply plumbing ───────────────────────────────────────────────
+// One round-trip against an actor's request channel: attach a fresh private reply channel, send
+// the envelope, block for the answer. Shared by rate_check and cg_acquire (the dance was written
+// out twice). Fire-and-forget ops (stop/release) just send their envelope literal directly.
+fn _ask(req, env: dict) -> int
+    let rc = channel()
+    env["reply"] = rc
+    send(req, env)
+    receive(rc)
 
 // ── Rate-limiter ACTOR (N>1-safe: single-owner, per-key token buckets) ────────────────────────────
 // The pure rate_allow above mutates ONE bucket dict -- unsafe to share across the spawn-per-connection
@@ -93,37 +97,25 @@ fn _ratelimiter_loop(lim)
     while running == 1
         let env = receive(lim["req"])
         let op = env["op"]
-        if op == "stop"
-            running = 0
-        else if op == "check"
-            let key = env["key"]
-            if contains(buckets, key) == false
-                buckets[key] = rate_new(cap, refill)
-            send(env["reply"], rate_allow(buckets[key], env["now_ms"], 1.0))
+        match op
+            "stop"
+                running = 0
+            "check"
+                let key = env["key"]
+                if contains(buckets, key) == false
+                    buckets[key] = rate_new(cap, refill)
+                send(env["reply"], rate_allow(buckets[key], env["now_ms"], 1.0))
 
 fn rate_limiter(capacity: float, refill_per_ms: float) -> any
-    let lim = {}
-    lim["req"] = channel()
-    lim["cap"] = capacity
-    lim["refill"] = refill_per_ms
+    let lim = {"req": channel(), "cap": capacity, "refill": refill_per_ms}
     spawn _ratelimiter_loop(lim)
     lim
 
 fn rate_check(lim, key: string, now_ms: int) -> int
-    let rc = channel()
-    let env = {}
-    env["op"] = "check"
-    env["key"] = key
-    env["now_ms"] = now_ms
-    env["reply"] = rc
-    send(lim["req"], env)
-    receive(rc)
+    _ask(lim["req"], {"op": "check", "key": key, "now_ms": now_ms})
 
 fn rate_limiter_stop(lim)
-    let env = {}
-    env["op"] = "stop"
-    env["reply"] = 0
-    send(lim["req"], env)
+    send(lim["req"], {"op": "stop", "reply": 0})
 
 // ── Conn-guard ACTOR (N>1-safe: mirrors rate_limiter) ──────────────────────────────────────────────
 // The pure conn_new/conn_acquire dict counter races at NOVA_CARRIERS>1: the acceptor increments while a
@@ -137,42 +129,28 @@ fn _connguard_loop(g)
     while running == 1
         let env = receive(g["req"])
         let op = env["op"]
-        if op == "stop"
-            running = 0
-        else if op == "acquire"
-            if cur >= mx
-                send(env["reply"], 0)
-            else
-                cur = cur + 1
-                send(env["reply"], 1)
-        else if op == "release"
-            cur = cur - 1
-            if cur < 0
-                cur = 0
+        match op
+            "stop"
+                running = 0
+            "acquire"
+                if cur >= mx
+                    send(env["reply"], 0)
+                else
+                    cur = cur + 1
+                    send(env["reply"], 1)
+            "release"
+                cur = (cur - 1) if cur > 0 else 0
 
 fn conn_guard(max_conns: int) -> any
-    let g = {}
-    g["req"] = channel()
-    g["max"] = max_conns
+    let g = {"req": channel(), "max": max_conns}
     spawn _connguard_loop(g)
     g
 
 fn cg_acquire(g) -> int
-    let rc = channel()
-    let env = {}
-    env["op"] = "acquire"
-    env["reply"] = rc
-    send(g["req"], env)
-    receive(rc)
+    _ask(g["req"], {"op": "acquire"})
 
 fn cg_release(g)
-    let env = {}
-    env["op"] = "release"
-    env["reply"] = 0
-    send(g["req"], env)
+    send(g["req"], {"op": "release", "reply": 0})
 
 fn conn_guard_stop(g)
-    let env = {}
-    env["op"] = "stop"
-    env["reply"] = 0
-    send(g["req"], env)
+    send(g["req"], {"op": "stop", "reply": 0})

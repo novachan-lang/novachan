@@ -2,19 +2,17 @@
 // days_from_civil / civil_from_days, the same math libc++ <chrono> uses). Real date handling was a gap: this
 // gives ISO 8601 parse/format, weekday, add/diff days, days-in-month, leap-year, epoch<->date -- all in pure
 // integer math (no floats, no libc time struct, deterministic and timezone-free/UTC). LEAF -- imports NOTHING.
+//
+// LEAF IS A CONTRACT, NOT AN ACCIDENT: six forge modules (business_days, countdown, cron_next, httpdate,
+// ical, ordinal_date) sit on top of this, so it deliberately pulls in no std/ module -- the zero-padding
+// helpers below are two lines of comprehension rather than an import of std/core/str.
 
 // Days since 1970-01-01 for a civil date (y,m,d). Exact for all Gregorian dates.
 fn _days_from_civil(y: int, m: int, d: int) -> int
-    let yy = y
-    if m <= 2
-        yy = yy - 1
-    let era = yy / 400
-    if yy < 0
-        era = (yy - 399) / 400
+    let yy = (y - 1) if m <= 2 else y
+    let era = (yy / 400) if yy >= 0 else ((yy - 399) / 400)
     let yoe = yy - era * 400
-    let mm = m - 3
-    if m <= 2
-        mm = m + 9
+    let mm = (m + 9) if m <= 2 else (m - 3)
     let doy = (153 * mm + 2) / 5 + d - 1
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
     era * 146097 + doe - 719468
@@ -22,38 +20,29 @@ fn _days_from_civil(y: int, m: int, d: int) -> int
 // Inverse: [y, m, d] for days since 1970-01-01.
 fn _civil_from_days(z0: int) -> list
     let z = z0 + 719468
-    let era = z / 146097
-    if z < 0
-        era = (z - 146096) / 146097
+    let era = (z / 146097) if z >= 0 else ((z - 146096) / 146097)
     let doe = z - era * 146097
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
     let y = yoe + era * 400
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
     let mp = (5 * doy + 2) / 153
     let d = doy - (153 * mp + 2) / 5 + 1
-    let m = mp + 3
-    if mp >= 10
-        m = mp - 9
-    let yr = y
-    if m <= 2
-        yr = y + 1
+    let m = (mp + 3) if mp < 10 else (mp - 9)
+    let yr = (y + 1) if m <= 2 else y
     [yr, m, d]
 
 fn is_leap(y: int) -> bool
-    if y % 4 != 0
-        return false
-    if y % 100 != 0
-        return true
-    y % 400 == 0
+    y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 
+// Month lengths indexed by m-1. Any m outside 1..12 answers 30 -- that is the ORIGINAL contract
+// (the old code fell through an `if m == 2` / `contains([1,3,5,7,8,10,12], m)` ladder to 30) and it
+// is preserved deliberately rather than "fixed", because callers may already rely on it.
 fn days_in_month(y: int, m: int) -> int
     if m == 2
-        if is_leap(y)
-            return 29
-        return 28
-    if contains([1, 3, 5, 7, 8, 10, 12], m)
-        return 31
-    30
+        return 29 if is_leap(y) else 28
+    if m < 1 or m > 12
+        return 30
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
 
 // Epoch-day helpers (the canonical serializable form).
 fn date_to_epoch_days(y: int, m: int, d: int) -> int
@@ -65,15 +54,18 @@ fn date_from_epoch_days(days: int) -> list
 // 0=Sunday .. 6=Saturday (1970-01-01 was a Thursday).
 fn date_weekday(y: int, m: int, d: int) -> int
     let w = (_days_from_civil(y, m, d) + 4) % 7
-    if w < 0
-        return w + 7
-    w
+    (w + 7) if w < 0 else w
 
 fn date_weekday_name(wd: int) -> string
-    let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     if wd < 0 or wd > 6
         return ""
-    names[wd]
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][wd]
+
+// Result form of date_weekday_name -- says WHY instead of handing back an empty string.
+fn date_weekday_name_res(wd: int) -> Result
+    if wd < 0 or wd > 6
+        return err("forge_date: weekday out of range 0..6, got {wd}")
+    ok(date_weekday_name(wd))
 
 // [y,m,d] shifted by n days (n may be negative). Handles month/year rollover exactly.
 fn date_add_days(y: int, m: int, d: int, n: int) -> list
@@ -84,25 +76,43 @@ fn date_diff_days(y1: int, m1: int, d1: int, y2: int, m2: int, d2: int) -> int
     _days_from_civil(y2, m2, d2) - _days_from_civil(y1, m1, d1)
 
 fn _z2(n: int) -> string
-    if n < 10
-        return "0" + str(n)
-    str(n)
+    ("0" + str(n)) if n < 10 else str(n)
 
+// Left-pad to width 4 with '0'. Deliberately NOT a "{n:04d}" format spec: that renders -5 as "-005"
+// whereas this has always produced "00-5", and negative years are reachable through date_format_iso.
 fn _z4(n: int) -> string
     let s = str(n)
-    while len(s) < 4
-        s = "0" + s
-    s
+    let deficit = 4 - len(s)
+    if deficit <= 0
+        return s
+    join(["0" for _ in 0..deficit], "") + s
 
 // "YYYY-MM-DD" from (y,m,d).
 fn date_format_iso(y: int, m: int, d: int) -> string
-    _z4(y) + "-" + _z2(m) + "-" + _z2(d)
+    "{_z4(y)}-{_z2(m)}-{_z2(d)}"
 
 // Parse "YYYY-MM-DD" (or the date portion of an ISO datetime) -> [y,m,d]; [] if too short.
+// LENIENT BY CONTRACT: the fields are not range-checked and non-digits fall out of parse_int as 0.
+// Use date_parse_iso_res when you want the malformed case reported instead of silently accepted.
 fn date_parse_iso(s: string) -> list
     if len(s) < 10
         return []
     [parse_int(slice(s, 0, 4)), parse_int(slice(s, 5, 7)), parse_int(slice(s, 8, 10))]
+
+// Validating parse: ok([y,m,d]) or err(reason). Builds on date_parse_iso, then range-checks the
+// month and the day against the real length of that month in that year.
+fn date_parse_iso_res(s: string) -> Result
+    let ymd = date_parse_iso(s)
+    if len(ymd) == 0
+        return err("forge_date: ISO date needs at least 10 chars 'YYYY-MM-DD', got '{s}'")
+    let y = ymd[0]
+    let m = ymd[1]
+    let d = ymd[2]
+    if m < 1 or m > 12
+        return err("forge_date: month out of range 1..12 in '{s}', got {m}")
+    if d < 1 or d > days_in_month(y, m)
+        return err("forge_date: day out of range 1..{days_in_month(y, m)} in '{s}', got {d}")
+    ok(ymd)
 
 // Today (UTC) as [y,m,d] from the wall clock.
 fn date_today() -> list

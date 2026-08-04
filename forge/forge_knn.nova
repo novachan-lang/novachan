@@ -4,32 +4,34 @@
 // find the k most similar items (recommendations, "customers who bought this", nearest stores, deduplication).
 // No training phase -- it reasons directly from the examples. Points are feature vectors (lists of numbers of
 // equal length); distance is EUCLIDEAN. We rank by SQUARED distance (same ordering, and it skips the sqrt), so
-// results are exact and there is no floating-point square-root edge. LEAF -- imports NOTHING.
+// results are exact and there is no floating-point square-root edge.
+//
+// Imports std/core/collect for `frequencies` (the label histogram in knn_classify) -- previously hand-rolled
+// here. std/core/collect is itself a leaf, so this stays at the bottom of the dependency graph.
+import std/core/collect
 
 // Squared Euclidean distance between two equal-length feature vectors.
+// KEPT as an explicit float accumulation: `reduce` over a float-arithmetic closure corrupts raw floats
+// across the any-boxed HOF boundary, and `sum` is typed -> int. `for i in 0..len(a)` replaces the
+// hand-incremented index; the bound is read once, which is correct -- nothing here resizes `a`.
 fn knn_distance_sq(a: list, b: list) -> float
-    let sum = 0.0
-    let i = 0
-    while i < len(a)
+    let total = 0.0
+    for i in 0..len(a)
         let d = a[i] * 1.0 - b[i] * 1.0
-        sum = sum + d * d
-        i = i + 1
-    sum
+        total = total + d * d
+    total
 
 // The indices of the k points nearest to `query`, closest first. O(n*k-ish via insertion sort; fine for
 // the moderate n this method targets. Uses PARALLEL scalar arrays (dists + idxs) sorted together -- moving
 // list-typed elements while holding a reference to one corrupts under NOVA's list semantics.)
+// A k <= 0, or a k larger than the point set, is clamped rather than being an error.
 fn knn_nearest(points: list, query: list, k: int) -> list
-    let dists = []
-    let idxs = []
-    let i = 0
-    while i < len(points)
-        push(dists, knn_distance_sq(points[i], query))
-        push(idxs, i)
-        i = i + 1
-    // insertion sort both arrays together by distance ascending (scalar moves only)
-    let a = 1
-    while a < len(dists)
+    let dists = [knn_distance_sq(points[i], query) for i in 0..len(points)]
+    let idxs = [i for i in 0..len(points)]
+    // Insertion sort both arrays together by distance ascending (scalar moves only).
+    // KEPT as a loop, and the inner scan KEPT as a `while`: a sort is an in-place data-dependent
+    // permutation, and the inner shift SHORT-CIRCUITS on the first element that is not greater.
+    for a in 1..len(dists)
         let cd = dists[a] * 1.0
         let ci = idxs[a]
         let b = a - 1
@@ -39,55 +41,38 @@ fn knn_nearest(points: list, query: list, k: int) -> list
             b = b - 1
         dists[b + 1] = cd
         idxs[b + 1] = ci
-        a = a + 1
-    let out = []
-    let m = k
-    if m > len(idxs)
-        m = len(idxs)
-    let j = 0
-    while j < m
-        push(out, idxs[j])
-        j = j + 1
-    out
+    let m = k if k < len(idxs) else len(idxs)
+    [idxs[j] for j in 0..m]
 
 // Classify `query` by the majority label among its k nearest neighbors. `labels` are strings parallel to
 // `points`. Ties are broken toward the label of the CLOSEST tied neighbor.
+// NOTE: returns "" when there are no neighbors (empty `points`, or k <= 0) -- a sentinel that a caller
+// cannot distinguish from a genuine empty label. Preserved deliberately; changing it to a Result would
+// break every caller's signature. Flagged rather than silently "fixed".
 fn knn_classify(points: list, labels: list, query: list, k: int) -> string
     let idxs = knn_nearest(points, query, k)
-    let counts = {}
-    let i = 0
-    while i < len(idxs)
-        let lbl = str(labels[idxs[i]])
-        let c = 0
-        if contains(counts, lbl)
-            c = counts[lbl]
-        counts[lbl] = c + 1
-        i = i + 1
-    // pick max count; iterate neighbors closest-first so ties favor the nearer label
+    let near = [str(labels[i]) for i in idxs]
+    let counts = frequencies(near)
+    // Scan the neighbors CLOSEST-FIRST and keep the FIRST STRICT maximum, so a tie resolves to the
+    // label of the nearer neighbor. (The original also carried a `seen` dict to skip repeat labels;
+    // it was redundant -- a label's count is fixed, and `best_count` only ever grows, so a second
+    // sighting can never satisfy `cnt > best_count`.)
     let best_label = ""
     let best_count = 0
-    let seen = {}
-    let j = 0
-    while j < len(idxs)
-        let lbl = str(labels[idxs[j]])
-        if contains(seen, lbl) == false
-            seen[lbl] = 1
-            let cnt = counts[lbl]
-            if cnt > best_count
-                best_count = cnt
-                best_label = lbl
-        j = j + 1
+    for lbl in near
+        let cnt = counts[lbl]
+        if cnt > best_count
+            best_count = cnt
+            best_label = lbl
     best_label
 
 // Predict a numeric value for `query` as the average of its k nearest neighbors' values (KNN regression).
+// Returns 0.0 when there are no neighbors.
+// KEPT as an explicit float accumulation for the same reason as knn_distance_sq.
 fn knn_regress(points: list, values: list, query: list, k: int) -> float
     let idxs = knn_nearest(points, query, k)
-    let sum = 0.0
-    let i = 0
-    while i < len(idxs)
-        sum = sum + values[idxs[i]] * 1.0
-        i = i + 1
-    let avg = 0.0
-    if len(idxs) > 0
-        avg = sum / (len(idxs) * 1.0)
-    avg
+    let total = 0.0
+    for ix in idxs
+        total = total + values[ix] * 1.0
+    let n = len(idxs)
+    total / (n * 1.0) if n > 0 else 0.0

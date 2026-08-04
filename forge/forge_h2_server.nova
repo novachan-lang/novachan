@@ -23,50 +23,38 @@ import forge_h2
 fn h2_request_from_headers(headers: list) -> Request
     let method = "GET"
     let path = "/"
-    let hdrs = ""
-    let i = 0
-    while i < len(headers)
-        let h = headers[i]
+    // header lines are pushed to a list and joined ONCE -- `hdrs = hdrs + line` per header is
+    // quadratic (every append copies the whole block built so far).
+    let lines = []
+    for h in headers
         if h[0] == ":method"
             method = h[1]
         else if h[0] == ":path"
             path = h[1]
         else if h[0] == ":authority"
-            hdrs = hdrs + "Host: " + h[1] + "\r\n"
+            push(lines, "Host: {h[1]}\r\n")
         else if not starts_with(h[0], ":")
-            hdrs = hdrs + h[0] + ": " + h[1] + "\r\n"
-        i = i + 1
-    forge.build_request(method + " " + path + " HTTP/1.1\r\n" + hdrs + "\r\n", 0)
+            push(lines, "{h[0]}: {h[1]}\r\n")
+    let hdrs = join(lines, "")
+    forge.build_request("{method} {path} HTTP/1.1\r\n{hdrs}\r\n", 0)
 
 // Encode a Forge Response as the HTTP/2 frames for a stream: a HEADERS frame ([:status] + response headers,
 // HPACK-encoded, END_HEADERS) followed by a DATA frame (body, END_STREAM). Returns the concatenated byte list.
 fn h2_response_frames(resp: Response, stream_id: int) -> list
-    let hdrs = []
-    push(hdrs, [":status", str(resp.status)])
-    let ks = keys(resp.headers)
-    let i = 0
-    while i < len(ks)
-        push(hdrs, [lower(ks[i]), resp.headers[ks[i]]])
-        i = i + 1
+    let hdrs = [[":status", str(resp.status)], ...[[lower(k), resp.headers[k]] for k in keys(resp.headers)]]
     let hblock = forge_hpack.hpack_encode_header_block(hdrs)
-    let out = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS(), stream_id, hblock)
-    let body = []
-    let j = 0
-    while j < len(resp.body)
-        push(body, ord(char_at(resp.body, j)))
-        j = j + 1
+    let hframe = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS(), stream_id, hblock)
+    let body = [ord(char_at(resp.body, j)) for j in 0..len(resp.body)]
     let dframe = forge_h2.h2_frame(forge_h2.h2_DATA(), forge_h2.h2_END_STREAM(), stream_id, body)
-    let k = 0
-    while k < len(dframe)
-        push(out, dframe[k])
-        k = k + 1
-    out
+    [...hframe, ...dframe]
 
 // Client/test-side: decode the response frames (HEADERS + DATA) back to [status, body]. Useful for an h2
 // client and to verify h2_response_frames without a second import of forge_h2/forge_hpack in the test.
 fn h2_decode_response(frames: list) -> list
     let status = 0
-    let body = ""
+    // DATA bytes accumulate as a list of 1-char pieces joined ONCE at the end; `body = body + chr(b)`
+    // per payload byte is quadratic in the response size.
+    let bparts = []
     let pos = 0
     let n = len(frames)
     while pos < n
@@ -76,73 +64,44 @@ fn h2_decode_response(frames: list) -> list
         else
             if fp[0] == forge_h2.h2_HEADERS()
                 let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(frames, fp), [])
-                let hs = dec[0]
-                let i = 0
-                while i < len(hs)
-                    if hs[i][0] == ":status"
-                        let sr = parse_int_safe(hs[i][1])
+                // no early exit: the LAST :status in the block wins, exactly as before
+                for hp in dec[0]
+                    if hp[0] == ":status"
+                        let sr = parse_int_safe(hp[1])
                         if is_ok(sr)
                             status = unwrap(sr)
-                    i = i + 1
             else if fp[0] == forge_h2.h2_DATA()
-                let db = forge_h2.h2_payload(frames, fp)
-                let j = 0
-                while j < len(db)
-                    body = body + chr(db[j])
-                    j = j + 1
+                for b in forge_h2.h2_payload(frames, fp)
+                    push(bparts, chr(b))
             pos = fp[5]
-    [status, body]
+    [status, join(bparts, "")]
 
 // ── byte-list <-> NovaBytes conversions (frames are int lists; the socket is bytes) ────────────────────
+// bytes_append is amortized O(1) (the runtime grows by doubling), so this accumulation is linear.
 fn list_to_bytes(lst: list) -> any
     let b = bytes(0)
-    let i = 0
-    while i < len(lst)
-        b = bytes_append(b, lst[i])
-        i = i + 1
+    for v in lst
+        b = bytes_append(b, v)
     b
 
 fn bytes_to_list(b) -> list
-    let out = []
-    let i = 0
-    while i < bytes_len(b)
-        push(out, bytes_get(b, i))
-        i = i + 1
-    out
+    [bytes_get(b, i) for i in 0..bytes_len(b)]
 
+// tail of `lst` from index `from` (>= len(lst) -> empty). NOT delegated to std/core/list's list_drop:
+// this module deliberately keeps a single import path (see the header note on module diamonds), and
+// list_drop additionally clamps a NEGATIVE n to 0 where this never receives one (callers pass a frame end).
 fn _slice_list(lst: list, from: int) -> list
-    let out = []
-    let i = from
-    while i < len(lst)
-        push(out, lst[i])
-        i = i + 1
-    out
+    [lst[i] for i in from..len(lst)]
 
 // Build a full h2c client request as a byte list: connection preface + empty SETTINGS + a HEADERS frame
 // (HPACK-encoded :method/:scheme/:path/:authority, END_HEADERS|END_STREAM on stream 1). For clients/tests.
 fn h2_client_request_frames(method: string, path: string) -> list
-    let out = []
     let pf = forge_h2.h2_preface()
-    let i = 0
-    while i < len(pf)
-        push(out, ord(char_at(pf, i)))
-        i = i + 1
-    let s = forge_h2.h2_settings([])
-    let j = 0
-    while j < len(s)
-        push(out, s[j])
-        j = j + 1
-    let hdrs = []
-    push(hdrs, [":method", method])
-    push(hdrs, [":scheme", "http"])
-    push(hdrs, [":path", path])
-    push(hdrs, [":authority", "localhost"])
+    let pbytes = [ord(char_at(pf, i)) for i in 0..len(pf)]
+    let sf = forge_h2.h2_settings([])
+    let hdrs = [[":method", method], [":scheme", "http"], [":path", path], [":authority", "localhost"]]
     let hf = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS() | forge_h2.h2_END_STREAM(), 1, forge_hpack.hpack_encode_header_block(hdrs))
-    let k = 0
-    while k < len(hf)
-        push(out, hf[k])
-        k = k + 1
-    out
+    [...pbytes, ...sf, ...hf]
 
 // serve_h2c(app, port, n): a cleartext HTTP/2 (prior-knowledge) server. Accepts `n` connections; per conn:
 // read the 24-byte preface, send our SETTINGS, then read frames -- ignore SETTINGS/etc, and on the first
@@ -150,12 +109,10 @@ fn h2_client_request_frames(method: string, path: string) -> list
 // HEADERS+DATA frames back, then close. v1 serves one stream per connection (multi-stream is a follow-up).
 fn serve_h2c(a, port: int, n: int)
     let listener = tcp_listen(port)
-    let ci = 0
-    while ci < n
+    for ci in 0..n
         let conn = tcp_accept(listener)
         if conn >= 0
             _h2c_serve_conn(a, conn)
-        ci = ci + 1
     tcp_close(listener)
 
 // The shared h2 frame-driving core, factored out of the (formerly h2c-only) connection loop so BOTH
@@ -170,6 +127,8 @@ fn _h2_drive_conn(a, post_preface: list, recv, send)
     let dyn = []
     let alive = true
     let served = 0
+    // the frame pump is a protocol state machine (blist is refilled and re-sliced as frames complete),
+    // so it stays a `while` -- there is no iteration count to range over.
     while alive
         let fp = forge_h2.h2_frame_parse(blist, 0)
         if len(fp) == 0
@@ -177,11 +136,9 @@ fn _h2_drive_conn(a, post_preface: list, recv, send)
             if bytes_len(more) == 0
                 alive = false
             else
-                let ml = bytes_to_list(more)
-                let k = 0
-                while k < len(ml)
-                    push(blist, ml[k])
-                    k = k + 1
+                // push (not blist = [...blist, ...ml]) -- rebuilding the buffer per read is quadratic
+                for mv in bytes_to_list(more)
+                    push(blist, mv)
         else
             if fp[0] == forge_h2.h2_HEADERS()
                 let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(blist, fp), dyn)
@@ -196,23 +153,23 @@ fn _h2_drive_conn(a, post_preface: list, recv, send)
 // Read the 24-byte h2 connection preface via `recv` (tcp_recv_bytes or tls_recv_bytes -- whichever
 // transport the caller is on), so this accumulation logic exists in exactly one place instead of
 // being copy-pasted per transport (h2c below and h2-over-TLS further down both call this). Returns
-// [1, rest] on success (rest = whatever bytes arrived past the preface, handed to _h2_drive_conn as
-// its post_preface), or [0, empty] if the peer closed before completing it.
-fn _h2_read_preface(recv) -> list
+// ok(rest) -- rest = whatever bytes arrived past the preface, handed to _h2_drive_conn as its
+// post_preface -- or err(..) if the peer closed before completing it.
+fn _h2_read_preface(recv) -> Result
     let buf = bytes(0)
     while bytes_len(buf) < 24
         let more = recv()
         if bytes_len(more) == 0
-            return [0, bytes(0)]
+            return err("h2: peer closed before the 24-byte connection preface")
         buf = bytes_concat(buf, more)
-    [1, bytes_slice(buf, 24, bytes_len(buf))]
+    ok(bytes_slice(buf, 24, bytes_len(buf)))
 
 fn _h2c_serve_conn(a, conn: int)
     defer tcp_close(conn)
     let r = _h2_read_preface(fn() tcp_recv_bytes(conn))
-    if r[0] == 0
+    if is_err(r)
         return
-    let post = bytes_to_list(r[1])
+    let post = bytes_to_list(unwrap(r))
     _h2_drive_conn(a, post, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d))
 
 // ── HTTP/2 over TLS, negotiated via ALPN (D-ALPN) ──────────────────────────────────────────────────────
@@ -233,7 +190,8 @@ fn _h2tls_max_body() -> int
 
 // Content-Length value out of a raw header-block string (case-insensitive), 0 if absent or malformed.
 // Digit-by-digit via find() on "0123456789" so a header that ends mid-number stops cleanly at the
-// declared bound (`n`) rather than indexing out of range.
+// declared bound (`n`) rather than indexing out of range. 0 is a real answer here ("no declared body"),
+// not a failure sentinel, so this stays an int rather than becoming a Result.
 fn _h2tls_content_length(headers: string) -> int
     let lo = lower(headers)
     let idx = find(lo, "content-length:")
@@ -241,6 +199,8 @@ fn _h2tls_content_length(headers: string) -> int
         return 0
     let p = idx + 15
     let n = len(headers)
+    // both scans are data-dependent (skip spaces, then consume digits until a non-digit) -- no
+    // iteration count to range over, and the digit loop short-circuits on the first non-digit.
     while p < n and headers[p] == " "
         p = p + 1
     let v = 0
@@ -259,25 +219,26 @@ fn _h2tls_content_length(headers: string) -> int
 // Read ONE HTTP/1.1 request off a TLS connection: accumulate bytes until the header terminator
 // (\r\n\r\n), then read exactly Content-Length more bytes of body if one was declared. Bounded by
 // _h2tls_max_header/_h2tls_max_body so a stalled or hostile client can never grow either buffer past a
-// fixed cap. Returns "" if the connection closed before a complete request arrived.
-fn _h2tls_recv_http11(conn: int) -> string
+// fixed cap. Returns ok(request-text), or err(..) if the connection closed before a complete request
+// arrived / either bound was exceeded (was a bare "" sentinel, which the caller had to re-derive).
+fn _h2tls_recv_http11(conn: int) -> Result
     let acc = bytes(0)
     let text = ""
     let hdr_end = -1
     while hdr_end < 0
         let more = tls_recv_bytes(conn)
         if bytes_len(more) == 0
-            return ""
+            return err("h2/1.1: connection closed before the header terminator")
         acc = bytes_concat(acc, more)
         if bytes_len(acc) > _h2tls_max_header()
-            return ""
+            return err("h2/1.1: header block exceeds the {_h2tls_max_header()}-byte bound")
         text = bytes_to_str(acc)
         hdr_end = find(text, "\r\n\r\n")
     let cl = _h2tls_content_length(slice(text, 0, hdr_end))
     if cl <= 0
-        return text
+        return ok(text)
     if cl > _h2tls_max_body()
-        return ""
+        return err("h2/1.1: Content-Length exceeds the {_h2tls_max_body()}-byte bound")
     let need_total = hdr_end + 4 + cl
     // bytes_len(acc), NOT len(text): bytes_to_str tags its result NOVA_MEM_RAW, so len()/str ops on
     // it fall through to C strlen() -- a body containing an embedded 0x00 byte before need_total
@@ -290,9 +251,10 @@ fn _h2tls_recv_http11(conn: int) -> string
     while bytes_len(acc) < need_total
         let more2 = tls_recv_bytes(conn)
         if bytes_len(more2) == 0
-            return bytes_to_str(acc)
+            // peer closed mid-body: hand back the truncated request rather than dropping it, as before
+            return ok(bytes_to_str(acc))
         acc = bytes_concat(acc, more2)
-    bytes_to_str(acc)
+    ok(bytes_to_str(acc))
 
 // Minimal HTTP/1.1 fallback for a TLS connection that did NOT negotiate "h2" -- either the client only
 // offered http/1.1, or ALPN negotiation itself failed (tls_listen_alpn/tls_accept fail OPEN to plain
@@ -303,7 +265,10 @@ fn _h2tls_recv_http11(conn: int) -> string
 // HTTPS/1.1 server, use forge.serve_req/serve_app layered over forge_tls_server.nova's TLS 1.3 stack
 // instead -- see the module note above for why the two TLS stacks cannot share a connection handle.
 fn _h2tls_serve_http11(a, conn: int)
-    let raw = _h2tls_recv_http11(conn)
+    let rr = _h2tls_recv_http11(conn)
+    if is_err(rr)
+        return
+    let raw = unwrap(rr)
     if len(raw) == 0
         return
     let req = forge.build_request(raw, 0)
@@ -315,9 +280,9 @@ fn _h2tls_serve_http11(a, conn: int)
 // parameterized over the TLS byte transport instead of raw tcp.
 fn _h2tls_serve_conn_h2(a, conn: int)
     let r = _h2_read_preface(fn() tls_recv_bytes(conn))
-    if r[0] == 0
+    if is_err(r)
         return
-    let post = bytes_to_list(r[1])
+    let post = bytes_to_list(unwrap(r))
     _h2_drive_conn(a, post, fn() tls_recv_bytes(conn), fn(d) tls_send_bytes(conn, d))
 
 // Per-connection dispatch once the TLS+ALPN handshake has picked a protocol: "h2" drives the h2 frame
@@ -353,9 +318,7 @@ fn serve_h2_tls(a, port: int, cert_path: string, key_path: string, n: int)
     if listener == 0
         return
     tls_listen_alpn(listener, "h2,http/1.1")
-    let ci = 0
-    while ci < n
+    for ci in 0..n
         let conn = tls_accept(listener)
         if conn != 0
             _h2tls_serve_conn(a, conn)
-        ci = ci + 1

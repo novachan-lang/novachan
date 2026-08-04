@@ -15,49 +15,27 @@
 // what the client cares about. A nested-fragment dynamic (a sub-view) is a later extension.
 
 // Assemble the full document from statics + dynamics (the first render, or a server-side check).
+// O(n): collect the interleaved pieces, then join ONCE. The old `out = out + ...` reallocated
+// and recopied the whole document on every slot -- quadratic in the number of slots.
 fn live_html(statics, dynamics) -> string
-    let out = ""
-    let i = 0
-    while i < len(dynamics)
-        out = out + statics[i] + str(dynamics[i])
-        i = i + 1
-    out + statics[len(statics) - 1]
+    let parts = [str(statics[i]) + str(dynamics[i]) for i in 0..len(dynamics)]
+    join(parts, "") + statics[len(statics) - 1]
 
 // Diff two dynamics lists -> a patch {changed:[{i, val}]} carrying ONLY the slots whose rendered value
 // changed. Statics never travel after the first render. Same template -> same slot count, so the lists
 // are the same length; a defensive bound on old_dyn handles a first-ever diff against an empty list.
+// ONE comprehension whose filter IS the "did this slot change?" test: a slot travels when it is
+// beyond the old render (the defensive first-ever-diff case) or renders differently.
 fn live_diff(old_dyn, new_dyn) -> any
-    let changed = []
-    let i = 0
-    while i < len(new_dyn)
-        let same = false
-        if i < len(old_dyn)
-            if str(old_dyn[i]) == str(new_dyn[i])
-                same = true
-        if same == false
-            let c = {}
-            c["i"] = i
-            c["val"] = new_dyn[i]
-            push(changed, c)
-        i = i + 1
-    let patch = {}
-    patch["changed"] = changed
-    patch
+    let changed = [{"i": i, "val": new_dyn[i]} for i in 0..len(new_dyn) if i >= len(old_dyn) or str(old_dyn[i]) != str(new_dyn[i])]
+    {"changed": changed}
 
 // Apply a patch to an old dynamics list -> the new dynamics (what the client does on receipt). Returns a
 // fresh list (no mutation of the input); only the patched indices differ.
 fn live_apply(old_dyn, patch) -> any
-    let out = []
-    let i = 0
-    while i < len(old_dyn)
-        push(out, old_dyn[i])
-        i = i + 1
-    let changed = patch["changed"]
-    let j = 0
-    while j < len(changed)
-        let c = changed[j]
+    let out = [...old_dyn]                   // spread = the fresh copy the contract promises
+    for c in patch["changed"]
         out[c["i"]] = c["val"]
-        j = j + 1
     out
 
 // Number of slots in a patch (the wire-size proxy -- 0 means "nothing to send").
@@ -97,9 +75,7 @@ fn _live_loop(view_fn, update_fn, initial_state, in_ch, out_ch)
 // view_fn/update_fn are passed straight to the spawned loop (the same way a GenServer hands its handler
 // to its loop); the channels are shared across the spawn boundary, so the handle wires both directions.
 fn live_view(view_fn, update_fn, initial_state) -> any
-    let lv = {}
-    lv["in"] = channel()
-    lv["out"] = channel()
+    let lv = {"in": channel(), "out": channel()}
     spawn _live_loop(view_fn, update_fn, initial_state, lv["in"], lv["out"])
     lv
 
@@ -118,36 +94,22 @@ fn live_recv(lv) -> any
 // "c" = changed slots; each is {i: slot index, v: rendered string}. Values are stringified (the client
 // substitutes text by index) and JSON-escaped so a value containing a quote or backslash cannot break
 // the message framing. Braces/quotes are built via chr() -- a literal '{' interpolates in a NOVA string.
+// Two linear passes instead of a per-character `out = out + ch` accumulation (which reallocated
+// and recopied the whole prefix on EVERY character -- quadratic in the value length).
+// ORDER IS LOAD-BEARING: backslash first, then quote. The quote pass only ever introduces
+// backslashes as escape PREFIXES, and a backslash-first order guarantees those are never
+// re-escaped -- exactly the per-character semantics of the old scan.
 fn _json_escape(s: string) -> string
     let bs = chr(92)
     let q = chr(34)
-    let out = ""
-    let i = 0
-    while i < len(s)
-        let ch = char_at(s, i)
-        if ch == bs
-            out = out + bs + bs
-        else if ch == q
-            out = out + bs + q
-        else
-            out = out + ch
-        i = i + 1
-    out
+    s.replace(bs, bs + bs).replace(q, bs + q)
 
 fn patch_json(patch) -> string
     let lb = chr(123)
     let rb = chr(125)
     let q = chr(34)
-    let changed = patch["changed"]
-    let body = lb + q + "c" + q + ":["
-    let i = 0
-    while i < len(changed)
-        let c = changed[i]
-        if i > 0
-            body = body + ","
-        body = body + lb + q + "i" + q + ":" + str(c["i"]) + "," + q + "v" + q + ":" + q + _json_escape(str(c["val"])) + q + rb
-        i = i + 1
-    body + "]" + rb
+    let items = [lb + q + "i" + q + ":" + str(c["i"]) + "," + q + "v" + q + ":" + q + _json_escape(str(c["val"])) + q + rb for c in patch["changed"]]
+    lb + q + "c" + q + ":[" + join(items, ",") + "]" + rb
 
 // The MOUNT frame: the first message a client receives on connect. It carries the STATICS (sent exactly
 // once) plus the initial DYNAMICS, so the client renders the full document and then applies every later
@@ -159,21 +121,9 @@ fn live_mount_json(statics, dynamics) -> string
     let lb = chr(123)
     let rb = chr(125)
     let q = chr(34)
-    let body = lb + q + "s" + q + ":["
-    let i = 0
-    while i < len(statics)
-        if i > 0
-            body = body + ","
-        body = body + q + _json_escape(statics[i]) + q
-        i = i + 1
-    body = body + "]," + q + "d" + q + ":["
-    let j = 0
-    while j < len(dynamics)
-        if j > 0
-            body = body + ","
-        body = body + q + _json_escape(str(dynamics[j])) + q
-        j = j + 1
-    body + "]" + rb
+    let sparts = [q + _json_escape(s) + q for s in statics]
+    let dparts = [q + _json_escape(str(d)) + q for d in dynamics]
+    lb + q + "s" + q + ":[" + join(sparts, ",") + "]," + q + "d" + q + ":[" + join(dparts, ",") + "]" + rb
 
 // ── Per-connection driver (the transport-agnostic LiveView connection) ────────────────────────────
 // live_conn is the loop the WS runner SPAWNS once per connection. Spawning it is what makes LiveView
@@ -213,8 +163,7 @@ fn live_conn(statics, view_fn, update_fn, initial_state, events, out) -> int
 // materialized via replace -> the returned string is real, valid JS.
 fn live_client_js() -> string
     let tpl = "(function()@var statics=[],dyn=[];function render()@var el=document.getElementById('live-root');if(!el)return;var out='';for(var i=0;i<dyn.length;i++)@out+=statics[i]+dyn[i];#out+=statics[statics.length-1];el.innerHTML=out;#var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/live');ws.onmessage=function(e)@var m=JSON.parse(e.data);if(m.s)@statics=m.s;dyn=m.d;render();#else if(m.c)@for(var i=0;i<m.c.length;i++)@dyn[m.c[i].i]=m.c[i].v;#render();##;window.liveSend=function(ev)@ws.send(ev);#;#)();"
-    let withopen = replace(tpl, "@", chr(123))
-    replace(withopen, "#", chr(125))
+    tpl.replace("@", chr(123)).replace("#", chr(125))
 
 // Split a template's markup into the statics list on a caller-chosen marker (where dynamics go). The
 // marker must be a non-brace token (e.g. "@@") since a literal { interpolates in NOVA strings. The
@@ -250,24 +199,16 @@ fn _live_loop_info(view_fn, update_fn, info_fn, initial_state, in_ch, out_ch)
 // Spawn a live view that also handles server-push messages. Handle {in,out}: drive client events with
 // live_send_ev, push server messages with live_send_info, drain patches with live_recv.
 fn live_view_info(view_fn, update_fn, info_fn, initial_state) -> any
-    let lv = {}
-    lv["in"] = channel()
-    lv["out"] = channel()
+    let lv = {"in": channel(), "out": channel()}
     spawn _live_loop_info(view_fn, update_fn, info_fn, initial_state, lv["in"], lv["out"])
     lv
 
 // Send a CLIENT event into an on_info live view (drives update_fn).
 fn live_send_ev(lv, ev) -> int
-    let env = {}
-    env["k"] = "ev"
-    env["d"] = ev
-    send(lv["in"], env)
+    send(lv["in"], {"k": "ev", "d": ev})
     0
 
 // Push a SERVER message into an on_info live view (drives info_fn) -- e.g. forward a pubsub broadcast here.
 fn live_send_info(lv, msg) -> int
-    let env = {}
-    env["k"] = "info"
-    env["d"] = msg
-    send(lv["in"], env)
+    send(lv["in"], {"k": "info", "d": msg})
     0

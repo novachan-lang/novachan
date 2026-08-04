@@ -2,194 +2,138 @@
 // Pure byte-list operations; no crypto dependency (the certificate signature is verified by the caller
 // using forge_crypto). DER tags: SEQUENCE 0x30, INTEGER 0x02, OID 0x06, BIT STRING 0x03, OCTET STRING
 // 0x04, UTCTime 0x17, [0] EXPLICIT 0xa0.
+//
+// Every offset in this module is an absolute index into the caller's byte-list. A TLV record is always the
+// 4-tuple [tag, length, value_start, next_offset] — `value_start` opens the value, `next_offset` opens the
+// SIBLING that follows, which is how the walks below step from field to field. Out-of-range reads return 0
+// (runtime-guarded), so a malformed certificate yields nonsense offsets rather than a crash, and every
+// public predicate here fails CLOSED on nonsense.
 
 // Parse one TLV at offset `off` -> [tag, length, value_start, next_offset].
 fn der_tlv(b, off: int) -> list
     let tag = b[off]
     let lb = b[off + 1]
-    let length = 0
-    let vstart = 0
+    // short form: the length byte IS the length
     if lb < 128
-        length = lb
-        vstart = off + 2
-    else
-        let nbytes = lb & 127
-        let acc = 0
-        let i = 0
-        while i < nbytes
-            acc = (acc << 8) | b[off + 2 + i]
-            i = i + 1
-        length = acc
-        vstart = off + 2 + nbytes
-    let r = []
-    push(r, tag)
-    push(r, length)
-    push(r, vstart)
-    push(r, vstart + length)
-    r
+        return [tag, lb, off + 2, off + 2 + lb]
+    // long form: 0x80|n, then n big-endian length bytes
+    let nbytes = lb & 127
+    let length = reduce([b[off + 2 + i] for i in 0..nbytes], (acc, v) => (acc << 8) | v, 0)
+    let vstart = off + 2 + nbytes
+    [tag, length, vstart, vstart + length]
 
+// The bytes of `b` in [start, end). An empty or inverted range yields [].
 fn der_slice(b, start: int, end: int) -> list
-    let out = []
-    let i = start
-    while i < end
-        push(out, b[i])
-        i = i + 1
-    out
+    [b[i] for i in start..end]
 
+// Concatenate two byte-lists.
 fn x_cat(a, b) -> list
-    let o = []
-    let i = 0
-    while i < len(a)
-        push(o, a[i])
-        i = i + 1
-    let j = 0
-    while j < len(b)
-        push(o, b[j])
-        j = j + 1
-    o
+    [...a, ...b]
 
 // DER length encoding (short form < 128, else 0x80|n followed by big-endian length bytes).
 fn der_enc_len(n: int) -> list
-    let out = []
     if n < 128
-        push(out, n)
-    else
-        let tmp = []
-        let v = n
-        while v > 0
-            push(tmp, v & 255)
-            v = v >> 8
-        push(out, 128 | len(tmp))
-        let i = len(tmp) - 1
-        while i >= 0
-            push(out, tmp[i])
-            i = i - 1
-    out
+        return [n]
+    // digits fall out least-significant first and the step is data-dependent (v >>= 8), so this stays a
+    // while; the big-endian order DER wants is then just the reverse of what came out.
+    let tmp = []
+    let v = n
+    while v > 0
+        push(tmp, v & 255)
+        v = v >> 8
+    [128 | len(tmp), ...reverse(tmp)]
 
 // Encode one TLV: tag || length || value.
 fn der_enc(tag: int, value) -> list
-    let out = []
-    push(out, tag)
-    let lb = der_enc_len(len(value))
-    let i = 0
-    while i < len(lb)
-        push(out, lb[i])
-        i = i + 1
-    let j = 0
-    while j < len(value)
-        push(out, value[j])
-        j = j + 1
-    out
+    [tag, ...der_enc_len(len(value)), ...value]
 
 // Parse a SubjectPublicKeyInfo -> [algorithm_oid_bytes, public_key_bytes].
 fn x509_spki_key(der) -> list
     let spki = der_tlv(der, 0)
     let alg = der_tlv(der, spki[2])
     let algoid = der_tlv(der, alg[2])
-    let oid = der_slice(der, algoid[2], algoid[3])
     let keybits = der_tlv(der, alg[3])
     // BIT STRING value begins with the unused-bits count (0x00 for keys)
-    let key = der_slice(der, keybits[2] + 1, keybits[3])
-    let r = []
-    push(r, oid)
-    push(r, key)
-    r
+    [der_slice(der, algoid[2], algoid[3]), der_slice(der, keybits[2] + 1, keybits[3])]
 
-// Parse a Certificate -> [tbs_raw, signature, spki_key, spki_alg_oid, serial, notBefore, notAfter].
-// tbs_raw is the exact DER of tbsCertificate (the bytes covered by the certificate signature).
-fn x509_parse_cert(der) -> list
+// Walk the fixed tbsCertificate fields ONCE and hand back each one's TLV record by name. Every certificate
+// accessor below reads its offsets from here, so the field walk exists in exactly one place instead of
+// being re-derived (previously five times, which is five chances to drift). Because a DER element begins
+// where its predecessor ends, "siginner"[3] is also the start of the raw issuer DN and "validity"[3] the
+// start of the raw subject DN — that is how the *_raw accessors recover whole elements including their tag.
+fn _x509_tbs(der) -> dict
     let outer = der_tlv(der, 0)
     let tbs = der_tlv(der, outer[2])
-    let tbs_raw = der_slice(der, outer[2], tbs[3])
-    let sigalg = der_tlv(der, tbs[3])
-    let sigval = der_tlv(der, sigalg[3])
-    let sig = der_slice(der, sigval[2] + 1, sigval[3])
-    // walk tbsCertificate children
-    let p = tbs[2]
-    let first = der_tlv(der, p)
-    if first[0] == 160
-        p = first[3]
+    let first = der_tlv(der, tbs[2])
+    // optional [0] EXPLICIT version (tag 0xa0 = 160) precedes serialNumber
+    let p = first[3] if first[0] == 160 else tbs[2]
     let serial = der_tlv(der, p)
     let siginner = der_tlv(der, serial[3])
     let issuer = der_tlv(der, siginner[3])
     let validity = der_tlv(der, issuer[3])
     let subject = der_tlv(der, validity[3])
-    let spki = der_tlv(der, subject[3])
-    let alg = der_tlv(der, spki[2])
+    {"outer": outer,
+     "tbs": tbs,
+     "serial": serial,
+     "siginner": siginner,
+     "issuer": issuer,
+     "validity": validity,
+     "subject": subject,
+     "spki": der_tlv(der, subject[3])}
+
+// Parse a Certificate -> [tbs_raw, signature, spki_key, spki_alg_oid, serial, notBefore, notAfter].
+// tbs_raw is the exact DER of tbsCertificate (the bytes covered by the certificate signature).
+fn x509_parse_cert(der) -> list
+    let f = _x509_tbs(der)
+    let tbs = f["tbs"]
+    let sigalg = der_tlv(der, tbs[3])
+    let sigval = der_tlv(der, sigalg[3])
+    let alg = der_tlv(der, f["spki"][2])
     let algoid = der_tlv(der, alg[2])
-    let spki_oid = der_slice(der, algoid[2], algoid[3])
     let keybits = der_tlv(der, alg[3])
-    let spki_key = der_slice(der, keybits[2] + 1, keybits[3])
-    let nb = der_tlv(der, validity[2])
+    let serial = f["serial"]
+    let nb = der_tlv(der, f["validity"][2])
     let na = der_tlv(der, nb[3])
-    let r = []
-    push(r, tbs_raw)
-    push(r, sig)
-    push(r, spki_key)
-    push(r, spki_oid)
-    push(r, der_slice(der, serial[2], serial[3]))
-    push(r, der_slice(der, nb[2], nb[3]))
-    push(r, der_slice(der, na[2], na[3]))
-    r
+    // both BIT STRINGs skip their leading unused-bits count
+    [der_slice(der, f["outer"][2], tbs[3]),
+     der_slice(der, sigval[2] + 1, sigval[3]),
+     der_slice(der, keybits[2] + 1, keybits[3]),
+     der_slice(der, algoid[2], algoid[3]),
+     der_slice(der, serial[2], serial[3]),
+     der_slice(der, nb[2], nb[3]),
+     der_slice(der, na[2], na[3])]
 
 // The certificate's outer signatureAlgorithm OID bytes (how the cert was signed by its issuer).
 fn x509_sig_alg_oid(der) -> list
-    let outer = der_tlv(der, 0)
-    let tbs = der_tlv(der, outer[2])
-    let sigalg = der_tlv(der, tbs[3])
+    let sigalg = der_tlv(der, _x509_tbs(der)["tbs"][3])
     let oid = der_tlv(der, sigalg[2])
     der_slice(der, oid[2], oid[3])
 
 // Raw issuer Distinguished Name element (whole SEQUENCE, tag..end) for byte-equality name chaining.
 fn x509_issuer_raw(der) -> list
-    let outer = der_tlv(der, 0)
-    let tbs = der_tlv(der, outer[2])
-    let p = tbs[2]
-    let first = der_tlv(der, p)
-    if first[0] == 160
-        p = first[3]
-    let serial = der_tlv(der, p)
-    let siginner = der_tlv(der, serial[3])
-    let issuer = der_tlv(der, siginner[3])
-    der_slice(der, siginner[3], issuer[3])
+    let f = _x509_tbs(der)
+    der_slice(der, f["siginner"][3], f["issuer"][3])
 
 // Raw subject Distinguished Name element (whole SEQUENCE, tag..end).
 fn x509_subject_raw(der) -> list
-    let outer = der_tlv(der, 0)
-    let tbs = der_tlv(der, outer[2])
-    let p = tbs[2]
-    let first = der_tlv(der, p)
-    if first[0] == 160
-        p = first[3]
-    let serial = der_tlv(der, p)
-    let siginner = der_tlv(der, serial[3])
-    let issuer = der_tlv(der, siginner[3])
-    let validity = der_tlv(der, issuer[3])
-    let subject = der_tlv(der, validity[3])
-    der_slice(der, validity[3], subject[3])
+    let f = _x509_tbs(der)
+    der_slice(der, f["validity"][3], f["subject"][3])
 
-// Returns 1 iff the certificate asserts BasicConstraints cA=TRUE (i.e. it is permitted to act as a CA and
-// issue other certificates). Walks the tbsCertificate to the [3] EXPLICIT extensions block (tag 0xa3=163),
-// finds the basicConstraints extension (OID 2.5.29.19 = bytes 55 1d 13), and checks its cA BOOLEAN. Absent
-// basicConstraints => DEFAULT FALSE => returns 0. Malformed DER => 0 (fail-closed; index reads are bounds-
-// guarded by the runtime). This is the check that prevents the CVE-2002-0862 chain-forgery: an end-entity
-// (cA=FALSE) cert must NOT be accepted as an issuer of another certificate.
-fn x509_is_ca(der) -> int
-    let outer = der_tlv(der, 0)
-    let tbs = der_tlv(der, outer[2])
-    let tbs_end = tbs[3]
-    let p = tbs[2]
-    let first = der_tlv(der, p)
-    if first[0] == 160
-        p = first[3]
-    let serial = der_tlv(der, p)
-    let siginner = der_tlv(der, serial[3])
-    let issuer = der_tlv(der, siginner[3])
-    let validity = der_tlv(der, issuer[3])
-    let subject = der_tlv(der, validity[3])
-    let spki = der_tlv(der, subject[3])
-    // optional [1] issuerUID (0xa1), [2] subjectUID (0xa2), [3] extensions (0xa3=163) follow the SPKI
-    let q = spki[3]
+// ── Extension scanning ────────────────────────────────────────────────────────────────────────────────
+// Find every v3 extension whose extnID is the 3-byte OID (b0,b1,b2) and hand its parsed extnValue content
+// TLV to `probe`; answer 1 as soon as a probe answers 1, else 0. The scan is the shared skeleton of
+// x509_is_ca and x509_matches_host — those differ ONLY in which OID they look for and what they then ask
+// of the value, so the question is passed in as a closure rather than copied twice.
+//
+// A probe answering 0 does NOT stop the scan: a certificate carrying the extension twice still gets every
+// copy examined, exactly as the inline scans this replaces did. Malformed DER => no probe ever answers 1
+// => 0 (fail-closed).
+fn _x509_scan_ext(der, b0: int, b1: int, b2: int, probe) -> int
+    let f = _x509_tbs(der)
+    let tbs_end = f["tbs"][3]
+    // optional [1] issuerUID (0xa1), [2] subjectUID (0xa2), [3] extensions (0xa3=163) follow the SPKI.
+    // Both walks step by the element's own encoded length, so they stay `while`.
+    let q = f["spki"][3]
     while q < tbs_end
         let el = der_tlv(der, q)
         if el[0] == 163
@@ -198,39 +142,55 @@ fn x509_is_ca(der) -> int
             while e < exts[3]
                 let ext = der_tlv(der, e)
                 let eoid = der_tlv(der, ext[2])
-                // basicConstraints OID == 55 1d 13
-                if eoid[1] == 3 and der[eoid[2]] == 85 and der[eoid[2] + 1] == 29 and der[eoid[2] + 2] == 19
-                    // skip optional critical BOOLEAN to reach the OCTET STRING extnValue
+                if eoid[1] == 3 and der[eoid[2]] == b0 and der[eoid[2] + 1] == b1 and der[eoid[2] + 2] == b2
+                    // skip the optional critical BOOLEAN to reach the OCTET STRING extnValue
                     let nx = der_tlv(der, eoid[3])
                     if nx[0] == 1
                         nx = der_tlv(der, nx[3])
-                    // extnValue (OCTET STRING, tag 4) wraps SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
-                    let bc = der_tlv(der, nx[2])
-                    if bc[1] >= 1
-                        let cab = der_tlv(der, bc[2])
-                        if cab[0] == 1 and cab[1] >= 1 and der[cab[2]] != 0
-                            return 1
+                    // extnValue (OCTET STRING, tag 4) wraps the extension's own structure
+                    if probe(der_tlv(der, nx[2])) == 1
+                        return 1
                 e = ext[3]
         q = el[3]
     0
 
+// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... } — 1 iff cA is present and TRUE.
+fn _x509_bc_is_ca(der, bc) -> int
+    if bc[1] < 1
+        return 0
+    let cab = der_tlv(der, bc[2])
+    if cab[0] == 1 and cab[1] >= 1 and der[cab[2]] != 0
+        return 1
+    0
+
+// Returns 1 iff the certificate asserts BasicConstraints cA=TRUE (i.e. it is permitted to act as a CA and
+// issue other certificates). basicConstraints is OID 2.5.29.19 = bytes 55 1d 13. Absent basicConstraints
+// => DEFAULT FALSE => returns 0. Malformed DER => 0 (fail-closed). This is the check that prevents the
+// CVE-2002-0862 chain-forgery: an end-entity (cA=FALSE) cert must NOT be accepted as an issuer of another
+// certificate.
+fn x509_is_ca(der) -> int
+    _x509_scan_ext(der, 85, 29, 19, (bc) => _x509_bc_is_ca(der, bc))
+
 // ── Hostname verification (SubjectAltName, RFC 6125) ──────────────────────────────────────────────────
 // Lowercase one ASCII byte (DNS names are case-insensitive).
 fn _x509_lc(c) -> int
-    if c >= 65 and c <= 90
-        return c + 32
-    c
+    c + 32 if c >= 65 and c <= 90 else c
 
 // Case-insensitive equality of two byte-lists.
 fn _x509_ci_eq(a, b) -> int
     if len(a) != len(b)
         return 0
-    let i = 0
-    while i < len(a)
+    for i in 0..len(a)
         if _x509_lc(a[i]) != _x509_lc(b[i])
             return 0
-        i = i + 1
     1
+
+// Index of the first '.' (46) in a byte-list, or -1 when there is none.
+fn _x509_first_dot(host) -> int
+    for i in 0..len(host)
+        if host[i] == 46
+            return i
+    0 - 1
 
 // Match a SAN dNSName pattern against a host. Exact (case-insensitive), or a leftmost-label wildcard
 // "*.suffix" that matches exactly ONE label: "*.example.com" matches "a.example.com" but NOT
@@ -240,72 +200,33 @@ fn _x509_dns_match(san, host) -> int
         return 1
     if len(san) < 3
         return 0
+    // 42 = '*', 46 = '.' — the wildcard must be the WHOLE leftmost label
     if san[0] != 42 or san[1] != 46
         return 0
-    let suffix = []
-    let i = 2
-    while i < len(san)
-        push(suffix, san[i])
-        i = i + 1
-    // the first dot in host splits off the single label the wildcard may cover
-    let dot = 0 - 1
-    let j = 0
-    while j < len(host)
-        if host[j] == 46 and dot == (0 - 1)
-            dot = j
-        j = j + 1
+    let suffix = der_slice(san, 2, len(san))
+    // the first dot in host splits off the single label the wildcard may cover; dot == 0 would mean an
+    // empty label and dot == -1 no dot at all, and neither may match a "*." pattern
+    let dot = _x509_first_dot(host)
     if dot <= 0
         return 0
-    let rest = []
-    let k = dot + 1
-    while k < len(host)
-        push(rest, host[k])
-        k = k + 1
-    _x509_ci_eq(rest, suffix)
+    _x509_ci_eq(der_slice(host, dot + 1, len(host)), suffix)
 
-// Returns 1 iff the certificate's SubjectAltName contains a dNSName that matches `host` (the hostname as a
-// byte-list, e.g. str_to_blist("example.com") -- kept as bytes so this DER module stays crypto-dependency-
-// free). A certificate with NO SAN does NOT match (the modern RFC 6125 rule -- the legacy subject CN is
-// intentionally ignored). This is the host-identity check a TLS client runs AFTER chain_verify proves the
-// chain to the trust anchor.
-fn x509_matches_host(der, host) -> int
-    let outer = der_tlv(der, 0)
-    let tbs = der_tlv(der, outer[2])
-    let tbs_end = tbs[3]
-    let p = tbs[2]
-    let first = der_tlv(der, p)
-    if first[0] == 160
-        p = first[3]
-    let serial = der_tlv(der, p)
-    let siginner = der_tlv(der, serial[3])
-    let issuer = der_tlv(der, siginner[3])
-    let validity = der_tlv(der, issuer[3])
-    let subject = der_tlv(der, validity[3])
-    let spki = der_tlv(der, subject[3])
-    let q = spki[3]
-    while q < tbs_end
-        let el = der_tlv(der, q)
-        if el[0] == 163
-            let exts = der_tlv(der, el[2])
-            let e = exts[2]
-            while e < exts[3]
-                let ext = der_tlv(der, e)
-                let eoid = der_tlv(der, ext[2])
-                // subjectAltName OID == 55 1d 11
-                if eoid[1] == 3 and der[eoid[2]] == 85 and der[eoid[2] + 1] == 29 and der[eoid[2] + 2] == 17
-                    let nx = der_tlv(der, eoid[3])
-                    if nx[0] == 1
-                        nx = der_tlv(der, nx[3])
-                    let gn = der_tlv(der, nx[2])
-                    let g = gn[2]
-                    while g < gn[3]
-                        let name = der_tlv(der, g)
-                        // dNSName = [2] IMPLICIT IA5String, tag 0x82 = 130
-                        if name[0] == 130
-                            let dns = der_slice(der, name[2], name[3])
-                            if _x509_dns_match(dns, host) == 1
-                                return 1
-                        g = name[3]
-                e = ext[3]
-        q = el[3]
+// 1 iff any dNSName inside this SubjectAltName GeneralNames SEQUENCE matches `host`.
+fn _x509_san_matches(der, gn, host) -> int
+    // steps by each GeneralName's encoded length, so it stays a `while`
+    let g = gn[2]
+    while g < gn[3]
+        let name = der_tlv(der, g)
+        // dNSName = [2] IMPLICIT IA5String, tag 0x82 = 130
+        if name[0] == 130 and _x509_dns_match(der_slice(der, name[2], name[3]), host) == 1
+            return 1
+        g = name[3]
     0
+
+// Returns 1 iff the certificate's SubjectAltName (OID 2.5.29.17 = bytes 55 1d 11) contains a dNSName that
+// matches `host` (the hostname as a byte-list, e.g. str_to_blist("example.com") -- kept as bytes so this
+// DER module stays crypto-dependency-free). A certificate with NO SAN does NOT match (the modern RFC 6125
+// rule -- the legacy subject CN is intentionally ignored). This is the host-identity check a TLS client
+// runs AFTER chain_verify proves the chain to the trust anchor.
+fn x509_matches_host(der, host) -> int
+    _x509_scan_ext(der, 85, 29, 17, (gn) => _x509_san_matches(der, gn, host))

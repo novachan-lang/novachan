@@ -59,60 +59,55 @@ fn _stm_max_body() -> int
 // every high-level frame builder (including caller-supplied extra headers) is injection-safe: a raw
 // LF/CR in a header can never split into a second header line or a second frame.
 
+// The 4 reserved octets as a lookup table. This replaces an if-ladder over string constants: the
+// table IS the spec's escape list, so adding/auditing a mapping is a one-line data change rather
+// than another `else if` branch.
+fn _stm_escape_map() -> dict
+    return {"\\": "\\\\", "\n": "\\n", "\r": "\\r", ":": "\\c"}
+
+// The reverse table, keyed by the character FOLLOWING the backslash.
+fn _stm_unescape_map() -> dict
+    return {"r": "\r", "n": "\n", "c": ":", "\\": "\\"}
+
+// RAISED: this built its result with `out = out + piece` per character, which is QUADRATIC in NOVA
+// (every append reallocates and copies everything accumulated so far). A header value is attacker-
+// influenced and unbounded in length, so that was a real DoS amplifier, not just a slow path.
+// Now: map each character through the escape table and `join` ONCE -- O(n).
 fn stomp_escape_header(s: string, escape: int) -> string
     if escape == 0
         return s
-    let n = len(s)
-    let out = ""
-    let i = 0
-    while i < n
-        let ch = slice(s, i, i + 1)
-        if ch == "\\"
-            out = out + "\\\\"
-        else if ch == "\n"
-            out = out + "\\n"
-        else if ch == "\r"
-            out = out + "\\r"
-        else if ch == ":"
-            out = out + "\\c"
-        else
-            out = out + ch
-        i = i + 1
-    out
+    let esc = _stm_escape_map()
+    let chars = [slice(s, i, i + 1) for i in 0..len(s)]
+    join([get(esc, c, c) for c in chars], "")
 
 // stomp_unescape_header: reverse of stomp_escape_header. An unrecognized escape sequence (backslash
 // followed by anything other than r/n/c/\\, or a trailing backslash at end-of-string) is passed through
 // LITERALLY rather than treated as a fatal error -- defensive against a malformed/adversarial peer;
 // never crashes, never silently drops bytes.
+// RAISED the same way as stomp_escape_header (quadratic `out = out + piece` -> push + one `join`)
+// and the 4-branch if-ladder -> the _stm_unescape_map table. The `while` is KEPT: the cursor advances
+// by 1 or 2 depending on the byte it just read, which is a data-dependent step, not a range.
 fn stomp_unescape_header(s: string, escape: int) -> string
     if escape == 0
         return s
+    let unesc = _stm_unescape_map()
     let n = len(s)
-    let out = ""
+    let parts = []
     let i = 0
     while i < n
         let ch = slice(s, i, i + 1)
         if ch == "\\" and i + 1 < n
             let nx = slice(s, i + 1, i + 2)
-            if nx == "r"
-                out = out + "\r"
-                i = i + 2
-            else if nx == "n"
-                out = out + "\n"
-                i = i + 2
-            else if nx == "c"
-                out = out + ":"
-                i = i + 2
-            else if nx == "\\"
-                out = out + "\\"
+            if contains(unesc, nx)
+                push(parts, unesc[nx])
                 i = i + 2
             else
-                out = out + ch
+                push(parts, ch)
                 i = i + 1
         else
-            out = out + ch
+            push(parts, ch)
             i = i + 1
-    out
+    join(parts, "")
 
 // _stm_strip_crlf: used ONLY on the non-escaping (CONNECT/CONNECTED) path. Those two frame types never
 // escape header values (spec-mandated, for 1.0/1.1 compatibility), which would otherwise let a raw LF/CR
@@ -120,16 +115,11 @@ fn stomp_unescape_header(s: string, escape: int) -> string
 // Since a legitimate host/login/passcode/heart-beat value never legitimately contains a control
 // character, we defensively DROP any CR/LF byte from the value rather than reject the whole frame --
 // closes the injection vector while staying wire-compatible with 1.0/1.1 brokers for the common case.
+// RAISED: it is a filter, so it is written as one -- a filtering comprehension plus a single `join`,
+// instead of the quadratic per-character `out = out + ch`.
 fn _stm_strip_crlf(s: string) -> string
-    let n = len(s)
-    let out = ""
-    let i = 0
-    while i < n
-        let ch = slice(s, i, i + 1)
-        if ch != "\n" and ch != "\r"
-            out = out + ch
-        i = i + 1
-    out
+    let chars = [slice(s, i, i + 1) for i in 0..len(s)]
+    join([c for c in chars if c != "\n" and c != "\r"], "")
 
 // ── generic frame encode / decode (byte-exact, content-length aware) ───────────────────────────────
 
@@ -148,25 +138,21 @@ fn stomp_encode_frame(command: string, headers: list, body) -> any
     let out = str_to_bytes(command)
     out = bytes_append(out, _stm_lf())
 
-    let i = 0
-    let nh = len(headers)
-    while i < nh
-        let pair = headers[i]
-        let k = pair[0]
-        let v = pair[1]
-        let ek = k
-        let ev = v
+    // Iterating the pairs directly; the byte accumulation itself is left alone on purpose -- this is
+    // the wire encoder, and its emission order IS the frame layout.
+    for pair in headers
+        let ek = pair[0]
+        let ev = pair[1]
         if escape == 1
-            ek = stomp_escape_header(k, 1)
-            ev = stomp_escape_header(v, 1)
+            ek = stomp_escape_header(ek, 1)
+            ev = stomp_escape_header(ev, 1)
         else
-            ek = _stm_strip_crlf(k)
-            ev = _stm_strip_crlf(v)
+            ek = _stm_strip_crlf(ek)
+            ev = _stm_strip_crlf(ev)
         out = bytes_concat(out, str_to_bytes(ek))
         out = bytes_append(out, _stm_colon())
         out = bytes_concat(out, str_to_bytes(ev))
         out = bytes_append(out, _stm_lf())
-        i = i + 1
 
     out = bytes_append(out, _stm_lf())
     out = bytes_concat(out, body)
@@ -180,41 +166,28 @@ fn _stm_read_line_bytes(b, pos: int) -> list
     let n = bytes_len(b)
     let cur = pos
     let found = -1
+    // KEPT: a byte scan that SHORT-CIRCUITS on the first LF. Wire framing -- untouched.
     while cur < n and found == -1
         if bytes_get(b, cur) == _stm_lf()
             found = cur
         else
             cur = cur + 1
     if found == -1
-        let result = []
-        push(result, bytes_to_str(bytes_slice(b, pos, n)))
-        push(result, n)
-        return result
-    let result = []
-    push(result, bytes_to_str(bytes_slice(b, pos, found)))
-    push(result, found + 1)
-    result
+        return [bytes_to_str(bytes_slice(b, pos, n)), n]
+    [bytes_to_str(bytes_slice(b, pos, found)), found + 1]
 
 // _stm_split_header_line: split "key:value" on the FIRST colon only (STOMP 1.2 allows a raw, unescaped
 // colon nowhere in a well-formed header line except as the key/value separator -- any colon inside an
 // escaped value arrives on the wire as the two-char sequence "\c", never a bare ':'). Returns ["", ""]
 // if the line has no colon at all (malformed).
+// RAISED: the hand-rolled first-colon scan (which walked the WHOLE line even after finding it) is
+// the exact contract of the `str_index_of` builtin -- first index, or -1 when absent. Verified on
+// all four edges before delegating: found-at-0, found-in-middle, absent, empty string.
 fn _stm_split_header_line(line: string) -> list
-    let n = len(line)
-    let colon = -1
-    let i = 0
-    while i < n
-        if colon == -1 and slice(line, i, i + 1) == ":"
-            colon = i
-        i = i + 1
-    let result = []
+    let colon = str_index_of(line, ":")
     if colon == -1
-        push(result, "")
-        push(result, "")
-        return result
-    push(result, slice(line, 0, colon))
-    push(result, slice(line, colon + 1, n))
-    result
+        return ["", ""]
+    [slice(line, 0, colon), slice(line, colon + 1, len(line))]
 
 // _stm_read_raw_headers: read header lines starting at `start_pos` until a blank line (or end of
 // buffer). Returns [pairs, next_pos] where pairs is a list of [key,value] string pairs IN WIRE FORM
@@ -225,21 +198,19 @@ fn _stm_read_raw_headers(b, start_pos: int) -> list
     let pairs = []
     let pos = start_pos
     let reading = 1
+    // KEPT as a `while`: the cursor advances by whatever the next line consumed, and the loop stops
+    // on the blank line. Wire framing -- untouched.
     while reading == 1 and pos < n
         let hres = _stm_read_line_bytes(b, pos)
         let hline = hres[0]
-        let next = hres[1]
-        pos = next
+        pos = hres[1]
         if len(hline) == 0
             reading = 0
         else
             let kv = _stm_split_header_line(hline)
             if len(kv[0]) > 0
                 push(pairs, kv)
-    let result = []
-    push(result, pairs)
-    push(result, pos)
-    result
+    [pairs, pos]
 
 // stomp_parse_frame: parse one complete STOMP frame from `bytes` into
 //   {"command": string, "headers": dict<string,string>, "body": bytes}
@@ -278,14 +249,11 @@ fn stomp_parse_frame(frame_bytes) -> dict
     let body_start = rh[1]
 
     let headers = {}
-    let i = 0
-    let np = len(pairs)
-    while i < np
-        let k = stomp_unescape_header(pairs[i][0], escape)
-        let v = stomp_unescape_header(pairs[i][1], escape)
+    for pair in pairs
+        let k = stomp_unescape_header(pair[0], escape)
+        let v = stomp_unescape_header(pair[1], escape)
         if not contains(headers, k)
             headers[k] = v
-        i = i + 1
 
     let body = bytes(0)
     if contains(headers, "content-length")
@@ -315,9 +283,8 @@ fn stomp_parse_frame(frame_bytes) -> dict
 // stomp_connect_frame: build a CONNECT (or, if `command`=="STOMP", a STOMP) frame. `login`/`passcode`
 // are omitted from the frame entirely when empty (no empty-header noise on the wire).
 fn stomp_connect_frame(command: string, host: string, login: string, passcode: string, heartbeat_cx: int, heartbeat_cy: int) -> any
-    let headers = []
-    push(headers, ["accept-version", "1.2"])
-    push(headers, ["host", host])
+    // Not a comprehension: two of the five entries are CONDITIONAL, and the wire order matters.
+    let headers = [["accept-version", "1.2"], ["host", host]]
     if len(login) > 0
         push(headers, ["login", login])
     if len(passcode) > 0
@@ -330,44 +297,35 @@ fn stomp_connect_frame(command: string, host: string, login: string, passcode: s
 // (e.g. content-type, receipt, transaction, or any custom header) are inserted between `destination`
 // and the auto-computed `content-length`.
 fn stomp_send_frame(destination: string, body, extra_headers: list) -> any
-    let headers = []
-    push(headers, ["destination", destination])
-    let i = 0
-    let n = len(extra_headers)
-    while i < n
-        push(headers, extra_headers[i])
-        i = i + 1
-    push(headers, ["content-length", str(bytes_len(body))])
+    // The copy loop was exactly a splice, so it is written as one -- spread keeps the wire order
+    // (destination, caller's extras, content-length) literally visible in the source.
+    let headers = [["destination", destination], ...extra_headers, ["content-length", str(bytes_len(body))]]
     stomp_encode_frame("SEND", headers, body)
 
 // stomp_subscribe_frame: `ack` is one of "auto" (default if ""), "client", "client-individual"; header
 // omitted (broker defaults to "auto") when `ack` is "".
 fn stomp_subscribe_frame(id: string, destination: string, ack: string) -> any
-    let headers = []
-    push(headers, ["id", id])
-    push(headers, ["destination", destination])
+    let headers = [["id", id], ["destination", destination]]
     if len(ack) > 0
         push(headers, ["ack", ack])
     stomp_encode_frame("SUBSCRIBE", headers, bytes(0))
 
 fn stomp_unsubscribe_frame(id: string) -> any
-    let headers = []
-    push(headers, ["id", id])
-    stomp_encode_frame("UNSUBSCRIBE", headers, bytes(0))
+    stomp_encode_frame("UNSUBSCRIBE", [["id", id]], bytes(0))
+
+// ACK and NACK are byte-for-byte the same frame shape with a different command word -- they were two
+// identical bodies. One builder, parameterised by the command; the two public names stay.
+fn _stm_id_txn_frame(command: string, id: string, transaction: string) -> any
+    let headers = [["id", id]]
+    if len(transaction) > 0
+        push(headers, ["transaction", transaction])
+    stomp_encode_frame(command, headers, bytes(0))
 
 fn stomp_ack_frame(id: string, transaction: string) -> any
-    let headers = []
-    push(headers, ["id", id])
-    if len(transaction) > 0
-        push(headers, ["transaction", transaction])
-    stomp_encode_frame("ACK", headers, bytes(0))
+    _stm_id_txn_frame("ACK", id, transaction)
 
 fn stomp_nack_frame(id: string, transaction: string) -> any
-    let headers = []
-    push(headers, ["id", id])
-    if len(transaction) > 0
-        push(headers, ["transaction", transaction])
-    stomp_encode_frame("NACK", headers, bytes(0))
+    _stm_id_txn_frame("NACK", id, transaction)
 
 fn stomp_disconnect_frame(receipt: string) -> any
     let headers = []
@@ -390,17 +348,19 @@ fn _stm_recv_at_least(sock: int, buf, need: int) -> any
 // _stm_peek_content_length: given a buffer that holds AT LEAST the full header section (up through
 // `hdr_end`, the first byte of the body), return the parsed content-length header value, or -1 if that
 // header is absent. Used by stomp_read_frame to size the body fetch BEFORE the body has fully arrived.
+// KEPT as a loop: this is a FIND, and it short-circuits. `hdr_end` is unused (the header section is
+// re-scanned from offset 0) -- preserved in the signature rather than changed during a raise.
 fn _stm_peek_content_length(buf, hdr_end: int) -> int
     let cmd_res = _stm_read_line_bytes(buf, 0)
     let rh = _stm_read_raw_headers(buf, cmd_res[1])
-    let pairs = rh[0]
-    let i = 0
-    let n = len(pairs)
     let found = -1
-    while i < n and found == -1
-        if pairs[i][0] == "content-length"
-            found = parse_int(pairs[i][1])
-        i = i + 1
+    for pair in rh[0]
+        if pair[0] == "content-length"
+            found = parse_int(pair[1])
+            // Exactly the original's `found == -1` continue-condition: a header value that parses
+            // to -1 is indistinguishable from "not found" here, so the scan goes on. Preserved.
+            if found != -1
+                break
     found
 
 // stomp_read_frame: read exactly one STOMP frame off `sock`, buffering with carried-over `buf`.
@@ -422,10 +382,7 @@ fn stomp_read_frame(sock: int, buf) -> any
     while skip_done == 0
         buf = _stm_recv_at_least(sock, buf, 1)
         if bytes_len(buf) < 1
-            let out = []
-            push(out, stomp_parse_frame(bytes(0)))
-            push(out, buf)
-            return out
+            return [stomp_parse_frame(bytes(0)), buf]
         if bytes_get(buf, 0) == _stm_lf()
             buf = bytes_slice(buf, 1, bytes_len(buf))
         else
@@ -436,10 +393,7 @@ fn stomp_read_frame(sock: int, buf) -> any
     while hdr_end == -1
         buf = _stm_recv_at_least(sock, buf, scan_from + 2)
         if bytes_len(buf) < scan_from + 2
-            let out = []
-            push(out, stomp_parse_frame(bytes(0)))
-            push(out, buf)
-            return out
+            return [stomp_parse_frame(bytes(0)), buf]
         let n = bytes_len(buf)
         let i = scan_from
         while i < n - 1 and hdr_end == -1
@@ -455,27 +409,18 @@ fn stomp_read_frame(sock: int, buf) -> any
         let total = hdr_end + clen + 1
         buf = _stm_recv_at_least(sock, buf, total)
         if bytes_len(buf) < total
-            let out = []
-            push(out, stomp_parse_frame(bytes(0)))
-            push(out, buf)
-            return out
+            return [stomp_parse_frame(bytes(0)), buf]
         frame_bytes = bytes_slice(buf, 0, total)
         buf = bytes_slice(buf, total, bytes_len(buf))
     else if clen > _stm_max_body()
-        let out = []
-        push(out, stomp_parse_frame(bytes(0)))
-        push(out, bytes(0))
-        return out
+        return [stomp_parse_frame(bytes(0)), bytes(0)]
     else
         let scan_pos = hdr_end
         let nul_found = -1
         while nul_found == -1
             buf = _stm_recv_at_least(sock, buf, scan_pos + 1)
             if bytes_len(buf) <= scan_pos
-                let out = []
-                push(out, stomp_parse_frame(bytes(0)))
-                push(out, buf)
-                return out
+                return [stomp_parse_frame(bytes(0)), buf]
             if bytes_get(buf, scan_pos) == _stm_nul()
                 nul_found = scan_pos
             else
@@ -483,32 +428,26 @@ fn stomp_read_frame(sock: int, buf) -> any
         frame_bytes = bytes_slice(buf, 0, nul_found + 1)
         buf = bytes_slice(buf, nul_found + 1, bytes_len(buf))
 
-    let result = []
-    push(result, stomp_parse_frame(frame_bytes))
-    push(result, buf)
-    result
+    [stomp_parse_frame(frame_bytes), buf]
 
 // stomp_open: TCP-connect to host:port, send CONNECT, and wait for the CONNECTED reply.
 // Returns ok([sock, leftover_buf, connected_headers]) or err(message).
 fn stomp_open(host: string, port: int, vhost: string, login: string, passcode: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
-        return err("stomp: cannot connect to " + host + ":" + str(port))
+        return err("stomp: cannot connect to {host}:{port}")
     tcp_send_bytes(sock, stomp_connect_frame("CONNECT", vhost, login, passcode, 0, 0))
     let rd = stomp_read_frame(sock, bytes(0))
     let frame = rd[0]
     let leftover = rd[1]
     if frame["command"] == "ERROR"
         tcp_close(sock)
-        return err("stomp: broker sent ERROR: " + bytes_to_str(frame["body"]))
+        let detail = bytes_to_str(frame["body"])
+        return err("stomp: broker sent ERROR: {detail}")
     if frame["command"] != "CONNECTED"
         tcp_close(sock)
         return err("stomp: no CONNECTED frame received")
-    let result = []
-    push(result, sock)
-    push(result, leftover)
-    push(result, frame["headers"])
-    ok(result)
+    ok([sock, leftover, frame["headers"]])
 
 // stomp_close: send DISCONNECT then close the socket.
 fn stomp_close(sock: int, receipt_id: string)

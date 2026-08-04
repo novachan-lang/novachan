@@ -35,15 +35,14 @@ fn _cstr(s: string) -> any
 
 // Read a C string from `b` at `p` -> [string, next_offset_after_NUL].
 fn _rd_cstr(b, p: int) -> any
-    let s = ""
+    // The scan is data-dependent (stop at the NUL), so the `while` stays -- but the string is built by
+    // pushing one char per byte and join()ing ONCE. `s = s + chr(..)` was quadratic (realloc+copy per byte).
+    let parts = []
     let i = p
     while bytes_get(b, i) != 0
-        s = s + chr(bytes_get(b, i))
+        push(parts, chr(bytes_get(b, i)))
         i = i + 1
-    let r = []
-    push(r, s)
-    push(r, i + 1)
-    r
+    [join(parts, ""), i + 1]
 
 // StartupMessage: int32 length (incl. itself) + int32 protocol (196608 = v3.0) + "user\0<u>\0database\0<d>\0"
 // + a final \0 (empty key terminates the parameter list).
@@ -71,12 +70,10 @@ fn pg_parse_row_description(b, off: int) -> any
     let count = pg_rd_be16(b, off + 5)
     let names = []
     let p = off + 7
-    let i = 0
-    while i < count
+    for i in 0..count
         let r = _rd_cstr(b, p)
         push(names, r[0])
         p = r[1] + 18
-        i = i + 1
     names
 
 // Parse a DataRow ('D') message at `off` -> the list of column value strings ("" for SQL NULL). Layout:
@@ -85,21 +82,15 @@ fn pg_parse_data_row(b, off: int) -> any
     let count = pg_rd_be16(b, off + 5)
     let vals = []
     let p = off + 7
-    let i = 0
-    while i < count
+    for i in 0..count
         let vlen = pg_rd_be32(b, p)
         p = p + 4
         if vlen > 2147483647
             push(vals, "")
         else
-            let s = ""
-            let j = 0
-            while j < vlen
-                s = s + chr(bytes_get(b, p + j))
-                j = j + 1
-            push(vals, s)
+            // was a quadratic `s = s + chr(..)` per byte -> one comprehension + a single join.
+            push(vals, join([chr(bytes_get(b, p + j)) for j in 0..vlen], ""))
             p = p + vlen
-        i = i + 1
     vals
 
 // ── SCRAM-SHA-256 client (RFC 5802 / RFC 7677), pure-NOVA via forge_crypto ─────────────────────────
@@ -108,7 +99,7 @@ fn pg_parse_data_row(b, off: int) -> any
 // ClientProof) and the expected ServerSignature (to verify the server-final). gs2 header "n,," -> "biws".
 
 fn pg_scram_client_first(user: string, cnonce: string) -> string
-    "n,,n=" + user + ",r=" + cnonce
+    "n,,n={user},r={cnonce}"
 
 // Parse "r=<rnonce>,s=<b64salt>,i=<iter>" -> [rnonce, salt_b64, iter].
 fn _pg_scram_parse_sf(sf: string) -> any
@@ -116,9 +107,7 @@ fn _pg_scram_parse_sf(sf: string) -> any
     let rnonce = ""
     let salt_b64 = ""
     let iter = 0
-    let i = 0
-    while i < len(parts)
-        let p = parts[i]
+    for p in parts
         if len(p) >= 2
             let tag = slice(p, 0, 2)
             let val = slice(p, 2, len(p))
@@ -128,12 +117,7 @@ fn _pg_scram_parse_sf(sf: string) -> any
                 salt_b64 = val
             else if tag == "i="
                 iter = parse_int(val)
-        i = i + 1
-    let out = []
-    push(out, rnonce)
-    push(out, salt_b64)
-    push(out, iter)
-    out
+    [rnonce, salt_b64, iter]
 
 // Finish the exchange: returns [client_final_message, expected_server_signature_b64]. The caller sends
 // out[0] and checks the server-final "v=" against out[1].
@@ -152,38 +136,29 @@ fn pg_scram_finish(user: string, password: string, cnonce: string, server_first:
         return []
     if iter < 1
         return []
-    let client_first_bare = "n=" + user + ",r=" + cnonce
-    let client_final_noproof = "c=biws,r=" + rnonce
-    let auth_message = client_first_bare + "," + server_first + "," + client_final_noproof
+    let client_first_bare = "n={user},r={cnonce}"
+    let client_final_noproof = "c=biws,r={rnonce}"
+    let auth_message = "{client_first_bare},{server_first},{client_final_noproof}"
     let am = str_to_blist(auth_message)
     let salted = pbkdf2_sha256(str_to_blist(password), salt, iter, 32)
     let client_key = hmac_sha256_bytes(salted, str_to_blist("Client Key"))
     let stored_key = sha256_bytes(client_key)
     let client_sig = hmac_sha256_bytes(stored_key, am)
-    let proof = []
-    let j = 0
-    while j < len(client_key)
-        push(proof, client_key[j] ^ client_sig[j])
-        j = j + 1
-    let client_final = client_final_noproof + ",p=" + b64_encode_blist(proof)
+    // ClientProof = ClientKey XOR ClientSignature, byte-for-byte (RFC 5802 §3). Same arithmetic, one
+    // comprehension -- this is NOT a crypto round, just the final XOR fold.
+    let proof = [client_key[j] ^ client_sig[j] for j in 0..len(client_key)]
+    let client_final = "{client_final_noproof},p={b64_encode_blist(proof)}"
     let server_key = hmac_sha256_bytes(salted, str_to_blist("Server Key"))
     let server_sig = hmac_sha256_bytes(server_key, am)
-    let out = []
-    push(out, client_final)
-    push(out, b64_encode_blist(server_sig))
-    out
+    [client_final, b64_encode_blist(server_sig)]
 
 // PG MD5 auth (legacy AuthenticationMD5Password). The client sends "md5" + md5(md5(password + user) +
 // salt), where `salt` is the 4 random bytes the server sent. SCRAM (above) is the modern default; this is
 // only for old servers. PG MD5 is structurally weak by design -- compatibility, not security.
 fn pg_md5_auth(user: string, password: string, salt) -> string
     let inner = md5_hex(password + user)
-    let outer_in = str_to_blist(inner)
-    let i = 0
-    while i < len(salt)
-        push(outer_in, salt[i])
-        i = i + 1
-    "md5" + hex_of(md5_bytes(outer_in))
+    let outer_in = [...str_to_blist(inner), ...salt]
+    "md5{hex_of(md5_bytes(outer_in))}"
 
 // ── v2: LIVE driver (real socket; PLAINTEXT over tcp_* OR TLS via SChannel/OpenSSL) ──────────────────
 // A connection is [kind, handle]: kind 0 = plaintext (handle = tcp sock fd), 1 = TLS (handle = tls handle).
@@ -197,12 +172,7 @@ extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
 // A SCRAM client nonce: 18 CSPRNG bytes, base64'd (its alphabet excludes ',' so it is a valid nonce as-is).
 fn _pg_gen_nonce() -> string
     let rb = unsafe nova_rt_os_random(18)
-    let bl = []
-    let i = 0
-    while i < bytes_len(rb)
-        push(bl, bytes_get(rb, i))
-        i = i + 1
-    b64_encode_blist(bl)
+    b64_encode_blist([bytes_get(rb, i) for i in 0..bytes_len(rb)])
 
 // Tagged frontend message: tag(1) + int32 len(payload+4) + payload.
 fn _pg_msg(tag: int, payload) -> any
@@ -233,31 +203,20 @@ fn _pg_close_transport(conn)
 // Read exactly ONE backend message off the transport (accumulating across chunks). Returns
 // [tag(int), full_message_bytes (tag+len+body -> pg_parse_* take off=0), leftover_bytes]. tag -1 = EOF.
 fn _pg_recv_msg(conn, buf) -> any
+    // Both `while`s are data-dependent socket reads (read until enough bytes) -- NOT convertible.
     while bytes_len(buf) < 5
         let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
-            let e = []
-            push(e, 0 - 1)
-            push(e, bytes(0))
-            push(e, buf)
-            return e
+            return [0 - 1, bytes(0), buf]
         buf = bytes_concat(buf, chunk)
     let tag = bytes_get(buf, 0)
     let total = 1 + pg_rd_be32(buf, 1)
     while bytes_len(buf) < total
         let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
-            let e = []
-            push(e, 0 - 1)
-            push(e, bytes(0))
-            push(e, buf)
-            return e
+            return [0 - 1, bytes(0), buf]
         buf = bytes_concat(buf, chunk)
-    let r = []
-    push(r, tag)
-    push(r, bytes_slice(buf, 0, total))
-    push(r, bytes_slice(buf, total, bytes_len(buf)))
-    r
+    [tag, bytes_slice(buf, 0, total), bytes_slice(buf, total, bytes_len(buf))]
 
 // Parse an ErrorResponse ('E') / NoticeResponse ('N') -> the primary human message (field 'M').
 fn _pg_parse_error(msg) -> string
@@ -293,11 +252,7 @@ fn _pg_handshake(conn, user: string, db: string, password: string) -> any
             else if code == 3
                 _pg_send(conn, _pg_msg(112, _cstr(password)))
             else if code == 5
-                let salt = []
-                let si = 0
-                while si < 4
-                    push(salt, bytes_get(msg, 9 + si))
-                    si = si + 1
+                let salt = [bytes_get(msg, 9 + si) for si in 0..4]
                 _pg_send(conn, _pg_msg(112, _cstr(pg_md5_auth(user, password, salt))))
             else if code == 10
                 cnonce = _pg_gen_nonce()
@@ -316,16 +271,16 @@ fn _pg_handshake(conn, user: string, db: string, password: string) -> any
                 _pg_send(conn, _pg_msg(112, str_to_bytes(fin[0])))
             else if code == 12
                 let svf = bytes_to_str(bytes_slice(msg, 9, bytes_len(msg)))
-                if svf != "v=" + expected_sig
+                if svf != "v={expected_sig}"
                     _pg_close_transport(conn)
                     return err("pg: SCRAM server signature mismatch (possible MITM)")
             else
                 _pg_close_transport(conn)
-                return err("pg: unsupported auth code " + str(code))
+                return err("pg: unsupported auth code {code}")
         else if tag == 69
             let e = _pg_parse_error(msg)
             _pg_close_transport(conn)
-            return err("pg: " + e)
+            return err("pg: {e}")
         else if tag == 90
             done = 1
     ok(conn)
@@ -334,11 +289,8 @@ fn _pg_handshake(conn, user: string, db: string, password: string) -> any
 fn pg_connect(host: string, port: int, user: string, db: string, password: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
-        return err("pg: cannot connect to " + host + ":" + str(port))
-    let conn = []
-    push(conn, 0)
-    push(conn, sock)
-    _pg_handshake(conn, user, db, password)
+        return err("pg: cannot connect to {host}:{port}")
+    _pg_handshake([0, sock], user, db, password)
 
 // TLS connect: PG SSLRequest ([int32 8][int32 80877103]); on 'S' upgrade the socket to TLS and run the SAME
 // startup+auth over the encrypted transport. `sslmode`: "require" = encrypt only (no cert check -- works
@@ -347,7 +299,7 @@ fn pg_connect(host: string, port: int, user: string, db: string, password: strin
 fn pg_connect_tls(host: string, port: int, user: string, db: string, password: string, sslmode: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
-        return err("pg: cannot connect to " + host + ":" + str(port))
+        return err("pg: cannot connect to {host}:{port}")
     let req = pg_be32(8)
     req = bytes_concat(req, pg_be32(80877103))
     tcp_send_bytes(sock, req)
@@ -358,17 +310,12 @@ fn pg_connect_tls(host: string, port: int, user: string, db: string, password: s
     if bytes_get(reply, 0) != 83
         tcp_close(sock)
         return err("pg: server declined TLS (SSLRequest reply was not 'S')")
-    let verify = 0
-    if sslmode == "verify-full" or sslmode == "verify-ca"
-        verify = 1
+    let verify = 1 if sslmode == "verify-full" or sslmode == "verify-ca" else 0
     let tls = unsafe nova_rt_tls_upgrade(sock, host, verify)
     if tls == 0
         tcp_close(sock)
-        return err("pg: TLS handshake/verification failed (sslmode=" + sslmode + ")")
-    let conn = []
-    push(conn, 1)
-    push(conn, tls)
-    _pg_handshake(conn, user, db, password)
+        return err("pg: TLS handshake/verification failed (sslmode={sslmode})")
+    _pg_handshake([1, tls], user, db, password)
 
 // Run a simple-protocol query -> ok(list of name-keyed row dicts; "" for SQL NULL) or err.
 fn pg_exec(conn, sql: string) -> any
@@ -391,11 +338,9 @@ fn pg_exec(conn, sql: string) -> any
         else if tag == 68
             let vals = pg_parse_data_row(msg, 0)
             let row = {}
-            let i = 0
-            while i < len(names)
+            for i, nm in names
                 if i < len(vals)
-                    row[names[i]] = vals[i]
-                i = i + 1
+                    row[nm] = vals[i]
             push(rows, row)
         else if tag == 69
             errmsg = _pg_parse_error(msg)
@@ -403,7 +348,7 @@ fn pg_exec(conn, sql: string) -> any
         else if tag == 90
             done = 1
     if had_err == 1
-        return err("pg: " + errmsg)
+        return err("pg: {errmsg}")
     ok(rows)
 
 // Close cleanly: Terminate ('X') then close the transport.
@@ -431,12 +376,10 @@ fn _pg_bind_msg(params: list) -> any
     payload = bytes_concat(payload, _cstr(""))
     payload = bytes_concat(payload, pg_be16(0))
     payload = bytes_concat(payload, pg_be16(len(params)))
-    let i = 0
-    while i < len(params)
-        let pb = str_to_bytes(params[i])
+    for p in params
+        let pb = str_to_bytes(p)
         payload = bytes_concat(payload, pg_be32(bytes_len(pb)))
         payload = bytes_concat(payload, pb)
-        i = i + 1
     payload = bytes_concat(payload, pg_be16(0))
     _pg_msg(66, payload)
 
@@ -458,13 +401,14 @@ fn _pg_execute_msg() -> any
 // PRIVATE: read a NUL-terminated ASCII C-string from bytes `b` at `off`. Command tags are ASCII
 // (0x00-free until the terminator), so chr()-building is safe here.
 fn _pg_cstr(b, off: int) -> string
-    let s = ""
+    // Short-circuiting NUL scan -> the `while` stays; the string is joined ONCE instead of `s = s + c`.
+    let parts = []
     let i = off
     let n = bytes_len(b)
     while i < n and bytes_get(b, i) != 0
-        s = s + chr(bytes_get(b, i))
+        push(parts, chr(bytes_get(b, i)))
         i = i + 1
-    s
+    join(parts, "")
 
 // affected-row count from a CommandComplete tag (libpq's PQcmdTuples). Postgres tags: "INSERT <oid>
 // <rows>", "UPDATE <rows>", "DELETE <rows>", "SELECT <rows>", "MOVE <n>", "FETCH <n>", "COPY <n>"; the
@@ -505,11 +449,9 @@ fn _pg_run_batch(conn, sql: string, params: list) -> list
         else if tag == 68
             let vals = pg_parse_data_row(msg, 0)
             let row = {}
-            let i = 0
-            while i < len(names)
+            for i, nm in names
                 if i < len(vals)
-                    row[names[i]] = vals[i]
-                i = i + 1
+                    row[nm] = vals[i]
             push(rows, row)
         else if tag == 67
             affected = pg_cmd_affected(_pg_cstr(msg, 5))
@@ -524,7 +466,7 @@ fn _pg_run_batch(conn, sql: string, params: list) -> list
 fn pg_query_params(conn, sql: string, params: list) -> any
     let r = _pg_run_batch(conn, sql, params)
     if r[0] == 1
-        return err("pg: " + r[1])
+        return err("pg: {r[1]}")
     ok(r[2])
 
 // Like pg_query_params but for INSERT/UPDATE/DELETE/DDL: returns ok(affected_row_count) parsed from the
@@ -532,7 +474,7 @@ fn pg_query_params(conn, sql: string, params: list) -> any
 fn pg_exec_params(conn, sql: string, params: list) -> any
     let r = _pg_run_batch(conn, sql, params)
     if r[0] == 1
-        return err("pg: " + r[1])
+        return err("pg: {r[1]}")
     ok(r[3])
 
 // ── connection POOL + transactions (parallel to forge_db pool_*/with_tx) ─────────────────────────────
@@ -541,8 +483,7 @@ fn pg_exec_params(conn, sql: string, params: list) -> any
 fn pg_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
     let ch = channel()
     let opened = 0
-    let i = 0
-    while i < n
+    for i in 0..n
         let r = pg_connect(host, port, user, db, password)
         // is_ok/unwrap (runtime Result-tag checks) -- NOT `match Ok/Err`. A match on the any-typed
         // pg_connect() result mis-resolves the constructor inside this module (tracked compiler bug); the
@@ -551,12 +492,9 @@ fn pg_pool_open(host: string, port: int, user: string, db: string, password: str
             send(ch, unwrap(r))
             opened = opened + 1
         else
-            let j = 0
-            while j < opened
+            for j in 0..opened
                 pg_close(recv(ch))
-                j = j + 1
             return r
-        i = i + 1
     ok(ch)
 
 fn pg_acquire(pool)
@@ -601,7 +539,5 @@ fn pg_with_tx(pool, body_fn) -> any
 
 // Close all n pooled connections (drain + Terminate + close each).
 fn pg_pool_close(pool, n: int)
-    let i = 0
-    while i < n
+    for i in 0..n
         pg_close(recv(pool))
-        i = i + 1

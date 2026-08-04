@@ -3,42 +3,32 @@
 // 2048-bit private exponent is intentionally out of scope (too slow in the list bigint).
 import forge_crypto
 
+// PRIVATE: one base-2^16 limb read out of a big-endian byte list — b[i] is the low byte, b[i-1] the high
+// byte (absent => 0). `i` is a byte index counted from the END of the number, so it may reach -1.
+fn _rsa_limb_at(b, i: int) -> int
+    let hi = b[i - 1] if i - 1 >= 0 else 0
+    b[i] | (hi << 8)
+
 // big-endian bytes -> LE 16-bit limb list
 fn rsa_be_to_num(b) -> list
-    let f = []
-    let i = len(b) - 1
-    while i >= 0
-        let lo = b[i]
-        let hi = 0
-        if i - 1 >= 0
-            hi = b[i - 1]
-        push(f, lo | (hi << 8))
-        i = i - 2
-    f
+    let n = len(b)
+    [_rsa_limb_at(b, n - 1 - 2 * t) for t in 0..((n + 1) / 2)]
+
+// PRIVATE: byte number `sig` (counted from the LSB) of an LE limb list; 0 past the end of the number.
+fn _rsa_be_byte(v, sig: int) -> int
+    let li = sig / 2
+    let limb = v[li] if li < len(v) else 0
+    (limb & 255) if (sig & 1) == 0 else ((limb >> 8) & 255)
 
 // LE limb list -> k big-endian bytes
 fn rsa_num_to_be(v, k: int) -> list
-    let out = []
-    let j = 0
-    while j < k
-        let sig = k - 1 - j
-        let li = sig / 2
-        let limb = 0
-        if li < len(v)
-            limb = v[li]
-        if (sig & 1) == 0
-            push(out, limb & 255)
-        else
-            push(out, (limb >> 8) & 255)
-        j = j + 1
-    out
+    [_rsa_be_byte(v, k - 1 - j) for j in 0..k]
 
 // x mod m by binary long division (m a limb list); result < m
 fn rsa_mod(x, m) -> list
     let xn = _p_norm(x)
     let nbits = len(xn) * 16
-    let rem = []
-    push(rem, 0)
+    let rem = [0]
     let i = nbits - 1
     while i >= 0
         rem = _shl1(rem)
@@ -52,8 +42,7 @@ fn rsa_mod(x, m) -> list
 
 // base^e mod m, e given as a limb list scanned over ebits bits (MSB first)
 fn rsa_modexp(base, e, m, ebits: int) -> list
-    let result = []
-    push(result, 1)
+    let result = [1]
     let i = ebits - 1
     while i >= 0
         result = rsa_mod(_p_mul(result, result), m)
@@ -65,13 +54,12 @@ fn rsa_modexp(base, e, m, ebits: int) -> list
 
 // RSASSA-PKCS1-v1_5 verify with SHA-256 and e=65537.
 // n_bytes/sig_bytes are big-endian (k = modulus byte length); hash_bytes is the 32-byte SHA-256 of the message.
+// Returns 1 for a valid signature, 0 otherwise — a PREDICATE, not a failure sentinel, so it stays an int
+// (forge_tls / forge_chain compare it against 1).
 fn rsa_pkcs1_sha256_verify(n_bytes, hash_bytes, sig_bytes) -> int
     let n = rsa_be_to_num(n_bytes)
     let sig = rsa_be_to_num(sig_bytes)
-    let e = []
-    push(e, 1)
-    push(e, 1)
-    let m = rsa_modexp(sig, e, n, 17)
+    let m = rsa_modexp(sig, [1, 1], n, 17)          // e = 65537 = limbs [1, 1] over 17 bits
     let k = len(n_bytes)
     let em = rsa_num_to_be(m, k)
     if em[0] != 0
@@ -80,41 +68,17 @@ fn rsa_pkcs1_sha256_verify(n_bytes, hash_bytes, sig_bytes) -> int
         return 0
     if em[k - 52] != 0
         return 0
-    let i = 2
-    while i < k - 52
+    for i in 2..(k - 52)
         if em[i] != 255
             return 0
-        i = i + 1
-    let di = []
-    push(di, 48)
-    push(di, 49)
-    push(di, 48)
-    push(di, 13)
-    push(di, 6)
-    push(di, 9)
-    push(di, 96)
-    push(di, 134)
-    push(di, 72)
-    push(di, 1)
-    push(di, 101)
-    push(di, 3)
-    push(di, 4)
-    push(di, 2)
-    push(di, 1)
-    push(di, 5)
-    push(di, 0)
-    push(di, 4)
-    push(di, 32)
-    let j = 0
-    while j < 19
-        if em[k - 51 + j] != di[j]
+    // DER DigestInfo prefix for SHA-256 (RFC 8017 A.2.4), 19 bytes
+    let di = [48, 49, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 1, 5, 0, 4, 32]
+    for j, dv in di
+        if em[k - 51 + j] != dv
             return 0
-        j = j + 1
-    let h = 0
-    while h < 32
+    for h in 0..32
         if em[k - 32 + h] != hash_bytes[h]
             return 0
-        h = h + 1
     1
 
 // MGF1 with SHA-256 (RFC 8017): mask of `masklen` bytes from `seed`.
@@ -122,32 +86,22 @@ fn _rsa_mgf1(seed, masklen: int) -> list
     let out = []
     let counter = 0
     while len(out) < masklen
-        let inp = []
-        let i = 0
-        while i < len(seed)
-            push(inp, seed[i])
-            i = i + 1
-        push(inp, (counter >> 24) & 255)
-        push(inp, (counter >> 16) & 255)
-        push(inp, (counter >> 8) & 255)
-        push(inp, counter & 255)
+        let inp = [...seed, (counter >> 24) & 255, (counter >> 16) & 255, (counter >> 8) & 255, counter & 255]
         let h = sha256_bytes(inp)
-        let j = 0
-        while j < 32 and len(out) < masklen
+        let want = masklen - len(out)
+        let take = 32 if want > 32 else want
+        for j in 0..take
             push(out, h[j])
-            j = j + 1
         counter = counter + 1
     out
 
 // RSASSA-PSS verify with SHA-256 / MGF1-SHA-256 / salt length 32 (TLS 1.3 rsa_pss_rsae_sha256), e=65537.
 // n_bytes/sig_bytes big-endian; mhash = the 32-byte SHA-256 of the signed message.
+// Returns 1 for a valid signature, 0 otherwise (same predicate contract as the PKCS#1 verify above).
 fn rsa_pss_sha256_verify(n_bytes, mhash, sig_bytes) -> int
     let n = rsa_be_to_num(n_bytes)
     let sig = rsa_be_to_num(sig_bytes)
-    let e = []
-    push(e, 1)
-    push(e, 1)
-    let m = rsa_modexp(sig, e, n, 17)
+    let m = rsa_modexp(sig, [1, 1], n, 17)          // e = 65537 = limbs [1, 1] over 17 bits
     let k = len(n_bytes)
     let em = rsa_num_to_be(m, k)
     let hlen = 32
@@ -158,50 +112,22 @@ fn rsa_pss_sha256_verify(n_bytes, mhash, sig_bytes) -> int
     if (em[0] & 128) != 0
         return 0
     let dblen = k - hlen - 1
-    let hh = []
-    let i = 0
-    while i < hlen
-        push(hh, em[dblen + i])
-        i = i + 1
+    let hh = [em[dblen + i] for i in 0..hlen]
     let dbmask = _rsa_mgf1(hh, dblen)
-    let db = []
-    let j = 0
-    while j < dblen
-        push(db, em[j] ^ dbmask[j])
-        j = j + 1
+    let db = [em[j] ^ dbmask[j] for j in 0..dblen]
     db[0] = db[0] & 127
     let ps = dblen - slen - 1
-    let p = 0
-    while p < ps
+    for p in 0..ps
         if db[p] != 0
             return 0
-        p = p + 1
     if db[ps] != 1
         return 0
-    let salt = []
-    let s = 0
-    while s < slen
-        push(salt, db[ps + 1 + s])
-        s = s + 1
-    let mp = []
-    let z = 0
-    while z < 8
-        push(mp, 0)
-        z = z + 1
-    let a = 0
-    while a < len(mhash)
-        push(mp, mhash[a])
-        a = a + 1
-    let b = 0
-    while b < slen
-        push(mp, salt[b])
-        b = b + 1
+    let salt = [db[ps + 1 + s] for s in 0..slen]
+    // M' = 8 zero bytes || mHash || salt
+    let mp = [0, 0, 0, 0, 0, 0, 0, 0, ...mhash, ...salt]
     let hp = sha256_bytes(mp)
-    let diff = 0
-    let q = 0
-    while q < hlen
-        diff = diff | (hp[q] ^ hh[q])
-        q = q + 1
+    // constant-time-ish compare: OR every byte difference together, then test once
+    let diff = reduce([hp[q] ^ hh[q] for q in 0..hlen], (acc, v) => acc | v, 0)
     if diff != 0
         return 0
     1
