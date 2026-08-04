@@ -4,6 +4,14 @@ This is the authoritative catalog of NOVA's high-level features. Write NOVA from
 
 Sourced from a 5-agent feature audit (242 raw entries) deduplicated into the sections below. When two constructs overlap, the entry lives in its most natural home and is cross-referenced rather than repeated.
 
+**Sections 1–5** are that audit (2026-07-25). **Section 6** lists everything added since, each
+entry verified by EXECUTING a probe program; where the two disagree, section 6 wins. **Section 7**
+is the trap list — read it before writing NOVA, it is short and every item cost real time.
+
+> **MAINTENANCE RULE: a new language feature goes into this file in the SAME COMMIT that lands
+> it.** A feature nobody wrote down is a feature nobody reaches for, so it stays untested and
+> rots. Generics sat effectively unused for a year behind a syntax nobody could guess.
+
 ---
 
 ## Quick Reference — the constructs you reach for constantly
@@ -1282,3 +1290,167 @@ These are the constructs most likely being hand-rolled today (as if/else + index
 8. **Automatic struct derivation** — `print(p)`, `p.to_json()`, `a == b`, `copy(a)` for free on every struct; never hand-write a serializer or equality method (and never reach for `@derive`).
 9. **std/functional + std/itertools** — `fg_group_by`, `ftw_take_while`, `itw_pairwise`, `itc_chunk`, `ita_sums` instead of bespoke grouping/windowing/chunking loops.
 10. **spawn + channels + selective receive** — cheap green-task concurrency (`spawn fn() ...`, `receive ... after`) instead of hand-rolled OS threads and shared mutable state.
+
+---
+
+## 6. Added since the original audit (2026-07-25 → 2026-08-04)
+
+Every entry below was **verified by executing a probe program**, not inferred from the source.
+Sections 1–5 above predate these; this section is authoritative where they disagree.
+
+### 6.1 `EXPR else FALLBACK` — one-word error handling
+CLAUDE.md promised this from day one and nothing implemented it; only the `unwrap_or`/`or_else`
+*functions* existed. Two forms:
+```nova
+config = read_file_safe("config.txt") else "\{\}"        // value fallback
+port   = parse_int_safe(env("PORT"))  else 8080          // ditto
+user   = parse_json(json) else return err("Invalid JSON") // escape form
+buffer_push(rb, v) else Error("buffer full")             // as a bare expression statement
+```
+* Evaluates the subject **exactly once** (unlike `??`, whose shape mentions it twice).
+* ⚠️ **Statement level only** — on an assignment RHS or as an expression statement.
+  `str(f() else 0)` does **not** parse.
+
+### 6.2 `-> T or E` fallible return type
+```nova
+fn push(rb: RingBuffer, val: byte) -> bool or Error
+```
+Desugars to `Result<T, E>`; keeps the failure type visible without generic-bracket ceremony.
+
+### 6.3 Inline if-expression as a function body
+```nova
+fn max(a: int, b: int) -> int
+    if a > b a else b
+```
+Already worked after `=` and after `return`; now also works when a statement *starts* with `if`.
+
+### 6.4 Tuple patterns in `match` arms
+```nova
+match (a, b)
+    (0, 0) => "origin"
+    (x, 0) => "on x-axis"
+    (x, y) => "general"
+```
+
+### 6.5 Multi-line lambda in argument position
+```nova
+http.serve(8080, routes =>
+    routes.get("/health", req => ok_json(...))
+    routes.get("/data", req =>
+        let data = fetch(req) else return not_found()
+        ok_json(data)
+    )
+)
+```
+Lifted into a nested named function, so it **captures** the enclosing scope. Nesting works.
+
+### 6.6 Named arguments accept `=` as well as `:`
+```nova
+supervise(w, restart = "always", max_restarts = 5)   // both spellings work
+supervise(w, restart: "always", max_restarts: 5)
+```
+
+### 6.7 Sized numerics — now actually usable
+```nova
+let a = 255u8 + 1        // 0    wraps at width
+let b: u8  = 300         // 44   the ANNOTATION narrows (const and runtime alike)
+let c = u8(x)            // explicit conversion; the RESULT carries the width
+```
+Mixing two explicit widths (`u8` vs `i32`) is a **type error** — convert explicitly.
+
+### 6.8 Real `f32`
+```nova
+16777217.0f32            // 16777216.0  — the nearest binary32 value
+0.1f32 + 0.2f32          // 0.300000011920929   (f64 gives 0.3)
+1.0f32 / 3.0f32          // 0.333333343267441   (f64 gives 0.333333333333333)
+let x: f32 = 16777217.0  // narrows
+f32(v) / f64(v)          // explicit conversion
+```
+Rounds after **every** operation — genuine IEEE binary32, not f64 wearing a label. `f32` vs
+`f64` is a type error; both float widths are explicit.
+
+### 6.9 Packed typed arrays — `std/collections/typedarray`
+```nova
+import std/collections/typedarray
+let a = unwrap(ta_new(ta_u8(), 1000))     // 1000 BYTES, not 8000
+let b = unwrap(ta_of_list(ta_i32(), [1,2,3]))
+unwrap(ta_map(b, x => x * 2))             // closures, staying packed
+unwrap(ta_filter(b, x => x % 2 == 0))
+ta_fold(b, 0, (acc, v) => acc + v)
+unwrap(ta_at(b, 99))                      // Result — err() on out of range
+json_stringify(b)                         // [1,2,3] — a real JSON array
+b[1:3]                                    // a NEW same-kind packed array
+```
+Kinds: `ta_i8 ta_u8 ta_i16 ta_u16 ta_i32 ta_u32 ta_i64 ta_u64 ta_f32 ta_f64`.
+Float elements use the float-typed accessors: `ta_atf` / `ta_putf` / `ta_pushf` / `ta_sumf`.
+*(No `u8[]` annotation sugar yet — construct via `ta_new`.)*
+
+### 6.10 Crash-safe cleanup — `on_exit_send` / `cancel_on_exit_val`
+```nova
+let db = recv(pool)
+on_exit_send(pool, db)        // released even if this task dies by a contained crash
+...
+send(pool, db)
+cancel_on_exit_val(pool, db)  // normal path releases eagerly and cancels
+```
+Needed because **`defer` is compile-time**: it inlines at the function's exit points, so a panic
+longjmps straight past it. This registry is drained on *every* exit path.
+
+### 6.11 Struct-by-value FFI — `byval<T>`
+```nova
+extern fn vec2_sum(v: byval<Vec2>) -> float        // parameter by value
+extern fn make_v2(k: float) -> byval<Vec2>         // RETURN by value
+```
+Lowered per target (Win64 / SysV / AAPCS64) to exactly the signature clang emits. A plain
+`@repr("C")` parameter keeps its original meaning — pass the heap **pointer**, so C can write
+through it and NOVA reads the result back. Two different C signatures, two different spellings.
+
+### 6.12 `unsafe` block yields its value
+```nova
+fn f(n: int) -> int
+    unsafe
+        let a = n * 2
+        a + 1              // the block's value is the function's value
+```
+
+---
+
+## 7. TRAPS — verified, each cost real debugging time
+
+1. **`fn name<T>(...)` does not parse.** Type parameters come **first**: `fn <T> name(...)`.
+   Inside a MODULE the wrong form fails **silently and truncates that module's exports** — every
+   function defined after it becomes invisible to importers, with no error naming the cause.
+   This is very likely why generics went years effectively unused.
+
+2. **⚠️ OPEN BUG — `@comptime` folds to 0 when the body ends in a BARE EXPRESSION.**
+   ```nova
+   @comptime
+   fn size() -> int
+       return 16 * 4      // 64  ✅
+   @comptime
+   fn size() -> int
+       16 * 4             // 0   ❌ silently wrong
+   ```
+   Always write an explicit `return` in a `@comptime` function until this is fixed.
+
+3. **`else` fallback is statement-level only** — not usable inside an argument expression.
+
+4. **`defer` does not survive a panic** (compile-time construct) — use `on_exit_send` (6.10).
+
+5. **Strings interpolate a bare `{`** — escape as `\{` in literals containing braces
+   (JSON/YAML/format templates).
+
+6. **`@derive` is rejected on purpose** — show / json / `==` / hash / `copy()` are automatic.
+
+7. **Reserved words silently mis-codegen** when used as identifiers.
+
+8. **`reduce(list, fn, init)`** — the function is the **second** argument.
+
+9. **Enum variant constructors return the VARIANT type, not the enum type** — a function that
+   `match`es over an enum usually leaves its parameter unannotated (`fn area(s)`).
+
+---
+
+**MAINTENANCE RULE: when a language feature lands, add it to this file IN THE SAME COMMIT.**
+A feature that is not written down is not reached for, so it stays untested and rots — which is
+exactly how generics sat unused behind a syntax nobody could guess.
