@@ -100,27 +100,17 @@ fn sha256_bytes(msg: list) -> list
 // A string's UTF-8 bytes as a byte list (via str_to_bytes -> the real bytes, not codepoint guesses).
 fn str_to_blist(s: string) -> list
     let nb = str_to_bytes(s)
-    let n = bytes_len(nb)
-    let out = []
-    let i = 0
-    while i < n
-        push(out, bytes_get(nb, i))
-        i = i + 1
-    out
+    [bytes_get(nb, i) for i in 0..bytes_len(nb)]
 
 fn sha256_str(s: string) -> list
     sha256_bytes(str_to_blist(s))
 
 // Lowercase hex of a byte list.
+// One nibble pair per byte, joined ONCE. The old form did `out = out + ..` per byte, which
+// reallocates and copies the whole accumulated string every iteration -- quadratic in the input.
 fn hex_of(blist: list) -> string
     let digs = "0123456789abcdef"
-    let out = ""
-    let i = 0
-    while i < len(blist)
-        let b = blist[i]
-        out = out + char_at(digs, (b >> 4) & 15) + char_at(digs, b & 15)
-        i = i + 1
-    out
+    join([char_at(digs, (b >> 4) & 15) + char_at(digs, b & 15) for b in blist], "")
 
 fn sha256_hex(s: string) -> string
     hex_of(sha256_str(s))
@@ -228,23 +218,25 @@ fn pbkdf2_sha256(password: list, salt: list, iterations: int, dklen: int) -> lis
 fn _b64char(v: int) -> string
     char_at("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", v)
 
+// Whole 3-byte groups, then the 1- or 2-byte tail. `while i + 3 <= n` runs for i = 0,3,6,... i.e.
+// exactly floor(n/3) groups, so the range states the count directly and the tail offset follows.
+//
+// The accumulator is a LIST joined once. The old `out = out + ...` per group was quadratic, and
+// base64 is applied to whole payloads -- this is the one place in this module where that actually bites.
 fn b64_encode_blist(data: list) -> string
-    let out = ""
     let n = len(data)
-    let i = 0
-    while i + 3 <= n
-        let trip = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
-        out = out + _b64char((trip >> 18) & 63) + _b64char((trip >> 12) & 63) + _b64char((trip >> 6) & 63) + _b64char(trip & 63)
-        i = i + 3
+    let ngroups = n / 3
+    let parts = [_b64char((((data[k * 3] << 16) | (data[k * 3 + 1] << 8) | data[k * 3 + 2]) >> 18) & 63) + _b64char((((data[k * 3] << 16) | (data[k * 3 + 1] << 8) | data[k * 3 + 2]) >> 12) & 63) + _b64char((((data[k * 3] << 16) | (data[k * 3 + 1] << 8) | data[k * 3 + 2]) >> 6) & 63) + _b64char(((data[k * 3] << 16) | (data[k * 3 + 1] << 8) | data[k * 3 + 2]) & 63) for k in 0..ngroups]
+    let i = ngroups * 3
     let rem = n - i
     if rem == 1
         let t1 = data[i] << 16
-        out = out + _b64char((t1 >> 18) & 63) + _b64char((t1 >> 12) & 63) + "=="
+        push(parts, _b64char((t1 >> 18) & 63) + _b64char((t1 >> 12) & 63) + "==")
     else
         if rem == 2
             let t2 = (data[i] << 16) | (data[i + 1] << 8)
-            out = out + _b64char((t2 >> 18) & 63) + _b64char((t2 >> 12) & 63) + _b64char((t2 >> 6) & 63) + "="
-    out
+            push(parts, _b64char((t2 >> 18) & 63) + _b64char((t2 >> 12) & 63) + _b64char((t2 >> 6) & 63) + "=")
+    join(parts, "")
 
 fn _b64val(c: int) -> int
     if c >= 65 and c <= 90
@@ -259,25 +251,24 @@ fn _b64val(c: int) -> int
         return 63
     0 - 1
 
+// The `go` flag was standing in for `break`: once a '=' was seen the guard failed on the next
+// check and the loop ended, doing nothing further. `break` says that directly, and the index
+// becomes an ordinary range. Bit accumulation is untouched -- it is the decode itself.
 fn b64_decode_blist(s: string) -> list
     let out = []
     let acc = 0
     let nbits = 0
-    let i = 0
-    let go = 1
-    while i < len(s) and go == 1
+    for i in 0..len(s)
         let c = ord(char_at(s, i))
         if c == 61
-            go = 0
-        else
-            let v = _b64val(c)
-            if v >= 0
-                acc = (acc << 6) | v
-                nbits = nbits + 6
-                if nbits >= 8
-                    nbits = nbits - 8
-                    push(out, (acc >> nbits) & 255)
-        i = i + 1
+            break
+        let v = _b64val(c)
+        if v >= 0
+            acc = (acc << 6) | v
+            nbits = nbits + 6
+            if nbits >= 8
+                nbits = nbits - 8
+                push(out, (acc >> nbits) & 255)
     out
 
 // ── MD5 (RFC 1321) -- LITTLE-endian. Legacy, but Postgres MD5 auth needs it. NOT for security. ───────
@@ -489,13 +480,11 @@ fn _hexval(c: string) -> int
         return o - 55
     0
 
+// Stride-2 over nibble pairs. `while i + 1 < len(h)` steps i = 0,2,4,... and stops when fewer than
+// two characters remain, i.e. exactly floor(len(h)/2) pairs -- which is what the range says directly.
+// A trailing odd character is ignored, as before.
 fn hex_to_blist(h: string) -> list
-    let out = []
-    let i = 0
-    while i + 1 < len(h)
-        push(out, _hexval(char_at(h, i)) * 16 + _hexval(char_at(h, i + 1)))
-        i = i + 2
-    out
+    [_hexval(char_at(h, k * 2)) * 16 + _hexval(char_at(h, k * 2 + 1)) for k in 0..(len(h) / 2)]
 
 // ── AES-CTR (NIST SP 800-38A) -- self-inverse stream mode, forward cipher only ──────────────────────
 // Increment a 16-byte big-endian counter block in place.

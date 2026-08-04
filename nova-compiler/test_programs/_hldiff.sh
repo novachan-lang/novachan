@@ -15,15 +15,24 @@ MOD="$1"; EX="$2"
 # file -- observed live as modules "clobbered with unrelated content". Never share a temp path
 # in a script that can run in parallel.
 TAG="$(echo "$MOD" | tr '/' '_')_$$"
-OLDT="/tmp/hl_old_$TAG.txt"; NEWT="/tmp/hl_new_$TAG.txt"; SAVE="/tmp/hl_save_$TAG.nova"
+HLTMP="$REPO/nova-compiler/test_programs/_hlwork"; mkdir -p "$HLTMP"
+OLDT="$HLTMP/old_$TAG.txt"; NEWT="$HLTMP/new_$TAG.txt"; SAVE="$HLTMP/save_$TAG.nova"
 [ -f "$EX" ] || { echo "DIFF-SKIP $MOD (no exercise program)"; exit 0; }
-SRC="$REPO/$MOD.nova"
-DST="$REPO/nova-compiler/$MOD.nova"
+# Two mirror layouts:
+#   std/a/b   ->  source std/a/b.nova       mirror nova-compiler/std/a/b.nova
+#   forge_x   ->  source forge/forge_x.nova mirror nova-compiler/lib/forge_x.nova
+# (forge modules are imported by BARE name, and the mirror is lib/, not forge/.)
+case "$MOD" in
+  std/*) SRC="$REPO/$MOD.nova";              DST="$REPO/nova-compiler/$MOD.nova" ;;
+  *)     SRC="$REPO/forge/$MOD.nova";        DST="$REPO/nova-compiler/lib/$MOD.nova" ;;
+esac
+GITPATH="$MOD.nova"
+[ "${MOD#std/}" = "$MOD" ] && GITPATH="forge/$MOD.nova"
 cp "$DST" "$SAVE"
 build() { rm -f _hd.ll _hd.exe; ./gen3_test.exe "$EX" "_hd_$TAG.ll" >/dev/null 2>&1 \
   && clang -O1 -o "_hd_$TAG.exe" "_hd_$TAG.ll" ../compiler/nova_runtime.c -lws2_32 -lbcrypt -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w >/dev/null 2>&1 \
   && timeout 60 "./_hd_$TAG.exe" > "$1" 2>&1; }
-( cd "$REPO" && git show "HEAD:$MOD.nova" > "$DST" 2>/dev/null )
+( cd "$REPO" && git show "HEAD:$GITPATH" > "$DST" 2>/dev/null )
 build "$OLDT"; OLD=$?
 cp "$SAVE" "$DST"
 build "$NEWT"; NEW=$?
