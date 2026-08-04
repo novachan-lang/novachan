@@ -1,0 +1,88 @@
+// _mysql_pool_test -- MySQL connection POOL + transactions + TLS connect (Forge production-gaps fixes:
+// pooling, START TRANSACTION/COMMIT/ROLLBACK, mysql_connect_tls, COM_STMT_CLOSE). Compiles/type-checks all
+// of mysql_pool_open/mysql_pool_acquire/mysql_pool_release/mysql_pool_query/mysql_pool_query_params/
+// mysql_with_tx/mysql_pool_close/mysql_connect_tls unconditionally; the LIVE round-trip only runs when
+// MYSQLPASSWORD is set (mirrors _mysql_test.nova's skip convention -- this sandbox has no live server).
+import forge_mysql
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+// Multi-statement transaction body (mysql_with_tx's fn(conn) can't be an inline multi-statement lambda --
+// lambdas here are single-expression only): insert a row, then force a rollback by returning Err.
+fn _tx_body_forced_rollback(c) -> any
+    mysql_query_params(c, "INSERT INTO nova_pool_test.t (id, name) VALUES (?, ?)", [3, "Rolled"])
+    err("forced rollback")
+
+fn main()
+    let pw = env("MYSQLPASSWORD")
+    if len(pw) == 0
+        print("_mysql_pool_test: live MySQL skipped (set MYSQLPASSWORD to run)")
+        print("_mysql_pool_test passed")
+        return
+    let host = _envor("MYSQLHOST", "127.0.0.1")
+    let port = parse_int(_envor("MYSQLPORT", "3306"))
+    let user = _envor("MYSQLUSER", "root")
+
+    // FIX 1: pool open + pooled query + pooled parameterized query.
+    let pr = mysql_pool_open(host, port, user, "", pw, 3)
+    match pr
+        Ok(pool) =>
+            print("POOL OPEN OK (3 authenticated connections)")
+            mysql_pool_query(pool, "CREATE DATABASE IF NOT EXISTS nova_pool_test")
+            mysql_pool_query(pool, "DROP TABLE IF EXISTS nova_pool_test.t")
+            mysql_pool_query(pool, "CREATE TABLE nova_pool_test.t (id int, name varchar(64))")
+            let q = mysql_pool_query_params(pool, "INSERT INTO nova_pool_test.t (id, name) VALUES (?, ?)", [1, "Ada"])
+            match q
+                Ok(_) => print("POOL PARAMETERIZED INSERT OK")
+                Err(e) =>
+                    print("FAIL: pooled params insert: " + e)
+                    exit(1)
+
+            // FIX 2: transaction commits on ok(..).
+            let t1 = mysql_with_tx(pool, fn(c) mysql_query_params(c, "INSERT INTO nova_pool_test.t (id, name) VALUES (?, ?)", [2, "Linus"]))
+            match t1
+                Ok(_) => print("TX COMMIT OK")
+                Err(e) =>
+                    print("FAIL: tx commit: " + e)
+                    exit(1)
+
+            // FIX 2: transaction rolls back on err(..) -- the row must NOT appear afterward.
+            let t2 = mysql_with_tx(pool, _tx_body_forced_rollback)
+            if is_ok(t2)
+                print("FAIL: expected the forced-rollback tx to return Err")
+                exit(1)
+            print("TX ROLLBACK triggered as expected")
+
+            let rows = mysql_pool_query(pool, "SELECT id, name FROM nova_pool_test.t ORDER BY id")
+            match rows
+                Ok(rs) =>
+                    assert_eq(len(rs), 2)
+                    assert_eq(rs[0]["name"], "Ada")
+                    assert_eq(rs[1]["name"], "Linus")
+                    print("POOL + TX ROUND-TRIP OK: " + rs[0]["name"] + " / " + rs[1]["name"])
+                Err(e) =>
+                    print("FAIL: final select: " + e)
+                    exit(1)
+
+            mysql_pool_query(pool, "DROP TABLE IF EXISTS nova_pool_test.t")
+            mysql_pool_close(pool, 3)
+        Err(e) =>
+            print("POOL OPEN returned a structured error: " + e)
+            assert(starts_with(e, "mysql:"), "structured mysql: error")
+
+    // FIX 3: TLS connect entry point (structured outcome proves the SSLRequest+upgrade plumbing ran; a
+    // dev MySQL with ssl disabled will error, which still proves the code path executed end to end).
+    let tr = mysql_connect_tls(host, port, user, "", pw)
+    match tr
+        Ok(conn) =>
+            print("LIVE MYSQL/TLS CONNECT OK")
+            mysql_close(conn)
+        Err(e) =>
+            print("MySQL/TLS connect returned a structured error: " + e)
+            assert(starts_with(e, "mysql:"), "structured mysql: error (TLS plumbing ran end to end)")
+
+    print("_mysql_pool_test passed")

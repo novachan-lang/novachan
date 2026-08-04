@@ -129,6 +129,134 @@ fn password_needs_rehash(stored: string, target_iters: int) -> bool
         return true
     iters < target_iters
 
+// ── Account lockout: brute-force / credential-stuffing defense ──────────────────────────────────────
+// Nothing in this file previously tracked failed login attempts at all: an attacker could hammer
+// password_verify for one username forever, and password_verify (PBKDF2-HMAC-SHA256 @ 100000 iters,
+// deliberately expensive) is exactly the function you do NOT want an attacker forcing repeatedly --
+// that's a CPU-exhaustion vector, not just a credential-guessing one. This adds a per-username
+// failed-attempt tracker: after `max_failures` consecutive failures within `window_ms`, further
+// attempts for that username are rejected with err("account temporarily locked") WITHOUT calling
+// password_verify at all. A successful login resets the counter immediately.
+//
+// State shape mirrors forge_limits.nova's rate_limiter/rate_check EXACTLY (single-owner ACTOR: all
+// per-username state is BORN INSIDE the actor loop and only the actor mutates it), for the same
+// reason forge_limits chose an actor over a shared dict: a plain dict counter mutated from multiple
+// spawn-per-connection tasks is an N>1 data race (the exact class already found and fixed elsewhere
+// in this audit -- see forge_limits.nova's rate_limiter comment). Routing every check/record through
+// one channel-owned task makes lockout state race-free by construction, with zero extra locking code.
+fn _lockout_loop(lo)
+    let fails = {}       // username -> consecutive failed-attempt count within the current window
+    let starts = {}      // username -> ms timestamp the current failure window started
+    let max_failures = lo["max_failures"]
+    let window_ms = lo["window_ms"]
+    let running = 1
+    while running == 1
+        let env = receive(lo["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "check"
+            let user = env["user"]
+            let locked = 0
+            if contains(fails, user)
+                if fails[user] >= max_failures
+                    if env["now_ms"] - starts[user] <= window_ms
+                        locked = 1
+            if locked == 1
+                send(env["reply"], 0)
+            else
+                send(env["reply"], 1)
+        else if op == "fail"
+            let user = env["user"]
+            let now_ms = env["now_ms"]
+            let window_expired = 1
+            if contains(starts, user)
+                if now_ms - starts[user] <= window_ms
+                    window_expired = 0
+            if window_expired == 1
+                fails[user] = 1
+                starts[user] = now_ms
+            else
+                fails[user] = fails[user] + 1
+        else if op == "success"
+            // del, not zero: zeroing starts[user] anchors the NEXT failure streak's window-expiry
+            // check to the stale sentinel 0 instead of a real timestamp, so `now_ms - starts[user]`
+            // is (at small/test-scale now_ms) still <= window_ms long after the real window should
+            // have expired, under-counting the lockout duration. Deleting the entries makes the next
+            // "fail" op see `contains(starts,user)==false` -> window_expired=1 -> a clean, correctly-
+            // anchored new streak, exactly like a user who has never failed before.
+            let user = env["user"]
+            fails.del(user)
+            starts.del(user)
+
+// lockout_tracker: spawn a fresh lockout actor. Defaults (5 failures / 15 minutes) are a standard,
+// conservative account-lockout policy (OWASP's suggested range is 3-5 within 15-30 minutes).
+// Note (verified against the current toolchain): default parameter values only fill in for a caller
+// in the SAME module/file as the definition -- a caller importing forge_auth from another file must
+// pass BOTH arguments explicitly (a cross-module call supplying fewer args than the full parameter
+// list fails to compile with "function expects N arguments, but got M", even though the missing
+// ones have declared defaults). Since importing this module is the overwhelmingly common case, use
+// lockout_tracker_default() below for the recommended zero-arg policy, or lockout_tracker(n, ms)
+// with BOTH values given for a custom policy.
+fn lockout_tracker(max_failures: int = 5, window_ms: int = 900000) -> any
+    let lo = {}
+    lo["req"] = channel()
+    lo["max_failures"] = max_failures
+    lo["window_ms"] = window_ms
+    spawn _lockout_loop(lo)
+    lo
+
+// lockout_tracker_default: the recommended zero-argument entry point -- OWASP-standard 5 failures /
+// 15 minutes -- that sidesteps the zero-arg-with-all-defaults toolchain gap noted above.
+fn lockout_tracker_default() -> any
+    lockout_tracker(5, 900000)
+
+// lockout_check: 1 if `username` may attempt a login right now, 0 if it is currently locked out.
+fn lockout_check(lo, username: string, now_ms: int) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "check"
+    env["user"] = username
+    env["now_ms"] = now_ms
+    env["reply"] = rc
+    send(lo["req"], env)
+    receive(rc)
+
+// lockout_record_failure: call after a failed password_verify for `username`.
+fn lockout_record_failure(lo, username: string, now_ms: int)
+    let env = {}
+    env["op"] = "fail"
+    env["user"] = username
+    env["now_ms"] = now_ms
+    send(lo["req"], env)
+
+// lockout_record_success: call after a successful login for `username` -- resets its counter.
+fn lockout_record_success(lo, username: string)
+    let env = {}
+    env["op"] = "success"
+    env["user"] = username
+    send(lo["req"], env)
+
+fn lockout_tracker_stop(lo)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(lo["req"], env)
+
+// login_verify: the recommended integration point wiring password_verify to the lockout tracker in
+// ONE call. Checks lockout FIRST -- an already-locked username never reaches password_verify at all,
+// closing the CPU-exhaustion angle. A failure records against the tracker and returns Err; a success
+// resets the tracker and returns Ok(username). Callers who already loaded the user row via
+// user_by_username plug this in right after, passing row["password_hash"] as stored_hash.
+fn login_verify(lo, username: string, password: string, stored_hash: string, now_ms: int) -> Result
+    if lockout_check(lo, username, now_ms) == 0
+        return err("account temporarily locked")
+    if password_verify(password, stored_hash) == false
+        lockout_record_failure(lo, username, now_ms)
+        return err("invalid credentials")
+    lockout_record_success(lo, username)
+    ok(username)
+
 // ── mw_auth: resolver-driven authentication middleware ───────────────────────────────────────────────
 // The resolver has shape fn(req: Request) -> Result<user>. On Ok(user) it writes req.state["user"]
 // and calls next (the route or next middleware handles authorization). On Err it writes

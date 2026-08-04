@@ -20,6 +20,10 @@ import forge_db
 import forge_pg
 import forge_mysql
 
+// Default acquire timeout for the sqlite pool paths below (orm_all / orm_exec): a saturated pool degrades
+// to a fast, catchable err()/[] instead of parking the calling task forever -- see forge_db.pool_acquire_to.
+let _ORM_ACQUIRE_TIMEOUT_MS = 5000
+
 // ---- internal helpers -------------------------------------------------------------------------------
 
 // First index of `sub` in `s`, or -1. (Self-contained; no dependency on a stdlib index_of.)
@@ -120,14 +124,35 @@ fn _orm_apply_nulls(sql: string, params) -> any
 
 // ---- connection -------------------------------------------------------------------------------------
 
-// Open a database from a URL. Returns ok(db) where db = ["orm", kind, pool].
+// Open a database from a URL. Returns ok(db) where db = ["orm", kind, pool, pool_size]. `pool_size`
+// (sqlite + postgres only; mysql has no pool yet) is fixed at 4 in orm_open -- use orm_open_with_pool to
+// raise the connection ceiling for real traffic. orm_close reads the SAME `pool_size` back out of `db` to
+// drain exactly as many connections as were opened -- keep these two functions in sync if the db tuple's
+// shape ever changes.
 //   sqlite://<path>                               (e.g. sqlite://app.db)
 //   postgres://user:password@host:port/dbname     (postgresql:// also accepted; ?query is ignored)
+//
+// NOTE ON `pool_size` NOT BEING A DEFAULTED PARAMETER: the obvious API is `orm_open(url, pool_size = 4)`
+// (NOVA supports default parameter values -- see NOVA_LANGUAGE_FEATURES.md). Verified against the CURRENT
+// toolchain first: a default parameter value is NOT honored across a module-import boundary (confirmed
+// with a minimal 2-file repro -- a single-arg call to an imported fn with a defaulted 2nd param fails
+// E1003 "expects 2 arguments, but got 1"), and orm_open is ALWAYS called cross-module (it's a library
+// entry point; forge_orm_test.nova alone has 3 single-arg call sites). Falling back to two plain
+// functions sharing one implementation, per the fleet instructions, rather than shipping a construct that
+// only compiles from within forge_orm.nova itself.
 fn orm_open(url: string) -> any
+    _orm_open_impl(url, 4)
+
+// Same as orm_open, but with an explicit connection-pool size (sqlite + postgres only) instead of the
+// fixed default of 4 -- for an app that needs a higher connection ceiling than the default allows.
+fn orm_open_with_pool(url: string, pool_size: int) -> any
+    _orm_open_impl(url, pool_size)
+
+fn _orm_open_impl(url: string, pool_size: int) -> any
     if starts_with(url, "sqlite://")
         let path = url[9:len(url)]
-        let pool = forge_db.pool_open(path, 4)
-        return ok(["orm", "sqlite", pool])
+        let pool = forge_db.pool_open(path, pool_size)
+        return ok(["orm", "sqlite", pool, pool_size])
     if starts_with(url, "postgresql://") or starts_with(url, "postgres://")
         let rest = url[11:len(url)]
         if starts_with(url, "postgresql://")
@@ -158,9 +183,9 @@ fn orm_open(url: string) -> any
         if pi >= 0
             host = hostport[0:pi]
             port = parse_int(hostport[pi + 1:len(hostport)])
-        let r = forge_pg.pg_pool_open(host, port, user, dbname, password, 4)
+        let r = forge_pg.pg_pool_open(host, port, user, dbname, password, pool_size)
         if is_ok(r)
-            return ok(["orm", "postgres", unwrap(r)])
+            return ok(["orm", "postgres", unwrap(r), pool_size])
         return r
     if starts_with(url, "mysql://")
         let rest = url[8:len(url)]
@@ -200,9 +225,12 @@ fn orm_close(db)
     let kind = db[1]
     let h = db[2]
     if kind == "sqlite"
-        forge_db.pool_close(h, 4)
+        // db[3] is the SAME pool_size orm_open passed to forge_db.pool_open -- must drain exactly that
+        // many connections (a hardcoded 4 here would hang forever draining a smaller pool, or leak
+        // connections it never drained from a larger one, once orm_open's pool_size became configurable).
+        forge_db.pool_close(h, db[3])
     if kind == "postgres"
-        forge_pg.pg_pool_close(h, 4)
+        forge_pg.pg_pool_close(h, db[3])
     if kind == "mysql"
         forge_mysql.mysql_close(h)
 
@@ -217,10 +245,18 @@ fn orm_all(db, sql: string, params) -> list
     sql = _na[0]
     params = _na[1]
     if kind == "sqlite"
-        let c = recv(h)
-        let rows = db_query_named(c, sql, params)
-        send(h, c)
-        return rows
+        let acq = pool_acquire_to(h, _ORM_ACQUIRE_TIMEOUT_MS)
+        if is_err(acq)
+            // orm_all's contract is `-> list` (the typed `list<T> = orm_all(...)` let-site rewrite depends
+            // on it), so a pool-exhaustion timeout can't be surfaced as an err() Result here without
+            // breaking that contract -- consistent with the postgres/mysql branches just below, which also
+            // degrade ANY driver failure to [] rather than changing the return type. The production win is
+            // still real: a saturated pool now returns FAST (bounded by _ORM_ACQUIRE_TIMEOUT_MS) instead of
+            // parking this call forever.
+            return []
+        let c = unwrap(acq)
+        defer send(h, c)
+        return db_query_named(c, sql, params)
     if kind == "postgres"
         let r = forge_pg.pg_query_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
         if is_ok(r)
@@ -262,11 +298,12 @@ fn orm_exec(db, sql: string, params) -> any
     sql = _na[0]
     params = _na[1]
     if kind == "sqlite"
-        let c = recv(h)
-        db_query(c, sql, params)
-        let n = db_affected(c)
-        send(h, c)
-        return ok(n)
+        let c = pool_acquire_to(h, _ORM_ACQUIRE_TIMEOUT_MS)?
+        defer send(h, c)
+        // db_write actually checks sqlite3_step's return code (see sqlitex.nova) -- previously this called
+        // db_query (which can't report failure) and then ALWAYS returned ok(n), so a constraint violation,
+        // SQLITE_BUSY, or any other write failure was reported as success to every orm_exec caller.
+        return db_write(c, sql, params)
     if kind == "postgres"
         // pg_exec_params_pool returns ok(affected) from the CommandComplete tag (0 for DDL).
         return forge_pg.pg_exec_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
@@ -281,14 +318,20 @@ fn orm_exec(db, sql: string, params) -> any
 // Select, Table, Index, ...) -- and the zero-annotation, type-derived table/column names -- are always
 // legal SQL rather than a syntax error that silently swallows into an empty result / lost write. MySQL
 // quotes with backticks; SQLite and PostgreSQL (and the default) use ANSI double quotes. NOVA struct and
-// field names are lexer-validated identifiers (letters, digits, underscore), so they cannot contain the
-// quote character -- no escaping is required; we simply wrap every identifier. NOTE: in PostgreSQL a
-// quoted identifier is case-SENSITIVE; every struct-driven builder here quotes the SAME type_name-derived
-// string, so create/insert/update/delete/fetch stay mutually consistent.
+// field names ARE lexer-validated identifiers and cannot contain the quote character, so a struct-driven
+// caller (orm_insert/orm_update/orm_create_table/...) never hits this -- but `name` here also carries
+// plain caller-supplied strings (orm_count/orm_where/orm_get/q_from(table).columns(...) take a raw table
+// name, and a generic/admin/reporting endpoint that lets a client PICK a table or column, e.g. a
+// `?sort=`/`?resource=` request param, is a realistic way an untrusted, non-identifier string reaches
+// here). Double any embedded quote character before wrapping -- the standard SQL-identifier escape (a
+// literal quote inside a quoted identifier is written as two quotes) -- so `name = 'a" OR 1=1 --'` becomes
+// an inert quoted identifier instead of breaking out of the quotes. NOTE: in PostgreSQL a quoted
+// identifier is case-SENSITIVE; every struct-driven builder here quotes the SAME type_name-derived string,
+// so create/insert/update/delete/fetch stay mutually consistent.
 fn _orm_qident(kind: string, name: string) -> string
     if kind == "mysql"
-        return "`" + name + "`"
-    "\"" + name + "\""
+        return "`" + name.replace("`", "``") + "`"
+    "\"" + name.replace("\"", "\"\"") + "\""
 
 // ---- inbuilt query functions ------------------------------------------------------------------------
 
@@ -306,9 +349,21 @@ fn orm_count(db, table: string, where: string, params) -> int
 fn orm_exists(db, table: string, where: string, params) -> bool
     orm_count(db, table, where, params) > 0
 
-// MIN/MAX/SUM/AVG aggregate over a column (returns the text value, "" if no rows). The caller coerces.
+// Aggregate function names orm_agg is willing to splice into SQL. fn_name is a keyword, not a value -- it
+// CANNOT be bound as a parameter -- so unlike every other piece of this file it was being raw string-
+// concatenated with no quoting or validation at all (the most directly injectable path in the ORM: an
+// unwhitelisted fn_name like "count(*); DROP TABLE users; --" went straight into the query). Whitelisting
+// against the aggregates every one of NOVA's driver dialects (SQLite/PostgreSQL/MySQL) agrees on closes
+// that off entirely -- anything else is refused rather than executed.
+fn _orm_is_valid_agg_fn(fn_name: string) -> bool
+    fn_name in ["count", "sum", "avg", "min", "max"]
+
+// MIN/MAX/SUM/AVG aggregate over a column (returns the text value, "" if no rows, or if fn_name isn't a
+// recognized aggregate -- see _orm_is_valid_agg_fn). The caller coerces the returned text.
 fn orm_agg(db, fn_name: string, col: string, table: string, where: string, params) -> string
-    let sql = "SELECT " + fn_name + "(" + col + ") AS a FROM " + _orm_qident(db[1], table)
+    if not _orm_is_valid_agg_fn(fn_name)
+        return ""
+    let sql = "SELECT " + fn_name + "(" + _orm_qident(db[1], col) + ") AS a FROM " + _orm_qident(db[1], table)
     if len(where) > 0
         sql = sql + " WHERE " + where
     let rows = orm_all(db, sql, params)

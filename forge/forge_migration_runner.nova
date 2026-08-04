@@ -1,4 +1,21 @@
 // forge_migration_runner — database migration tracker with Result API.
+//
+// Two APIs live here:
+//   1. mr_new/mr_register/mr_apply/mr_rollback/mr_is_applied/... -- a PURE IN-MEMORY tracker (a dict
+//      flip). Useful for dry-run planning or as a building block, but it never opens a connection or
+//      runs any SQL -- applying a migration here does not touch a real database.
+//   2. mr_apply_sql/mr_rollback_sql/mr_run_migrations (below, keyed off `_sql`/`_migrations`, not off
+//      a version int) -- the REAL executor. It wires forge_migrate's schema_migrations SQL-fragment
+//      generators (migration_history_ddl/migration_check_sql/migration_record_sql/migration_delete_sql)
+//      through forge_db's pooled connection + with_tx transaction API, so a migration is idempotent
+//      (checked against a real history table) AND all-or-nothing (the up/down SQL and the history-row
+//      write/delete happen inside the SAME transaction). This is what a real app calls at startup.
+// The two APIs intentionally do NOT share function names: mr_apply(m, version) takes an in-memory
+// tracker dict and an int version (arity 2); the real one needs a pool handle + a SQL string (arity 3)
+// -- genuinely different signatures for a genuinely different job, so new names avoid silently
+// colliding two incompatible behaviors under one name.
+import forge_migrate
+import forge_db
 
 fn mr_new() -> dict
     let m = {}
@@ -53,3 +70,97 @@ fn mr_migration_name(m: dict, version: int) -> Result
     if contains(m["migrations"], key) != true
         return err("not found")
     ok(m["migrations"][key])
+
+// ── real-DB-backed migration execution ──────────────────────────────────────────────────────────────
+// Wires forge_migrate's SQL-fragment generators through forge_db's pooled connection so migrations
+// ACTUALLY run, exactly-once, all-or-nothing. `pool` is a forge_db connection pool (from pool_open).
+
+// Millisecond epoch timestamp as text -- exact, sortable, and needs no clock/locale-aware formatting
+// module for a history-table audit column (the column is TEXT; any caller that wants a human-readable
+// date can convert time_ms() themselves for display -- this value is for exactly-once bookkeeping).
+fn _mr_now() -> string
+    str(time_ms())
+
+// Idempotent: CREATE TABLE IF NOT EXISTS is safe to run on every call, including concurrently from
+// multiple pooled connections -- there is no separate "first use" flag to keep in sync. Returns a
+// Result (not a bare rc) so a failure here (lock contention, disk pressure) is surfaced to the
+// caller instead of silently letting _mr_is_recorded run against a table that may not exist.
+fn _mr_ensure_history(db) -> Result
+    let rc = db_exec(db, migration_history_ddl())
+    if rc != 0
+        return err("migration history table setup failed (sqlite rc=" + str(rc) + ")")
+    ok(rc)
+
+// Has `migration_id` already been recorded as applied on THIS connection's view of the DB?
+fn _mr_is_recorded(db, migration_id: string) -> bool
+    let check = migration_check_sql(migration_id)
+    let rows = db_query(db, check[0], check[1])
+    len(rows) > 0
+
+// Run a non-parameterized statement (the migration's own up/down SQL) and turn sqlite's bare rc into a
+// structured Result -- shared by both mr_apply_sql and mr_rollback_sql so the "rc != 0 -> err" check
+// exists in exactly one place.
+fn _mr_exec_or_err(db, sql: string, context: string) -> Result
+    let rc = db_exec(db, sql)
+    if rc != 0
+        return err(context + " failed (sqlite rc=" + str(rc) + ")")
+    ok(rc)
+
+// Runs entirely on the ONE connection with_tx hands in -- ensure history table, skip if already
+// recorded, else run up_sql and record it, all inside with_tx's BEGIN/COMMIT/ROLLBACK.
+fn _mr_apply_body(db, migration_id: string, up_sql: string) -> Result
+    _mr_ensure_history(db)?
+    if _mr_is_recorded(db, migration_id)
+        return ok(0)
+    _mr_exec_or_err(db, up_sql, "migration '" + migration_id + "' (up)")?
+    let rec = migration_record_sql(migration_id, _mr_now())
+    // db_write, NOT db_query: db_query's own doc comment says a failed write is not surfaced through
+    // its return value (it silently returns rows-so-far, so a failed history-row INSERT would still
+    // look like success here) -- that would let with_tx COMMIT the up_sql schema change with NO
+    // history row, silently breaking this fix's whole "all-or-nothing" guarantee. db_write checks
+    // sqlite3_step's real result and returns err() on anything but SQLITE_DONE.
+    db_write(db, rec[0], rec[1])?
+    ok(1)
+
+// mr_apply_sql -- apply ONE versioned migration against a real DB pool. Idempotent: if migration_id is
+// already recorded in schema_migrations, this is a no-op (ok(0)). Otherwise up_sql runs and the history
+// record is written -- BOTH inside the SAME transaction (forge_db's with_tx), so an error partway
+// leaves NEITHER the schema change NOR the history row behind (all-or-nothing). Returns ok(1) when
+// newly applied, ok(0) when already applied (skipped), err(msg) if up_sql failed.
+fn mr_apply_sql(pool, migration_id: string, up_sql: string) -> Result
+    with_tx(pool, fn(db) _mr_apply_body(db, migration_id, up_sql))
+
+fn _mr_rollback_body(db, migration_id: string, down_sql: string) -> Result
+    _mr_ensure_history(db)?
+    if not _mr_is_recorded(db, migration_id)
+        return err("migration '" + migration_id + "' is not recorded as applied -- nothing to roll back")
+    _mr_exec_or_err(db, down_sql, "migration '" + migration_id + "' (down)")?
+    let del = migration_delete_sql(migration_id)
+    // db_write, NOT db_query -- same reasoning as _mr_apply_body above.
+    db_write(db, del[0], del[1])?
+    ok(migration_id)
+
+// mr_rollback_sql -- the symmetric down-migration: errors if migration_id was never recorded as
+// applied, otherwise runs down_sql and deletes its history record -- both inside the SAME transaction,
+// so a failing down_sql leaves the history record (and the schema) untouched.
+fn mr_rollback_sql(pool, migration_id: string, down_sql: string) -> Result
+    with_tx(pool, fn(db) _mr_rollback_body(db, migration_id, down_sql))
+
+// mr_run_migrations -- the real "run pending migrations at startup" entry point. `migrations` is an
+// ORDERED list of [migration_id, up_sql, down_sql] triples. Applies each one not yet recorded, IN
+// ORDER (mr_apply_sql's own idempotency check skips ones already applied). Stops at the FIRST failure
+// and returns that err() Result immediately via `?` -- later migrations in the list are never
+// attempted once one fails, so schema_migrations always reflects a contiguous applied prefix, never a
+// gap. Returns ok(applied_ids): the migration_ids that were NEWLY applied this call (already-applied
+// ones are skipped and excluded, so an empty ok([]) means every migration was already up to date).
+fn mr_run_migrations(pool, migrations: list) -> Result
+    let applied_ids = []
+    for i, mig in migrations
+        if len(mig) < 3
+            return err("malformed migration entry at index " + str(i) + ": expected [migration_id, up_sql, down_sql]")
+        let migration_id = mig[0]
+        let up_sql = mig[1]
+        let applied = mr_apply_sql(pool, migration_id, up_sql)?
+        if applied == 1
+            push(applied_ids, migration_id)
+    ok(applied_ids)

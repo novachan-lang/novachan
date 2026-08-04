@@ -110,12 +110,13 @@ fn sup_start(sup) -> int
 //   rest_for_one: (re)start the crashed child + every child started AFTER it (in spec order)
 // Backward-compatible: one_for_one still uses _supervise_one (independent per-child loops).
 //
-// TERMINATION LIMITATION (NOVA has no preemptive kill): "restart" here means SPAWN A FRESH INSTANCE.
-// A healthy sibling being force-replaced is NOT stopped -- its old process keeps running until it exits
-// on its own (its stale DOWN is discarded via the generation check). So use one_for_all / rest_for_one
-// only with children that SELF-TERMINATE or are stop-signal-aware; long-running non-terminating children
-// leave the old instance lingering. True terminate-then-restart needs a runtime linked-exit primitive
-// (TRACKED). one_for_one is unaffected (each child restarted only when it exits by itself).
+// TERMINATION: a healthy sibling being force-replaced under one_for_all / rest_for_one is stopped via
+// the runtime's safepoint `kill(pid)` (LOCK-5) right where it is marked for replacement, so the old
+// instance does not linger indefinitely -- its stale DOWN is still discarded via the generation check
+// (kill is cooperative: the target unwinds at its OWN next safepoint/fault boundary, the same path a
+// panic takes, so teardown is the proven one; a child parked forever on a channel with no other
+// safepoint is not force-unlinked yet -- see LOCK-5 notes). one_for_one is unaffected (each child
+// restarted only when it exits by itself, so nothing needs killing).
 //
 // WATCHER TASK: watches one child process and sends [idx, exit_status, gen] to the central down_ch.
 // `gen` is the generation counter for this particular launch — stale DOWNs from replaced siblings
@@ -157,17 +158,21 @@ fn _supervise_multi(sup)
     let gens = []
     // alive: per-child boolean (1=active slot, 0=permanently retired)
     let alive = []
+    // pids: per-child CURRENT process handle, so a force-replace can kill() the old instance
+    let pids = []
     let i = 0
     while i < n
         push(stamps, [])
         push(gens, 0)
         push(alive, 1)
+        push(pids, 0)
         i = i + 1
     // Start all children; each child gets gen=0 watcher
     let k = 0
     while k < n
         let start_fn = specs[k][1]
         let p = spawn _run_child(start_fn)
+        pids[k] = p
         spawn _child_watcher(p, k, 0, down_ch)
         k = k + 1
     // Central supervision loop
@@ -206,6 +211,9 @@ fn _supervise_multi(sup)
                             // Force-replace running sibling if policy allows
                             if alive[oi] == 1 and pol != "temporary"
                                 push(restart_indices, oi)
+                                // Actually stop the old instance (LOCK-5 safepoint kill) instead of
+                                // letting it linger; best-effort/cooperative, see the fn header note.
+                                kill(pids[oi])
                                 // Pre-emptively retire so stale DOWNs are discarded (gen check)
                                 alive[oi] = 0
                                 active = active - 1
@@ -221,6 +229,7 @@ fn _supervise_multi(sup)
                         else if ri > cidx
                             if alive[ri] == 1 and pol != "temporary"
                                 push(restart_indices, ri)
+                                kill(pids[ri])
                                 alive[ri] = 0
                                 active = active - 1
                         ri = ri + 1
@@ -240,6 +249,7 @@ fn _supervise_multi(sup)
                     gens[ridx] = new_gen
                     let sfn = specs[ridx][1]
                     let np = spawn _run_child(sfn)
+                    pids[ridx] = np
                     spawn _child_watcher(np, ridx, new_gen, down_ch)
                     alive[ridx] = 1
                     active = active + 1

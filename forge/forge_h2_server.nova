@@ -4,6 +4,13 @@
 // build_request) + forge_hpack (header compression) + forge_h2 (frame codec). Tests import ONLY this module
 // (single import path -> no module diamond). The socket serve loop (serve_h2c, cleartext h2c prior-knowledge)
 // rides these + tcp; this unit is the deterministic mapping core. See NOVA_DESIGN/HTTP2_PLAN.md.
+//
+// serve_h2_tls additionally serves h2 over REAL TLS with ALPN negotiation (the native SChannel/OpenSSL
+// tls_listen/tls_listen_alpn/tls_accept/tls_alpn builtins) -- the enabling primitive for gRPC-over-TLS and
+// browser-facing h2 (browsers only ever negotiate h2 via ALPN over TLS, never h2c). It drives the SAME
+// frame/HPACK/dispatch core as serve_h2c (_h2_drive_conn, parameterized over the byte transport) so there is
+// exactly one h2 dispatch path regardless of transport. See the serve_h2_tls doc comment below for the
+// http/1.1 fallback when ALPN does not negotiate "h2".
 // ══════════════════════════════════════════════════════════════════════════════
 import forge
 import forge_hpack
@@ -151,23 +158,22 @@ fn serve_h2c(a, port: int, n: int)
         ci = ci + 1
     tcp_close(listener)
 
-fn _h2c_serve_conn(a, conn: int)
-    let buf = bytes(0)
-    while bytes_len(buf) < 24
-        let more = tcp_recv_bytes(conn)
-        if bytes_len(more) == 0
-            tcp_close(conn)
-            return
-        buf = bytes_concat(buf, more)
-    tcp_send_bytes(conn, list_to_bytes(forge_h2.h2_settings([])))
-    let blist = bytes_to_list(bytes_slice(buf, 24, bytes_len(buf)))
+// The shared h2 frame-driving core, factored out of the (formerly h2c-only) connection loop so BOTH
+// serve_h2c (cleartext) and serve_h2_tls (TLS+ALPN, "h2" branch) dispatch through exactly ONE place --
+// no copy-pasted frame/HPACK logic between the two transports. `recv`/`send` are zero/one-arg closures
+// over the connection's byte transport (tcp_*_bytes for h2c, tls_*_bytes for h2-over-TLS); `post_preface`
+// is whatever bytes the caller already read past the 24-byte connection preface. Sends our SETTINGS, then
+// reads/parses frames until the first HEADERS stream has been served (v1: one stream per connection).
+fn _h2_drive_conn(a, post_preface: list, recv, send)
+    send(list_to_bytes(forge_h2.h2_settings([])))
+    let blist = post_preface
     let dyn = []
     let alive = true
     let served = 0
     while alive
         let fp = forge_h2.h2_frame_parse(blist, 0)
         if len(fp) == 0
-            let more = tcp_recv_bytes(conn)
+            let more = recv()
             if bytes_len(more) == 0
                 alive = false
             else
@@ -181,9 +187,175 @@ fn _h2c_serve_conn(a, conn: int)
                 let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(blist, fp), dyn)
                 dyn = dec[1]
                 let resp = forge.dispatch_safe(a, h2_request_from_headers(dec[0]))
-                tcp_send_bytes(conn, list_to_bytes(h2_response_frames(resp, fp[2])))
+                send(list_to_bytes(h2_response_frames(resp, fp[2])))
                 served = served + 1
             blist = _slice_list(blist, fp[5])
             if served >= 1
                 alive = false
-    tcp_close(conn)
+
+// Read the 24-byte h2 connection preface via `recv` (tcp_recv_bytes or tls_recv_bytes -- whichever
+// transport the caller is on), so this accumulation logic exists in exactly one place instead of
+// being copy-pasted per transport (h2c below and h2-over-TLS further down both call this). Returns
+// [1, rest] on success (rest = whatever bytes arrived past the preface, handed to _h2_drive_conn as
+// its post_preface), or [0, empty] if the peer closed before completing it.
+fn _h2_read_preface(recv) -> list
+    let buf = bytes(0)
+    while bytes_len(buf) < 24
+        let more = recv()
+        if bytes_len(more) == 0
+            return [0, bytes(0)]
+        buf = bytes_concat(buf, more)
+    [1, bytes_slice(buf, 24, bytes_len(buf))]
+
+fn _h2c_serve_conn(a, conn: int)
+    defer tcp_close(conn)
+    let r = _h2_read_preface(fn() tcp_recv_bytes(conn))
+    if r[0] == 0
+        return
+    let post = bytes_to_list(r[1])
+    _h2_drive_conn(a, post, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d))
+
+// ── HTTP/2 over TLS, negotiated via ALPN (D-ALPN) ──────────────────────────────────────────────────────
+// serve_h2_tls uses the NATIVE SChannel/OpenSSL TLS builtins (tls_listen/tls_listen_alpn/tls_accept/
+// tls_alpn/tls_send_bytes/tls_recv_bytes/tls_close) -- a DIFFERENT stack from forge_tls_server.nova's
+// hand-rolled TLS 1.3 implementation. The two are NOT interchangeable: forge_tls_server's API does its
+// own tcp_listen/tcp_accept + handshake and returns its own key material, so a tls_accept() handle from
+// this module can never be handed to it (incompatible connection representations). That is intentional
+// scope, not an oversight -- see the fallback note below.
+
+// Bounds for the minimal HTTP/1.1-over-TLS fallback (v1: single request per connection, no keep-alive) --
+// a slow or hostile client can never grow the accumulation buffer unbounded.
+fn _h2tls_max_header() -> int
+    65536
+
+fn _h2tls_max_body() -> int
+    10485760
+
+// Content-Length value out of a raw header-block string (case-insensitive), 0 if absent or malformed.
+// Digit-by-digit via find() on "0123456789" so a header that ends mid-number stops cleanly at the
+// declared bound (`n`) rather than indexing out of range.
+fn _h2tls_content_length(headers: string) -> int
+    let lo = lower(headers)
+    let idx = find(lo, "content-length:")
+    if idx < 0
+        return 0
+    let p = idx + 15
+    let n = len(headers)
+    while p < n and headers[p] == " "
+        p = p + 1
+    let v = 0
+    let seen = false
+    while p < n
+        let d = find("0123456789", headers[p])
+        if d < 0
+            break
+        v = v * 10 + d
+        seen = true
+        p = p + 1
+    if not seen
+        return 0
+    v
+
+// Read ONE HTTP/1.1 request off a TLS connection: accumulate bytes until the header terminator
+// (\r\n\r\n), then read exactly Content-Length more bytes of body if one was declared. Bounded by
+// _h2tls_max_header/_h2tls_max_body so a stalled or hostile client can never grow either buffer past a
+// fixed cap. Returns "" if the connection closed before a complete request arrived.
+fn _h2tls_recv_http11(conn: int) -> string
+    let acc = bytes(0)
+    let text = ""
+    let hdr_end = -1
+    while hdr_end < 0
+        let more = tls_recv_bytes(conn)
+        if bytes_len(more) == 0
+            return ""
+        acc = bytes_concat(acc, more)
+        if bytes_len(acc) > _h2tls_max_header()
+            return ""
+        text = bytes_to_str(acc)
+        hdr_end = find(text, "\r\n\r\n")
+    let cl = _h2tls_content_length(slice(text, 0, hdr_end))
+    if cl <= 0
+        return text
+    if cl > _h2tls_max_body()
+        return ""
+    let need_total = hdr_end + 4 + cl
+    // bytes_len(acc), NOT len(text): bytes_to_str tags its result NOVA_MEM_RAW, so len()/str ops on
+    // it fall through to C strlen() -- a body containing an embedded 0x00 byte before need_total
+    // would make len(text) permanently understate the true accumulated size, so the loop guard could
+    // never go false even once every byte has arrived, blocking forever on the next tls_recv_bytes
+    // (a real client that already sent its whole body and is just waiting for the response, not
+    // closing the socket). bytes_len is a true byte count and is immune to embedded NULs. Also only
+    // convert to a string ONCE, after the loop, instead of on every network read (was O(n^2) up to
+    // the 10MB body cap).
+    while bytes_len(acc) < need_total
+        let more2 = tls_recv_bytes(conn)
+        if bytes_len(more2) == 0
+            return bytes_to_str(acc)
+        acc = bytes_concat(acc, more2)
+    bytes_to_str(acc)
+
+// Minimal HTTP/1.1 fallback for a TLS connection that did NOT negotiate "h2" -- either the client only
+// offered http/1.1, or ALPN negotiation itself failed (tls_listen_alpn/tls_accept fail OPEN to plain
+// http/1.1 by design rather than erroring; this path exists precisely so that fail-open guarantee is
+// actually served, not silently dropped on the floor). v1 scope, matching serve_h2c's own "one
+// stream/request per connection" scope: read ONE request, dispatch it through the SAME router as h2
+// (forge.dispatch_safe), send ONE Connection:-close response back. For a full keep-alive, multi-request
+// HTTPS/1.1 server, use forge.serve_req/serve_app layered over forge_tls_server.nova's TLS 1.3 stack
+// instead -- see the module note above for why the two TLS stacks cannot share a connection handle.
+fn _h2tls_serve_http11(a, conn: int)
+    let raw = _h2tls_recv_http11(conn)
+    if len(raw) == 0
+        return
+    let req = forge.build_request(raw, 0)
+    let resp = forge.dispatch_safe(a, req)
+    tls_send_bytes(conn, str_to_bytes(forge.finalize(resp)))
+
+// h2-over-TLS per-connection driver: read the 24-byte connection preface off the (already handshaken)
+// TLS socket, then hand off to the SAME frame/HPACK/dispatch core the h2c path uses (_h2_drive_conn),
+// parameterized over the TLS byte transport instead of raw tcp.
+fn _h2tls_serve_conn_h2(a, conn: int)
+    let r = _h2_read_preface(fn() tls_recv_bytes(conn))
+    if r[0] == 0
+        return
+    let post = bytes_to_list(r[1])
+    _h2_drive_conn(a, post, fn() tls_recv_bytes(conn), fn(d) tls_send_bytes(conn, d))
+
+// Per-connection dispatch once the TLS+ALPN handshake has picked a protocol: "h2" drives the h2 frame
+// core; anything else (including "" -- ALPN not offered/not negotiated) falls back to plain HTTP/1.1, so
+// a non-h2 client is served rather than silently dropped. `defer` guarantees the connection is closed
+// exactly once no matter which branch runs or whether it returns early (crash-in-handler included, since
+// dispatch_safe already isolates a panicking route handler and always returns a Response).
+fn _h2tls_serve_conn(a, conn: int)
+    defer tls_close(conn)
+    let proto = tls_alpn(conn)
+    if proto == "h2"
+        _h2tls_serve_conn_h2(a, conn)
+    else
+        _h2tls_serve_http11(a, conn)
+
+// serve_h2_tls(app, port, cert_path, key_path, n): HTTP/2 over TLS with ALPN negotiation ("h2" offered
+// ahead of "http/1.1", server preference order) -- the enabling primitive for gRPC-over-TLS and real
+// browser-facing h2 (browsers only ever negotiate h2 via ALPN over TLS, never h2c prior-knowledge).
+// cert_path/key_path are the PFX (SChannel) / cert+key (OpenSSL) pair tls_listen already expects. Accepts
+// `n` connections; each is fully handled (including its own TLS handshake) by _h2tls_serve_conn, which
+// picks h2 vs the http/1.1 fallback from what ALPN actually negotiated on that connection. Mirrors
+// serve_h2c's shape (finite `n`, one stream/request per connection -- multi-stream/keep-alive is a
+// tracked follow-up for both transports).
+//
+// NOTE on the listener handle: there is currently no runtime-exposed way to close a TLS LISTENER
+// (tls_close assumes the NovaTlsConn layout of an accepted connection; calling it on the listener's
+// NovaTlsServer handle would misinterpret that memory -- unsafe, not attempted here). The listener is
+// therefore left open for the server process's lifetime, same as a long-running tcp_listen-based server
+// that never tears down its own listener mid-process. This is a tracked runtime gap (nova_runtime.c is
+// out of this module's scope), not something silently ignored.
+fn serve_h2_tls(a, port: int, cert_path: string, key_path: string, n: int)
+    let listener = tls_listen(port, cert_path, key_path)
+    if listener == 0
+        return
+    tls_listen_alpn(listener, "h2,http/1.1")
+    let ci = 0
+    while ci < n
+        let conn = tls_accept(listener)
+        if conn != 0
+            _h2tls_serve_conn(a, conn)
+        ci = ci + 1

@@ -6,6 +6,7 @@ import forge_tls
 import forge_crypto
 import forge_x509
 import forge_chain
+import std/time/strftime
 
 // CSPRNG: real OS entropy for the ephemeral X25519 key + client random. NOVA's random_int is C rand()
 // (non-crypto); nova_rt_os_random uses the OS CSPRNG (CryptGenRandom / urandom). Reached via the @link
@@ -142,6 +143,50 @@ fn _tlsc_send_record(sock, ct: int, ver_lo: int, body) -> int
         i = i + 1
     tcp_send_bytes(sock, _tlsc_l2b(rec))
 
+// FIX 3 (MITM defense): current time as UTCTime VALUE bytes ("YYMMDDHHMMSSZ") for chain_verify's `now` --
+// the real wall clock, so the certificate validity window is enforced on every call, not skippable by a
+// caller who doesn't supply one. dt_strftime has no %y (2-digit year) directive, so build the 4-digit year
+// form first ("20260803143022", 14 chars) and drop the century (UTCTime is YY not YYYY).
+fn _tlsc_now_utctime() -> list
+    let full = dt_strftime(datetime_timestamp(), "%Y%m%d%H%M%S")
+    str_to_blist(full[2:14] + "Z")
+
+// FIX 3 (MITM defense): extract EVERY certificate DER from a Certificate message body, leaf first then any
+// intermediates/root the server actually sent -- forge_tls's tls13_cert_leaf_der only returns the FIRST
+// entry, but chain_verify (forge_chain) needs the FULL chain [leaf, intermediate.., root] to walk issuer ->
+// issuer up to the trust anchor. Per RFC 8446 4.4.2 each CertificateEntry is
+// [cert_data uint24-len][cert_data][extensions uint16-len][extensions]; walked with explicit bounds (every
+// length field clamped to the declared list end) so a truncated/malformed Certificate message yields
+// whatever complete entries were read, never an OOB read.
+fn _tlsc_cert_chain(cert_body) -> list
+    let n = len(cert_body)
+    let ctxlen = cert_body[0]
+    let p = 1 + ctxlen
+    if p + 3 > n
+        return []
+    let listlen = (cert_body[p] << 16) | (cert_body[p + 1] << 8) | cert_body[p + 2]
+    p = p + 3
+    let listend = p + listlen
+    if listend > n
+        listend = n
+    let out = []
+    while p + 3 <= listend
+        let clen = (cert_body[p] << 16) | (cert_body[p + 1] << 8) | cert_body[p + 2]
+        p = p + 3
+        let cend = p + clen
+        if cend > listend
+            cend = listend
+        push(out, _tlsc_slice(cert_body, p, cend))
+        p = cend
+        if p + 2 > listend
+            p = listend
+        else
+            let extlen = (cert_body[p] << 8) | cert_body[p + 1]
+            p = p + 2 + extlen
+            if p > listend
+                p = listend
+    out
+
 // Does `flight` (concatenated handshake messages) end exactly with a complete Finished (type 20)?
 fn _tlsc_flight_done(flight) -> int
     let p = 0
@@ -229,8 +274,24 @@ fn tls13_client_l1(host, port: int) -> list
 // Full TLS 1.3 client: complete the handshake (verify CertificateVerify + server Finished, send client
 // Finished), derive application keys, send `request` and return the decrypted server response.
 // Returns [ok, response_bytes_list]. Verifies the server's handshake signature + Finished (per-handshake
-// authentication); chain-to-trust-anchor is a separate policy layer (forge_chain).
-fn tls13_client_request(host, port: int, request) -> list
+// authentication) AND (FIX 3) WHO the peer actually is: the certificate chain to `trust_anchor` (forge_chain)
+// and the leaf's hostname against `expected_host` (forge_x509, RFC 6125 SAN matching). Without those two,
+// the signature+Finished checks alone are satisfiable by ANY active MITM holding a fresh, self-signed
+// keypair -- they also derive a valid ECDHE secret and can sign their own handshake with their own key.
+// SECURITY: `trust_anchor` and `expected_host` are REQUIRED params (NOT defaulted) -- this widens the
+// signature, a legitimate breaking change; the only in-tree caller (forge_tls_client_l2_test.nova) is
+// updated alongside this. (Default parameter values were tried first but VERIFIED not to work across a
+// module import boundary in the current toolchain -- a probe with an imported fn's trailing args defaulted
+// compiled fine called from its OWN file, but failed arity checking called from a DIFFERENT file that
+// imports it; required params are the correct, toolchain-compatible choice here, and they are also the
+// more honest one: the caller cannot forget to think about verification.) An empty trust_anchor FAILS
+// CLOSED (mirrors chain_verify's own `now` convention: a caller that can't supply what verification needs
+// gets a clean refusal, never a silent bypass) -- pass a real pinned root/leaf DER to actually verify. Pass
+// "" for expected_host to verify against `host` itself (the address actually connected to); hostname
+// binding can never be silently skipped. On any failure (including a failed chain/host check) this returns
+// [0, []] -- the SAME failure value every earlier check in this function already used, never a silent
+// success.
+fn tls13_client_request(host, port: int, request, trust_anchor, expected_host: string) -> list
     let st = tls13_client_l1(host, port)
     if st[0] != 1
         return [0, []]
@@ -264,6 +325,22 @@ fn tls13_client_request(host, port: int, request) -> list
 
     // verify the server Finished
     if tls13_verify_server_finished(s_hs, th_cv, _tlsc_slice(flight, m4[2], m4[3])) != 1
+        return [0, []]
+
+    // FIX 3 (MITM defense): authenticate WHO the peer is, not just that they hold A keypair. An empty
+    // trust_anchor fails CLOSED -- there is nothing to pin to, so this refuses rather than silently trusting
+    // an unverified leaf.
+    if len(trust_anchor) == 0
+        return [0, []]
+    let certs = _tlsc_cert_chain(cert_body)
+    if len(certs) == 0
+        return [0, []]
+    if chain_verify(certs, trust_anchor, _tlsc_now_utctime()) != 1
+        return [0, []]
+    let want_host = expected_host
+    if want_host == ""
+        want_host = host
+    if x509_matches_host(leaf, str_to_blist(want_host)) != 1
         return [0, []]
 
     // send ChangeCipherSpec (legacy) + the encrypted client Finished (c_hs, seq 0)

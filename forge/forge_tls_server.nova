@@ -6,6 +6,7 @@ import forge_tls
 import forge_crypto
 import forge_x509
 import forge_chain
+import forge_limits
 
 // CSPRNG: real OS entropy for the ephemeral X25519 key, server random, and cert key. NOVA's random_int is
 // C rand() (non-crypto); nova_rt_os_random uses the OS CSPRNG (CryptGenRandom / urandom). Reached via the
@@ -13,6 +14,12 @@ import forge_chain
 // freshly generated per handshake (self-signed, unverified demo cert); a production server would load a
 // stable identity key -- but the ephemeral X25519 key MUST be fresh per handshake, which this guarantees.
 extern fn nova_rt_os_random(n: int) -> bytes
+
+// FIX 2 (real CA-issued certs): binary TLS I/O over the runtime's OS-native TLS listener (tls_listen/
+// tls_accept are already plain builtins -- see forge_pg.nova for the identical extern pattern for these
+// two symbols specifically; tls_close/tls_accept/tls_listen do NOT need extern, they resolve directly).
+extern fn nova_rt_tls_send_bytes(handle: int, b: bytes) -> int
+extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
 
 fn _tlss_b2l(b) -> list
     let out = []
@@ -524,41 +531,149 @@ fn forge_serve_tls(port: int, handler) -> int
 fn _tlss_run(conn: int, handler, cert_sk, srv_priv)
     _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
 
+// FIX 1 (admission control): default concurrent in-flight cap for the spawn-per-connection loops below --
+// matches the plain-HTTP path's default (forge.nova::_max_conns). Every accepted connection otherwise ran a
+// full ECDHE + Ed25519 CertificateVerify signing UNCONDITIONALLY, with zero cap: an accept storm could spawn
+// unbounded concurrent handshake tasks (CPU exhaustion, not just memory/FDs). Gating happens BEFORE the
+// handshake starts (cg_acquire in the accept loop, before spawn), not after.
+fn _tlss_max_conns() -> int
+    10000
+
 // Serve ONE connection in its own task, CRASH-ISOLATED. The serve runs in a monitored sub-process; whether
 // it returns cleanly OR PANICS, the monitor fires and THIS frame (no user code -> never panics) ALWAYS runs
-// tcp_close(conn) + send(done_ch,1). Without this, a handler panic would longjmp over both -> the conn fd
-// leaks AND the accept loop's drain (receive n done signals) blocks forever (the listener never closes).
-// Mirrors the HTTP path's dispatch_safe/_handle_req_safe_done. Connections are handled CONCURRENTLY so a
-// slow handshake on one connection cannot block the others.
-fn _tlss_serve_spawned(conn: int, handler, cert_sk, srv_priv, done_ch)
+// tcp_close(conn) + cg_release(guard) + send(done_ch,1). Without this, a handler panic would longjmp over
+// all three -> the conn fd leaks, the admission-control slot leaks (permanently shrinking the live cap), AND
+// the accept loop's drain (receive n done signals) blocks forever (the listener never closes). Mirrors the
+// HTTP path's dispatch_safe/_handle_req_safe_done. Connections are handled CONCURRENTLY so a slow handshake
+// on one connection cannot block the others.
+fn _tlss_serve_spawned(conn: int, handler, cert_sk, srv_priv, done_ch, guard)
     let p = spawn _tlss_run(conn, handler, cert_sk, srv_priv)
     let m = monitor(p)
     receive(m)
     tcp_close(conn)
+    cg_release(guard)
     send(done_ch, 1)
 
-// Serve n HTTPS requests (n connections) CONCURRENTLY. The Ed25519 cert key (the server's IDENTITY) is
-// STABLE for the server's lifetime; the ephemeral X25519 key is FRESH per connection (forward secrecy).
-// Each accepted connection is spawned into its own task, so one slow handshake cannot block other clients
-// (defense in depth beyond the per-read timeout). The accept loop then waits for all n handlers (the done
-// channel) before closing the listener. Returns 1.
+// Serve n HTTPS requests (n connections) CONCURRENTLY, capped at _tlss_max_conns() in-flight handshakes+
+// handlers via the conn_guard actor (forge_limits) -- N>1-SAFE admission control (a plain dict counter would
+// race under NOVA_CARRIERS>1; the actor serializes acquire/release through one owning task). cg_acquire is
+// checked BEFORE spawning the handler, i.e. before the (expensive) ECDHE+cert-signing handshake ever starts,
+// so an accept storm past the cap is rejected (connection closed, no handshake, no task spawned) instead of
+// piling up unbounded concurrent handshakes. The Ed25519 cert key (the server's IDENTITY) is STABLE for the
+// server's lifetime; the ephemeral X25519 key is FRESH per connection (forward secrecy). The accept loop
+// waits for all n ADMITTED handlers (the done channel) before closing the listener. Returns 1.
 fn forge_serve_tls_n(port: int, handler, n: int) -> int
     let cert_sk = _tlss_b2l(unsafe nova_rt_os_random(32))
     let srv = tcp_listen(port)
     if srv < 0
         return 0
     let done_ch = channel()
+    let guard = conn_guard(_tlss_max_conns())
     let spawned = 0
     while spawned < n
         let conn = tcp_accept(srv)
         if conn < 0
             break                    // listener error -> stop accepting; DRAIN what we already spawned (no orphans)
-        let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
-        spawn _tlss_serve_spawned(conn, handler, cert_sk, srv_priv, done_ch)
-        spawned = spawned + 1
+        if cg_acquire(guard) != 1
+            tcp_close(conn)          // at capacity -- reject BEFORE the handshake; no handler spawned, no permit held
+        else
+            let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
+            spawn _tlss_serve_spawned(conn, handler, cert_sk, srv_priv, done_ch, guard)
+            spawned = spawned + 1
     let got = 0
     while got < spawned
         receive(done_ch)
         got = got + 1
     tcp_close(srv)
+    conn_guard_stop(guard)
+    1
+
+// ── FIX 2: real CA-issued certificates via the runtime's OS-native TLS listener ─────────────────────────
+// Every entry point above draws its keypair EXCLUSIVELY from nova_rt_os_random -- a fresh SELF-SIGNED cert
+// every process start, which no real client will trust. The runtime already has a working OS-native TLS
+// listener (tls_listen -> nova_rt_tls_listen, SChannel on Windows / OpenSSL elsewhere) that loads a REAL
+// cert/key from disk and does the complete handshake itself -- this section is purely ADDITIVE: it does not
+// touch tls13_server_handshake or any hand-rolled path above, it just routes through the runtime's listener
+// instead. cert_path/key_path are passed straight through to nova_rt_tls_listen: PEM file paths on the
+// OpenSSL build; on the SChannel (Windows) build cert_path is a PFX file and key_path is its passphrase --
+// a pre-existing platform difference in the runtime (nova_runtime.c), not something this module changes.
+
+// Read one complete HTTP/1.1 request off an OS-native TLS handle (tls_recv_bytes already returns decrypted
+// application data -- no record-layer bookkeeping needed here, unlike the hand-rolled path above). Bounded
+// by the same 64-read / 1MB guards as _tlss_serve_conn; returns whatever was accumulated (possibly
+// incomplete) once EOF, the guard, or the size cap is hit -- the caller checks completeness before dispatch.
+fn _tlss_read_plain_request(handle) -> string
+    let acc = ""
+    let guard = 0
+    while guard < 64
+        guard = guard + 1
+        let chunk = unsafe nova_rt_tls_recv_bytes(handle)
+        if bytes_len(chunk) == 0
+            return acc
+        acc = acc + bytes_to_str(chunk)
+        if len(acc) > 1048576
+            return acc
+        if _tlss_req_complete(acc)
+            return acc
+    acc
+
+// Serve ONE already-accepted OS-native TLS connection: read the (decrypted) request, run `handler`, send the
+// response back encrypted. Returns 1 iff a complete request was actually served.
+fn _tlss_serve_conn_file(handle, handler) -> int
+    let acc = _tlss_read_plain_request(handle)
+    if _tlss_req_complete(acc) != true
+        return 0
+    let resp = handler(acc)
+    unsafe nova_rt_tls_send_bytes(handle, str_to_bytes(resp))
+    1
+
+// Crash-isolation inner worker, mirrors _tlss_run for the OS-native path.
+fn _tlss_run_file(handle, handler)
+    _tlss_serve_conn_file(handle, handler)
+
+// Crash-isolated per-connection wrapper, mirrors _tlss_serve_spawned for the OS-native path: whether the
+// serve returns cleanly or PANICS, this frame (never panics) always closes the connection handle, releases
+// the admission-control permit, and signals done -- no leaked fd, no leaked permit, no hung drain.
+fn _tlss_serve_spawned_file(handle, handler, done_ch, guard)
+    let p = spawn _tlss_run_file(handle, handler)
+    let m = monitor(p)
+    receive(m)
+    tls_close(handle)
+    cg_release(guard)
+    send(done_ch, 1)
+
+// Serve n HTTPS requests using a REAL cert/key loaded from disk instead of the hand-rolled self-signed
+// identity -- for presenting a certificate a browser/client will actually trust. Mirrors forge_serve_tls_n's
+// admission-control cap (conn_guard, gated before any per-connection work) and crash-isolation shape; the
+// handshake itself is done entirely by the runtime's native TLS listener, not tls13_server_handshake.
+fn forge_serve_tls_file(port: int, cert_path: string, key_path: string, handler, n: int) -> int
+    let srv = tls_listen(port, cert_path, key_path)
+    if srv == 0
+        return 0
+    let done_ch = channel()
+    let guard = conn_guard(_tlss_max_conns())
+    let spawned = 0
+    while spawned < n
+        let handle = tls_accept(srv)
+        if handle == 0
+            break                    // listener error/closed -> stop accepting; DRAIN what we already spawned
+        if cg_acquire(guard) != 1
+            tls_close(handle)        // at capacity -- reject; connection handle IS safely closeable (NovaTlsConn)
+        else
+            spawn _tlss_serve_spawned_file(handle, handler, done_ch, guard)
+            spawned = spawned + 1
+    let got = 0
+    while got < spawned
+        receive(done_ch)
+        got = got + 1
+    conn_guard_stop(guard)
+    // NOTE (known runtime gap; tracked for the runtime owner, NOT fixed here -- out of this module's scope):
+    // there is no safe call that closes the LISTENER handle `srv`. nova_rt_tls_close unconditionally casts
+    // its argument to the CONNECTION struct type; on the SChannel (Windows) backend the listener is a
+    // DIFFERENT, differently-laid-out struct, so tls_close(srv) would misinterpret live SSPI handles as
+    // socket/context fields -- a type-confused OOB read, not a clean close (confirmed by reading
+    // nova_rt_tls_listen/nova_rt_tls_accept/nova_rt_tls_close in nova_runtime.c; also why the existing
+    // _tls_server_test.nova never closes its listener either). Per-CONNECTION handles from tls_accept ARE
+    // the connection struct type and ARE safely closed above. Leaking the listener's one fd+struct until
+    // process exit is the correct tradeoff until the runtime grows a dedicated listener-close primitive.
     1

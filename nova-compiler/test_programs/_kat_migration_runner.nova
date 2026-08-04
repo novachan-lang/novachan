@@ -1,4 +1,5 @@
 import forge_migration_runner
+import forge_db
 
 fn main()
     let m = mr_new()
@@ -30,4 +31,74 @@ fn main()
     assert(is_ok(nm), "name ok")
     assert(unwrap(nm) == "create_users", "correct name")
 
+    // ── real-DB-backed path: forge_migrate's SQL generators wired through forge_db ──────────────
+    let pool = pool_open("_kat_migration_runner.db", 2)
+    pool_exec(pool, "DROP TABLE IF EXISTS schema_migrations")
+    pool_exec(pool, "DROP TABLE IF EXISTS widgets")
+
+    // first apply: table doesn't exist yet -> up_sql runs, history row written, ok(1) = newly applied
+    let r1 = mr_apply_sql(pool, "001_create_widgets", "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+    assert(is_ok(r1), "001 applies ok")
+    assert(unwrap(r1) == 1, "001 newly applied")
+
+    // re-apply the SAME id: idempotent no-op, ok(0) -- must NOT re-run the DDL / re-insert the history row
+    let r1_again = mr_apply_sql(pool, "001_create_widgets", "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+    assert(is_ok(r1_again), "001 re-apply ok")
+    assert(unwrap(r1_again) == 0, "001 re-apply is a skip, not a re-run")
+    let hist_count = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["001_create_widgets"])
+    assert(hist_count[0][0] == "1", "exactly one history row for 001, not two")
+
+    // a failing up_sql (bad SQL) must NOT record a history row -- all-or-nothing
+    let bad = mr_apply_sql(pool, "999_broken", "THIS IS NOT VALID SQL")
+    assert(is_err(bad), "broken migration surfaces as Err, not a crash")
+    let bad_hist = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["999_broken"])
+    assert(bad_hist[0][0] == "0", "failed migration left no history row")
+
+    // insert through the newly-created table to prove up_sql really ran against the real connection
+    pool_query(pool, "INSERT INTO widgets (id, name) VALUES (?, ?)", [1, "gizmo"])
+    let widget_rows = pool_query(pool, "SELECT name FROM widgets WHERE id = ?", [1])
+    assert(widget_rows[0][0] == "gizmo", "widgets table is real and queryable")
+
+    // rollback: down_sql runs and the history record is deleted
+    let rb1 = mr_rollback_sql(pool, "001_create_widgets", "DROP TABLE widgets")
+    assert(is_ok(rb1), "rollback of 001 ok")
+    let hist_after_rb = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["001_create_widgets"])
+    assert(hist_after_rb[0][0] == "0", "history row removed after rollback")
+
+    // rolling back an id that was never applied is a structured error, not a crash
+    let rb_missing = mr_rollback_sql(pool, "no_such_id", "DROP TABLE nothing")
+    assert(is_err(rb_missing), "rollback of unknown id is Err")
+
+    // mr_run_migrations: an ordered plan, stops at the first failure, skips already-applied ones
+    pool_exec(pool, "DROP TABLE IF EXISTS schema_migrations")
+    pool_exec(pool, "DROP TABLE IF EXISTS a")
+    pool_exec(pool, "DROP TABLE IF EXISTS b")
+    pool_exec(pool, "DROP TABLE IF EXISTS c")
+    let plan = [
+        ["m1", "CREATE TABLE a (id INTEGER)", "DROP TABLE a"],
+        ["m2", "CREATE TABLE b (id INTEGER)", "DROP TABLE b"],
+        ["m3_bad", "NOT VALID SQL AT ALL", "DROP TABLE c"],
+        ["m4", "CREATE TABLE c (id INTEGER)", "DROP TABLE c"],
+    ]
+    let run1 = mr_run_migrations(pool, plan)
+    assert(is_err(run1), "runner stops at the first bad migration")
+
+    let m1_hist = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["m1"])
+    assert(m1_hist[0][0] == "1", "m1 committed before the failure")
+    let m2_hist = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["m2"])
+    assert(m2_hist[0][0] == "1", "m2 committed before the failure")
+    let m4_hist = pool_query(pool, "SELECT count(*) FROM schema_migrations WHERE version = ?", ["m4"])
+    assert(m4_hist[0][0] == "0", "m4 (after the failing one) never attempted")
+
+    // re-running the SAME plan minus the broken entry: m1/m2 skip (already applied), m4 newly applies
+    let plan2 = [
+        ["m1", "CREATE TABLE a (id INTEGER)", "DROP TABLE a"],
+        ["m2", "CREATE TABLE b (id INTEGER)", "DROP TABLE b"],
+        ["m4", "CREATE TABLE c (id INTEGER)", "DROP TABLE c"],
+    ]
+    let run2 = mr_run_migrations(pool, plan2)
+    assert(is_ok(run2), "re-run without the broken entry succeeds")
+    assert(unwrap(run2) == ["m4"], "only m4 was newly applied -- m1/m2 were skipped as already-applied")
+
+    pool_close(pool, 2)
     print("MIGRATION-RUNNER KAT PASS")

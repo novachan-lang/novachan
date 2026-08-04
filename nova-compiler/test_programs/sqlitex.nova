@@ -12,7 +12,7 @@ type DbHandle
 @opaque
 type StmtHandle
 
-extern fn sqlite3_open(path: string, db_out: out<DbHandle>) -> i32
+extern fn sqlite3_open_v2(path: string, db_out: out<DbHandle>, flags: i32, vfs: int) -> i32
 extern fn sqlite3_close(db: DbHandle) -> i32
 extern fn sqlite3_last_insert_rowid(db: DbHandle) -> i64
 extern fn sqlite3_changes(db: DbHandle) -> i32
@@ -25,12 +25,53 @@ extern fn sqlite3_step(stmt: StmtHandle) -> i32
 extern fn sqlite3_column_count(stmt: StmtHandle) -> i32
 extern fn sqlite3_column_text(stmt: StmtHandle, col: i32) -> int
 extern fn sqlite3_column_name(stmt: StmtHandle, col: i32) -> int
+extern fn sqlite3_column_type(stmt: StmtHandle, col: i32) -> i32
+extern fn sqlite3_errmsg(db: DbHandle) -> int
 extern fn sqlite3_finalize(stmt: StmtHandle) -> i32
 
-// db_open(path) -> a DB handle. ":memory:" for an in-memory DB.
+// Bind `params` positionally onto `stmt`: an int binds via bind_int, a float via bind_double (binding a
+// float as text would pass its raw bits where a char* is expected -> silent numeric corruption), anything
+// else via bind_text with SQLITE_TRANSIENT (sqlite copies the bytes, so it's safe once this call returns).
+// Shared by every parameterized path (db_query / db_query_named / db_write) so the int/float/text
+// dispatch logic lives in exactly one place.
+fn _sqlite_bind_params(stmt, params)
+    let SQLITE_TRANSIENT = -1
+    let i = 0
+    while i < len(params)
+        let p = params[i]
+        if type_name(p) == "int"
+            unsafe sqlite3_bind_int(stmt, i + 1, p)
+        else if type_name(p) == "float"
+            unsafe sqlite3_bind_double(stmt, i + 1, p)
+        else
+            unsafe sqlite3_bind_text(stmt, i + 1, p, -1, SQLITE_TRANSIENT)
+        i = i + 1
+
+// The last error message reported by sqlite for this connection (sqlite3_errmsg is PER-CONNECTION, not
+// per-call -- it reflects the most recent failure on `db`, mirroring the real C API).
+fn db_errmsg(db) -> string
+    cstr_to_string(unsafe sqlite3_errmsg(db))
+
+// db_open(path) -> a DB handle. ":memory:" is opened via the URI form "file::memory:?cache=shared" (the
+// documented SQLite pattern for a shared in-memory DB, verified against this repo's vendored sqlite3.c:
+// SQLITE_OPEN_URI unconditionally enables URI parsing for this call regardless of the library's
+// compile-time default, and the "cache" query param is honored by sqlite3_open_v2 -- see sqlite3.c's own
+// doc comment on SQLITE_OPEN_URI/"cache"). This closes a silent footgun: forge_db.pool_open() opens N
+// connections by calling db_open() with the SAME literal ":memory:" path N times, expecting them to share
+// data like a real pooled file DB would -- without this rewrite each call got its own private, mutually
+// invisible in-memory database (writes on one pooled connection invisible to the others). SQLITE_OPEN_URI
+// only changes behavior for filenames that literally start with "file:" (SQLite's URI-filename rule), so
+// every ordinary file path (no such prefix) opens byte-identically to before -- purely additive.
 fn db_open(path)
+    let SQLITE_OPEN_READWRITE = 2
+    let SQLITE_OPEN_CREATE = 4
+    let SQLITE_OPEN_URI = 64
+    let flags = SQLITE_OPEN_READWRITE + SQLITE_OPEN_CREATE + SQLITE_OPEN_URI
+    let real_path = path
+    if path == ":memory:"
+        real_path = "file::memory:?cache=shared"
     let db = 0
-    unsafe sqlite3_open(path, db)
+    unsafe sqlite3_open_v2(real_path, db, flags, 0)
     return db
 
 fn db_close(db)
@@ -54,25 +95,11 @@ fn db_exec(db, sql)
 // INSERT/UPDATE/DELETE return [] (no result rows). Pass [] for no params.
 fn db_query(db, sql, params)
     let SQLITE_ROW = 100
-    let SQLITE_TRANSIENT = -1
     let stmt = 0
     let prc = unsafe sqlite3_prepare_v2(db, sql, -1, stmt, 0)
     if prc != 0
         return []
-    let i = 0
-    while i < len(params)
-        let p = params[i]
-        // type_name is a RUNTIME check (is_int is static -> always "any"=false for a
-        // list<any> element, which would mis-bind an int as text -> crash). A FLOAT must bind via
-        // bind_double: binding it as text passes the double's bits where a char* is expected, which
-        // stored an empty/garbage REAL (silent float data-corruption on every INSERT).
-        if type_name(p) == "int"
-            unsafe sqlite3_bind_int(stmt, i + 1, p)
-        else if type_name(p) == "float"
-            unsafe sqlite3_bind_double(stmt, i + 1, p)
-        else
-            unsafe sqlite3_bind_text(stmt, i + 1, p, -1, SQLITE_TRANSIENT)
-        i = i + 1
+    _sqlite_bind_params(stmt, params)
     let ncol = unsafe sqlite3_column_count(stmt)
     let rows = []
     let sc = unsafe sqlite3_step(stmt)
@@ -84,29 +111,48 @@ fn db_query(db, sql, params)
             c = c + 1
         push(rows, row)
         sc = unsafe sqlite3_step(stmt)
+    // NOTE: `sc` here is whatever sqlite3_step returned to end the loop -- SQLITE_DONE (101) on a clean
+    // finish, or a genuine error code (e.g. SQLITE_CONSTRAINT=19, SQLITE_BUSY=5) if the statement failed
+    // mid-execution. db_query's return type is a bare list (every existing caller depends on that), so a
+    // failure here is NOT surfaced through the return value -- use db_write (below) for a parameterized
+    // write that needs a real ok()/err() Result instead of a silent list.
     unsafe sqlite3_finalize(stmt)
     return rows
+
+// db_write(db, sql, params) -> Result<int, string>: parameterized WRITE (INSERT/UPDATE/DELETE) with REAL
+// error checking. db_query's row-collection loop exits identically whether sqlite3_step completed with
+// SQLITE_DONE (success) or failed with e.g. SQLITE_CONSTRAINT/SQLITE_BUSY/SQLITE_ERROR -- so a write
+// through db_query is a "silent success" even when it did nothing. db_write checks the step return code
+// and reports a genuine failure via err(db_errmsg(db)) instead. Drains any SQLITE_ROW results first (an
+// INSERT/UPDATE/DELETE ... RETURNING clause legitimately produces rows) so those aren't misread as an
+// error, then requires the terminating code to be SQLITE_DONE. Returns ok(rows_affected) on success.
+fn db_write(db, sql, params) -> any
+    let SQLITE_DONE = 101
+    let SQLITE_ROW = 100
+    let stmt = 0
+    let prc = unsafe sqlite3_prepare_v2(db, sql, -1, stmt, 0)
+    if prc != 0
+        return err(db_errmsg(db))
+    _sqlite_bind_params(stmt, params)
+    let sc = unsafe sqlite3_step(stmt)
+    while sc == SQLITE_ROW
+        sc = unsafe sqlite3_step(stmt)
+    unsafe sqlite3_finalize(stmt)
+    if sc != SQLITE_DONE
+        return err(db_errmsg(db))
+    ok(unsafe sqlite3_changes(db))
 
 // db_query_named(db, sql, params) -> list of rows as DICTS keyed by the ACTUAL column names
 // (sqlite3_column_name), values as strings. Parameterized like db_query (injection-safe). This is
 // what the typed db_all<T>/db_find<T> build on: name-keyed rows map straight to <T>__from_dict.
 fn db_query_named(db, sql, params)
     let SQLITE_ROW = 100
-    let SQLITE_TRANSIENT = -1
+    let SQLITE_NULL = 5
     let stmt = 0
     let prc = unsafe sqlite3_prepare_v2(db, sql, -1, stmt, 0)
     if prc != 0
         return []
-    let i = 0
-    while i < len(params)
-        let p = params[i]
-        if type_name(p) == "int"
-            unsafe sqlite3_bind_int(stmt, i + 1, p)
-        else if type_name(p) == "float"
-            unsafe sqlite3_bind_double(stmt, i + 1, p)
-        else
-            unsafe sqlite3_bind_text(stmt, i + 1, p, -1, SQLITE_TRANSIENT)
-        i = i + 1
+    _sqlite_bind_params(stmt, params)
     let ncol = unsafe sqlite3_column_count(stmt)
     let cnames = []
     let cn = 0
@@ -119,7 +165,17 @@ fn db_query_named(db, sql, params)
         let d = {}
         let c = 0
         while c < ncol
-            d[cnames[c]] = cstr_to_string(unsafe sqlite3_column_text(stmt, c))
+            // nova_rt_cstr_to_string collapses a NULL column pointer to "" -- indistinguishable from a
+            // real empty-string value. Check the column's actual storage type FIRST: a genuine SQL NULL
+            // OMITS the key from the row dict entirely (rather than writing a sentinel value), so a caller
+            // reading the untyped dict directly can tell "never set" from "set to empty" via `"col" not in
+            // row`. Typed struct hydration (<T>__from_dict, consumed by forge_orm's orm_all/orm_one) then
+            // falls back to the field's zero value for the absent key, the same documented behavior
+            // from_json already has for a missing key -- so this is a strict improvement (untyped readers
+            // gain a real signal) with no regression for typed readers (unchanged zero-value fallback).
+            let ctype = unsafe sqlite3_column_type(stmt, c)
+            if ctype != SQLITE_NULL
+                d[cnames[c]] = cstr_to_string(unsafe sqlite3_column_text(stmt, c))
             c = c + 1
         push(rows, d)
         sc = unsafe sqlite3_step(stmt)

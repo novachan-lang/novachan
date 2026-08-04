@@ -21,6 +21,9 @@
 // live_mount_json) used by the WebSocket live runner below. The dependency is acyclic -- forge_live
 // imports nothing -- so forge may layer on it the way it would a dependency-free stdlib module.
 import forge_live
+// forge_limits: LEAF module (imports nothing), supplies the N>1-safe actor rate limiter that
+// mw_rate_limit is wired over below (its own header comment names this as the intended wiring).
+import forge_limits
 
 fn _status_line(status: int) -> string
     if status == 200
@@ -338,7 +341,23 @@ fn json_obj(status: int, pairs: list) -> string
 fn _max_header() -> int
     65536
 
+// Dict-boxed so it can be reassigned from set_max_body (a plain top-level `let` scalar is
+// immutable in NOVA; a module-singleton dict mutated in place is the proven pattern for shared
+// mutable config -- see forge_live's `registry` for the same shape). A global rather than a
+// per-app setting: _max_body() is also called from parse_body(req: string), the OLDER untyped
+// dispatch path, which has no app-dict in scope at all -- threading a per-app override through
+// would be a much larger, riskier change than this process-wide knob.
+let _max_body_cfg = {"bytes": 0}
+
+// Override the request/multipart body-size cap (bytes) for the whole process; call once at
+// startup. 0 (the default, never set) keeps the original 8 MiB limit.
+fn set_max_body(bytes: int)
+    _max_body_cfg["bytes"] = bytes
+
 fn _max_body() -> int
+    let over = _max_body_cfg["bytes"]
+    if over > 0
+        return over
     8388608
 
 fn _is_digits(s: string) -> bool
@@ -897,6 +916,8 @@ fn ws_try_decode(buf, start: int) -> WsFrame
 
 // Length-aware decode: `avail` is the count of valid bytes from `start` (decoupled from bytes_len(buf) so
 // it works on the fixed over-allocated connection scratch). The payload is sliced (copied) out of buf.
+// Direction-agnostic by design (existing behavior, unchanged) -- see ws_try_decode_n_checked below for
+// the masking-DIRECTION-enforcing variant the server's own frame loop now uses.
 fn ws_try_decode_n(buf, start: int, avail: int) -> WsFrame
     if avail < 2
         return WsFrame(0, 0, 0, 0, 0)
@@ -967,6 +988,27 @@ fn ws_try_decode_n(buf, start: int, avail: int) -> WsFrame
             bytes_set(payload, i, bytes_get(payload, i) ^ mk)
             i = i + 1
     WsFrame(1, fin, opcode, total, payload)
+
+// Masking-direction-enforcing decode (RFC 6455 5.1: "a server MUST close the connection upon
+// receiving a frame that is not masked"; the client has the symmetric MUST for masked frames).
+// ws_try_decode/ws_try_decode_n never enforced direction (any existing caller keeps that exact,
+// unchanged behavior); this is an additive wrapper the SERVER'S OWN frame loop (_ws_fill_frame)
+// uses so a client that sends unmasked frames now gets a protocol-error close (1002) instead of
+// having them processed normally -- closing a real conformance/hardening gap (this also defeats
+// the historical proxy-cache-poisoning motivation for mandatory masking). Peeking byte 1's mask
+// bit here (before the real decode) is safe and cheap: it is the same bit ws_try_decode_n itself
+// reads, just checked one layer up so the two call sites needing OPPOSITE directions (server vs
+// client) do not have to share one required parameter across every existing caller.
+fn ws_try_decode_n_checked(buf, start: int, avail: int, require_masked: int) -> WsFrame
+    if avail < 2
+        return WsFrame(0, 0, 0, 0, 0)
+    let b1 = bytes_get(buf, start + 1)
+    let masked = (b1 & 128) != 0
+    if require_masked == 1 and masked == false
+        return WsFrame(0 - 1002, 0, 0, 0, 0)
+    if require_masked == 0 and masked == true
+        return WsFrame(0 - 1002, 0, 0, 0, 0)
+    ws_try_decode_n(buf, start, avail)
 
 // --- WebSocket connection: a live, parked green task speaking the framed protocol over the raw fd ---
 // A WS connection. open: 1 while live (reference-semantic struct -> mutating open=0 is visible to _ws_run).
@@ -1227,7 +1269,7 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
     let guard = 0
     while guard < 2000000000
         guard = guard + 1
-        let fr = ws_try_decode_n(ws.buf, 0, ws.blen)
+        let fr = ws_try_decode_n_checked(ws.buf, 0, ws.blen, 1)
         if fr.status != 0
             return fr
         let do_recv = true
@@ -2269,12 +2311,36 @@ fn dispatch(a, method: string, path: string, body: string) -> string
 // FIXED: nova_arena_new_chunk now tracks chunk bounds. split/parse inside the scope are
 // correct again, so routed serving runs arena-scoped for flat per-request memory. See
 // NOVA_DESIGN/ARENA_SPLIT_BUG.md.)
-fn serve_app_n(a, port: int, n: int)
-    serve_n_arena(port, fn(m, p, b) dispatch(a, m, p, b), n)
+// Crash-isolated untyped dispatch: mirrors dispatch_safe (below, for the typed Request/Response
+// path) but for this file's OLDER dict-based `dispatch()`. serve_app/serve_app_n are the entry
+// points a developer reaches for right after app()/get()/post() -- without this, a single handler
+// panic under serve_app took down the ENTIRE server process (dispatch() ran inline, no spawn,
+// nothing between the crash and the process's own root-task exit), unlike serve_safe_req.
+fn _dispatch_run_untyped(a, m: string, p: string, b: string, rc)
+    let r: string = dispatch(a, m, p, b)
+    send(rc, r)
 
-// Infinite routed serve, arena-scoped per request.
+fn dispatch_safe_untyped(a, m: string, p: string, b: string) -> string
+    let rc = channel()
+    let ap = a
+    let mm = m
+    let pp = p
+    let bb = b
+    let c = rc
+    let proc = spawn _dispatch_run_untyped(ap, mm, pp, bb, c)
+    let mon = monitor(proc)
+    let st = receive(mon)
+    if st == 0
+        return receive(rc)
+    text(500, "Internal Server Error")
+
+// Serve exactly N routed requests, crash-isolated (a handler panic -> 500, not a dead server).
+fn serve_app_n(a, port: int, n: int)
+    serve_n_arena(port, fn(m, p, b) dispatch_safe_untyped(a, m, p, b), n)
+
+// Infinite routed serve, arena-scoped per request, crash-isolated.
 fn serve_app(a, port: int)
-    serve_arena(port, fn(m, p, b) dispatch(a, m, p, b))
+    serve_arena(port, fn(m, p, b) dispatch_safe_untyped(a, m, p, b))
 
 // ── Middleware ───────────────────────────────────────────────────────────────
 // A middleware is fn(req, next) -> response-string: it may inspect/modify req, call
@@ -3545,6 +3611,17 @@ fn unsign_value(secret: string, signed: string) -> string
 fn session_set(resp: Response, secret: string, value: string) -> Response
     resp_set_cookie(resp, "session", sign_value(secret, value))
 
+// Login helper: sets the session AND rotates the CSRF token bound to it, in one call. Use this
+// (not plain session_set) in an auth handler after a successful login/privilege change --
+// otherwise a pre-authentication CSRF token/cookie pair stays valid after login (classic
+// login-CSRF: an attacker primes a token before the victim authenticates, then replays it to
+// authorize a state-changing request as the now-authenticated victim). `value` is also the
+// session id the CSRF cookie binds to, since session_get(req,secret) later reads back this exact
+// value -- the same identifier is used on both call sites by construction.
+fn session_set_authed(resp: Response, secret: string, value: string) -> Response
+    let r = session_set(resp, secret, value)
+    csrf_rotate(r, secret, value)
+
 // Read + verify the session cookie. "" if absent or tampered (forged/edited cookies are rejected).
 fn session_get(req: Request, secret: string) -> string
     let c = cookie_get(req, "session")
@@ -4727,60 +4804,83 @@ fn _t_request_id(req: Request, next) -> Response
 fn mw_request_id()
     return fn(req, next) _t_request_id(req, next)
 
-// Fixed-window rate limit: at most `max` requests per `window_ms` per client (keyed by
+// Token-bucket rate limit: at most `lim` requests per `window_ms` per client (keyed by
 // X-Forwarded-For -- the reverse-proxy norm -- or a shared "global" bucket if absent). Over the
-// limit -> 429. State is a dict captured by the middleware closure (persists across requests);
-// safe under the default single-carrier cooperative scheduler. (The lock-free owner-actor variant
-// for N>1 carriers is a later refinement.)
-fn _t_rate_limit(req: Request, next, state, lim: int, window_ms: int) -> Response
+// limit -> 429. Backed by forge_limits' rate_limiter/rate_check actor: per-key buckets are owned
+// by ONE serializing green task, so this is race-free by construction under NOVA_CARRIERS>1 --
+// the previous implementation mutated a plain dict directly from every carrier's request path,
+// which is the same unsynchronized-resize class of bug already fixed elsewhere for the @memo
+// cache (a concurrent insert/rehash on that dict shape can corrupt the heap, not just miscount).
+// A token bucket also avoids the classic fixed-window flaw (up to 2x `lim` requests can land at
+// a window boundary); capacity=lim/refill=lim per window_ms gives the same "lim per window_ms"
+// configuration the public API already promises, just soundly enforced.
+fn _t_rate_limit(req: Request, next, lim_actor, lim: int, window_ms: int) -> Response
     let key = req_header(req, "x-forwarded-for")
     if key == ""
         key = "global"
-    let now = time_ms()
-    let start = now
-    let count = 0
-    if contains(state, key)
-        let cur = state[key]
-        count = cur[0]
-        start = cur[1]
-        if now - start >= window_ms
-            count = 0
-            start = now
-    count = count + 1
-    state[key] = [count, start]
-    if count > lim
+    let allowed = rate_check(lim_actor, key, time_ms())
+    if allowed == 0
         return resp_text(429, "rate limit exceeded")
     next(req)
 
 fn mw_rate_limit(lim: int, window_ms: int)
-    let state = {}
-    return fn(req, next) _t_rate_limit(req, next, state, lim, window_ms)
+    let refill = (lim + 0.0) / (window_ms + 0.0)
+    let lim_actor = rate_limiter(lim + 0.0, refill)
+    return fn(req, next) _t_rate_limit(req, next, lim_actor, lim, window_ms)
 
 // Built-in health endpoint. forge.health_route(app) registers GET /health -> 200 {"status":"ok"}
-// (+ HEAD via the GET path), the liveness probe orchestrators (k8s, load balancers) expect.
+// -- an HONEST liveness-only probe ("the process is up and can answer HTTP"), nothing more
+// claimed. THIS IS NOT A READINESS CHECK. Use forge.health_route_checked(app, checks) instead to
+// get one: the first failing check short-circuits to 503 {"status":"not ready","failed":"<name>"}
+// -- so an orchestrator's readiness probe actually reflects real dependency state instead of
+// always answering 200 regardless of whether the database is reachable.
 type Health
     status: string
 
-fn _health_handler(req: Request) -> Health
-    Health("ok")
+fn _health_run_checks(checks: list) -> Response
+    for check in checks
+        let name = check[0]
+        let f = check[1]
+        if f() == false
+            return resp_json(503, {"status": "not ready", "failed": name})
+    resp_json(200, Health("ok"))
 
 fn health_route(a)
-    get(a, "/health", _health_handler)
+    get(a, "/health", fn(req) _health_run_checks([]))
     a
 
-// Logging: print method + path, then pass through (typed Request).
+// Readiness variant: checks is a list of [name, fn() -> bool] pairs, e.g.
+//   forge.health_route_checked(a, [["db", fn() -> bool db_ping(pool)], ["cache", fn() -> bool cache_ok()]])
+fn health_route_checked(a, checks: list)
+    let cs = checks
+    get(a, "/health", fn(req) _health_run_checks(cs))
+    a
+
+// request_id if mw_request_id ran on this request, else "" -- shared by the logging middleware
+// below so a log line can actually be correlated back to a specific request/response pair.
+fn _log_rid(req: Request) -> string
+    if contains(req.state, "request_id")
+        return req.state["request_id"]
+    ""
+
+// Logging: print method + path, then pass through (typed Request). Includes request_id (empty if
+// mw_request_id did not run) so this line can be correlated with the matching access-log line.
 fn _t_log_next(req: Request, next)
-    print("[forge] " + req.method + " " + req.path)
+    print("[forge] request_id=" + _log_rid(req) + " " + req.method + " " + req.path)
     next(req)
 
 fn mw_log()
     return fn(req, next) _t_log_next(req, next)
 
 // Access log: log "METHOD path -> status" AFTER the response (the status is the useful part vs
-// mw_log's request-only line) -- the standard access-log line, paired with request-id for tracing.
+// mw_log's request-only line) -- the standard access-log line. Now genuinely "paired with
+// request-id for tracing" as the doc comment always claimed: previously this printed no
+// request_id at all even when mw_request_id ran earlier in the chain, so a client-reported
+// X-Request-Id was ungreppable in the access log -- register mw_request_id BEFORE this middleware
+// to get a non-empty id here.
 fn _t_access_log(req: Request, next) -> Response
     let resp = next(req)
-    print("[forge] " + req.method + " " + req.path + " -> " + str(resp.status))
+    print("[forge] request_id=" + _log_rid(req) + " " + req.method + " " + req.path + " -> " + str(resp.status))
     resp
 
 fn mw_access_log()
@@ -4803,7 +4903,21 @@ fn _max_keepalive() -> int
 fn _want_keep_alive(req: Request, count: int) -> bool
     if count >= _max_keepalive()
         return false
+    if shutdown_requested()
+        return false
     lower(req_header(req, "connection")) != "close"
+
+// Graceful shutdown: poll the runtime's shutdown flag (set on SIGINT/SIGTERM) and, once it fires,
+// close the listener so every accept loop above -- which already treats a closed listener as a
+// clean exit (tcp_accept returns <0, see _acceptor's own comment) -- stops taking NEW connections
+// instead of the process hard-dropping every in-flight socket. Existing keep-alive connections are
+// not cut off mid-response: _want_keep_alive (above) starts returning false once shutdown begins,
+// so each connection finishes its CURRENT request/response and then closes like a normal
+// `Connection: close` client, draining naturally rather than being severed.
+fn _shutdown_watcher(listener: int)
+    while not shutdown_requested()
+        sleep(100)
+    tcp_close(listener)
 
 fn _dispatch_pick(a, req: Request, safe: int) -> Response
     if safe == 1
@@ -4875,8 +4989,11 @@ fn _serve_conn(conn: int, a, safe: int)
                     alive = false
     tcp_close(conn)
 
+// safe=1: routed through dispatch_safe, so a handler panic returns a clean 500 instead of
+// unwinding past this function's return -- which would otherwise skip the done-signal in
+// _handle_req_done below (serve_req_n) and hang the caller waiting on it forever.
 fn _handle_req_arena(conn: int, a)
-    _serve_conn(conn, a, 0)
+    _serve_conn(conn, a, 1)
 
 // done-signaling wrapper for the deterministic serve_req_n.
 fn _handle_req_done(conn: int, a, done)
@@ -4923,8 +5040,13 @@ fn _conn_sem(n: int)
 
 // Per-connection handler that RELEASES its cap permit when the connection finally closes (keep-alive
 // included, since _serve_conn loops until the connection ends). Always runs -> no permit leak.
+// safe=1 (crash-isolated dispatch): previously this passed safe=0, so a handler panic would longjmp
+// past BOTH tcp_close (inside _serve_conn) and this fn's own send(sem,1) -- permanently leaking one
+// fd + one connection-cap permit per crash, on top of taking the crashing request down uncontained.
+// Routing through dispatch_safe means a panic returns a plain 500 Response from WITHIN _serve_conn's
+// own stack frame (never propagates here), so _serve_conn returns normally and send(sem,1) always runs.
 fn _handle_req_capped(conn: int, a, sem)
-    _serve_conn(conn, a, 0)
+    _serve_conn(conn, a, 1)
     send(sem, 1)
 
 // S-c (FORGE_ACCEPT_POLLER_PLAN.md): one acceptor loop. Each accepts ONE connection, ACQUIRES a cap permit,
@@ -4948,6 +5070,7 @@ fn _acceptor(listener: int, a, sem)
 // N=1 it runs a single acceptor inline (the original single-loop behavior, byte-identical).
 fn serve_req(a, port: int)
     let listener = tcp_listen(port)
+    spawn _shutdown_watcher(listener)
     let sem = _conn_sem(_max_conns())
     let nc = sched_carrier_count()
     if nc <= 1
@@ -4974,6 +5097,17 @@ fn _dispatch_run(a, req, rc)
     let r: Response = dispatch_req(a, req)
     send(rc, r)
 
+// On a crash, log a STRUCTURED line (timestamp, request-id if mw_request_id ran, method, route,
+// the real panic message via exit_reason) instead of the bare, uncorrelated stderr fault line the
+// runtime prints on its own -- previously this was the ONLY trace of a production crash: no
+// request-id, no route, no method, and the caller never even called exit_reason(), so the actual
+// panic message (e.g. "unwrap called on Err/None") was discoverable only via the raw runtime log.
+fn _log_crash(req: Request, p) -> string
+    let rid = _log_rid(req)
+    let reason = exit_reason(p)
+    print("[forge] CRASH request_id=" + rid + " method=" + req.method + " path=" + req.path + " reason=\"" + reason + "\"")
+    reason
+
 fn dispatch_safe(a, req: Request) -> Response
     let rc = channel()
     let ap = a
@@ -4984,6 +5118,7 @@ fn dispatch_safe(a, req: Request) -> Response
     let st = receive(m)
     if st == 0
         return receive(rc)
+    _log_crash(req, p)
     resp_text(500, "Internal Server Error")
 
 // Crash-isolated per-connection handling: a handler panic returns a clean 500 to the client
@@ -5023,6 +5158,7 @@ fn _handle_req_safe_capped(conn: int, a, sem)
 
 fn serve_safe_req(a, port: int)
     let listener = tcp_listen(port)
+    spawn _shutdown_watcher(listener)
     let sem = _conn_sem(_max_conns())
     while true
         let conn = tcp_accept(listener)
