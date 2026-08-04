@@ -4620,6 +4620,13 @@ int64_t nova_rt_contains(int64_t container, int64_t item) {
     /* Bytes containment is not supported in Stage 0; never strstr the {data,size,cap}
        struct (wild read). A bytes container, or a bytes item against a string container
        (needle would be the struct), returns 0 safely. */
+    if (tag == NOVA_MEM_TARRAY) {
+        /* ELEMENT membership. Falling through to the string path would strstr the struct. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        for (int64_t i = 0; i < ta->size; i++)
+            if (nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i) == item) return 1;
+        return 0;
+    }
     if (tag == NOVA_MEM_BYTES) return 0;
     if (nova_mem_find_tag((void*)(uintptr_t)item) == NOVA_MEM_BYTES) return 0;
     /* SOUNDNESS: string containment requires BOTH operands to be genuine strings; a non-string container or
@@ -5214,6 +5221,18 @@ int64_t nova_rt_for_kv_init(int64_t obj) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_items(obj);
+    }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* (index, element) pairs, read at the true element width. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        int64_t tresult = nova_rt_list_create();
+        for (int64_t i = 0; i < ta->size; i++) {
+            int64_t pair = nova_rt_list_create();
+            nova_rt_list_append(pair, i);
+            nova_rt_list_append(pair, nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i));
+            nova_rt_list_append(tresult, pair);
+        }
+        return tresult;
     }
     if (tag == NOVA_MEM_BYTES) {
         /* (index, byteValue) pairs -- read data[i] as a 0..255 int, NOT as int64 (which would overread). */
@@ -6166,6 +6185,29 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
         jbuf_char(b, ']');
         return;
     }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Unlike bytes, a typed array HAS a canonical JSON form -- it is an array of numbers --
+           so emit the real thing rather than a diagnostic placeholder. Float kinds print through
+           the float formatter; integer kinds as integers. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        int64_t h = (int64_t)(uintptr_t)ptr;
+        jbuf_append(b, "[", 1);
+        for (int64_t i = 0; i < ta->size; i++) {
+            if (i > 0) jbuf_append(b, ",", 1);
+            char tmp[64];
+            int n;
+            if (nova_ta_is_float(ta->kind)) {
+                int64_t bits = nova_rt_tarray_get(h, i);
+                double d; memcpy(&d, &bits, 8);
+                n = snprintf(tmp, sizeof(tmp), "%.17g", d);
+            } else {
+                n = snprintf(tmp, sizeof(tmp), "%lld", (long long)nova_rt_tarray_get(h, i));
+            }
+            jbuf_append(b, tmp, (int64_t)n);
+        }
+        jbuf_append(b, "]", 1);
+        return;
+    }
     if (tag == NOVA_MEM_BYTES) {
         /* Bytes have no canonical JSON form; emit a diagnostic string showing the length
            (never strlen the struct). A base64 policy is a later stage. */
@@ -6466,6 +6508,18 @@ static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
         return;
     }
     if (tag == NOVA_MEM_RAW) { ntb_str(b, (const char*)ptr); return; }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* Encode as a LIST term of its elements: values survive the wire, which a pointer-valued
+           INT term would not. The receiving side gets an ordinary list -- kind is not carried, so
+           this is a lossy-but-correct encoding rather than a wrong one. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        int64_t h = (int64_t)(uintptr_t)ptr;
+        int64_t lst = nova_rt_list_create();
+        for (int64_t i = 0; i < ta->size; i++)
+            nova_rt_list_append(lst, nova_rt_tarray_get(h, i));
+        term_encode_value(b, lst, depth + 1);
+        return;
+    }
     if (tag == NOVA_MEM_BYTES) {
         /* Stage 0: encode bytes as a LENGTH-PREFIXED STR term (binary-safe on the wire,
            content preserved) -- never NOVA_TT_INT (which would corrupt bytes -> the pointer
@@ -17548,6 +17602,22 @@ int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_slice(obj, start, end);  /* size-bounded; else nova_rt_slice would strlen the struct */
     }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* A slice of a typed array is a NEW typed array of the SAME kind -- not a list, and not a
+           view. Clamped to bounds like the other slice paths, so a wide range yields a short
+           array rather than an over-read. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        int64_t n = ta->size;
+        if (start < 0) start += n;
+        if (end < 0) end += n;
+        if (start < 0) start = 0;
+        if (end > n) end = n;
+        if (end < start) end = start;
+        int64_t out = nova_rt_tarray_new(ta->kind, end - start);
+        for (int64_t i = start; i < end; i++)
+            nova_rt_tarray_set(out, i - start, nova_rt_tarray_get(obj, i));
+        return out;
+    }
     /* SOUNDNESS: only a genuine string may reach nova_rt_slice; a non-sliceable value (bare int/float/bool)
        would otherwise be dereferenced as a char* -> wild read. Return 0 (null) for a non-sliceable value. */
     if (nova_is_readable_str(ptr)) {
@@ -19276,6 +19346,16 @@ static int nova_secret_span(int64_t h, unsigned char** out, size_t* len, int wri
         NovaBytes* b = (NovaBytes*)ptr;
         if (!b->data && b->size) return 0;
         *out = b->data; *len = (size_t)b->size; return 1;
+    }
+    if (tag == NOVA_MEM_TARRAY) {
+        /* LOCK-7 @redact: expose the raw element bytes so key material held in a typed array
+           (the natural home for a byte/word key schedule) can actually be zeroed. Without this
+           a @redact-marked typed array would be silently skipped -- the secret would survive. */
+        NovaTypedArray* ta = (NovaTypedArray*)ptr;
+        if (!ta->data && ta->size) return 0;
+        *out = ta->data;
+        *len = (size_t)(ta->size * nova_ta_elem_size(ta->kind));
+        return 1;
     }
     if (tag == NOVA_MEM_FAT_STR) {
         int64_t n = NOVA_FAT_LEN((const char*)ptr);

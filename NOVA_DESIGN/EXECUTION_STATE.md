@@ -183,18 +183,54 @@ loops. The raw builtins keep list convention (out-of-range reads 0) so the langu
 coherent; anything that can fail says so in its type. `ta_sum` on a float kind returns `err()`
 rather than a plausible wrong number.
 
-## `stack_enter` for WASM/freestanding — SCOPED, deliberately not shipped
+## `stack_enter` for WASM — DONE and VERIFIED BY EXECUTION (2026-08-04)
 
-Native targets are correct as-is (see the analysis below): hardware containment exists on both
-platforms and auto-emitting a depth counter would tax every function prologue and epilogue.
+I was wrong to claim the harness had no WASM runner. It has a complete one
+(`_wasm_node_probe.ps1`, `wasm_run.js`, `nova_runtime_wasm.c`) and it works — NOVA -> wasm ->
+Node returns 5050. I had not looked hard enough before declaring the item unverifiable.
 
-The residual case is wasm32/freestanding, which has neither signals nor SEH. It is NOT
-implemented here, and the reason is verification rather than difficulty: emitting matched
-`stack_enter`/`stack_exit` pairs is a bounded backend change, but exercising it needs WASM
-execution tooling the harness does not have today (node is present; a runner is not). Shipping
-an unverified guard for a target that cannot be tested is the half-done pattern this campaign
-has been avoiding. Correct scope for whoever picks it up: emit the pair ONLY for
-wasm32/freestanding, and build the WASM runner FIRST so the guard can be proven to fire.
+WASM has neither signals nor SEH, so the software depth counter is the ONLY containment there;
+an unbounded recursion otherwise dies in an opaque engine trap. Native targets still emit
+**zero** guard calls — the hardware guard page catches the fault for free, and a
+load/increment/compare/store in every prologue and epilogue would be a permanent throughput
+cost that GATE 4/5 measures. The gate asserts both halves.
+
+Measured under Node, not inspected:
+
+| depth (limit 8000) | result |
+|---|---|
+| 5000 | `RETURNED 5000` — the guard is transparent below the limit |
+| 20000 | `GUARD FIRED (contained stack overflow)` |
+
+Two implementation findings, both from running it rather than reasoning about it:
+
+* **`exit()` was the wrong mechanism and HUNG.** It routes through `__wasi_proc_exit`, so the
+  guard would only work on a WASI host; worse, a JS host that throws from `proc_exit` does NOT
+  unwind the wasm frames, so control returned into `exit()`'s `for(;;)` spin and the module hung
+  — strictly worse than the trap it was meant to replace. `__builtin_trap()` lowers to the wasm
+  `unreachable` instruction: immediate, host-agnostic, reported as a clean RuntimeError.
+* **A trap alone is not diagnosable.** Engine stack exhaustion and our guard both surface as a
+  RuntimeError, so the message cannot tell them apart. An exported `nova_rt_stack_overflowed`
+  flag is what lets the host distinguish them, and it is what the gate actually asserts on.
+
+Wired as CI stage **2l**.
+
+## Typed arrays — ALL 14 tag dispatchers now covered
+
+The initial landing wired the 8 load-bearing ones. The rest are done: `contains` (element
+membership, not string containment), `for i, v in a` (index/element pairs at the true width),
+`json_stringify`/`json_pretty` (a typed array HAS a canonical JSON form — an array of numbers —
+unlike bytes, which only get a diagnostic placeholder), `term_encode` (as a list term, so values
+survive the wire rather than a pointer-valued INT term), `slice` (a NEW same-kind packed array,
+clamped — not a list and not a view), and `secret_span` (raw element bytes, so LOCK-7 `@redact`
+can actually zero key material held in a typed array instead of silently skipping it).
+
+KAT `_kat_typedarray` is now 18 cases.
+
+**A process note worth keeping:** I syntax-checked the runtime with `gcc -fsyntax-only -w` and it
+reported clean while I had called a function that does not exist — `-w` suppresses
+implicit-declaration warnings, so the error would only have surfaced at link time. Never
+syntax-check with `-w`.
 
 ## LOCK-11 COMPLETE + Forge blocker #3 ACTUALLY FIXED (2026-08-04)
 

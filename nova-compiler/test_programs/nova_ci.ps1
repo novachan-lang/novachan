@@ -106,6 +106,10 @@ if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurre
 
 Write-Host "`n[CI 2k/3] Negative type-error gate (Tier 1.5 - wrong programs MUST be rejected)..."
 & .\_neg_type_tests.ps1
+
+Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
+& .\_wasm_stackguard_probe.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k (negative type-error soundness) ==="; exit 1 }
 
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."

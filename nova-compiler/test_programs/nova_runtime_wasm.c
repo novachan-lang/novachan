@@ -14,6 +14,47 @@ void exit(int code) { __wasi_proc_exit(code); for(;;); }
 /* Stubs: NOVA's IR-pipeline emits declares for many runtime functions even
    if the program doesn't use them. For pure-compute programs, these are
    never called — but the linker still needs them to resolve. */
+/* ── Stack-depth guard (the ONLY overflow containment available here) ───────────
+   Native targets contain a hardware stack overflow: SEH on Windows, a sigaltstack
+   SIGSEGV handler on POSIX. WASM has NEITHER -- no signals, no SEH -- so an unbounded
+   recursion hits the engine's own stack limit and becomes an opaque trap that takes the
+   whole instance down with no diagnostic. This counter is what makes it a REPORTED,
+   contained failure instead.
+
+   It is emitted ONLY for wasm32/freestanding: adding a load/increment/compare/store to
+   every function prologue and epilogue on native would be a permanent throughput cost for
+   a hazard the guard page already catches for free. */
+static int64_t nova_wasm_depth = 0;
+static int64_t nova_wasm_depth_max = 8000;   /* well under a default 1MB engine stack */
+int64_t nova_rt_stack_overflowed = 0;        /* readable by the host after a trap-free exit */
+
+void nova_rt_stack_enter(void) {
+    if (++nova_wasm_depth > nova_wasm_depth_max) {
+        nova_rt_stack_overflowed = 1;
+        nova_wasm_depth = 0;
+        /* TRAP rather than exit(). Two reasons, both learned by measurement:
+           - exit() routes through __wasi_proc_exit, so the guard would only work on a WASI
+             host; a plain browser/embedder has no such import. The guard must not depend on
+             one particular host ABI.
+           - A JS host that throws from proc_exit does NOT unwind the wasm frames, so control
+             returned into the `for(;;)` spin in exit() and the module HUNG instead of failing.
+             A hang is strictly worse than the trap it was meant to replace.
+           __builtin_trap lowers to the wasm `unreachable` instruction: immediate, host-agnostic,
+           and reported as a clean RuntimeError. The exported nova_rt_stack_overflowed flag is
+           what lets the host tell OUR guard apart from the engine running out of stack. */
+        __builtin_trap();
+    }
+}
+
+void nova_rt_stack_exit(void) {
+    if (nova_wasm_depth > 0) --nova_wasm_depth;
+}
+
+int64_t nova_rt_stack_limit(int64_t n) {
+    if (n > 0) nova_wasm_depth_max = n;
+    return nova_wasm_depth_max;
+}
+
 #define STUB(name, sig) int64_t nova_rt_##name sig { return 0; }
 #define STUB_VOID(name, sig) void nova_rt_##name sig { }
 
