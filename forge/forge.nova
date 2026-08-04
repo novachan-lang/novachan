@@ -28,6 +28,18 @@ import forge_limits
 // had no caller because no remote_addr was available until tcp_peer_addr landed.
 import forge_clientip
 
+// ── Shared primitives used throughout this file ───────────────────────────────────────────────────
+// `if contains(d, k) return d[k]; default` was written out at a dozen call sites, at TWO different
+// value types (int for the timeout/keepalive knobs, string for headers/query/state). One GENERIC
+// states it once: the type parameter is inferred from the default, so `_get_or(a, "ws_ka_ms", 0)`
+// is an int read and `_get_or(req.headers, k, "")` is a string read, with no `any` box in between.
+// Private, so every instantiation is created and consumed inside this module.
+
+fn <T> _get_or(d, key, dflt: T) -> T
+    if contains(d, key)
+        return d[key]
+    dflt
+
 // Reason phrases, as a lookup rather than a 21-branch if-ladder. A dict states the mapping as
 // DATA -- adding a status is one entry, and no branch can be reached in the wrong order.
 fn _status_table() -> dict
@@ -88,11 +100,11 @@ fn json_of(status: int, value) -> string
 // an embedded CR/LF into req.path / req.query (an attacker-controlled "GET /a\r\nX: b HTTP/1.1"
 // would otherwise land a CRLF in the path that a handler could reflect into a response header).
 fn _cut_at_crlf(s: string) -> string
-    let i = 0
-    while i < len(s)
+    // The loop STAYS -- it short-circuits on the first CR/LF -- but as a counted `for` range, so the
+    // bound and the step are stated once instead of a hand-maintained index.
+    for i in 0..len(s)
         if s[i] == "\r" or s[i] == "\n"
             return slice(s, 0, i)
-        i = i + 1
     s
 
 // Strip CR / LF / NUL from a header name or value -- the single defense against response splitting
@@ -100,15 +112,15 @@ fn _cut_at_crlf(s: string) -> string
 // including any built from request data (req.query reflected via resp_set_header), is safe by
 // construction. We strip rather than reject so a serve loop never dies on hostile input, and a
 // stripped value can never break framing.
+// QUADRATIC REMOVED: `out = out + c` re-allocated and re-copied the whole accumulated header on
+// every character -- n chars copied n(n+1)/2 bytes. Collecting the kept characters and joining ONCE
+// is a single allocation. This runs for EVERY header name and value of EVERY response.
 fn _safe_header(value: string) -> string
-    let out = ""
-    let i = 0
-    while i < len(value)
-        let c = value[i]
+    let kept = []
+    for c in value
         if c != "\r" and c != "\n" and c != chr(0)
-            out = out + c
-        i = i + 1
-    out
+            push(kept, c)
+    join(kept, "")
 
 fn parse_method(req: string) -> string
     let sp = find(req, " ")
@@ -172,31 +184,28 @@ fn parse_path_clean(req: string) -> string
 // silently missing a present param (a parameter-parsing confusion an attacker could exploit). First match
 // wins on duplicate keys.
 fn query_get(req: string, key: string) -> string
-    let q = parse_query(req)
-    let pairs = split(q, "&")
-    let i = 0
-    while i < len(pairs)
-        let p = pairs[i]
+    // Short-circuits on the first match (first-wins on duplicate keys), so the loop stays -- but it
+    // iterates the pairs directly instead of indexing them.
+    for p in split(parse_query(req), "&")
         let eq = find(p, "=")
         if eq >= 0 and slice(p, 0, eq) == key
             return slice(p, eq + 1, len(p))
-        i = i + 1
     ""
 
 // ALL values for a repeated query key, in order -> a list (empty if the key is absent). A multi-select /
 // checkbox form submits "?tag=a&tag=b&tag=c"; query_get returns only the first ("a"), so this is the way to
 // read every value. Exact key match (same anti-shadowing as query_get); a valueless "&key&" is skipped.
 fn query_all(req: string, key: string) -> list
+    _qs_values(parse_query(req), key)
+
+// The scan itself, over a bare "a=1&b=2" query string. It was written out TWICE, byte for byte --
+// here for the dict path and again in req_query_all for the typed path. One definition, two callers.
+fn _qs_values(qs: string, key: string) -> list
     let out = []
-    let q = parse_query(req)
-    let pairs = split(q, "&")
-    let i = 0
-    while i < len(pairs)
-        let p = pairs[i]
+    for p in split(qs, "&")
         let eq = find(p, "=")
         if eq >= 0 and slice(p, 0, eq) == key
             push(out, slice(p, eq + 1, len(p)))
-        i = i + 1
     out
 
 // Header value, matched CASE-INSENSITIVELY on the header name (HTTP header names are case-insensitive, so
@@ -228,13 +237,9 @@ fn header_get(req: string, name: string) -> string
 // escaped by the caller — MVP, not a full JSON encoder.
 // Redirect response (301/302/303/307/308). Includes the Location header.
 fn redirect(status: int, url: string) -> string
-    let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
-    r = r + "Location: " + _safe_header(url) + "\r\n"
-    r = r + "Content-Length: 0\r\n"
-    r = r + "Connection: close\r\n"
-    r = r + "Server: NOVA Forge\r\n"
-    r = r + "\r\n"
-    r
+    // One interpolated template rather than six re-allocating concatenations -- the wire format reads
+    // as the wire format, exactly like _build above.
+    "HTTP/1.1 {_status_line(status)}\r\nLocation: {_safe_header(url)}\r\nContent-Length: 0\r\nConnection: close\r\nServer: NOVA Forge\r\n\r\n"
 
 // Returns 1 iff `url` is a SAFE same-origin redirect target -- a local absolute PATH that cannot send the
 // browser off-site. This is the open-redirect guard for the "?next=..." / "return to" pattern (a raw
@@ -251,12 +256,10 @@ fn is_local_redirect(url: string) -> int
     if n >= 2
         if url[1] == "/" or url[1] == "\\"
             return 0
-    let i = 0
-    while i < n
-        let c = url[i]
+    // Rejection scan -- short-circuits on the first hostile byte, so the loop stays.
+    for c in url
         if c == "\\" or c == "\r" or c == "\n" or c == chr(0)
             return 0
-        i = i + 1
     1
 
 // Redirect to `url` ONLY if it is a safe local target (is_local_redirect), else to `fallback`. The
@@ -267,23 +270,27 @@ fn redirect_local(status: int, url: string, fallback: string) -> string
         return redirect(status, url)
     redirect(status, fallback)
 
+// Extension -> Content-Type as an ORDERED DATA table instead of a nine-branch if-ladder: adding a
+// media type is one row, and no branch can be written in the wrong place. The list (not a dict) keeps
+// the ladder's exact first-match-wins order, so the mapping is provably the one it replaced.
+fn _ctype_table() -> list
+    [
+        [".html", "text/html; charset=utf-8"],
+        [".htm", "text/html; charset=utf-8"],
+        [".css", "text/css; charset=utf-8"],
+        [".js", "application/javascript; charset=utf-8"],
+        [".json", "application/json"],
+        [".png", "image/png"],
+        [".jpg", "image/jpeg"],
+        [".jpeg", "image/jpeg"],
+        [".svg", "image/svg+xml"],
+        [".wasm", "application/wasm"]
+    ]
+
 fn _ext_ctype(path: string) -> string
-    if ends_with(path, ".html") or ends_with(path, ".htm")
-        return "text/html; charset=utf-8"
-    if ends_with(path, ".css")
-        return "text/css; charset=utf-8"
-    if ends_with(path, ".js")
-        return "application/javascript; charset=utf-8"
-    if ends_with(path, ".json")
-        return "application/json"
-    if ends_with(path, ".png")
-        return "image/png"
-    if ends_with(path, ".jpg") or ends_with(path, ".jpeg")
-        return "image/jpeg"
-    if ends_with(path, ".svg")
-        return "image/svg+xml"
-    if ends_with(path, ".wasm")
-        return "application/wasm"
+    for row in _ctype_table()
+        if ends_with(path, row[0])
+            return row[1]
     "application/octet-stream"
 
 // Is this content-type textual? Text assets serve as a STRING (string body -- inspectable by middleware
@@ -314,11 +321,8 @@ fn serve_file(path: string) -> string
 // replaced did not escape and emitted broken JSON.
 fn json_obj(status: int, pairs: list) -> string
     let d = {}
-    let i = 0
-    while i < len(pairs)
-        let kv = pairs[i]
+    for kv in pairs
         d[kv[0]] = kv[1]
-        i = i + 1
     _build(status, "application/json", json_stringify(d))
 
 // Maximum request header region (64 KiB) and body (8 MiB). Defaults that BOUND arena growth so a
@@ -349,11 +353,10 @@ fn _max_body() -> int
 fn _is_digits(s: string) -> bool
     if len(s) == 0
         return false
-    let i = 0
-    while i < len(s)
-        if find("0123456789", s[i]) < 0
+    // Short-circuits on the first non-digit, so the loop stays -- iterating the characters directly.
+    for c in s
+        if find("0123456789", c) < 0
             return false
-        i = i + 1
     true
 
 // Content-Length from the HEADER REGION only, case-insensitive, anchored to a header-line boundary
@@ -369,8 +372,8 @@ fn _content_length(raw)
     let cl = -1
     let seen = 0
     let te = 0
-    let i = 1
-    while i < len(lines)
+    // From 1: line 0 is the request line, not a header. A counted range states that offset once.
+    for i in 1..len(lines)
         let line = lines[i]
         let c = find(line, ":")
         if c >= 0
@@ -388,7 +391,6 @@ fn _content_length(raw)
                     cl = -2
             else if nm == "transfer-encoding"
                 te = 1
-        i = i + 1
     if te == 1
         return -2
     if seen > 1
@@ -433,23 +435,19 @@ fn recv_request(conn)
 // first \r, or -1. `start` lets the caller skip already-scanned bytes (with a small overlap for a split).
 fn _find_header_end(buf, start: int) -> int
     let n = bytes_len(buf)
-    let i = start
-    if i < 0
-        i = 0
-    while i + 3 < n
+    let from = start if start > 0 else 0
+    // `while i + 3 < n` visited exactly i in [from, n-4]; the counted range says that directly. The
+    // buffer is not appended to inside the scan, so the once-evaluated bound is the same bound.
+    for i in from..(n - 3)
         if bytes_get(buf, i) == 13 and bytes_get(buf, i + 1) == 10 and bytes_get(buf, i + 2) == 13 and bytes_get(buf, i + 3) == 10
             return i
-        i = i + 1
     -1
 
 // Append every byte of `chunk` to `buf` (amortized-doubling bytes_append); returns the grown buffer.
 // O(len(chunk)) amortized -- avoids the O(n^2)-under-arena cost of repeated bytes_concat for accumulation.
 fn _append_chunk(buf, chunk)
-    let m = bytes_len(chunk)
-    let j = 0
-    while j < m
+    for j in 0..bytes_len(chunk)
         buf = bytes_append(buf, bytes_get(chunk, j))
-        j = j + 1
     buf
 
 // Binary-safe request read (parallel to recv_request; the string path is untouched). Reads headers + body
@@ -461,9 +459,7 @@ fn _append_chunk(buf, chunk)
 // original untimed blocking read). The WS frame loop uses its OWN keepalive (ws_keepalive), so this only
 // bounds the initial HTTP request read + any keep-alive idle gap, never an upgraded WebSocket.
 fn _read_timeout_ms(a) -> int
-    if contains(a, "read_timeout_ms")
-        return a["read_timeout_ms"]
-    30000
+    _get_or(a, "read_timeout_ms", 30000)
 
 fn read_timeout(a, ms: int)
     a["read_timeout_ms"] = ms
@@ -559,13 +555,7 @@ type Part
 // Convert an (ASCII) string into a list of its byte codes -- so a hot scan compares ints, not freshly
 // allocated 1-char strings. HTTP delimiters/boundaries are ASCII, so ord(char_at) is exact here.
 fn _str_codes(s: string) -> list
-    let codes = []
-    let i = 0
-    let n = len(s)
-    while i < n
-        push(codes, ord(char_at(s, i)))
-        i = i + 1
-    codes
+    [ord(char_at(s, i)) for i in 0..len(s)]
 
 // find `needle` (an ASCII string) inside `hay` (a string) starting at `start`; -1 if absent. NOVA's `find`
 // has no start offset, so slice-then-find and re-add the offset.
@@ -588,10 +578,11 @@ fn _bytes_find(hay, needle: string, start: int) -> int
     let n = bytes_len(hay)
     if m == 0
         return start
-    let i = start
-    if i < 0
-        i = 0
-    while i + m <= n
+    let from = start if start > 0 else 0
+    // Outer scan is a counted walk of every candidate offset; the INNER compare stays a `while`
+    // because `ok` makes it abandon a mismatched candidate early -- that early exit is what keeps
+    // this O(n) in practice over an 8MB body, and a `for` would compare all m bytes every time.
+    for i in from..(n - m + 1)
         let j = 0
         let ok = true
         while j < m and ok
@@ -600,7 +591,6 @@ fn _bytes_find(hay, needle: string, start: int) -> int
             j = j + 1
         if ok
             return i
-        i = i + 1
     -1
 
 // Pull the boundary token out of the RAW (case-preserved) Content-Type header. Boundaries are
@@ -640,11 +630,9 @@ fn _mp_attr(hdr: string, key: string) -> string
 // True if any byte in body[a, e) is NUL. A part header carrying an embedded NUL would be truncated by
 // bytes_to_str (a C string), letting an attacker hide the real name/filename/content-type after the NUL.
 fn _bytes_range_has_nul(body, a: int, e: int) -> bool
-    let i = a
-    while i < e
+    for i in a..e
         if bytes_get(body, i) == 0
             return true
-        i = i + 1
     false
 
 // Parse a multipart/form-data body (a NovaBytes) into a list of Part. The body is split on the delimiter
@@ -816,22 +804,36 @@ fn _ws_b64char(v: int) -> string
     char_at("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", v)
 
 // base64 of a byte list (NUL/high-byte safe).
+//
+// QUADRATIC REMOVED: the body appended four characters to `out` per input triple, re-copying the
+// whole encoded prefix each time. The triple count is ARITHMETIC (n/3), not something to discover by
+// stepping an index, so the walk is a counted range and the pieces are joined ONCE. This is the
+// base64 under BOTH the WebSocket handshake accept and the JWT HS256 signature segment.
 fn ws_b64_bytes(data: list) -> string
     let n = len(data)
-    let out = ""
-    let i = 0
-    while i + 3 <= n
+    let full = n / 3
+    let parts = []
+    for t in 0..full
+        let i = t * 3
         let trip = ((data[i] & 255) << 16) | ((data[i + 1] & 255) << 8) | (data[i + 2] & 255)
-        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + _ws_b64char((trip >> 6) & 63) + _ws_b64char(trip & 63)
-        i = i + 3
-    let rem = n - i
+        push(parts, _ws_b64char((trip >> 18) & 63))
+        push(parts, _ws_b64char((trip >> 12) & 63))
+        push(parts, _ws_b64char((trip >> 6) & 63))
+        push(parts, _ws_b64char(trip & 63))
+    let tail = full * 3
+    let rem = n - tail
     if rem == 1
-        let trip = (data[i] & 255) << 16
-        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + "=="
+        let trip = (data[tail] & 255) << 16
+        push(parts, _ws_b64char((trip >> 18) & 63))
+        push(parts, _ws_b64char((trip >> 12) & 63))
+        push(parts, "==")
     if rem == 2
-        let trip = ((data[i] & 255) << 16) | ((data[i + 1] & 255) << 8)
-        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + _ws_b64char((trip >> 6) & 63) + "="
-    out
+        let trip = ((data[tail] & 255) << 16) | ((data[tail + 1] & 255) << 8)
+        push(parts, _ws_b64char((trip >> 18) & 63))
+        push(parts, _ws_b64char((trip >> 12) & 63))
+        push(parts, _ws_b64char((trip >> 6) & 63))
+        push(parts, "=")
+    join(parts, "")
 
 // Sec-WebSocket-Accept = base64(sha1(key + RFC6455-GUID)). The GUID ends ...85B11 (NOT 85B16 -- a one-char
 // error makes every browser reject the handshake). KAT-verified against the two canonical RFC 6455 examples.
@@ -1022,9 +1024,7 @@ fn _ws_bufcap() -> int
 // (the default -> the frame read loop is byte-identical to no-keepalive). A server enables dead-client
 // detection / proxy-warming with forge.ws_keepalive(app, 30000).
 fn _ws_app_ka(a) -> int
-    if contains(a, "ws_ka_ms")
-        return a["ws_ka_ms"]
-    0
+    _get_or(a, "ws_ka_ms", 0)
 
 // Enable WebSocket keepalive for this app: every connection that goes `ms` idle gets a ping; a peer that
 // fails to answer 3 pings is reaped (the read returns EOF, the handler ends, the socket closes).
@@ -1046,49 +1046,50 @@ fn ws_is_upgrade(req: Request) -> bool
 // bytes are arena-scoped to the call). Stored in a SEPARATE a["ws_routes"] table so
 // the HTTP dispatch path stays byte-identical. The pattern + handler are registered at app-config time
 // (active_arena == NULL) so they are connection-lived (non-arena) -- safe to hold across a request arena.
-fn ws(a, pattern: string, handler)
+// Append one route row to a named route table on the app dict, creating the table on first use.
+// This exact four-line block was copy-pasted SIX times (ws / ws_room / ws_room_ex / live_ws /
+// sse_every / stream); it is one definition now, and a new route family is a one-line registrar.
+fn _push_route(a, key: string, row: list)
     let routes = []
-    if contains(a, "ws_routes")
-        routes = a["ws_routes"]
-    push(routes, [pattern, handler])
-    a["ws_routes"] = routes
+    if contains(a, key)
+        routes = a[key]
+    push(routes, row)
+    a[key] = routes
+
+fn ws(a, pattern: string, handler)
+    _push_route(a, "ws_routes", [pattern, handler])
 
 // Register a BROADCAST/room WebSocket route bound to a `hub` (forge.hub()). handler: fn(ws, msg, hub),
 // called per inbound message -- typically calls room_say(hub, ...) to fan a message out to EVERY connection
 // on that hub. The framework runs the dual-task model (reader + single writer) and auto-subscribes /
 // unsubscribes the connection. A 3-element route [pattern, handler, hub] selects _ws_run_room.
 fn ws_room(a, pattern: string, hub, handler)
-    let routes = []
-    if contains(a, "ws_routes")
-        routes = a["ws_routes"]
-    push(routes, [pattern, handler, hub])
-    a["ws_routes"] = routes
+    _push_route(a, "ws_routes", [pattern, handler, hub])
 
 // A room route WITH lifecycle hooks for presence: on_join(ws, hub) fires when a client joins (e.g.
 // room_say(hub, "* a user joined *")), on_msg(ws, msg, hub) per message, on_leave(ws, hub) when it
 // disconnects. The join broadcast reaches the joiner too; the leave broadcast reaches the rest of the room.
 // Route = [pattern, on_msg, hub, on_join, on_leave] (length 5 selects the hook path in _ws_run_room).
 fn ws_room_ex(a, pattern: string, hub, on_join, on_msg, on_leave)
-    let routes = []
-    if contains(a, "ws_routes")
-        routes = a["ws_routes"]
-    push(routes, [pattern, on_msg, hub, on_join, on_leave])
-    a["ws_routes"] = routes
+    _push_route(a, "ws_routes", [pattern, on_msg, hub, on_join, on_leave])
+
+// First row of route table `key` whose pattern matches `path`, or []. The ws / sse / stream lookups
+// below were three byte-identical copies of this scan differing only in the table name and in the
+// guard their CALLER applies (upgrade-ness vs GET-ness), so the guards stay with the callers and the
+// scan is stated once. Returned row is non-arena (registered at app-config time).
+fn _routes_find(a, key: string, path: string) -> list
+    if not contains(a, key)
+        return []
+    for rt in a[key]
+        if is_ok(_fr_match(rt[0], path))
+            return rt
+    []
 
 // Find the route ([pattern,handler] or [pattern,handler,hub]) for a ws-upgrade request, or [] if none.
 fn _ws_lookup(a, req: Request) -> list
     if not ws_is_upgrade(req)
         return []
-    if not contains(a, "ws_routes")
-        return []
-    let routes = a["ws_routes"]
-    let i = 0
-    while i < len(routes)
-        let rt = routes[i]
-        if is_ok(_fr_match(rt[0], req.path))
-            return rt
-        i = i + 1
-    []
+    _routes_find(a, "ws_routes", req.path)
 
 // ── WebSocket CONSUME client (D7r.4b) ────────────────────────────────────────────────────────────────
 // The OUTBOUND side of WebSockets: dial a ws:// server, do the client handshake, and read/send frames via
@@ -1100,12 +1101,7 @@ fn _ws_lookup(a, req: Request) -> list
 // 16 CSPRNG bytes -> the base64 Sec-WebSocket-Key (RFC 6455 4.1).
 fn _ws_client_key() -> string
     let kb = secure_bytes(16)
-    let klist = []
-    let i = 0
-    while i < 16
-        push(klist, bytes_get(kb, i))
-        i = i + 1
-    ws_b64_bytes(klist)
+    ws_b64_bytes([bytes_get(kb, i) for i in 0..16])
 
 // A fresh 4-byte masking key as a list (ws_encode_frame masks client frames with it).
 fn _ws_client_mask() -> list
@@ -1137,9 +1133,9 @@ fn ws_connect(url: string) -> Result<any>
             port = unwrap(pr)
     let sock = tcp_connect(host, port)
     if sock <= 0
-        return err("ws connect failed: " + host + ":" + str(port))
+        return err("ws connect failed: {host}:{port}")
     let key = _ws_client_key()
-    tcp_send(sock, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    tcp_send(sock, "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
     // Read the 101 handshake response as text up to the terminator (headers are ASCII/NUL-free -- the
     // tcp_recv string path, same as forge_ws_echo_test's client). The frame buffer starts EMPTY: a WS
     // server sends frames only after the client does, so no server frame is concatenated with the 101.
@@ -1185,7 +1181,7 @@ fn ws_client_recv(c) -> Result<string>
         c["buf"] = _append_chunk(c["buf"], more)
         fr = ws_try_decode(c["buf"], 0)
     if fr.status < 0
-        return err("ws: protocol error " + str(fr.status))
+        return err("ws: protocol error {fr.status}")
     c["buf"] = bytes_slice(c["buf"], fr.consumed, bytes_len(c["buf"]))
     if fr.opcode == 8
         return err("ws: closed by server")
@@ -1242,8 +1238,7 @@ fn ws_handshake(conn: int, req: Request) -> int
         tcp_send(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
         return 0
     let accept = ws_compute_accept(key)
-    let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
-    tcp_send(conn, resp)
+    tcp_send(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
     1
 
 // Fill ws.buf until it holds >= one complete frame, then return that frame DECODED (status 1; the payload
@@ -1279,10 +1274,8 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
                 return WsFrame(0 - 1, 0, 0, 0, bytes(0))
             if ws.blen + cn > _ws_bufcap()
                 return WsFrame(0 - 1009, 0, 0, 0, bytes(0))
-            let k = 0
-            while k < cn
+            for k in 0..cn
                 bytes_set(ws.buf, ws.blen + k, bytes_get(chunk, k))
-                k = k + 1
             ws.blen = ws.blen + cn
             ws.pings = 0   // got data (incl. a pong) -> the peer is alive; reset the keepalive counter
     WsFrame(0 - 1, 0, 0, 0, bytes(0))
@@ -1290,10 +1283,10 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
 // Drop the first `n` bytes of ws.buf, compacting the leftover to the front IN PLACE (bytes_set, no alloc).
 fn _ws_consume(ws: Ws, n: int)
     let rem = ws.blen - n
-    let k = 0
-    while k < rem
+    // Forward compaction: every read is from a HIGHER index than the write, so a counted walk is
+    // exactly the in-place move the manual index performed.
+    for k in 0..rem
         bytes_set(ws.buf, k, bytes_get(ws.buf, n + k))
-        k = k + 1
     ws.blen = rem
 
 // Read ONE complete frame and consume it from the buffer. status 1 = frame in opcode/fin/payload; <0 sentinel.
@@ -1401,9 +1394,7 @@ fn ws_assign(ws: Ws, key: string, val: string)
 
 // Retrieve a value previously set with ws_assign. Returns "" when the key is absent.
 fn ws_get(ws: Ws, key: string) -> string
-    if contains(ws.assigns, key)
-        return ws.assigns[key]
-    ""
+    _get_or(ws.assigns, key, "")
 
 // Create a mock Ws with an empty assigns dict and an invalid (zero) fd. The fd is unusable for
 // actual I/O (no open socket); only ws_assign/ws_get are safe to call on the result. Intended for
@@ -1472,11 +1463,7 @@ fn _ws_run(conn: int, route, ka: int)
 // state; init_fn() -> the initial state; statics = the constant markup parts (len == len(dynamics)+1).
 // The route is length 6 so _ws_run dispatches it to _ws_run_live (distinct from basic(2)/room(3)/ex(5)).
 fn live_ws(a, pattern: string, view_fn, update_fn, init_fn, statics)
-    let routes = []
-    if contains(a, "ws_routes")
-        routes = a["ws_routes"]
-    push(routes, [pattern, view_fn, update_fn, init_fn, statics, "live"])
-    a["ws_routes"] = routes
+    _push_route(a, "ws_routes", [pattern, view_fn, update_fn, init_fn, statics, "live"])
 
 // Bridge the driver's STRING wire frames to the single socket writer (as text frames). The driver +
 // this pump are the only producers for `outbound` besides the close sentinel. Stops on "__pump_stop__"
@@ -1592,11 +1579,7 @@ fn sse(a, pattern: string, hub)
 // emits an SSE comment line: it keeps proxies from dropping the connection AND reaps a silently-dead client
 // (the comment send fails -> the stream exits + unsubscribes). Route = [pattern, hub, ka_ms].
 fn sse_every(a, pattern: string, hub, ka_ms: int)
-    let routes = []
-    if contains(a, "sse_routes")
-        routes = a["sse_routes"]
-    push(routes, [pattern, hub, ka_ms])
-    a["sse_routes"] = routes
+    _push_route(a, "sse_routes", [pattern, hub, ka_ms])
 
 // A sentinel value the per-connection keepalive ticker sends on the outbound channel -- distinguished from
 // real published events (which are plain text). The leading NUL makes a collision with real data impossible.
@@ -1620,16 +1603,7 @@ fn _sse_ticker(outbound, stopch, ka: int)
 fn _sse_lookup(a, req: Request) -> list
     if req.method != "GET"
         return []
-    if not contains(a, "sse_routes")
-        return []
-    let routes = a["sse_routes"]
-    let i = 0
-    while i < len(routes)
-        let rt = routes[i]
-        if is_ok(_fr_match(rt[0], req.path))
-            return rt
-        i = i + 1
-    []
+    _routes_find(a, "sse_routes", req.path)
 
 // Run an SSE stream: send the event-stream headers, subscribe to the hub, then stream each published string
 // as an SSE event. The sole socket writer (server->client only). PRECONDITION: active_arena == NULL (caller
@@ -1712,26 +1686,13 @@ fn _to_hex(n: int) -> string
 // Register a chunked-streaming route. ctype = Content-Type. producer: fn(conn) -> unit, which calls
 // forge.send_chunk(conn, data) to emit each chunk. Route = [pattern, producer, ctype].
 fn stream(a, pattern: string, ctype: string, producer)
-    let routes = []
-    if contains(a, "stream_routes")
-        routes = a["stream_routes"]
-    push(routes, [pattern, producer, ctype])
-    a["stream_routes"] = routes
+    _push_route(a, "stream_routes", [pattern, producer, ctype])
 
 // Find the [pattern, producer, ctype] for a GET matching a stream route, or [] if none.
 fn _stream_lookup(a, req: Request) -> list
     if req.method != "GET"
         return []
-    if not contains(a, "stream_routes")
-        return []
-    let routes = a["stream_routes"]
-    let i = 0
-    while i < len(routes)
-        let rt = routes[i]
-        if is_ok(_fr_match(rt[0], req.path))
-            return rt
-        i = i + 1
-    []
+    _routes_find(a, "stream_routes", req.path)
 
 // Emit one chunk: "<hexlen>\r\n<data>\r\n" (RFC 7230). Empty data is skipped (a 0-length chunk would end
 // the response prematurely). Returns the tcp_send result (<= 0 means the client is gone).
@@ -3121,33 +3082,29 @@ fn _finalize2(resp: Response, method: string, keep_alive: bool) -> string
     // (would NUL-truncate). For binary, we emit the HEADER ONLY with a bytes_len Content-Length, and
     // _serve_conn sends the body separately via tcp_send_bytes. type_name discriminates at runtime.
     let is_bin = type_name(resp.body) == "bytes"
-    let r = "HTTP/1.1 " + _status_line(resp.status) + "\r\n"
-    let ks = keys(resp.headers)
-    let i = 0
-    while i < len(ks)
-        let k = ks[i]
-        let kl = lower(k)
-        if kl != "content-length" and kl != "connection" and kl != "server"
-            r = r + _safe_header(k) + ": " + _safe_header(resp.headers[k]) + "\r\n"
-        i = i + 1
-    if is_bin
-        r = r + "Content-Length: " + str(bytes_len(resp.body)) + "\r\n"
-    else
-        r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
-    if keep_alive
-        r = r + "Connection: keep-alive\r\n"
-    else
-        r = r + "Connection: close\r\n"
-    r = r + "Server: NOVA Forge\r\n"
+    // Built as a LIST of header lines joined ONCE. The previous form grew a string with eleven
+    // successive `r = r + ..` steps, each reallocating and copying everything accumulated so far --
+    // quadratic in the header count, on EVERY response.
+    // Content-Length / Connection / Server are hop-by-hop and re-derived below, so a caller-supplied
+    // copy is dropped; the filter states that rule directly instead of as a negated if-chain.
+    let reserved = ["content-length", "connection", "server"]
+    let lines = ["HTTP/1.1 " + _status_line(resp.status)]
+    for k in keys(resp.headers)
+        if not contains(reserved, lower(k))
+            push(lines, _safe_header(k) + ": " + _safe_header(resp.headers[k]))
+    push(lines, "Content-Length: " + str(bytes_len(resp.body) if is_bin else len(resp.body)))
+    push(lines, "Connection: keep-alive" if keep_alive else "Connection: close")
+    push(lines, "Server: NOVA Forge")
     // Each cookie gets its OWN Set-Cookie line (sanitized so a value cannot inject a header).
-    let ci = 0
-    while ci < len(resp.cookies)
-        r = r + "Set-Cookie: " + _safe_header(resp.cookies[ci]) + "\r\n"
-        ci = ci + 1
-    r = r + "\r\n"
+    for c in resp.cookies
+        push(lines, "Set-Cookie: " + _safe_header(c))
+    // NOTE: a module-level `let CRLF = chr(13) + chr(10)` reads back EMPTY here (module-scope
+    // consts are baked and this one folded to ""), which silently ran every header together on
+    // one line. Use the literal, as the rest of this file does.
+    let head = join(lines, "\r\n") + "\r\n\r\n"
     if method != "HEAD" and not is_bin
-        r = r + resp.body
-    r
+        return head + resp.body
+    head
 
 // Public, backward-compatible: serialize as a full-body, Connection: close response (the form
 // callers and tests expect). The keep-alive serve loop uses _finalize2 directly.
@@ -4362,13 +4319,18 @@ fn openapi(a, info)
 
 // Swagger UI page (loaded from CDN) pointed at the spec URL. Braces via chr() to dodge interpolation.
 fn _swagger_html(spec_url: string) -> string
+    // Interpolation, so the markup reads as markup. The quote and brace characters still come from
+    // chr() -- a bare { interpolates and a bare " closes the literal -- but each now appears once
+    // inside the template rather than being spliced in by 21 separate concatenations.
     let q = chr(34)
     let lb = chr(123)
     let rb = chr(125)
-    let head = "<!doctype html><html><head><meta charset=" + q + "utf-8" + q + "><title>API Docs</title><link rel=" + q + "stylesheet" + q + " href=" + q + "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui.css" + q + "></head>"
-    let body = "<body><div id=" + q + "swagger-ui" + q + "></div><script src=" + q + "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js" + q + "></script>"
-    let js = "<script>window.onload=function()" + lb + "SwaggerUIBundle(" + lb + "url:" + q + spec_url + q + ",dom_id:" + q + "#swagger-ui" + q + rb + ")" + rb + "</script></body></html>"
-    return head + body + js
+    let css = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui.css"
+    let jsurl = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js"
+    let head = "<!doctype html><html><head><meta charset={q}utf-8{q}><title>API Docs</title><link rel={q}stylesheet{q} href={q}{css}{q}></head>"
+    let body = "<body><div id={q}swagger-ui{q}></div><script src={q}{jsurl}{q}></script>"
+    let js = "<script>window.onload=function(){lb}SwaggerUIBundle({lb}url:{q}{spec_url}{q},dom_id:{q}#swagger-ui{q}{rb}){rb}</script></body></html>"
+    head + body + js
 
 // Closures capture the prebuilt spec/html (long-lived; built at startup, read-only inside request arenas).
 fn _oapi_serve_spec(spec)
