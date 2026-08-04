@@ -1,0 +1,262 @@
+// std/collections/typedarray — PACKED, fixed-width numeric arrays.
+//
+// A `u8[]` of a million elements costs 1 MB here, not the 8 MB a boxed list would: elements are
+// stored at their true width (1/2/4/8 bytes) instead of one i64 slot each. That is the whole
+// point — typed columns, image buffers, audio frames and f32 tensors are all "a lot of numbers
+// of one known width", and paying 8 bytes for a u8 is a 8x memory tax on exactly the workloads
+// that care most.
+//
+// WHY THIS IS NOT A LIST WITH A WIDTH FLAG
+// NovaList already has an unboxed fast path, and its soundness rests on the slot size never
+// changing — only its interpretation. A conflicting append flips one flag and every alias
+// immediately agrees, because the buffer layout is identical either way. A width would break
+// that: a u8 array receiving a float would have to REALLOCATE from 1-byte to 8-byte slots while
+// other references still point at the old buffer. That is a representation change under aliases,
+// not a flag flip, and it is where silent corruption lives. So a typed array is homogeneous BY
+// CONTRACT — its element kind is fixed at creation — and a list stays heterogeneous-by-default.
+// Every mature system draws the same line: NumPy's ndarray is not a Python list, Java's `int[]`
+// is not an `ArrayList<Integer>`.
+//
+// FALLIBLE OPERATIONS RETURN Result. The raw builtins follow list convention (out of range reads
+// 0, writes no-op) so the language stays coherent; everything here that can fail says so in its
+// type, and `at`/`put`/`of_list` are the accessors to reach for when the index is not already
+// known good.
+
+// ── element kinds ────────────────────────────────────────────────────────────
+fn ta_i8() -> int
+    0
+fn ta_u8() -> int
+    1
+fn ta_i16() -> int
+    2
+fn ta_u16() -> int
+    3
+fn ta_i32() -> int
+    4
+fn ta_u32() -> int
+    5
+fn ta_i64() -> int
+    6
+fn ta_u64() -> int
+    7
+fn ta_f32() -> int
+    8
+fn ta_f64() -> int
+    9
+
+// Human name of a kind, for diagnostics and error messages.
+fn ta_kind_name(k: int) -> string
+    let names = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"]
+    if k < 0 or k >= len(names)
+        return "?"
+    names[k]
+
+fn ta_is_float(k: int) -> bool
+    k == 8 or k == 9
+
+// Bytes per element — the number that makes the packing visible.
+fn ta_width(k: int) -> int
+    let widths = [1, 1, 2, 2, 4, 4, 8, 8, 4, 8]
+    if k < 0 or k >= len(widths)
+        return 8
+    widths[k]
+
+// ── construction ─────────────────────────────────────────────────────────────
+
+// A zero-filled array of `n` elements. err() on a bad kind or a negative length rather than
+// silently handing back an empty array that fails much later and further away.
+fn ta_new(kind: int, n: int) -> Result
+    if kind < 0 or kind > 9
+        return err("typedarray: unknown element kind " + str(kind))
+    if n < 0
+        return err("typedarray: negative length " + str(n))
+    let a = tarray_new(kind, n)
+    if a == 0
+        return err("typedarray: allocation failed for " + str(n) + " x " + ta_kind_name(kind))
+    ok(a)
+
+// Build from an existing list. The generic parameter documents that the SOURCE element type is
+// whatever the caller has; the packed result is always numeric.
+fn <T> ta_of_list(kind: int, xs: list<T>) -> Result
+    let a = ta_new(kind, len(xs))?
+    // `for i, v in xs` IS the index/value form in NOVA -- wrapping it in enumerate() double-wraps
+    // and binds v to the [index, value] PAIR, which stores a list pointer into the array.
+    for i, v in xs
+        tarray_set(a, i, v)
+    ok(a)
+
+// Filled with a repeated value.
+fn ta_repeat(kind: int, n: int, v) -> Result
+    let a = ta_new(kind, n)?
+    tarray_fill(a, v)
+    ok(a)
+
+// ── access ───────────────────────────────────────────────────────────────────
+
+fn ta_len(a) -> int
+    tarray_len(a)
+
+fn ta_kind(a) -> int
+    tarray_kind(a)
+
+// Occupied bytes. `ta_bytes(u8 array of 1000) == 1000`, against 8000 for the boxed equivalent —
+// this is the assertion that proves the packing is real rather than nominal.
+fn ta_bytes(a) -> int
+    tarray_bytes(a)
+
+// CHECKED read. Use this when the index is not already known to be in range; the unchecked
+// `tarray_get` follows list convention and returns 0 past the end, which is a wrong answer
+// rather than an error.
+fn ta_at(a, i: int) -> Result
+    if i < 0 or i >= tarray_len(a)
+        return err("typedarray: index " + str(i) + " out of range for length " + str(tarray_len(a)))
+    ok(tarray_get(a, i))
+
+// CHECKED write.
+fn ta_put(a, i: int, v) -> Result
+    if i < 0 or i >= tarray_len(a)
+        return err("typedarray: index " + str(i) + " out of range for length " + str(tarray_len(a)))
+    tarray_set(a, i, v)
+    ok(i)
+
+fn ta_push(a, v) -> int
+    tarray_push(a, v)
+
+// ── float element kinds ──────────────────────────────────────────────────────
+// f32/f64 arrays need FLOAT-typed accessors. The integer ones would coerce a float argument on
+// the way in and render the result as a bit pattern on the way out; these are the same runtime
+// primitives seen through a float type, exactly as list_get_f is for float lists.
+
+fn ta_atf(a, i: int) -> Result
+    if i < 0 or i >= tarray_len(a)
+        return err("typedarray: index " + str(i) + " out of range for length " + str(tarray_len(a)))
+    ok(tarray_getf(a, i))
+
+fn ta_putf(a, i: int, v: float) -> Result
+    if i < 0 or i >= tarray_len(a)
+        return err("typedarray: index " + str(i) + " out of range for length " + str(tarray_len(a)))
+    tarray_setf(a, i, v)
+    ok(i)
+
+fn ta_pushf(a, v: float) -> int
+    tarray_pushf(a, v)
+
+// Sum of a FLOAT array, as a float. The integer ta_sum deliberately refuses these kinds.
+fn ta_sumf(a) -> Result
+    if not ta_is_float(tarray_kind(a))
+        return err("typedarray: ta_sumf is for f32/f64; " + ta_kind_name(tarray_kind(a)) + " is an integer kind")
+    let acc = 0.0
+    for i in 0..tarray_len(a)
+        acc = acc + tarray_getf(a, i)
+    ok(acc)
+
+// ── higher-order operations ──────────────────────────────────────────────────
+// These take CLOSURES, so callers compose rather than hand-rolling index loops. They stay in
+// the packed representation throughout: nothing here materialises a boxed list.
+
+// Apply `f` to every element IN PLACE. Returns the array so calls chain.
+fn ta_map_inplace(a, f)
+    for i in 0..tarray_len(a)
+        tarray_set(a, i, f(tarray_get(a, i)))
+    a
+
+// A NEW array of the same kind with `f` applied to each element.
+fn ta_map(a, f) -> Result
+    let out = ta_new(tarray_kind(a), tarray_len(a))?
+    for i in 0..tarray_len(a)
+        tarray_set(out, i, f(tarray_get(a, i)))
+    ok(out)
+
+// Left fold. `f(acc, elem) -> acc`.
+fn ta_fold(a, init, f)
+    let acc = init
+    for i in 0..tarray_len(a)
+        acc = f(acc, tarray_get(a, i))
+    acc
+
+// A NEW array holding only the elements satisfying `pred`. Grows as it goes, so the result is
+// exactly the matching count rather than a padded buffer.
+fn ta_filter(a, pred) -> Result
+    let out = ta_new(tarray_kind(a), 0)?
+    for v in ta_to_list(a)
+        if pred(v)
+            tarray_push(out, v)
+    ok(out)
+
+// Does any element satisfy `pred`? Short-circuits.
+// any/all/find_index stay as explicit loops on purpose: they SHORT-CIRCUIT, and routing them
+// through ta_to_list would materialise a boxed list of every element just to inspect the first
+// few -- defeating the packing this type exists to provide. `for i in 0..n` is the idiomatic
+// form; what is banished is the hand-rolled `while` with a manual index increment.
+fn ta_any(a, pred) -> bool
+    for i in 0..tarray_len(a)
+        if pred(tarray_get(a, i))
+            return true
+    false
+
+// Do all elements satisfy `pred`? Short-circuits.
+fn ta_all(a, pred) -> bool
+    for i in 0..tarray_len(a)
+        if not pred(tarray_get(a, i))
+            return false
+    true
+
+// Index of the first element satisfying `pred`, or err() when there is none — an Option-shaped
+// answer in Result form, so a miss cannot be mistaken for index 0.
+fn ta_find_index(a, pred) -> Result
+    for i in 0..tarray_len(a)
+        if pred(tarray_get(a, i))
+            return ok(i)
+    err("typedarray: no element matched")
+
+// ── numeric reductions ───────────────────────────────────────────────────────
+// Integer kinds only; the float kinds hold raw double bits, so summing them as integers would
+// be meaningless. Saying so in the type beats returning a plausible wrong number.
+
+fn ta_sum(a) -> Result
+    if ta_is_float(tarray_kind(a))
+        return err("typedarray: ta_sum is for integer kinds; " + ta_kind_name(tarray_kind(a)) + " holds float bits")
+    ok(ta_fold(a, 0, (acc, v) => acc + v))
+
+fn ta_min(a) -> Result
+    if tarray_len(a) == 0
+        return err("typedarray: min of an empty array")
+    if ta_is_float(tarray_kind(a))
+        return err("typedarray: ta_min is for integer kinds")
+    ok(ta_fold(a, tarray_get(a, 0), (m, v) => v if v < m else m))
+
+fn ta_max(a) -> Result
+    if tarray_len(a) == 0
+        return err("typedarray: max of an empty array")
+    if ta_is_float(tarray_kind(a))
+        return err("typedarray: ta_max is for integer kinds")
+    ok(ta_fold(a, tarray_get(a, 0), (m, v) => v if v > m else m))
+
+// ── conversion ───────────────────────────────────────────────────────────────
+
+// Materialise as an ordinary list. Costs the 8-bytes-per-element the packed form exists to
+// avoid, so this is for interop at a boundary, not for iterating.
+fn ta_to_list(a) -> list
+    [tarray_get(a, i) for i in 0..tarray_len(a)]
+
+// A copy with an independent buffer.
+fn ta_clone(a) -> Result
+    let out = ta_new(tarray_kind(a), tarray_len(a))?
+    for i in 0..tarray_len(a)
+        tarray_set(out, i, tarray_get(a, i))
+    ok(out)
+
+// Element-wise equality. Arrays of different kinds are never equal even when their values
+// coincide, matching how the runtime hashes them.
+fn ta_eq(a, b) -> bool
+    if tarray_kind(a) != tarray_kind(b) or tarray_len(a) != tarray_len(b)
+        return false
+    ta_all(a, _ => true) and not ta_any_index(a, i => tarray_get(a, i) != tarray_get(b, i))
+
+// Does any INDEX satisfy the predicate? (ta_any tests values; comparing two arrays needs the
+// index so both sides can be read at the same position.)
+fn ta_any_index(a, pred) -> bool
+    for i in 0..tarray_len(a)
+        if pred(i)
+            return true
+    false

@@ -1,0 +1,171 @@
+// coro.nova — lazy, suspendable generators / coroutines, the NOVA way.
+//
+// NOVA's built-in `yield` is EAGER: it materializes every yielded value into a
+// list up front, so an infinite producer would never return. A coro generator
+// produces values ON DEMAND by suspending a green task (the Stage-1 fiber
+// primitive) between values — so it supports INFINITE producers consumed by a
+// finite prefix, with bounded memory. This is a LIBRARY composing the fiber
+// primitive (fiber_create / fiber_resume / fiber_yield / fiber_is_done), not a
+// compiler coroutine state-machine — Values + green Processes, no new ceremony.
+//
+// Contract: a producer is a function fn(box) that, for each value, calls
+//   gen_emit(box, v)   // write the value, then suspend
+// The caller wires it with a SHARED 1-slot box:
+//   let box = [0]
+//   let g = gen_new(box, fn(z) my_producer(box))
+// Then pulls values:
+//   while gen_next(g) == 0
+//     use(gen_value(g))
+
+// A generator: box[0] holds the most recently emitted value; fib is the fiber.
+type Gen
+  box: list<int>
+  fib: int
+
+// Build a generator. `box` is a 1-slot list shared with the producer closure;
+// `producer` = fn(z) my_producer(box), capturing the SAME box.
+fn gen_new(box: list<int>, producer) -> Gen
+  Gen(box, fiber_create(producer))
+
+// Called from inside a producer: publish a value, then suspend until resumed.
+fn gen_emit(box: list<int>, v: int)
+  box[0] = v
+  fiber_yield()
+
+// Advance the generator. Returns 0 if it emitted a value, 1 if it has finished.
+fn gen_next(g: Gen) -> int
+  fiber_resume(g.fib)
+
+// The most recently emitted value (valid after gen_next returned 0).
+fn gen_value(g: Gen) -> int
+  g.box[0]
+
+// Has the producer run to completion?
+fn gen_done(g: Gen) -> int
+  fiber_is_done(g.fib)
+
+// Pull up to n values into a list. Safe on INFINITE generators: it stops after
+// n values (or when the producer finishes), leaving an infinite producer
+// suspended forever — bounded memory, the proof of laziness.
+fn gen_take(g: Gen, n: int) -> list<int>
+  let out = []
+  let count = 0
+  while count < n
+    let done = gen_next(g)
+    if done == 1
+      count = n
+    else
+      push(out, gen_value(g))
+      count = count + 1
+  out
+
+// Sum the first n emitted values (a streaming fold — never builds the full list).
+fn gen_sum_first(g: Gen, n: int) -> int
+  let total = 0
+  let count = 0
+  while count < n
+    let done = gen_next(g)
+    if done == 1
+      count = n
+    else
+      total = total + gen_value(g)
+      count = count + 1
+  total
+
+// ── Example producers ───────────────────────────────────────────────
+
+// Finite: the squares 0,1,4,9,16.
+fn squares_producer(box: list<int>)
+  let i = 0
+  while i < 5
+    gen_emit(box, i * i)
+    i = i + 1
+
+// INFINITE: the natural numbers 0,1,2,3,...  (never terminates on its own).
+fn naturals_producer(box: list<int>)
+  let i = 0
+  while 1 == 1
+    gen_emit(box, i)
+    i = i + 1
+
+// INFINITE: the Fibonacci sequence 0,1,1,2,3,5,8,...
+fn fib_producer(box: list<int>)
+  let a = 0
+  let b = 1
+  while 1 == 1
+    gen_emit(box, a)
+    let t = a + b
+    a = b
+    b = t
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// Test 1: finite generator, pulled value by value.
+let sbox = [0]
+let sg = gen_new(sbox, fn(z) squares_producer(sbox))
+let sq = []
+while gen_next(sg) == 0
+  push(sq, gen_value(sg))
+assert(len(sq) == 5, "5 squares emitted")
+assert(sq[0] == 0, "sq[0]==0")
+assert(sq[1] == 1, "sq[1]==1")
+assert(sq[2] == 4, "sq[2]==4")
+assert(sq[3] == 9, "sq[3]==9")
+assert(sq[4] == 16, "sq[4]==16")
+assert(gen_done(sg) == 1, "finite generator finished")
+print("PASS: finite generator (squares)")
+
+// Test 2: gen_take on a finite generator.
+let tbox = [0]
+let tg = gen_new(tbox, fn(z) squares_producer(tbox))
+let taken = gen_take(tg, 3)
+assert(len(taken) == 3, "took 3 of 5")
+assert(taken[2] == 4, "third taken is 4")
+print("PASS: gen_take finite prefix")
+
+// Test 3: INFINITE generator — the laziness proof. An eager yield would hang here.
+let nbox = [0]
+let ng = gen_new(nbox, fn(z) naturals_producer(nbox))
+let first5 = gen_take(ng, 5)
+assert(len(first5) == 5, "5 naturals from an infinite stream")
+assert(first5[0] == 0, "naturals[0]==0")
+assert(first5[4] == 4, "naturals[4]==4")
+assert(gen_done(ng) == 0, "infinite generator still suspended (NOT finished)")
+// pull 3 more — it resumes exactly where it left off
+let next3 = gen_take(ng, 3)
+assert(next3[0] == 5, "resumes at 5")
+assert(next3[2] == 7, "then 6,7")
+print("PASS: INFINITE generator consumed lazily (the differentiator)")
+
+// Test 4: Fibonacci generator + streaming fold.
+let fbox = [0]
+let fg = gen_new(fbox, fn(z) fib_producer(fbox))
+let fibs = gen_take(fg, 10)
+assert(fibs[0] == 0, "fib0")
+assert(fibs[1] == 1, "fib1")
+assert(fibs[6] == 8, "fib6==8")
+assert(fibs[9] == 34, "fib9==34")
+// streaming sum of first 10 fibs (0+1+1+2+3+5+8+13+21+34 = 88)
+let fbox2 = [0]
+let fg2 = gen_new(fbox2, fn(z) fib_producer(fbox2))
+let s = gen_sum_first(fg2, 10)
+assert(s == 88, "sum of first 10 fibs == 88")
+print("PASS: fibonacci generator + streaming fold")
+
+// Test 5: two independent generators interleaved (separate fibers + boxes).
+let abox = [0]
+let bbox = [0]
+let ag = gen_new(abox, fn(z) naturals_producer(abox))
+let bg = gen_new(bbox, fn(z) fib_producer(bbox))
+gen_next(ag)
+gen_next(bg)
+assert(gen_value(ag) == 0, "ag first == 0")
+assert(gen_value(bg) == 0, "bg first == 0")
+gen_next(ag)
+gen_next(ag)
+gen_next(bg)
+assert(gen_value(ag) == 2, "ag advanced to 2 independently")
+assert(gen_value(bg) == 1, "bg advanced to 1 independently")
+print("PASS: independent generators interleaved")
+
+print("ALL PASS: coro — lazy/infinite generators over the fiber primitive")

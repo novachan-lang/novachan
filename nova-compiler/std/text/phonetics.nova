@@ -1,0 +1,794 @@
+// std/text/phonetics -- Phonetic algorithms library (name matching / "sounds like").
+// LEAF -- imports NOTHING.
+//
+// Public API (all functions ph_-prefixed):
+//   ph_normalize(name)               -> string  uppercase, strip non-alpha (trim is
+//                                                 implicit: no non-alpha survives).
+//   ph_soundex(name)                 -> string  American Soundex, 4-char code
+//                                                 (NARA/Knuth standard: H,W transparent,
+//                                                 vowels+Y reset the same-code run).
+//   ph_metaphone(name)               -> string  Metaphone phonetic code (Lawrence
+//                                                 Philips 1990 rule set; TH is folded to
+//                                                 "T" rather than the original paper's
+//                                                 theta digit, for a readable A-Z code).
+//   ph_nysiis(name)                  -> string  NYSIIS (New York State Identification
+//                                                 and Intelligence System) code.
+//   ph_caverphone(name)              -> string  Caverphone 2.0 style code, always
+//                                                 exactly 10 characters (right-padded
+//                                                 with '1'). Implements the documented
+//                                                 pipeline (silent-prefix rules, digraph
+//                                                 substitution, vowel-to-placeholder
+//                                                 collapsing, duplicate-consonant
+//                                                 collapsing, 10-char pad/truncate); the
+//                                                 rarer vowel-adjacency edge rules for
+//                                                 y/w/h/r/l in the original 2004 paper
+//                                                 are approximated by the same generic
+//                                                 vowel-placeholder pass rather than
+//                                                 special-cased letter by letter.
+//   ph_cologne(name)                 -> string  Koelner Phonetik (Cologne Phonetik) for
+//                                                 German names: digit string, 0-8.
+//   ph_match(a, b)                   -> int     1 if a and b share the same Soundex
+//                                                 code, else 0.
+//   ph_distance(a, b)                -> int     Hamming distance (0..4) between the two
+//                                                 4-char Soundex codes. 0 = identical
+//                                                 code, 4 = every position differs.
+//   ph_fuzzy_score(query, candidate) -> int     Combined phonetic+positional score,
+//                                                 higher = more similar:
+//                                                   (4 - ph_distance) * 10   [0..40]
+//                                                 + 25 if Metaphone codes match
+//                                                 + 3 * common-prefix length of the
+//                                                   normalized forms.
+//   ph_group(names)                  -> dict    Groups names by Soundex code:
+//                                                 { code: [name, ...], ... }, each
+//                                                 group in original insertion order.
+//   ph_dedup(names)                  -> list    Names with phonetic duplicates removed
+//                                                 (first occurrence of each Soundex
+//                                                 code wins; input order preserved).
+//   ph_suggest(query, candidates)    -> list    candidates with Soundex distance <= 2
+//                                                 or a matching Metaphone code, ranked
+//                                                 by ph_fuzzy_score descending (ties
+//                                                 broken alphabetically), names only.
+//
+// Soundex, Metaphone, NYSIIS and Cologne are ported from this codebase's own
+// already-KAT-verified implementations (std/text/soundex.nova, std/text/metaphone.nova,
+// std/phonetic/nysiis.nova, std/phonetic/cologne.nova) so their published-vector
+// behavior (Robert/Rupert->R163, Ashcraft/Ashcroft->A261, Tymczak->T522, Pfister->P236,
+// Thompson->TMPSN, Braun/Brown-style NYSIIS collisions, Mueller->657, Meyer->67, ...)
+// carries over unchanged.
+
+// ── shared low-level helpers ─────────────────────────────────────────────────
+
+// Uppercase a single ASCII letter; non-alpha input returns "".
+fn _ph_upc(c: string) -> string
+    let o = ord(c)
+    let r = ""
+    if o >= 65 and o <= 90
+        r = c
+    else if o >= 97 and o <= 122
+        r = chr(o - 32)
+    r
+
+// Uppercase and strip every non-alpha character. This IS ph_normalize's body
+// and is also the "clean" step shared by metaphone, NYSIIS and Cologne.
+fn _ph_clean(s: string) -> string
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n
+        let uc = _ph_upc(char_at(s, i))
+        if len(uc) > 0
+            out = out + uc
+        i = i + 1
+    out
+
+// Return 1 if uppercase char c is a vowel (AEIOU).
+fn _ph_is_vowel(c: string) -> int
+    let r = 0
+    if c == "A" or c == "E" or c == "I" or c == "O" or c == "U"
+        r = 1
+    r
+
+// Safe char access: returns "" if i is out of bounds.
+fn _ph_at(s: string, i: int) -> string
+    let r = ""
+    if i >= 0 and i < len(s)
+        r = char_at(s, i)
+    r
+
+// Collapse runs of consecutive identical characters down to one.
+fn _ph_collapse_dup(s: string) -> string
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        if len(out) == 0
+            out = out + c
+        else
+            let prev = slice(out, len(out) - 1, len(out))
+            if c != prev
+                out = out + c
+        i = i + 1
+    out
+
+// Lexicographic less-than for tie-breaking sorts.
+fn _ph_str_lt(a: string, b: string) -> int
+    let na = len(a)
+    let nb = len(b)
+    let limit = na
+    if nb < limit
+        limit = nb
+    let i = 0
+    let decided = 0
+    let result = 0
+    while i < limit and decided == 0
+        let oa = ord(char_at(a, i))
+        let ob = ord(char_at(b, i))
+        if oa < ob
+            result = 1
+            decided = 1
+        else if oa > ob
+            decided = 1
+        i = i + 1
+    if decided == 0
+        if na < nb
+            result = 1
+    result
+
+// ── ph_normalize ─────────────────────────────────────────────────────────────
+
+// Uppercase, strip non-alpha. Trim is implicit: whitespace is non-alpha and is
+// removed by the same pass.
+fn ph_normalize(name: string) -> string
+    _ph_clean(name)
+
+// ── ph_soundex (American Soundex, NARA/Knuth rules) ─────────────────────────
+
+fn _ph_sx_upper(c: string) -> string
+    let o = ord(c)
+    let r = c
+    if o >= 97 and o <= 122
+        r = chr(o - 32)
+    r
+
+fn _ph_sx_code(c: string) -> int
+    let r = 0
+    if c == "B" or c == "F" or c == "P" or c == "V"
+        r = 1
+    else if c == "C" or c == "G" or c == "J" or c == "K" or c == "Q" or c == "S" or c == "X" or c == "Z"
+        r = 2
+    else if c == "D" or c == "T"
+        r = 3
+    else if c == "L"
+        r = 4
+    else if c == "M" or c == "N"
+        r = 5
+    else if c == "R"
+        r = 6
+    r
+
+// H and W are transparent: they do not break a same-code run.
+fn _ph_sx_is_hw(c: string) -> int
+    let r = 0
+    if c == "H" or c == "W"
+        r = 1
+    r
+
+fn ph_soundex(s: string) -> string
+    let slen = len(s)
+    let result = "0000"
+    if slen > 0
+        let first = _ph_sx_upper(char_at(s, 0))
+        let first_code = _ph_sx_code(first)
+        let digits = ""
+        let prev_code = first_code
+        let i = 1
+        while i < slen and len(digits) < 3
+            let c = _ph_sx_upper(char_at(s, i))
+            let hw = _ph_sx_is_hw(c)
+            if hw == 0
+                let code = _ph_sx_code(c)
+                if code == 0
+                    prev_code = 0
+                else if code != prev_code
+                    digits = digits + str(code)
+                    prev_code = code
+            i = i + 1
+        let dlen = len(digits)
+        if dlen < 3
+            let pad = 3 - dlen
+            if pad == 3
+                digits = digits + "000"
+            else if pad == 2
+                digits = digits + "00"
+            else
+                digits = digits + "0"
+        result = first + slice(digits, 0, 3)
+    result
+
+// ── ph_metaphone (Metaphone, Lawrence Philips 1990 rule set) ────────────────
+
+fn ph_metaphone(s: string) -> string
+    let w = _ph_clean(s)
+    let n = len(w)
+    if n == 0
+        return ""
+
+    let start = 0
+    let c0 = _ph_at(w, 0)
+    let c1 = _ph_at(w, 1)
+    if c0 == "K" and c1 == "N"
+        start = 1
+    else if c0 == "G" and c1 == "N"
+        start = 1
+    else if c0 == "P" and c1 == "N"
+        start = 1
+    else if c0 == "W" and c1 == "R"
+        start = 1
+
+    let out = ""
+    let i = start
+    let prev_out = ""
+
+    while i < n
+        let c = _ph_at(w, i)
+        let nx = _ph_at(w, i + 1)
+        let nx2 = _ph_at(w, i + 2)
+        let prev = ""
+        if i > 0
+            prev = _ph_at(w, i - 1)
+
+        let emit = ""
+        let skip = 0
+
+        if c == "A" or c == "E" or c == "I" or c == "O" or c == "U"
+            if i == start
+                emit = c
+        else if c == "B"
+            emit = "B"
+        else if c == "C"
+            if nx == "H"
+                emit = "X"
+                skip = 1
+            else if nx == "K"
+                emit = "K"
+                skip = 1
+            else if nx == "E" or nx == "I" or nx == "Y"
+                emit = "S"
+            else
+                emit = "K"
+        else if c == "D"
+            if nx == "G" and (nx2 == "E" or nx2 == "I" or nx2 == "Y")
+                emit = "J"
+                skip = 2
+            else
+                emit = "T"
+        else if c == "F"
+            emit = "F"
+        else if c == "G"
+            if nx == "H"
+                if _ph_is_vowel(prev) == 1 or prev == ""
+                    emit = ""
+                    skip = 1
+                else
+                    emit = "K"
+                    skip = 1
+            else if nx == "N"
+                emit = ""
+            else if nx == "E" or nx == "I" or nx == "Y"
+                emit = "J"
+            else
+                emit = "K"
+        else if c == "H"
+            if _ph_is_vowel(nx) == 1 and _ph_is_vowel(prev) == 0
+                emit = "H"
+        else if c == "J"
+            emit = "J"
+        else if c == "K"
+            if prev == "C"
+                emit = ""
+            else
+                emit = "K"
+        else if c == "L"
+            emit = "L"
+        else if c == "M"
+            emit = "M"
+        else if c == "N"
+            emit = "N"
+        else if c == "P"
+            if nx == "H"
+                emit = "F"
+                skip = 1
+            else
+                emit = "P"
+        else if c == "Q"
+            emit = "K"
+        else if c == "R"
+            emit = "R"
+        else if c == "S"
+            if nx == "H"
+                emit = "X"
+                skip = 1
+            else if nx == "I" and (nx2 == "A" or nx2 == "O")
+                emit = "X"
+            else
+                emit = "S"
+        else if c == "T"
+            if nx == "H"
+                emit = "T"
+                skip = 1
+            else if nx == "I" and (nx2 == "A" or nx2 == "O")
+                emit = "X"
+            else
+                emit = "T"
+        else if c == "V"
+            emit = "F"
+        else if c == "W"
+            if _ph_is_vowel(nx) == 1
+                emit = "W"
+        else if c == "X"
+            emit = "KS"
+        else if c == "Y"
+            if _ph_is_vowel(nx) == 1
+                emit = "Y"
+        else if c == "Z"
+            emit = "S"
+
+        if len(emit) > 0
+            if len(emit) > 1
+                out = out + emit
+                prev_out = slice(emit, len(emit) - 1, len(emit))
+            else
+                if emit != prev_out
+                    out = out + emit
+                    prev_out = emit
+
+        i = i + 1 + skip
+
+    out
+
+// ── ph_nysiis (New York State Identification and Intelligence System) ──────
+
+fn _ph_ny_prefix(s: string) -> string
+    let n = len(s)
+    let r = s
+    if n >= 3 and slice(s, 0, 3) == "MAC"
+        r = "MCC" + slice(s, 3, n)
+    else if n >= 3 and slice(s, 0, 3) == "SCH"
+        r = "SSS" + slice(s, 3, n)
+    else if n >= 2 and slice(s, 0, 2) == "KN"
+        r = "NN" + slice(s, 2, n)
+    else if n >= 2 and slice(s, 0, 2) == "PH"
+        r = "FF" + slice(s, 2, n)
+    else if n >= 2 and slice(s, 0, 2) == "PF"
+        r = "FF" + slice(s, 2, n)
+    else if n >= 1 and _ph_at(s, 0) == "K"
+        r = "C" + slice(s, 1, n)
+    r
+
+fn _ph_ny_initial_vowel(s: string) -> string
+    let r = s
+    if len(s) > 0 and _ph_is_vowel(_ph_at(s, 0)) == 1
+        r = "A" + slice(s, 1, len(s))
+    r
+
+fn _ph_ny_suffix(s: string) -> string
+    let n = len(s)
+    let r = s
+    if n >= 2
+        let last2 = slice(s, n - 2, n)
+        if last2 == "EE" or last2 == "IE"
+            r = slice(s, 0, n - 2) + "Y"
+        else if last2 == "DT" or last2 == "RT" or last2 == "RD" or last2 == "NT" or last2 == "ND"
+            r = slice(s, 0, n - 2) + "D"
+    r
+
+fn _ph_ny_encode_tail(tail: string, key_first: string) -> string
+    let n = len(tail)
+    let result = ""
+    let i = 0
+    while i < n
+        let c = _ph_at(tail, i)
+        let nx = _ph_at(tail, i + 1)
+        let nx2 = _ph_at(tail, i + 2)
+        let prev_orig = _ph_at(tail, i - 1)
+        let prev_ch = key_first
+        if len(result) > 0
+            prev_ch = slice(result, len(result) - 1, len(result))
+
+        if c == "E" and nx == "V"
+            result = result + "AF"
+            i = i + 2
+        else if _ph_is_vowel(c) == 1
+            result = result + "A"
+            i = i + 1
+        else if c == "Q"
+            result = result + "G"
+            i = i + 1
+        else if c == "Z"
+            result = result + "S"
+            i = i + 1
+        else if c == "M"
+            result = result + "N"
+            i = i + 1
+        else if c == "K" and nx == "N"
+            result = result + "N"
+            i = i + 2
+        else if c == "K"
+            result = result + "C"
+            i = i + 1
+        else if c == "S" and nx == "C" and nx2 == "H"
+            result = result + "SSS"
+            i = i + 3
+        else if c == "P" and nx == "H"
+            result = result + "FF"
+            i = i + 2
+        else if c == "H"
+            let after_v = 0
+            if i > 0 and _ph_is_vowel(prev_orig) == 1
+                after_v = 1
+            let before_v = 0
+            if len(nx) > 0 and _ph_is_vowel(nx) == 1
+                before_v = 1
+            if after_v == 1 or before_v == 1
+                result = result + prev_ch
+            else
+                result = result + "H"
+            i = i + 1
+        else if c == "W"
+            if i > 0 and _ph_is_vowel(prev_orig) == 1
+                result = result + prev_ch
+            else
+                result = result + "W"
+            i = i + 1
+        else
+            result = result + c
+            i = i + 1
+    result
+
+fn _ph_ny_strip_trailing(s: string) -> string
+    let n = len(s)
+    let r = s
+    if n > 1 and slice(r, len(r) - 1, len(r)) == "S"
+        r = slice(r, 0, len(r) - 1)
+    if len(r) > 2 and slice(r, len(r) - 2, len(r)) == "AY"
+        r = slice(r, 0, len(r) - 2)
+    if len(r) > 1 and slice(r, len(r) - 1, len(r)) == "A"
+        r = slice(r, 0, len(r) - 1)
+    if len(r) > 1 and slice(r, len(r) - 1, len(r)) == "H"
+        r = slice(r, 0, len(r) - 1)
+    r
+
+fn ph_nysiis(name: string) -> string
+    let cleaned = _ph_clean(name)
+    let r = ""
+    if len(cleaned) == 0
+        r = ""
+    else
+        let s = _ph_ny_prefix(cleaned)
+        s = _ph_ny_initial_vowel(s)
+        s = _ph_ny_suffix(s)
+        let kf = slice(s, 0, 1)
+        let tail = ""
+        if len(s) > 1
+            tail = slice(s, 1, len(s))
+        let encoded_tail = _ph_ny_encode_tail(tail, kf)
+        let key = kf + encoded_tail
+        let collapsed = _ph_collapse_dup(key)
+        r = _ph_ny_strip_trailing(collapsed)
+    r
+
+// ── ph_cologne (Koelner Phonetik / Cologne Phonetik, German names) ──────────
+
+fn _ph_co_code(prev: string, cur: string, next: string) -> int
+    let r = -1
+    if cur == "A" or cur == "E" or cur == "I" or cur == "O" or cur == "U"
+        r = 0
+    else if cur == "J" or cur == "Y"
+        r = 0
+    else if cur == "H"
+        r = -1
+    else if cur == "B"
+        r = 1
+    else if cur == "P"
+        if next == "H"
+            r = 3
+        else
+            r = 1
+    else if cur == "D" or cur == "T"
+        if next == "C" or next == "Z"
+            r = 8
+        else
+            r = 2
+    else if cur == "F" or cur == "V" or cur == "W"
+        r = 3
+    else if cur == "G" or cur == "K" or cur == "Q"
+        r = 4
+    else if cur == "C"
+        if prev == "S" or prev == "Z"
+            r = 8
+        else if next == "A" or next == "H" or next == "K" or next == "L" or next == "O" or next == "Q" or next == "R" or next == "U" or next == "X"
+            r = 4
+        else
+            r = 8
+    else if cur == "X"
+        r = 48
+    else if cur == "L"
+        r = 5
+    else if cur == "M" or cur == "N"
+        r = 6
+    else if cur == "R"
+        r = 7
+    else if cur == "S" or cur == "Z"
+        r = 8
+    r
+
+fn ph_cologne(name: string) -> string
+    let cleaned = _ph_clean(name)
+    let n = len(cleaned)
+    if n == 0
+        return ""
+
+    let raw = ""
+    let i = 0
+    while i < n
+        let c = _ph_at(cleaned, i)
+        let prev = _ph_at(cleaned, i - 1)
+        let nx = _ph_at(cleaned, i + 1)
+        let nx2 = _ph_at(cleaned, i + 2)
+
+        if c == "S" and nx == "C" and nx2 == "H"
+            raw = raw + "8"
+            i = i + 3
+        else
+            let code = _ph_co_code(prev, c, nx)
+            if code == 48
+                raw = raw + "4"
+                raw = raw + "8"
+                i = i + 1
+            else if code == -1
+                i = i + 1
+            else
+                raw = raw + str(code)
+                i = i + 1
+
+    let deduped = _ph_collapse_dup(raw)
+
+    let result = ""
+    let k = 0
+    let dn = len(deduped)
+    while k < dn
+        let d = char_at(deduped, k)
+        if d == "0"
+            if k == 0
+                result = result + "0"
+        else
+            result = result + d
+        k = k + 1
+    result
+
+// ── ph_caverphone (Caverphone 2.0 style, always 10 characters) ──────────────
+
+fn ph_caverphone(name: string) -> string
+    let lowered = lower(name)
+    let n0 = len(lowered)
+    let cleaned = ""
+    let i0 = 0
+    while i0 < n0
+        let o = ord(char_at(lowered, i0))
+        if o >= 97 and o <= 122
+            cleaned = cleaned + char_at(lowered, i0)
+        i0 = i0 + 1
+    let s = cleaned
+    if len(s) == 0
+        return "1111111111"
+
+    if ends_with(s, "e")
+        s = slice(s, 0, len(s) - 1)
+
+    if starts_with(s, "cough")
+        s = "cou2f" + slice(s, 5, len(s))
+    else if starts_with(s, "rough")
+        s = "rou2f" + slice(s, 5, len(s))
+    else if starts_with(s, "tough")
+        s = "tou2f" + slice(s, 5, len(s))
+    else if starts_with(s, "enough")
+        s = "enou2f" + slice(s, 6, len(s))
+    else if starts_with(s, "trough")
+        s = "trou2f" + slice(s, 6, len(s))
+    else if starts_with(s, "gn")
+        s = "2n" + slice(s, 2, len(s))
+
+    if ends_with(s, "mb")
+        s = slice(s, 0, len(s) - 1) + "2"
+
+    s = replace(s, "cq", "2q")
+    s = replace(s, "ci", "si")
+    s = replace(s, "ce", "se")
+    s = replace(s, "cy", "sy")
+    s = replace(s, "tch", "2ch")
+    s = replace(s, "c", "k")
+    s = replace(s, "q", "k")
+    s = replace(s, "x", "k")
+    s = replace(s, "v", "f")
+    s = replace(s, "dg", "2g")
+    s = replace(s, "tio", "sio")
+    s = replace(s, "tia", "sia")
+    s = replace(s, "d", "t")
+    s = replace(s, "ph", "fh")
+    s = replace(s, "b", "p")
+    s = replace(s, "sh", "s2")
+    s = replace(s, "z", "s")
+    s = replace(s, "j", "y")
+
+    let first = slice(s, 0, 1)
+    let rest = ""
+    if len(s) > 1
+        rest = slice(s, 1, len(s))
+    rest = replace(rest, "a", "3")
+    rest = replace(rest, "e", "3")
+    rest = replace(rest, "i", "3")
+    rest = replace(rest, "o", "3")
+    rest = replace(rest, "u", "3")
+    rest = replace(rest, "y", "3")
+    s = first + rest
+
+    s = _ph_collapse_dup(s)
+    s = replace(s, "2", "")
+
+    if ends_with(s, "3")
+        s = slice(s, 0, len(s) - 1) + "A"
+    s = replace(s, "3", "")
+
+    let slen = len(s)
+    let result = s
+    if slen > 10
+        result = slice(s, 0, 10)
+    else if slen < 10
+        let pad = 10 - slen
+        let p = 0
+        while p < pad
+            result = result + "1"
+            p = p + 1
+    result
+
+// ── matching / scoring / grouping ────────────────────────────────────────────
+
+// 1 if a and b share the same Soundex code, else 0.
+fn ph_match(a: string, b: string) -> int
+    let r = 0
+    if ph_soundex(a) == ph_soundex(b)
+        r = 1
+    r
+
+// Hamming distance (0..4) between the two 4-char Soundex codes.
+fn ph_distance(a: string, b: string) -> int
+    let ca = ph_soundex(a)
+    let cb = ph_soundex(b)
+    let n = len(ca)
+    let d = 0
+    let i = 0
+    while i < n
+        if char_at(ca, i) != char_at(cb, i)
+            d = d + 1
+        i = i + 1
+    d
+
+// Length of the common leading prefix of a and b.
+fn _ph_common_prefix_len(a: string, b: string) -> int
+    let na = len(a)
+    let nb = len(b)
+    let limit = na
+    if nb < limit
+        limit = nb
+    let i = 0
+    let matching = 1
+    while i < limit and matching == 1
+        if char_at(a, i) == char_at(b, i)
+            i = i + 1
+        else
+            matching = 0
+    i
+
+// Combined phonetic+positional score: (4-ph_distance)*10 + 25 (Metaphone match)
+// + 3*common-prefix-length(normalized forms). Higher = more similar.
+fn ph_fuzzy_score(query: string, candidate: string) -> int
+    let d = ph_distance(query, candidate)
+    let sx_score = (4 - d) * 10
+    let mq = ph_metaphone(query)
+    let mc = ph_metaphone(candidate)
+    let meta_bonus = 0
+    if len(mq) > 0 and mq == mc
+        meta_bonus = 25
+    let nq = ph_normalize(query)
+    let nc = ph_normalize(candidate)
+    let pre = _ph_common_prefix_len(nq, nc)
+    let pre_score = pre * 3
+    sx_score + meta_bonus + pre_score
+
+// Groups names by Soundex code: { code: [name, ...], ... }, insertion order
+// preserved within each group.
+fn ph_group(names) -> dict
+    let groups = {}
+    let i = 0
+    let n = len(names)
+    while i < n
+        let name = names[i]
+        let code = ph_soundex(name)
+        if not contains(groups, code)
+            groups[code] = []
+        push(groups[code], name)
+        i = i + 1
+    groups
+
+// Removes phonetic duplicates: keeps the first occurrence of each Soundex
+// code, input order preserved.
+fn ph_dedup(names) -> list
+    let seen = {}
+    let result = []
+    let i = 0
+    let n = len(names)
+    while i < n
+        let name = names[i]
+        let code = ph_soundex(name)
+        if not contains(seen, code)
+            seen[code] = 1
+            push(result, name)
+        i = i + 1
+    result
+
+// Insertion sort of [score, name] pairs: score descending, name ascending on ties.
+fn _ph_sort_score_pairs(pairs) -> list
+    let n = len(pairs)
+    let i = 1
+    while i < n
+        let cur = pairs[i]
+        let cscore = cur[0]
+        let cname = cur[1]
+        let j = i - 1
+        let done = 0
+        while j >= 0 and done == 0
+            let p = pairs[j]
+            let pscore = p[0]
+            let pname = p[1]
+            let goes_before = 0
+            if cscore > pscore
+                goes_before = 1
+            else if cscore == pscore
+                if _ph_str_lt(cname, pname) == 1
+                    goes_before = 1
+            if goes_before == 1
+                pairs[j + 1] = p
+                j = j - 1
+            else
+                done = 1
+        pairs[j + 1] = [cscore, cname]
+        i = i + 1
+    pairs
+
+// Candidates with Soundex distance <= 2 or a matching Metaphone code, ranked
+// by ph_fuzzy_score descending (ties broken alphabetically). Names only.
+fn ph_suggest(query, candidates) -> list
+    let pairs = []
+    let i = 0
+    let n = len(candidates)
+    let mq = ph_metaphone(query)
+    while i < n
+        let cand = candidates[i]
+        let d = ph_distance(query, cand)
+        let meta_match = 0
+        if len(mq) > 0 and mq == ph_metaphone(cand)
+            meta_match = 1
+        if d <= 2 or meta_match == 1
+            let score = ph_fuzzy_score(query, cand)
+            push(pairs, [score, cand])
+        i = i + 1
+    let sorted = _ph_sort_score_pairs(pairs)
+    let result = []
+    let j = 0
+    let ns = len(sorted)
+    while j < ns
+        let p = sorted[j]
+        push(result, p[1])
+        j = j + 1
+    result
