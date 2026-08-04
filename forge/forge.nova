@@ -24,6 +24,9 @@ import forge_live
 // forge_limits: LEAF module (imports nothing), supplies the N>1-safe actor rate limiter that
 // mw_rate_limit is wired over below (its own header comment names this as the intended wiring).
 import forge_limits
+// blocker #2: the trusted-proxy-aware client-IP algorithm lives here; it always existed but
+// had no caller because no remote_addr was available until tcp_peer_addr landed.
+import forge_clientip
 
 fn _status_line(status: int) -> string
     if status == 200
@@ -4814,19 +4817,60 @@ fn mw_request_id()
 // A token bucket also avoids the classic fixed-window flaw (up to 2x `lim` requests can land at
 // a window boundary); capacity=lim/refill=lim per window_ms gives the same "lim per window_ms"
 // configuration the public API already promises, just soundly enforced.
-fn _t_rate_limit(req: Request, next, lim_actor, lim: int, window_ms: int) -> Response
-    let key = req_header(req, "x-forwarded-for")
-    if key == ""
-        key = "global"
-    let allowed = rate_check(lim_actor, key, time_ms())
-    if allowed == 0
+// The REAL TCP peer address for a request, or "" when it cannot be determined.
+//
+// Blocker #2 was "no real client IP exists anywhere in the stack", and it was true when it was
+// written: tcp_accept populated then discarded the sockaddr. The runtime now exposes it
+// (tcp_peer_addr), and Request already carries the connection fd, so the address is available at
+// every middleware -- it simply was never wired up.
+fn req_remote_addr(req: Request) -> string
+    if req.conn <= 0
+        return ""
+    tcp_peer_addr(req.conn)
+
+// Rate-limit key. THE DEFAULT IS THE REAL PEER ADDRESS, never a client-supplied header.
+//
+// Keying on X-Forwarded-For alone is not a weak limit, it is NO limit: a credential-stuffing
+// script sets a fresh random XFF per request, every request looks like a brand-new client with a
+// full bucket, and the attacker also forces unlimited PBKDF2 work -- a CPU-exhaustion DoS from a
+// one-line curl loop. XFF is honoured ONLY when the caller declares which proxies it trusts, and
+// then only via forge_clientip.client_ip, which walks the chain from the right and stops at the
+// first NON-trusted hop -- so a forged prefix cannot move the key.
+//
+// The fallback order is deliberate: real peer -> XFF (only if a trust list was given) -> "global".
+// "global" means one shared bucket, i.e. the limit still ENGAGES; the pre-fix behaviour of a
+// per-forged-header bucket meant it never did.
+fn _rate_key(req: Request, trusted: list) -> string
+    let peer = req_remote_addr(req)
+    let xff = req_header(req, "x-forwarded-for")
+    // X-Forwarded-For is honoured ONLY when the caller has named its trusted proxies. client_ip
+    // walks the chain from the RIGHT and stops at the first non-trusted hop, so a forged prefix
+    // cannot move the key.
+    if len(trusted) > 0 and xff != ""
+        return client_ip(xff, peer, trusted)
+    if peer != ""
+        return peer
+    // No real peer and no trust list -> ONE SHARED bucket. Deliberately NOT the XFF header:
+    // falling back to it is precisely the bypass this fix exists to close, and a shared bucket
+    // still ENGAGES the limit whereas a per-forged-header bucket never does.
+    "global"
+
+fn _t_rate_limit(req: Request, next, lim_actor, lim: int, window_ms: int, trusted: list) -> Response
+    if rate_check(lim_actor, _rate_key(req, trusted), time_ms()) == 0
         return resp_text(429, "rate limit exceeded")
     next(req)
 
+// Rate limit keyed on the REAL peer address. Use this unless you are behind a proxy.
 fn mw_rate_limit(lim: int, window_ms: int)
+    return mw_rate_limit_trusting(lim, window_ms, [])
+
+// Rate limit for a deployment BEHIND PROXIES. `trusted` is a list of CIDRs owned by you; the key
+// becomes the first hop that is not one of them. Passing [] (the default above) ignores XFF
+// entirely, which is the safe choice when directly internet-facing.
+fn mw_rate_limit_trusting(lim: int, window_ms: int, trusted: list)
     let refill = (lim + 0.0) / (window_ms + 0.0)
     let lim_actor = rate_limiter(lim + 0.0, refill)
-    return fn(req, next) _t_rate_limit(req, next, lim_actor, lim, window_ms)
+    return fn(req, next) _t_rate_limit(req, next, lim_actor, lim, window_ms, trusted)
 
 // Built-in health endpoint. forge.health_route(app) registers GET /health -> 200 {"status":"ok"}
 // -- an HONEST liveness-only probe ("the process is up and can answer HTTP"), nothing more

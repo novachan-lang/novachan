@@ -2520,6 +2520,12 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             p = p + 1
             let_type = tv(tokens, p)
             p = p + 1
+            // `T[]` -- a PACKED array of T. Recorded as the string "T[]" so the annotation
+            // bridge below can recognise it; the empty-bracket pair is consumed here because
+            // the generic capture that follows only understands `<...>`.
+            if tk(tokens, p) == "DELIM" and tv(tokens, p) == "[" and tk(tokens, p + 1) == "DELIM" and tv(tokens, p + 1) == "]"
+                let_type = let_type + "[]"
+                p = p + 2
             if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
                 // capture nested generic args (mirrors the param-type capture)
                 let_type = let_type + "<"
@@ -2580,7 +2586,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                 if tk(tokens, expr_r.pos) == "KW" and tv(tokens, expr_r.pos) == "fn"
                     _parse_trail_fn(tokens, expr_r.pos, tok_col(tokens, pos), pe, "trail_fn_let", name, expr_r.expr, ln)
                 else
-                    _maybe_where(tokens, _parse_else_tail(tokens, expr_r.pos, expr_r.expr, name, let_params, [], ln, pe), pe)
+                    _maybe_where(tokens, _parse_else_tail(tokens, expr_r.pos, _ta_ann_build(let_type, expr_r.expr, ln), name, let_params, [], ln, pe), pe)
         else
             StmtParseResult(Stmt("assign", name, null_expr(), [], let_params, [], [], ln), p)
     else if kind == "IDENT"
@@ -6587,6 +6593,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_int_to_str"
     else if name == "int"
         "nova_rt_to_int"
+    else if name == "tarray_of"
+        "nova_rt_tarray_of_list"
     else if name == "tarray_new"
         "nova_rt_tarray_new"
     else if name == "tarray_get"
@@ -11348,6 +11356,24 @@ fn _ir_float_res(rt: dict, op: string, dest: string, args: list, mix: string, nu
 // LOCK-4 inc3c-part2: is this let-annotation a sized-int type name? Returns the width
 // name (so `let x: u8 = f()` can seed the slot width) or "" for anything else — struct
 // names, generics, f32 and usize/isize all fall through to the default i64/any path.
+// `let xs: u8[] = [1,2,3]` -> tarray_of(kind, [1,2,3]).
+//
+// This is the same shape as the scalar bridge (`let x: u8 = 300` narrows to 44): the annotation
+// says what the binding IS, so the initialiser is converted to it. Without the sugar a packed
+// array had to be built by hand -- `ta_new` then a loop of `tarray_set` -- which is precisely the
+// low-level style the type exists to avoid.
+//
+// Emitted as a direct builtin call rather than through std/collections/typedarray, because the
+// COMPILER cannot depend on a stdlib module; the module wraps the same primitive.
+fn _ta_ann_build(ann: string, e: Expr, ln: int) -> Expr
+    let elem = _ta_elem_of_ann(ann)
+    if elem == ""
+        return e
+    let k = _ta_kind_of(elem)
+    if k < 0
+        return e
+    Expr("call", "tarray_of", 0, [Expr("int", str(k), k, [], [], ln), e], [], ln)
+
 fn _lock4_ann_width(t: string) -> string
     if t == "u8" or t == "i8" or t == "u16" or t == "i16"
         return t
@@ -14983,6 +15009,41 @@ fn _int_lit_suffix(v: string) -> string
         return ""
     slice(v, h + 1, len(v))
 
+// LOCK-4 inc3d sugar: the element-kind NUMBER for a `T[]` annotation, or -1 if T is not a
+// packed-array element type. Must agree with NOVA_TA_* in the runtime -- the two are a single
+// wire format, so they are listed in the same order and never reordered.
+fn _ta_kind_of(t: string) -> int
+    if t == "i8"
+        return 0
+    if t == "u8"
+        return 1
+    if t == "i16"
+        return 2
+    if t == "u16"
+        return 3
+    if t == "i32"
+        return 4
+    if t == "u32"
+        return 5
+    if t == "i64"
+        return 6
+    if t == "u64"
+        return 7
+    if t == "f32"
+        return 8
+    if t == "f64"
+        return 9
+    0 - 1
+
+// The element type of a `T[]` annotation, or "" when the annotation is not that shape.
+fn _ta_elem_of_ann(ann: string) -> string
+    let n = len(ann)
+    if n < 3
+        return ""
+    if slice(ann, n - 2, n) != "[]"
+        return ""
+    slice(ann, 0, n - 2)
+
 // Is `w` a known sized-int width name (used to recognize sized annotations)?
 fn _is_sized_int_name(w: string) -> bool
     w == "u8" or w == "u16" or w == "u32" or w == "u64" or w == "i8" or w == "i16" or w == "i32" or w == "i64" or w == "usize" or w == "isize"
@@ -15675,6 +15736,7 @@ fn ti_build_stdlib() -> dict
     // fixed at creation, which is what removes the deopt-under-aliases hazard a width-carrying
     // NovaList would have had.
     reg["tarray_new"] = NTypeScheme([], nt_fn([nt_int(), nt_int()], nt_any()))
+    reg["tarray_of"] = NTypeScheme([-1], nt_fn([nt_int(), nt_list(T)], nt_any()))
     reg["tarray_get"] = NTypeScheme([], nt_fn([nt_any(), nt_int()], nt_int()))
     // FLOAT-typed views of the same three primitives. NOVA holds a float as raw double BITS in
     // an i64 slot, so the C side is identical -- only the static type differs, which is what
@@ -17143,6 +17205,11 @@ fn ti_ann_to_type(ann: string) -> NType
     // nt_struct("byval:Vec2") and every call failed to unify.
     if len(ann) > 6 and ann[0:6] == "byval:"
         return ti_ann_to_type(slice(ann, 6, len(ann)))
+    // `T[]` is a PACKED ARRAY -- its own opaque handle type, deliberately not list<T>: its
+    // element kind is fixed at creation, which is what removes the deopt-under-aliases hazard a
+    // width-carrying list would have. Typed `any` so the existing tarray_* builtins accept it.
+    if _ta_elem_of_ann(ann) != "" and _ta_kind_of(_ta_elem_of_ann(ann)) >= 0
+        return nt_any()
     if ann == "float" or ann == "Float"
         return nt_float()
     // BOTH float widths are EXPLICIT. Mapping f64 to the width-less default would make
@@ -25265,6 +25332,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // when a by-value struct is passed by reference.
     ire_line(e, "declare void @llvm.memcpy.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1) nounwind")
     ire_line(e, "declare i64 @nova_rt_tarray_new(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_tarray_of_list(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_tarray_get(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_tarray_getf(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_tarray_setf(i64, i64, i64) nounwind")

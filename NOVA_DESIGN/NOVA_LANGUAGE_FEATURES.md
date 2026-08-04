@@ -1383,7 +1383,17 @@ b[1:3]                                    // a NEW same-kind packed array
 ```
 Kinds: `ta_i8 ta_u8 ta_i16 ta_u16 ta_i32 ta_u32 ta_i64 ta_u64 ta_f32 ta_f64`.
 Float elements use the float-typed accessors: `ta_atf` / `ta_putf` / `ta_pushf` / `ta_sumf`.
-*(No `u8[]` annotation sugar yet — construct via `ta_new`.)*
+
+**`T[]` annotation sugar** — the natural way to build one:
+```nova
+let xs: u8[]  = [1, 2, 3, 300]   // 4 BYTES; 300 narrows to 44
+let ws: i16[] = [1000, -1000]    // 4 bytes
+let ds: i32[] = [10, 20, 30]     // 12 bytes; ds[1] == 20; json_stringify -> [10,20,30]
+let fs: f64[] = [1.5, 2.25]      // 16 bytes; ta_sumf -> 3.75
+```
+Element types: `i8 u8 i16 u16 i32 u32 i64 u64 f32 f64`. The annotation says what the binding IS,
+so the initialiser is converted to it — the same shape as `let x: u8 = 300` narrowing to 44. A
+plain `list` annotation is unaffected.
 
 ### 6.10 Crash-safe cleanup — `on_exit_send` / `cancel_on_exit_val`
 ```nova
@@ -1445,6 +1455,14 @@ fn f(n: int) -> int
 7. **Reserved words silently mis-codegen** when used as identifiers.
 
 8. **`reduce(list, fn, init)`** — the function is the **second** argument.
+
+9. **`for i, v in xs` IS the index/value form — do NOT wrap it in `enumerate()`.**
+   ```nova
+   for i, v in xs                  // i = 0, v = "a"          ✅
+   for i, v in enumerate(xs)       // i = 0, v = [0, "a"]     ❌ double-wrapped
+   ```
+   `enumerate` is for when you want the pair list as a VALUE. Wrapping the loop form binds `v`
+   to the pair, which silently stores a list pointer where a scalar was expected.
 
 9. **Enum variant constructors return the VARIANT type, not the enum type** — a function that
    `match`es over an enum usually leaves its parameter unannotated (`fn area(s)`).

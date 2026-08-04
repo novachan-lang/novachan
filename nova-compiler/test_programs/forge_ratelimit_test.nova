@@ -1,30 +1,59 @@
-// forge_ratelimit_test -- master plan Phase 2.13: fixed-window rate limit. max=2 per window: the
-// 3rd request from the same client -> 429. Also verifies the closure-captured state dict persists
-// counts across requests, and that a DIFFERENT client key has its own bucket.
+// forge_ratelimit_test -- token-bucket rate limiting, and the SECURITY property that makes it
+// worth having.
+//
+// This test previously asserted the VULNERABLE behaviour: it keyed buckets on a client-supplied
+// X-Forwarded-For and checked that a "different client" (a different XFF value) got its own
+// fresh bucket. That is exactly the bypass -- a credential-stuffing script sets a fresh random
+// XFF per request, every request looks like a brand-new client, and the limit never engages,
+// while also forcing unlimited PBKDF2 work on any auth route.
+//
+// mw_rate_limit now keys on the REAL TCP peer (tcp_peer_addr(req.conn)). XFF is honoured ONLY
+// via mw_rate_limit_trusting(lim, window, trusted_cidrs), which resolves the chain against a
+// caller-declared proxy list so a forged prefix cannot move the key.
 import forge
+import forge_clientip
 
 fn h(req: Request) -> string
     "ok"
 
+// conn = 0 -> no real peer is available, which is the interesting case: the DEFAULT limiter must
+// then fall back to one SHARED bucket, never to the attacker-controlled header.
 fn _req(ip: string) -> Request
     forge.build_request("GET /x HTTP/1.1\r\nX-Forwarded-For: " + ip + "\r\n\r\n", 0)
 
 fn main()
+    // ── SECURITY: forged XFF must NOT mint fresh buckets under the default ──
     let a = forge.app()
     forge.use(a, forge.mw_rate_limit(2, 60000))
     forge.get(a, "/x", h)
 
-    // client A: 2 allowed, 3rd blocked
-    let a1: Response = forge.dispatch_req(a, _req("1.1.1.1"))
-    let a2: Response = forge.dispatch_req(a, _req("1.1.1.1"))
-    let a3: Response = forge.dispatch_req(a, _req("1.1.1.1"))
-    assert(a1.status == 200, "req 1 allowed")
-    assert(a2.status == 200, "req 2 allowed")
-    assert(a3.status == 429, "req 3 over limit -> 429 (captured state persisted the count)")
-    print("PASS: rate limit triggers after max (state persists across requests)")
+    let s1: Response = forge.dispatch_req(a, _req("1.1.1.1"))
+    let s2: Response = forge.dispatch_req(a, _req("2.2.2.2"))
+    let s3: Response = forge.dispatch_req(a, _req("3.3.3.3"))
+    assert(s1.status == 200, "first request allowed")
+    assert(s2.status == 200, "second request allowed")
+    assert(s3.status == 429, "THIRD request blocked even though every XFF differs -- a forged header no longer mints a fresh bucket")
+    print("PASS: forged X-Forwarded-For cannot bypass the limit (blocker #2)")
 
-    // a DIFFERENT client has its own bucket -> still allowed
-    let b1: Response = forge.dispatch_req(a, _req("2.2.2.2"))
-    assert(b1.status == 200, "different client -> own bucket, allowed")
-    print("PASS: per-client buckets independent")
+    // ── behind a TRUSTED proxy, the chain resolves to the real client ──
+    // Driven against forge_clientip directly rather than through dispatch: build_request pins
+    // conn = 0, so there is no real peer, and with no peer EVERY client correctly resolves to
+    // the same empty address. In production behind a proxy the peer is always the proxy, which
+    // is the case exercised here.
+    let resolved = client_ip("203.0.113.9, 10.0.0.7", "10.0.0.1", ["10.0.0.0/8"])
+    assert(resolved == "203.0.113.9", "trusted chain resolves to the real client, not the proxy")
+    // a forged PREFIX cannot move the key: the walk stops at the first non-trusted hop from the right
+    let forged = client_ip("1.2.3.4, 203.0.113.9, 10.0.0.7", "10.0.0.1", ["10.0.0.0/8"])
+    assert(forged == "203.0.113.9", "a forged prefix does not move the key")
+    print("PASS: trusted-proxy chain resolution ignores a forged prefix")
+
+    // ── the default limiter must NOT consult XFF at all ──
+    let c = forge.app()
+    forge.use(c, forge.mw_rate_limit(2, 60000))
+    forge.get(c, "/x", h)
+    let e1: Response = forge.dispatch_req(c, _req("9.9.9.9"))
+    let e2: Response = forge.dispatch_req(c, _req("8.8.8.8"))
+    let e3: Response = forge.dispatch_req(c, _req("7.7.7.7"))
+    assert(e1.status == 200 and e2.status == 200 and e3.status == 429, "one shared bucket when no real peer is available")
+    print("PASS: with no real peer the default shares ONE bucket rather than trusting the header")
     print("forge_ratelimit_test passed")

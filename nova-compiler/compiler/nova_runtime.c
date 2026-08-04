@@ -2058,6 +2058,21 @@ int64_t nova_rt_tarray_getf(int64_t h, int64_t i) { return nova_rt_tarray_get(h,
 int64_t nova_rt_tarray_setf(int64_t h, int64_t i, int64_t v) { return nova_rt_tarray_set(h, i, v); }
 int64_t nova_rt_tarray_pushf(int64_t h, int64_t v) { return nova_rt_tarray_push(h, v); }
 
+/* `let xs: u8[] = [1,2,3]` desugars to this: build a packed array of `kind` from an existing
+   list. Elements are unboxed on the way in (a float list holds boxed doubles), so the same call
+   serves both integer and float element kinds. A non-list argument yields an empty array rather
+   than reading it as one. */
+int64_t nova_rt_tarray_of_list(int64_t kind, int64_t lst) {
+    NovaList* l = (NovaList*)(uintptr_t)lst;
+    if (!lst || nova_mem_find_tag((void*)(uintptr_t)lst) != NOVA_MEM_LIST)
+        return nova_rt_tarray_new(kind, 0);
+    int64_t h = nova_rt_tarray_new(kind, l->size);
+    if (!h) return 0;
+    for (int64_t i = 0; i < l->size; i++)
+        nova_rt_tarray_set(h, i, l->data[i]);
+    return h;
+}
+
 int64_t nova_rt_tarray_fill(int64_t h, int64_t v) {
     NovaTypedArray* a = nova_ta_of(h);
     if (!a) return 0;
