@@ -662,7 +662,17 @@ $testScript = {
         $sp = $matches[1]
         $obj = "$workDir\$sp.o"
         if (Test-Path "$workDir\$sp") {
-            if (-not (Test-Path $obj)) {
+            # Rebuild when the SOURCE is newer than the object, not merely when the object is
+            # absent. The existence-only check silently linked a STALE object after any edit to
+            # a @link_source C file -- the failure surfaces as an unrelated "undefined symbol"
+            # link error, which is about as misleading as a build system gets. (The comment
+            # above always claimed nova_link's "rebuilt only when foo.c is newer" semantics;
+            # this makes the harness actually implement them.)
+            $needBuild = -not (Test-Path $obj)
+            if (-not $needBuild) {
+                $needBuild = (Get-Item "$workDir\$sp").LastWriteTimeUtc -gt (Get-Item $obj).LastWriteTimeUtc
+            }
+            if ($needBuild) {
                 _RunProc $clangExe "-c -O2 `"$workDir\$sp`" -o `"$obj`" -D_CRT_SECURE_NO_WARNINGS -w" 60000 $workDir | Out-Null
             }
             $xsrc += " `"$obj`""

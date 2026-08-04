@@ -82,6 +82,19 @@
    pass flagged as fatal). The compiler now emits calls to the nova_rt_*_error helpers
    below instead of touching the TLS globals directly. Fault-boundary fields migrate in
    Stage 0b. */
+/* One registered task cleanup. `kind` is deliberately an enum rather than a closure: running
+   a NOVA closure from the fault path would re-enter user code on a task that has already
+   crashed, which is how a cleanup mechanism turns one fault into two. These are primitive,
+   non-faulting operations only. */
+#define NOVA_CLEANUP_SEND_CHAN 1   /* send(b) to channel a -- returns a pooled resource */
+
+typedef struct NovaCleanup {
+    int64_t kind;
+    int64_t a;
+    int64_t b;
+    int64_t token;   /* 0 = free slot */
+} NovaCleanup;
+
 typedef struct {
     int64_t error_flag;
     int64_t error_msg;
@@ -94,6 +107,21 @@ typedef struct {
                                trace for it (and for non-task fatal panics) but NOT for supervised spawned crashes. */
     int64_t stack_depth;    /* Stage 1.5: per-task recursion depth (was global g_stack_depth) */
     int64_t stack_max;      /* per-task overflow limit; 0 => NOVA_DEFAULT_STACK_MAX */
+    /* Forge blocker #3: cleanups that MUST run even when the task dies by a contained
+       crash. `defer` cannot serve this -- it is a COMPILE-TIME construct that inlines at a
+       function's exit points, so a panic longjmps straight past it. That is precisely why a
+       handler faulting mid-transaction permanently leaked its pooled DB connection: the
+       longjmp skipped `send(pool, db)`, and after N such crashes (N = pool size) every later
+       request parked forever. A slow-motion outage that looks like a hang, not a 500.
+
+       Drained by the fiber trampoline on EVERY exit path -- normal completion and the fault
+       landing pad alike -- so a registered release runs exactly once either way. Entries are
+       cancellable, so the normal path releases eagerly (a long-lived task must not hold a
+       connection until it exits) and simply cancels its registration. */
+    struct NovaCleanup* cleanups;
+    int64_t  cleanup_count;
+    int64_t  cleanup_cap;
+    int64_t  cleanup_seq;            /* monotonic, so a cancelled slot's token is never reused */
     struct NovaArena* active_arena;  /* iter-94: PER-TASK transparent arena. nova_heap_alloc
                                         bumps into it when set. Per-task (not per-OS-thread) so a
                                         green task that PARKS mid-scope cannot leak its arena to
@@ -7748,6 +7776,93 @@ static void nova_ensure_carrier(void) {
    at all (undefined reference). Moved out of the guard -- it only touches nova_cur() and
    nova_rt_arena_free, neither of which is Windows-specific. */
 void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
+int64_t nova_rt_try_send(int64_t handle, int64_t value);
+
+/* Register a cleanup on the CURRENT task; returns a cancellation token (0 on failure, which
+   callers treat as "not registered" rather than an error -- a failed registration must never
+   break the acquire it is protecting). */
+int64_t nova_rt_task_on_exit_send(int64_t chan, int64_t value) {
+    NovaTaskState* t = nova_cur();
+    if (!t) return 0;
+    for (int64_t i = 0; i < t->cleanup_count; i++) {
+        if (t->cleanups[i].token == 0) {
+            t->cleanups[i].kind = NOVA_CLEANUP_SEND_CHAN;
+            t->cleanups[i].a = chan;
+            t->cleanups[i].b = value;
+            t->cleanups[i].token = ++t->cleanup_seq;
+            return t->cleanups[i].token;
+        }
+    }
+    if (t->cleanup_count >= t->cleanup_cap) {
+        int64_t ncap = t->cleanup_cap ? t->cleanup_cap * 2 : 4;
+        NovaCleanup* nc = (NovaCleanup*)realloc(t->cleanups, (size_t)ncap * sizeof(NovaCleanup));
+        if (!nc) return 0;
+        t->cleanups = nc;
+        t->cleanup_cap = ncap;
+    }
+    NovaCleanup* c = &t->cleanups[t->cleanup_count++];
+    c->kind = NOVA_CLEANUP_SEND_CHAN;
+    c->a = chan;
+    c->b = value;
+    c->token = ++t->cleanup_seq;
+    return c->token;
+}
+
+/* Cancel a registered cleanup -- the normal path releases the resource itself and calls this,
+   so the cleanup fires only when the task did NOT get that far. Unknown/stale tokens are a
+   no-op, which keeps double-release harmless. */
+int64_t nova_rt_task_cancel_exit(int64_t token) {
+    NovaTaskState* t = nova_cur();
+    if (!t || token == 0) return 0;
+    for (int64_t i = 0; i < t->cleanup_count; i++) {
+        if (t->cleanups[i].token == token) {
+            t->cleanups[i].token = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Cancel by (channel, value) rather than by token. The pool helpers release inside functions
+   that do not return the token, and threading one through would change every pool_* signature;
+   looking the entry up by what it holds keeps the API additive. Cancels the MOST RECENT match,
+   which is the right one when a task borrows the same pool more than once. */
+int64_t nova_rt_task_cancel_exit_val(int64_t chan, int64_t value) {
+    NovaTaskState* t = nova_cur();
+    if (!t) return 0;
+    for (int64_t i = t->cleanup_count - 1; i >= 0; i--) {
+        if (t->cleanups[i].token != 0 && t->cleanups[i].a == chan && t->cleanups[i].b == value) {
+            t->cleanups[i].token = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Drain every still-registered cleanup. Called on BOTH the normal and the crashed exit path.
+   Runs in reverse registration order (innermost resource first), and clears each slot BEFORE
+   acting so a fault inside the drain cannot re-run it. */
+static void nova_task_run_cleanups(void) {
+    NovaTaskState* t = nova_cur();
+    if (!t || !t->cleanups) return;
+    for (int64_t i = t->cleanup_count - 1; i >= 0; i--) {
+        if (t->cleanups[i].token == 0) continue;
+        int64_t kind = t->cleanups[i].kind;
+        int64_t a = t->cleanups[i].a;
+        int64_t b = t->cleanups[i].b;
+        t->cleanups[i].token = 0;
+        /* NON-blocking on purpose. A blocking send would PARK a task that is already dying,
+           on the fault path, with no one guaranteed to drain it -- turning a leak into a hang.
+           try_send can only fail when the channel is full, which for a pool means every
+           connection is already back, i.e. there was nothing to leak. */
+        if (kind == NOVA_CLEANUP_SEND_CHAN) nova_rt_try_send(a, b);
+    }
+    t->cleanup_count = 0;
+    free(t->cleanups);
+    t->cleanups = NULL;
+    t->cleanup_cap = 0;
+}
+
 static void nova_task_arena_cleanup(void) {
     NovaTaskState* t = nova_cur();
     NovaArena* a = t->active_arena;
@@ -7823,6 +7938,7 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         fflush(stderr);
     }
     f->task.fault_active = 0;
+    nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
@@ -8174,6 +8290,7 @@ static void nova_posix_fiber_trampoline(void) {
     }
     f->ovf_active = 0;
     f->task.fault_active = 0;
+    nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
@@ -12491,6 +12608,26 @@ int64_t nova_rt_to_i8(int64_t val)  { return (int64_t)(int8_t)(nova_rt_to_int(va
 int64_t nova_rt_to_i16(int64_t val) { return (int64_t)(int16_t)(nova_rt_to_int(val) & 0xFFFFLL); }
 int64_t nova_rt_to_i32(int64_t val) { return (int64_t)(int32_t)(nova_rt_to_int(val) & 0xFFFFFFFFLL); }
 int64_t nova_rt_to_i64(int64_t val) { return nova_rt_to_int(val); }
+
+/* LOCK-4 inc3c: explicit FLOAT-width conversions, the float twins of nova_rt_to_u8 et al.
+   NOVA floats live as raw double BITS in an i64 slot, so these take and return bits. f32()
+   rounds through binary32 -- the same rounding the compiler emits inline for f32 arithmetic,
+   so an explicit conversion and an inferred one cannot disagree. f64() is a widening, i.e.
+   the identity on the bit pattern; it exists so the width-mismatch error's suggested fix
+   ("convert explicitly, e.g. f64(x)") names something that actually exists. Both unbox first
+   because the argument may arrive boxed through an `any`-typed path. */
+int64_t nova_rt_to_f32(int64_t val) {
+    int64_t raw = nova_rt_unbox(val);
+    double d;
+    memcpy(&d, &raw, sizeof(double));
+    float f = (float)d;
+    double back = (double)f;
+    int64_t out;
+    memcpy(&out, &back, sizeof(double));
+    return out;
+}
+
+int64_t nova_rt_to_f64(int64_t val) { return nova_rt_unbox(val); }
 
 int64_t nova_rt_to_float(int64_t val) {
     if (val == 0) return f2i(0.0);

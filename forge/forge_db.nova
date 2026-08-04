@@ -8,8 +8,16 @@
 // queries are PARAMETERIZED (db_query binds positionally) -> injection-safe by construction.
 import sqlitex
 
-// Open a pool of N connections to `path`. Use a FILE path so the pooled connections share data
-// (":memory:" gives each connection its OWN private database).
+// Default acquire timeout for the transaction helpers below (with_tx / tx): a saturated pool degrades to
+// a fast, catchable err() instead of parking the calling task forever (see pool_acquire_to's own doc
+// comment -- a crash-isolation longjmp inside a handler that holds a connection currently leaks it, and
+// with no bound, every subsequent request just hangs once the pool is exhausted).
+let _DB_ACQUIRE_TIMEOUT_MS = 5000
+
+// Open a pool of N connections to `path`. A FILE path gives every pooled connection a view of the SAME
+// on-disk data, as expected. ":memory:" is special-cased by sqlitex.db_open to a shared-cache URI
+// ("file::memory:?cache=shared"), so pooled in-memory connections ALSO share one database instead of each
+// silently getting its own private, mutually invisible instance.
 fn pool_open(path: string, n: int)
     let ch = channel()
     let i = 0
@@ -19,11 +27,21 @@ fn pool_open(path: string, n: int)
     ch
 
 // Acquire a connection (parks until one is free); release it back to the pool when done.
+// Forge blocker #3: acquiring also REGISTERS a crash-safe release on the task, and releasing
+// cancels it. `defer send(pool, db)` alone cannot do this -- defer is a COMPILE-TIME construct
+// that inlines at a function's exit points, so a panic inside the body longjmps straight past
+// it and the connection is gone for good. After N such crashes (N = pool size) every later
+// request parked forever: a slow-motion outage that reads as a hang, not a 500. The registry is
+// drained by the fiber trampoline on BOTH the normal and the crashed exit path, so the release
+// happens exactly once either way.
 fn pool_acquire(pool)
-    recv(pool)
+    let db = recv(pool)
+    on_exit_send(pool, db)
+    db
 
 fn pool_release(pool, db)
     send(pool, db)
+    cancel_on_exit_val(pool, db)
 
 // Forge T2.6: timeout-bounded acquire. `recv(pool)` already PARKS the green task (cooperatively
 // yields the carrier -> no spin), but parks FOREVER if every connection stays busy. This bounds the
@@ -34,25 +52,29 @@ fn pool_release(pool, db)
 fn pool_acquire_to(pool, ms: int) -> Result<int>
     let r = select_timeout(pool, ms)
     if r[0] == 0
+        // same crash-safe registration as pool_acquire -- see the note there
+        on_exit_send(pool, r[1])
         ok(r[1])
     else
         err("pool acquire timeout")
 
-// Forge T2.7: run a body inside a DB TRANSACTION on a SINGLE pooled connection. Acquire one connection,
-// BEGIN, run body_fn(db) (which does its writes via db_query(db, ...) on THAT SAME connection -- a
-// transaction can't span connections), then COMMIT if the body returns ok(..) or ROLLBACK if it returns
-// err(..) -> all-or-nothing. The connection is released back to the pool either way. Returns the body's
-// Result. NOTE: this rolls back on a returned ERROR; rolling back on a PANIC would need runtime
-// panic-recovery (which NOVA lacks today) -> a transaction signals failure via err(), never a panic.
+// Forge T2.7: run a body inside a DB TRANSACTION on a SINGLE pooled connection. Acquire one connection
+// (timeout-bounded -- a saturated pool returns err("pool acquire timeout") fast instead of parking this
+// task forever), BEGIN, run body_fn(db) (which does its writes via db_query(db, ...) on THAT SAME
+// connection -- a transaction can't span connections), then COMMIT if the body returns ok(..) or ROLLBACK
+// if it returns err(..) -> all-or-nothing. The connection is released back to the pool on every path
+// (defer). Returns the body's Result, or the acquire-timeout Result if the pool never freed one. NOTE:
+// this rolls back on a returned ERROR; rolling back on a PANIC would need runtime panic-recovery (which
+// NOVA lacks today) -> a transaction signals failure via err(), never a panic.
 fn with_tx(pool, body_fn) -> any
-    let db = recv(pool)
+    let db = pool_acquire_to(pool, _DB_ACQUIRE_TIMEOUT_MS)?
+    defer pool_release(pool, db)
     db_query(db, "BEGIN", [])
     let r = body_fn(db)
     if is_ok(r)
         db_query(db, "COMMIT", [])
     else
         db_query(db, "ROLLBACK", [])
-    send(pool, db)
     r
 
 // Parameterized query on a pooled connection (acquire -> query -> release). Returns a list of rows
@@ -155,19 +177,32 @@ fn pool_exec(pool, sql: string)
     send(pool, db)
     rc
 
-// Run a list of [sql, params] statements in a single transaction on ONE pooled connection: BEGIN,
-// run all, COMMIT. Atomic against other connections. (Rollback-on-handler-panic via crash
-// isolation is a later refinement; this is the explicit-statement-list form.)
-fn tx(pool, statements)
-    let db = recv(pool)
+// Run a list of [sql, params] statements in a single transaction on ONE pooled connection: BEGIN, run
+// each statement through db_write (which checks sqlite3_step's real return code -- see sqlitex.nova),
+// COMMIT only if every one of them succeeded, ROLLBACK the moment any one fails. Previously this
+// unconditionally COMMITted regardless of whether an intermediate db_query() call had actually failed
+// (db_query has no way to report failure -- see its own doc comment), directly contradicting this
+// function's "Atomic against other connections" promise: a batch where statement 2-of-3 failed would
+// still commit statements 1 and 3. Returns ok(n) (n = statements executed) or err(message) from the
+// first failing statement. (Rollback-on-handler-panic via crash isolation is a separate, larger
+// refinement NOVA doesn't have yet -- this is the explicit-statement-list, explicit-error form.)
+fn tx(pool, statements) -> any
+    let db = pool_acquire_to(pool, _DB_ACQUIRE_TIMEOUT_MS)?
+    defer pool_release(pool, db)
     db_exec(db, "BEGIN")
-    let i = 0
-    while i < len(statements)
-        let s = statements[i]
-        db_query(db, s[0], s[1])
-        i = i + 1
-    db_exec(db, "COMMIT")
-    send(pool, db)
+    let count = 0
+    let failure = ""
+    for s in statements
+        let r = db_write(db, s[0], s[1])
+        if is_err(r)
+            failure = unwrap_err(r)
+            break
+        count = count + 1
+    if failure == ""
+        db_exec(db, "COMMIT")
+        return ok(count)
+    db_exec(db, "ROLLBACK")
+    err(failure)
 
 // Close all N connections in the pool.
 fn pool_close(pool, n: int)

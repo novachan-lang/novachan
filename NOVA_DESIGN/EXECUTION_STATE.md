@@ -117,6 +117,87 @@ surface and therefore belong to THIS tracker**:
 | F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
 | F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
 
+## LOCK-11 COMPLETE + Forge blocker #3 ACTUALLY FIXED (2026-08-04)
+
+### Struct-by-value RETURNS — LOCK-11 is now whole
+
+Params landed earlier; returns close it. Ground truth again taken from clang per target, and it
+contained a rule the ABI documents would not have handed me: **Win64 returns a ≤8-byte struct as
+a bare `i64` — the raw bits in RAX — even when its only field is a `double`.** SysV returns that
+same struct as `double`.
+
+| struct | Win64 | SysV | AAPCS64 |
+|---|---|---|---|
+| `{double}` | `i64` | `double` | `{double}` |
+| `{i64}` | `i64` | `i64` | `i64` |
+| `{double,double}` | `void(ptr sret)` | `{double,double}` | `{double,double}` |
+| `{i64,i64}` | `void(ptr sret)` | `{i64,i64}` | `[2 x i64]` |
+| `{double×3}` | `void(ptr sret)` | `void(ptr sret)` | `{double,double,double}` (HFA) |
+| `{i64×3}` | `void(ptr sret)` | `void(ptr sret)` | `void(ptr sret)` |
+
+All six match clang exactly on all three targets. Win64 and SysV are EXECUTED and correct;
+AAPCS64 is signature-equivalence only (Docker not running). The sret path costs no copy: a
+@repr(C) struct carries no leading type-hash slot, so its data pointer IS the C struct layout and
+the callee writes the result straight into its final home.
+
+**A latent bug found on the way, wider than struct returns.** `ir_expr_struct_type` did not see
+through an `unsafe` wrapper, and an extern call must be written `unsafe f(...)` — so the result of
+ANY struct-returning extern resolved to no struct type and its fields were read with the HASHED
+layout, one slot too high. That is silent field corruption, and it applied to the pre-existing
+pointer-returning `@repr(C)` externs too, not just the new by-value ones. `unsafe` is a safety
+marker and is now transparent to type resolution.
+
+### Forge blocker #3 — the DB pool leak is FIXED, not mitigated
+
+The earlier state was "mitigated": a 5000 ms acquire timeout turned a hang into a fast `err()`,
+but the connection was still gone for good. After N crashes (N = pool size) every later request
+failed. The underlying cause was recorded as needing "runtime panic-recovery", and that is
+exactly what this adds.
+
+**Why `defer` could never have fixed it.** `defer` is a COMPILE-TIME construct: the deferred
+expressions are collected into `b.ir_defers` and inlined at the function's exit points. A panic
+`longjmp`s to the task's fault boundary, skipping every one of those exit points. So
+`defer send(pool, db)` was never going to run on the crash path, no matter where it was placed.
+
+The fix is a **task-scoped cleanup registry drained on EVERY exit path**, normal and crashed
+alike, right where the per-task arena cleanup already runs in both fiber trampolines:
+
+* `on_exit_send(chan, value)` registers a release and returns a cancellation token.
+* `cancel_on_exit(token)` / `cancel_on_exit_val(chan, value)` cancel it, so the normal path
+  releases eagerly — a long-lived task must not hold a connection until it exits.
+* Entries are an ENUM of primitive operations, deliberately not closures: running user code from
+  the fault path, on a task that has already crashed, is how a cleanup mechanism turns one fault
+  into two.
+* The drain uses a NON-blocking send. A blocking one would park a dying task on the fault path
+  with nobody guaranteed to drain it — converting a leak into a hang, which is worse.
+
+`forge_db`'s `pool_acquire` / `pool_acquire_to` register, `pool_release` cancels.
+
+KAT `_kat_pool_crash` includes a CONTROL: the same crash without registering. The control shows
+the connection really is lost (`recv_timeout` → −1), so the test proves the registry is what
+recovers it rather than some incidental effect. The first version of this KAT passed for the
+wrong reason — `xs[99]` returned 0 instead of faulting, so nothing ever crashed; it now panics
+via `unwrap` on an `Err` and the fault is visible in the output.
+
+### `nova_rt_stack_enter` has zero call sites — that is CORRECT on native targets
+
+Recorded as an open gap; the analysis says otherwise, so it is corrected here rather than
+"fixed". Hardware stack-overflow containment now exists on BOTH native platforms (SEH on Windows,
+`sigaltstack`+SIGSEGV on POSIX), and the root task itself runs on a fiber, so it is covered too —
+verified: the contained overflow message observed on Linux is the signal handler's
+(`level=ERROR event=fault detail="stack overflow"`), not the depth guard's
+(`NOVA panic: stack overflow (depth > N)`).
+
+Auto-emitting the software depth guard would add a load/increment/compare/store to **every
+function prologue and epilogue**, which is a direct hit to the C-parity claim GATE 4/5 measures —
+paying a permanent throughput cost for a hazard the hardware guard page already catches at zero
+cost. So zero call sites on native is the right answer, not a defect.
+
+**The genuine residual gap is targets with no signals and no SEH — WASM and freestanding.** There
+the guard page cannot fire, and the software counter is the only mechanism available. The correct
+scope is therefore "auto-emit `stack_enter`/`stack_exit` for wasm32/freestanding only", not
+"emit it everywhere". Left open with that scope, deliberately not widened to native.
+
 ## THE LAST THREE LANGUAGE GAPS — ALL CLOSED (2026-08-04)
 
 f32, multi-line lambdas and struct-by-value FFI were the three items standing between NOVA and

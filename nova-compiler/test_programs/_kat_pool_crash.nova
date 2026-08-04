@@ -1,0 +1,102 @@
+// Forge blocker #3: a task that dies by a CONTAINED CRASH must still return its pooled
+// resource. `defer` cannot provide this -- it is compile-time and inlines at a function's
+// exit points, so a panic longjmps straight past it. That is exactly why a handler faulting
+// mid-transaction permanently leaked its connection: after N such crashes (N = pool size)
+// every later request parked forever, a slow-motion outage that looks like a hang, not a 500.
+//
+// on_exit_send registers the release on the TASK; the fiber trampoline drains the registry on
+// BOTH exit paths. The normal path releases eagerly and cancels its registration, so a
+// long-lived task never holds a connection until it exits.
+
+fn use_conn_ok(pool, ch)
+    let db = recv(pool)
+    let tok = on_exit_send(pool, db)
+    // ... work ...
+    send(pool, db)
+    cancel_on_exit(tok)
+    send(ch, 1)
+
+fn use_conn_crash(pool, ch)
+    let db = recv(pool)
+    let tok = on_exit_send(pool, db)
+    send(ch, 1)
+    // a perfectly ordinary bug, mid-"transaction": unwrapping an Err panics, which longjmps
+    // to the task's fault boundary -- straight past the release below.
+    let bad = err("transaction blew up")
+    print("unreachable " + str(unwrap(bad)))
+    // never reached; the release must still happen
+    send(pool, db)
+    cancel_on_exit(tok)
+
+// CONTROL: the same crash WITHOUT registering a release. This is the pre-fix behaviour, and
+// it is here so the test proves the registry is what recovers the connection rather than some
+// incidental effect -- without it the pool really does end up empty.
+fn use_conn_unregistered(pool, ch)
+    let db = recv(pool)
+    send(ch, 1)
+    let bad = err("transaction blew up")
+    print("unreachable " + str(unwrap(bad)))
+    send(pool, db)
+
+fn main()
+    // a pool of 2 connections
+    let pool = channel_bounded(8)
+    send(pool, 101)
+    send(pool, 102)
+
+    let done = channel_bounded(8)
+
+    // clean borrow/return, twice: must not double-release
+    let p1 = pool
+    let d1 = done
+    spawn fn()
+        use_conn_ok(p1, d1)
+    let a = recv(done)
+    assert(a == 1, "borrower signalled")
+    sleep(60)
+    spawn fn()
+        use_conn_ok(p1, d1)
+    let b = recv(done)
+    assert(b == 1, "borrower signalled")
+    sleep(60)
+
+    // now crash while holding one, twice -- more crashes than the pool has connections
+    spawn fn()
+        use_conn_crash(p1, d1)
+    let c = recv(done)
+    assert(c == 1, "borrower signalled")
+    sleep(150)
+    spawn fn()
+        use_conn_crash(p1, d1)
+    let d = recv(done)
+    assert(d == 1, "borrower signalled")
+    sleep(150)
+
+    // both connections must still be available; before the fix the pool was empty here and
+    // this recv would park forever.
+    let g1 = recv(pool)
+    let g2 = recv(pool)
+    print("recovered connections: " + str(g1) + " " + str(g2))
+    let sum = g1 + g2
+    assert(sum == 203, "both pooled connections survived crashing borrowers")
+    // ── control: an UNregistered borrower loses the connection ──────────
+    send(pool, g1)
+    send(pool, g2)
+    let p2 = pool
+    let d2 = done
+    spawn fn()
+        use_conn_unregistered(p2, d2)
+    let e = recv(done)
+    assert(e == 1, "control borrower signalled")
+    sleep(150)
+    // one connection is now gone; a bounded recv must still find the OTHER one, and then the
+    // pool must be empty. recv_timeout keeps this a test rather than a hang.
+    let c1 = recv_timeout(pool, 300)
+    let c2 = recv_timeout(pool, 300)
+    // recv_timeout signals "timed out" with -1, so a real connection id is never -1.
+    print("control: first=" + str(c1) + " second(expect -1 = timed out)=" + str(c2))
+    assert(c1 == 101 or c1 == 102, "control: one connection is still available")
+    assert(c2 == -1, "control: the unregistered borrower's connection is GONE -- exactly what the registry fixes")
+    print("ok: control confirms the leak exists without on_exit_send")
+
+    print("KAT pool_crash PASS")

@@ -2757,8 +2757,19 @@ fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         p = p + 1
         if tk(tokens, p) == "IDENT"
             ret_ann = tv(tokens, p)
-        while tk(tokens, p) == "IDENT" or tk(tokens, p) == "DELIM"
+        // `-> byval<T>` mirrors the parameter form: the C function returns T BY VALUE. A plain
+        // `-> T` keeps meaning "returns a POINTER to a T", which is also a real C signature
+        // (`Vec2* make_vec2(void)`) and what existing code expects, so this stays opt-in for
+        // exactly the reason the parameter side did.
+        if ret_ann == "byval" and tk(tokens, p + 1) == "OP" and tv(tokens, p + 1) == "<"
+            p = p + 2
+            ret_ann = "byval:" + tv(tokens, p)
             p = p + 1
+            if tk(tokens, p) == "OP" and tv(tokens, p) == ">"
+                p = p + 1
+        else
+            while tk(tokens, p) == "IDENT" or tk(tokens, p) == "DELIM"
+                p = p + 1
     let ret_expr = null_expr()
     if ret_ann != ""
         ret_expr = Expr("rettype", ret_ann, 0, [], [], ln)
@@ -6576,6 +6587,12 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_int_to_str"
     else if name == "int"
         "nova_rt_to_int"
+    else if name == "on_exit_send"
+        "nova_rt_task_on_exit_send"
+    else if name == "cancel_on_exit"
+        "nova_rt_task_cancel_exit"
+    else if name == "cancel_on_exit_val"
+        "nova_rt_task_cancel_exit_val"
     else if name == "f32"
         "nova_rt_to_f32"
     else if name == "f64"
@@ -12912,6 +12929,13 @@ fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
                 return "dict"
             if et == "bool" or (et == "ident" and (ev == "true" or ev == "false"))
                 return "bool"
+            // `unsafe <expr>` is a SAFETY marker, transparent to typing -- the value is
+            // whatever the inner expression produces. Without seeing through it, an extern
+            // call (which must be written `unsafe f(...)`) resolved to no struct type, and a
+            // @repr(C) result was then read with the HASHED layout: every field one slot too
+            // high. That is silent field corruption, not a compile error.
+            if et == "unsafe" and len(ec) >= 1
+                return ir_expr_struct_type(b, ec[0])
             if et == "struct_init" and contains(b.ir_sdefs, ev)
                 return ev
             if et == "call" and contains(b.ir_sdefs, ev)
@@ -15620,6 +15644,12 @@ fn ti_build_stdlib() -> dict
     reg["int"] = NTypeScheme([-1], nt_fn([T], nt_int()))
     // f32(x)/f64(x): accept ANY numeric width (that is the point of an explicit conversion --
     // it is how you legally cross a width boundary) and return the target width.
+    // Forge blocker #3: register a release that survives a CONTAINED CRASH. `defer` cannot do
+    // this -- it inlines at a function's exit points, so a panic longjmps past it. Returns a
+    // cancellation token; the normal path releases eagerly and cancels.
+    reg["on_exit_send"] = NTypeScheme([-1], nt_fn([nt_channel(T), T], nt_int()))
+    reg["cancel_on_exit"] = NTypeScheme([], nt_fn([nt_int()], nt_int()))
+    reg["cancel_on_exit_val"] = NTypeScheme([-1], nt_fn([nt_channel(T), T], nt_int()))
     reg["f32"] = NTypeScheme([], nt_fn([nt_any()], nt_float_w("f32")))
     reg["f64"] = NTypeScheme([], nt_fn([nt_any()], nt_float_w("f64")))
     reg["u8"] = NTypeScheme([-1], nt_fn([T], nt_int()))
@@ -21779,10 +21809,72 @@ fn _abi_field_kinds(b: IrBuilder, tname: string) -> string
         return "?"
     out
 
+// How a by-value @repr(C) struct RETURN is lowered. Returns one of:
+//   "sret"          -> void @f(ptr sret(%T) align 8, ...)  : caller supplies the storage
+//   "<llvm type>"   -> the value comes back in registers as that type
+// Ground truth from clang on each target, and it contains one rule that reading the ABI
+// documents would not have given me: **Win64 returns a <=8-byte struct as a bare i64, even
+// when its only field is a double** -- the raw bits come back in RAX, not in XMM0. SysV, by
+// contrast, returns that same struct as `double`.
+//
+//   {double}      Win64 i64            SysV double             AAPCS64 { double }
+//   {i64}         Win64 i64            SysV i64                AAPCS64 i64
+//   {double,double} Win64 sret         SysV { double, double } AAPCS64 { double, double }
+//   {i64,i64}     Win64 sret           SysV { i64, i64 }       AAPCS64 [2 x i64]
+//   {double x3}   Win64 sret           SysV sret               AAPCS64 { double,double,double }  (HFA)
+//   {i64 x3}      Win64 sret           SysV sret               AAPCS64 sret
+fn _abi_struct_ret_type(b: IrBuilder, tname: string, triple: string) -> string
+    let kinds = _abi_field_kinds(b, tname)
+    if contains(kinds, "?")
+        return ""
+    let n = len(kinds)
+    let size = n * 8
+    if target_is_windows(triple) == 1
+        // <=8 bytes comes back in RAX as raw bits, whatever the field's type.
+        if size <= 8
+            return "i64"
+        return "sret"
+    let allfloat = true
+    let ki = 0
+    while ki < n
+        if kinds[ki] != "f"
+            allfloat = false
+        ki = ki + 1
+    if _abi_is_aarch64(triple) == 1
+        // An HFA of up to four same-type floats comes back in the SIMD registers, spelled as
+        // the struct type -- note this is the STRUCT form, not the array form the same HFA
+        // uses in PARAMETER position. Matching clang exactly matters more than symmetry.
+        if allfloat and n <= 4
+            return _abi_struct_llty(b, tname)
+        if size <= 8
+            return "i64"
+        if size <= 16
+            return "[" + str(n) + " x i64]"
+        return "sret"
+    // SysV: up to two eightbytes come back in registers. One eightbyte returns the bare
+    // element type; two return a literal struct of the per-eightbyte classes.
+    if size > 16
+        return "sret"
+    if n == 1
+        if kinds[0] == "f"
+            return "double"
+        return "i64"
+    _abi_struct_llty(b, tname)
+
 // The LLVM parameter types one by-value @repr(C) struct argument lowers to, comma-joined.
 // "" means "not classifiable" -- the caller turns that into a compile error.
 // The LLVM struct type for a @repr(C) NOVA struct, e.g. "{ double, double }". Needed for
 // the by-reference classes, which have to name the type in a `byval` attribute.
+// Is every field of this kind-string a float? (used to pick the element type when an
+// AAPCS64 HFA comes back in the `[N x T]` form)
+fn allfloat_ret(kinds: string) -> bool
+    let i = 0
+    while i < len(kinds)
+        if kinds[i] != "f"
+            return false
+        i = i + 1
+    true
+
 fn _abi_struct_llty(b: IrBuilder, tname: string) -> string
     let kinds = _abi_field_kinds(b, tname)
     let out = "\{ "
@@ -24047,9 +24139,15 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(rtt, rtv, rtn, rtc, rtf, rtl) =>
                             if rtt == "rettype" and rtv != ""
                                 let rt_base = rtv
-                                let rt_lt = find(rtv, "<")
+                                // `byval:T` is a CALLING CONVENTION marker, not part of the type --
+                                // at NOVA level the function returns a T. Leaving the prefix on made
+                                // every field access on the result miss, because ir_fn_returns is
+                                // what tells the builder the result is a struct at all.
+                                if len(rt_base) > 6 and rt_base[0:6] == "byval:"
+                                    rt_base = slice(rt_base, 6, len(rt_base))
+                                let rt_lt = find(rt_base, "<")
                                 if rt_lt > 0
-                                    rt_base = slice(rtv, 0, rt_lt)
+                                    rt_base = slice(rt_base, 0, rt_lt)
                                 b.ir_fn_returns[name] = rt_base
                                 // Stage-1: a -> list<Struct> return annotation records the element
                                 // struct, so json_stringify on the fn's result serializes correctly.
@@ -24080,9 +24178,18 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(_ert, _erv, _ern, _erc, _erf, _erl) =>
                             if _ert == "rettype" and _erv != ""
                                 let _erb = _erv
-                                let _erlt = find(_erv, "<")
+                                // `byval:T` is a CALLING CONVENTION marker, not part of the type:
+                                // at NOVA level this extern returns a T. Externs record their
+                                // return type HERE, in their own block -- the generic function
+                                // path is a different one -- so the prefix has to come off in both
+                                // places or field access on the result silently uses the HASHED
+                                // struct layout (slot j+1) against a @repr(C) object that has no
+                                // hash slot, reading every field one position too high.
+                                if len(_erb) > 6 and _erb[0:6] == "byval:"
+                                    _erb = slice(_erb, 6, len(_erb))
+                                let _erlt = find(_erb, "<")
                                 if _erlt > 0
-                                    _erb = slice(_erv, 0, _erlt)
+                                    _erb = slice(_erb, 0, _erlt)
                                 b.ir_fn_returns[name] = _erb
                     // Record which params are 'out:T' (encoded by the extern
                     // parser as type_ann="out:...") so the call site can emit
@@ -24107,6 +24214,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                 ext_ret_ll = ffi_llvm_type(rxv)
                                 if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
                                     ext_ret_ll = "ptr"
+                                // A by-value RETURN needs the wrapper on its own: the wrapper is
+                                // what allocates the NOVA struct the result is materialised into.
+                                // Without this an extern with no struct PARAMS (abi_r_i1(int)) was
+                                // called directly and the call site's nova_ffi_ name had no
+                                // definition.
+                                if _abi_byval_type(rxv) != ""
+                                    ext_ret_ll = "byval"
                     let ext_needs = ext_ret_ll != "i64"
                     if not ext_needs
                         for ep in params
@@ -25085,6 +25199,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // LOCK-11: used by the FFI wrapper to make the caller-owned copy Win64/AAPCS64 require
     // when a by-value struct is passed by reference.
     ire_line(e, "declare void @llvm.memcpy.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1) nounwind")
+    ire_line(e, "declare i64 @nova_rt_task_on_exit_send(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_task_cancel_exit(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_task_cancel_exit_val(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_to_f32(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_f64(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_u8(i64) nounwind readnone")
@@ -25723,19 +25840,27 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             match ext_stmt
                 Stmt(et, en, eexpr, ebody, eparams, eelse, eann, esline) =>
                     let real_ret = "i64"
+                    let ret_struct = ""
+                    let ret_cls = ""
                     match eexpr
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 real_ret = ffi_llvm_type(rxv)
-                                if contains(b.ir_opaque_types, rxv)
-                                    real_ret = "ptr"
-                                else if contains(b.ir_repr_c_types, rxv)
-                                    // LOCK-11: RETURNING a @repr(C) struct by value needs the
-                                    // sret / register-pair lowering clang emits, which is not
-                                    // implemented. Passing a pointer here silently returns the
-                                    // wrong bytes on every target, so this is refused loudly
-                                    // instead. Returning an @opaque handle still works.
-                                    ire_line(e, "; LOCK-11: @repr(C) by-value RETURN not supported for " + rxv)
+                                let _rbv = _abi_byval_type(rxv)
+                                if _rbv != ""
+                                    // LOCK-11: RETURN the struct BY VALUE, lowered for this target.
+                                    let _rcls = _abi_struct_ret_type(b, _rbv, e.ire_target)
+                                    if _rcls == ""
+                                        ire_line(e, "; LOCK-11: cannot classify byval return " + _rbv)
+                                        real_ret = "ptr"
+                                    else
+                                        ret_struct = _rbv
+                                        ret_cls = _rcls
+                                        if _rcls == "sret"
+                                            real_ret = "void"
+                                        else
+                                            real_ret = _rcls
+                                else if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
                                     real_ret = "ptr"
                     let real_arg_types = []
                     let real_arg_structs = []
@@ -25776,6 +25901,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         if real_arg_types[ai] != "i64"
                             needs_wrapper = true
                         ai = ai + 1
+                    // A by-value RETURN always needs the wrapper too, and the `real_ret != "i64"`
+                    // test above does NOT catch it: on Win64 a <=8-byte struct comes back as a
+                    // bare i64. The wrapper is what allocates the NOVA struct the raw result is
+                    // materialised into, so without this the call site referenced an undefined
+                    // nova_ffi_ symbol.
+                    if ret_struct != ""
+                        needs_wrapper = true
                     // LOCK-11: a by-value @repr(C) struct ALWAYS needs the wrapper, even when its
                     // lowered form happens to be a bare i64 (a one-int-field struct on Win64).
                     // NOVA holds the struct as a HANDLE; the wrapper is what loads the field out
@@ -25811,6 +25943,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             real_arg_sig = real_arg_sig + ", "
                         real_arg_sig = real_arg_sig + real_arg_types[aj]
                         aj = aj + 1
+                    // An sret return prepends a hidden pointer parameter that the CALLER owns.
+                    if ret_cls == "sret"
+                        let _sr = "ptr sret(" + _abi_struct_llty(b, ret_struct) + ") align 8"
+                        if real_arg_sig == ""
+                            real_arg_sig = _sr
+                        else
+                            real_arg_sig = _sr + ", " + real_arg_sig
                     if not already_declared
                         ire_line(e, "declare " + real_ret + " @" + en + "(" + real_arg_sig + ") nounwind")
 
@@ -25893,7 +26032,45 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                 call_args = call_args + rt + " %a" + str(am)
                             am = am + 1
                         // Call the real C function
-                        if real_ret == "void"
+                        if ret_struct != ""
+                            // Allocate the NOVA @repr(C) struct FIRST. Those carry no leading
+                            // type-hash slot, so their data pointer IS the C struct layout --
+                            // which means the sret case can hand the callee this very pointer
+                            // and write the result straight into its final home, no copy.
+                            let _rsz = len(_abi_field_kinds(b, ret_struct)) * 8
+                            let _rk = _abi_field_kinds(b, ret_struct)
+                            ire_line(e, "  %robj = call ptr @nova_rt_struct_alloc(i64 " + str(_rsz) + ")")
+                            if ret_cls == "sret"
+                                let _sa = "ptr sret(" + _abi_struct_llty(b, ret_struct) + ") align 8 %robj"
+                                if call_args == ""
+                                    ire_line(e, "  call void @" + en + "(" + _sa + ")")
+                                else
+                                    ire_line(e, "  call void @" + en + "(" + _sa + ", " + call_args + ")")
+                            else
+                                ire_line(e, "  %rv = call " + ret_cls + " @" + en + "(" + call_args + ")")
+                                if starts_with(ret_cls, "\{") or starts_with(ret_cls, "[")
+                                    // register-pair / HFA: unpack each element into its slot
+                                    let _ri = 0
+                                    while _ri < len(_rk)
+                                        let _ell = "i64"
+                                        if _rk[_ri] == "f"
+                                            _ell = "double"
+                                        if starts_with(ret_cls, "[")
+                                            _ell = "i64"
+                                            if allfloat_ret(_rk)
+                                                _ell = "double"
+                                        ire_line(e, "  %rx" + str(_ri) + " = extractvalue " + ret_cls + " %rv, " + str(_ri))
+                                        ire_line(e, "  %rg" + str(_ri) + " = getelementptr " + _ell + ", ptr %robj, i64 " + str(_ri))
+                                        ire_line(e, "  store " + _ell + " %rx" + str(_ri) + ", ptr %rg" + str(_ri) + ", align 8")
+                                        _ri = _ri + 1
+                                else
+                                    // single register: `double` or `i64`. Win64 hands back a
+                                    // <=8-byte struct as raw i64 BITS even for a double field,
+                                    // so storing the i64 into the slot is exactly right there.
+                                    ire_line(e, "  store " + ret_cls + " %rv, ptr %robj, align 8")
+                            ire_line(e, "  %rip = ptrtoint ptr %robj to i64")
+                            ire_line(e, "  ret i64 %rip")
+                        else if real_ret == "void"
                             ire_line(e, "  call void @" + en + "(" + call_args + ")")
                             ire_line(e, "  ret i64 0")
                         else if real_ret == "double"
@@ -26794,9 +26971,15 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                         Expr(rtt, rtv, rtn, rtc, rtf, rtl) =>
                             if rtt == "rettype" and rtv != ""
                                 let rt_base = rtv
-                                let rt_lt = find(rtv, "<")
+                                // `byval:T` is a CALLING CONVENTION marker, not part of the type --
+                                // at NOVA level the function returns a T. Leaving the prefix on made
+                                // every field access on the result miss, because ir_fn_returns is
+                                // what tells the builder the result is a struct at all.
+                                if len(rt_base) > 6 and rt_base[0:6] == "byval:"
+                                    rt_base = slice(rt_base, 6, len(rt_base))
+                                let rt_lt = find(rt_base, "<")
                                 if rt_lt > 0
-                                    rt_base = slice(rtv, 0, rt_lt)
+                                    rt_base = slice(rt_base, 0, rt_lt)
                                 b.ir_fn_returns[name] = rt_base
                                 if rt_base == "list" and rt_lt > 0
                                     let _rle = slice(rtv, rt_lt + 1, len(rtv) - 1)
@@ -26831,6 +27014,13 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                                 ext_ret_ll = ffi_llvm_type(rxv)
                                 if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
                                     ext_ret_ll = "ptr"
+                                // A by-value RETURN needs the wrapper on its own: the wrapper is
+                                // what allocates the NOVA struct the result is materialised into.
+                                // Without this an extern with no struct PARAMS (abi_r_i1(int)) was
+                                // called directly and the call site's nova_ffi_ name had no
+                                // definition.
+                                if _abi_byval_type(rxv) != ""
+                                    ext_ret_ll = "byval"
                     let ext_needs = ext_ret_ll != "i64"
                     if not ext_needs
                         for ep in params
