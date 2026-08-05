@@ -13,68 +13,91 @@
 fn str_to_byte_list(s)
     return [ord(s[i]) for i in 0..len(s)]
 
+// A comprehension joined ONCE. The old form was reduce(b, fn(acc,x) acc + chr(x), "") -- a fold
+// whose accumulator is a STRING, so every byte reallocated and recopied the whole output. That is
+// quadratic in the decompressed size, on the function that turns inflate()'s result into text.
 fn byte_list_to_str(b)
-    return reduce(b, fn(acc, x) acc + chr(x), "")
+    join([chr(x) for x in b], "")
 
-fn bw_new()
-    return [[], 0, 0]
-fn bw_bits(bw, value, n)
+// ── Bit writer / reader as STRUCTS ───────────────────────────────────────────────────────────────
+// These were 3-element LISTS with the layout documented only in a comment: bw=[out,acc,nbits] and
+// br=[data,pos,bitpos]. Every access was a magic index -- bw[1] for the accumulator, br[2] for the
+// bit offset -- so a typo in a subscript was a silent bit-order bug in a DEFLATE stream, which is
+// the hardest possible class of bug to notice. Named fields make that typo a compile error.
+// Both are module-internal (verified: nothing outside deflatex calls bw_*/br_*; the same-named
+// functions in forge_bitio, std/concurrency/barrier and std/os/bufreader are unrelated modules).
+type BitWriter
+    out: list
+    acc: int
+    nbits: int
+
+type BitReader
+    data: list
+    pos: int
+    bitpos: int
+
+fn bw_new() -> BitWriter
+    BitWriter([], 0, 0)
+
+// Append ONE bit, flushing a full byte. bw_bits and bw_code each open-coded this five-line
+// accumulate-and-flush, differing only in which direction they walked the source bits; a fix to one
+// would not have reached the other.
+fn _bw_bit(bw: BitWriter, bit: int)
+    bw.acc = bw.acc | (bit << bw.nbits)
+    bw.nbits += 1
+    if bw.nbits == 8
+        push(bw.out, bw.acc)
+        bw.acc = 0
+        bw.nbits = 0
+
+// Plain values are LSB-first.
+fn bw_bits(bw: BitWriter, value: int, n: int)
     for i in 0..n
-        let bit = (value >> i) & 1
-        bw[1] = bw[1] | (bit << bw[2])
-        bw[2] = bw[2] + 1
-        if bw[2] == 8
-            push(bw[0], bw[1])
-            bw[1] = 0
-            bw[2] = 0
-    return 0
-fn bw_code(bw, code, n)
-    let i = n - 1
-    while i >= 0
-        let bit = (code >> i) & 1
-        bw[1] = bw[1] | (bit << bw[2])
-        bw[2] = bw[2] + 1
-        if bw[2] == 8
-            push(bw[0], bw[1])
-            bw[1] = 0
-            bw[2] = 0
-        i -= 1
-    return 0
-fn bw_finish(bw)
-    if bw[2] > 0
-        push(bw[0], bw[1])
-        bw[1] = 0
-        bw[2] = 0
-    return bw[0]
+        _bw_bit(bw, (value >> i) & 1)
 
-fn br_new(data)
-    return [data, 0, 0]
-fn br_bit(br)
-    if br[1] >= len(br[0])
+// Huffman codes are MSB-first -- the same bit push, walked the other way.
+fn bw_code(bw: BitWriter, code: int, n: int)
+    for i in reversed(0..n)
+        _bw_bit(bw, (code >> i) & 1)
+
+fn bw_finish(bw: BitWriter) -> list
+    if bw.nbits > 0
+        push(bw.out, bw.acc)
+        bw.acc = 0
+        bw.nbits = 0
+    bw.out
+
+fn br_new(data: list) -> BitReader
+    BitReader(data, 0, 0)
+
+// Past the end reads as 0, unchanged -- inflate relies on it for a truncated final byte.
+fn br_bit(br: BitReader) -> int
+    if br.pos >= len(br.data)
         return 0
-    let byte = br[0][br[1]]
-    let bit = (byte >> br[2]) & 1
-    br[2] = br[2] + 1
-    if br[2] == 8
-        br[2] = 0
-        br[1] = br[1] + 1
-    return bit
-fn br_bits(br, n)
+    let bit = (br.data[br.pos] >> br.bitpos) & 1
+    br.bitpos += 1
+    if br.bitpos == 8
+        br.bitpos = 0
+        br.pos += 1
+    bit
+
+fn br_bits(br: BitReader, n: int) -> int
     let v = 0
     for i in 0..n
         v = v | (br_bit(br) << i)
-    return v
+    v
 
-fn _enc_sym(bw, sym)
-    if sym <= 143
-        bw_code(bw, 48 + sym, 8)
-    else if sym <= 255
-        bw_code(bw, 400 + (sym - 144), 9)
-    else if sym <= 279
-        bw_code(bw, sym - 256, 7)
-    else
-        bw_code(bw, 192 + (sym - 280), 8)
-    return 0
+// RFC1951 3.2.6 fixed-Huffman literal/length code. The four ranges are DATA -- each row is
+// [upper_bound, code_base, offset_base, width] -- so the mapping can be read as the table the RFC
+// prints, instead of as four branches whose arithmetic has to be checked one at a time.
+fn _fixed_lit_code_table() -> list
+    [[143, 48, 0, 8], [255, 400, 144, 9], [279, 0, 256, 7], [287, 192, 280, 8]]
+
+fn _enc_sym(bw: BitWriter, sym: int)
+    for row in _fixed_lit_code_table()
+        if sym <= row[0]
+            bw_code(bw, row[1] + (sym - row[2]), row[3])
+            return
 fn _dec_sym(br)
     let code = 0
     let i = 0
@@ -91,24 +114,42 @@ fn _dec_sym(br)
     code = (code << 1) | br_bit(br)
     return 144 + (code - 400)
 
-fn _len_base()
-    return [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
-fn _len_extra()
-    return [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
-fn _dist_base()
-    return [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
-fn _dist_extra()
-    return [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+// RFC1951 3.2.5 length and distance codes. Each entry is [base, extra_bits] -- ONE table per axis
+// instead of two parallel arrays that had to stay index-aligned by hand. A base without its matching
+// extra-bit count is meaningless, so they belong in the same row.
+fn _len_table() -> list
+    [[3,0],[4,0],[5,0],[6,0],[7,0],[8,0],[9,0],[10,0],[11,1],[13,1],[15,1],[17,1],[19,2],[23,2],[27,2],[31,2],[35,3],[43,3],[51,3],[59,3],[67,4],[83,4],[99,4],[115,4],[131,5],[163,5],[195,5],[227,5],[258,0]]
+
+fn _dist_table() -> list
+    [[1,0],[2,0],[3,0],[4,0],[5,1],[7,1],[9,2],[13,2],[17,3],[25,3],[33,4],[49,4],[65,5],[97,5],[129,6],[193,6],[257,7],[385,7],[513,8],[769,8],[1025,9],[1537,9],[2049,10],[3073,10],[4097,11],[6145,11],[8193,12],[12289,12],[16385,13],[24577,13]]
+
+// The two axes are read column-wise in a few places; these keep those call sites unchanged.
+fn _len_base() -> list
+    [r[0] for r in _len_table()]
+fn _len_extra() -> list
+    [r[1] for r in _len_table()]
+fn _dist_base() -> list
+    [r[0] for r in _dist_table()]
+fn _dist_extra() -> list
+    [r[1] for r in _dist_table()]
+
+// The largest code index whose base is <= value -- the greedy bucket search that deflate() ran
+// inline twice, once over lengths and once over distances, with the loop bound (28 / 29) written as
+// a literal at each site. Stated once, with the bound derived from the table.
+fn _bucket(table: list, value: int) -> int
+    let last = len(table) - 1
+    let i = 0
+    while i < last and table[i + 1][0] <= value
+        i += 1
+    i
 
 fn _hkey(bytes, q)
     return str(bytes[q] * 65536 + bytes[q + 1] * 256 + bytes[q + 2])
-fn _insert(table, bytes, q)
-    let ks = _hkey(bytes, q)
-    if ks not in table
-        table[ks] = []
-    let chain = table[ks]
-    push(chain, q)
-    return 0
+// `return 0` dropped: nothing read it, and a meaningless return value invites a caller to test it.
+fn _insert(table: dict, bytes: list, q: int)
+    if _hkey(bytes, q) not in table
+        table[_hkey(bytes, q)] = []
+    push(table[_hkey(bytes, q)], q)
 
 fn deflate(bytes)
     let LB = _len_base()
@@ -143,15 +184,13 @@ fn deflate(bytes)
                     ci -= 1
                     cnt += 1
         if matchlen >= 3
-            let li = 0
-            while li < 28 and LB[li + 1] <= matchlen
-                li += 1
+            // Bucket search stated once (see _bucket) instead of open-coded here with the loop
+            // bound written as the literal 28 / 29.
+            let li = _bucket(_len_table(), matchlen)
             _enc_sym(bw, 257 + li)
             if LE[li] > 0
                 bw_bits(bw, matchlen - LB[li], LE[li])
-            let di = 0
-            while di < 29 and DB[di + 1] <= matchdist
-                di += 1
+            let di = _bucket(_dist_table(), matchdist)
             bw_code(bw, di, 5)
             if DE[di] > 0
                 bw_bits(bw, matchdist - DB[di], DE[di])
@@ -244,11 +283,11 @@ fn huff_decode(br, desc)
         ln += 1
     return -1
 
-fn br_align(br)
-    if br[2] > 0
-        br[2] = 0
-        br[1] = br[1] + 1
-    return 0
+// Advance to the next byte boundary (RFC1951 stored blocks start byte-aligned).
+fn br_align(br: BitReader)
+    if br.bitpos > 0
+        br.bitpos = 0
+        br.pos += 1
 
 // Read a dynamic block's code-length tables (RFC1951 3.2.7). Returns [litdesc, distdesc].
 fn _read_dynamic(br)
@@ -309,11 +348,11 @@ fn inflate(data)
         if btype == 0
             // stored block: skip to byte boundary, read LEN (2 LE) + NLEN (2, ignored), copy LEN bytes
             br_align(br)
-            let blen = br[0][br[1]] | (br[0][br[1] + 1] << 8)
-            br[1] = br[1] + 4
+            let blen = br.data[br.pos] | (br.data[br.pos + 1] << 8)
+            br.pos += 4
             for k in 0..blen
-                push(out, br[0][br[1]])
-                br[1] = br[1] + 1
+                push(out, br.data[br.pos])
+                br.pos += 1
         else
             let descs = []
             if btype == 1
@@ -322,11 +361,13 @@ fn inflate(data)
                 descs = _read_dynamic(br)
             let litdesc = descs[0]
             let distdesc = descs[1]
+            // `go` was a flag standing in for `break`: once the end-of-block symbol (256) arrived
+            // the guard failed on the next check and the loop ended having done nothing else.
             let go = 1
             while go == 1
                 let sym = huff_decode(br, litdesc)
                 if sym == 256
-                    go = 0
+                    break
                 else if sym < 256
                     push(out, sym)
                 else
