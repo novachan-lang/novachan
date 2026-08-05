@@ -5,115 +5,149 @@
 // with dots or spaces work; and any combination "$.store.book[0].title". Used for config lookups, webhook
 // payload extraction, and API response mining. This is DIFFERENT from forge_jsonpointer (RFC 6901 "/a/0/b").
 // LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. The descend-one-step walk was written TWICE -- once in jsonpath_get returning "" on a miss,
+// once in jsonpath_has returning false -- with the dict/list/scalar rules, the index test and the range test
+// duplicated in both. Two copies of a rule is two places for it to drift (the sibling module forge_jsonpointer
+// had exactly this and the copies HAD drifted: has() said true where get() returned "").
+//
+// Now there is ONE walk, _jp_walk, returning Result, and every entry point is a one-line adapter over it. A
+// caller who wants the reason gets it from jsonpath_resolve, naming the offending step and the cause.
 
-// A token is a valid array index iff it is non-empty and every char is a digit. Used by the resolvers to decide
-// whether a step may index into a list (vs. a dict key). We do NOT use parse_int for the test because a
-// negative sign or stray char must be rejected, not silently coerced.
+// Why a step failed. An ADT rather than a bare string so the CAUSE is a value a caller can match on: a missing
+// key is a client error, a non-descendable node is a malformed-document error, and flattening both into ""
+// (as before) made them indistinguishable. Variant names are Jp-prefixed because constructors share one
+// namespace with forge_jsonpointer's PtrFail, and a program may import both modules.
+enum JpFail
+    JpNoKey(string)
+    JpNotAnIndex(string)
+    JpIndexOutOfRange(string)
+    JpNotDescendable(string)
+
+fn _jp_fail_text(f: JpFail) -> string
+    match f
+        JpNoKey(t) => "no key '{t}'"
+        JpNotAnIndex(t) => "step '{t}' is not an array index"
+        JpIndexOutOfRange(t) => "index {t} out of range"
+        JpNotDescendable(t) => "cannot descend into a scalar at '{t}'"
+
+// What a bracket body means. The two readings are a CLOSED set -- quoted body = a literal key, bare body = an
+// index -- so they are an enum and the one-quote-each-end strip lives in the match arm that owns it, instead
+// of being an `if` in the middle of the tokenizer's control flow.
+enum JpBracket
+    JpQuotedKey(string)
+    JpRawIndex(string)
+
+fn _jp_is_quote(c: string) -> bool
+    c == chr(39) or c == chr(34)
+
+// Classify a bracket body. Only the OPENING quote is tested (and a length of at least 2 required) -- that is
+// the original rule, preserved exactly: "['a" is read as a quoted key whose body is empty.
+fn _jp_bracket(body: string) -> JpBracket
+    if len(body) >= 2 and _jp_is_quote(char_at(body, 0))
+        return JpQuotedKey(body)
+    JpRawIndex(body)
+
+fn _jp_bracket_text(b: JpBracket) -> string
+    match b
+        JpQuotedKey(s) => slice(s, 1, len(s) - 1)
+        JpRawIndex(s) => s
+
+// A step is a valid array index iff it is non-empty and every char is a digit. all_match states that rule ONCE
+// over every character instead of an early-return scan. We do NOT use parse_int for the test because a
+// negative sign or a stray char must be rejected, not silently coerced.
 fn _jp_is_index(s: string) -> bool
     if len(s) == 0
         return false
-    for i in 0..len(s)
-        if find("0123456789", char_at(s, i)) < 0
-            return false
-    true
+    all_match([char_at(s, i) for i in 0..len(s)], (c) => find("0123456789", c) >= 0)
 
 // Parse a path into a flat list of step STRINGS: each step is a key name or a numeric index (as a string).
-// "$.store.book[0].title" -> ["store","book","0","title"]; a['b'][2] -> ["a","b","2"]. Scan char by char:
-// skip a leading "$"; a "." separator or a "[" ends the current bare-key token (push it if non-empty); a "["
-// opens a bracket read up to the matching "]" -- a quoted body (starts with ' or ") is a KEY (strip the one
-// quote at each end), otherwise it is an INDEX pushed verbatim; every other char accumulates into the bare key.
-// This is the shared tokenizer both resolvers use.
+// "$.store.book[0].title" -> ["store","book","0","title"]; a['b'][2] -> ["a","b","2"]. This is the shared
+// tokenizer both resolvers use.
+//
+// The `while` STAYS and is not a for-range: a "[" jumps the cursor past a whole bracket body, so the step is
+// data-dependent. What DID change is the shape -- the original nested each case one level deeper inside the
+// previous one's `else`, four levels at the bottom; guard + `continue` makes the four cases siblings, which is
+// how the grammar actually reads. A dict-of-closures dispatch on the leading char was considered and REJECTED:
+// every branch advances the cursor by a different amount and mutates the pending key, so a closure table would
+// have to thread that state back out by hand and would be less clear, not more.
 fn jsonpath_tokens(path: string) -> list
     let out = []
     let n = len(path)
-    let sq = chr(39)
-    let dq = chr(34)
     let i = 0
     let key = ""
     while i < n
         let c = char_at(path, i)
+        // a leading "$" (root) is not a step
         if c == "$"
             i += 1
-        else
-            if c == "."
-                if len(key) > 0
-                    push(out, key)
-                    key = ""
-                i += 1
-            else
-                if c == "["
-                    if len(key) > 0
-                        push(out, key)
-                        key = ""
-                    // read the bracket body up to the next "]"
-                    let j = i + 1
-                    let body_parts = []
-                    while j < n and char_at(path, j) != "]"
-                        push(body_parts, char_at(path, j))
-                        j += 1
-                    let body = join(body_parts, "")
-                    // quoted body -> key (strip one quote each end); otherwise -> index verbatim
-                    let bn = len(body)
-                    if bn >= 2 and (char_at(body, 0) == sq or char_at(body, 0) == dq)
-                        push(out, slice(body, 1, bn - 1))
-                    else
-                        push(out, body)
-                    // advance past the "]" if present
-                    if j < n
-                        i = j + 1
-                    else
-                        i = j
-                else
-                    key += c
-                    i += 1
+            continue
+        // "." ends the pending bare key
+        if c == "."
+            if len(key) > 0
+                push(out, key)
+                key = ""
+            i += 1
+            continue
+        // "[" ends the pending bare key, then contributes one step of its own
+        if c == "["
+            if len(key) > 0
+                push(out, key)
+                key = ""
+            // The body runs to the next "]", or to the end of the path when the bracket is never closed --
+            // exactly what the original hand-rolled scan produced. find() over the remainder replaces that
+            // inner char-by-char while entirely.
+            let rest = slice(path, i + 1, n)
+            let close = find(rest, "]")
+            let body = rest if close < 0 else slice(rest, 0, close)
+            push(out, _jp_bracket(body) |> _jp_bracket_text())
+            i = n if close < 0 else (i + close + 2)
+            continue
+        key += c
+        i += 1
     if len(key) > 0
         push(out, key)
     out
 
-// Resolve `path` against `node` (a nested dict/list). Returns the found value, or "" if any step does not
-// resolve: a missing dict key, an out-of-range or non-numeric list index, or descending into a scalar. Return
-// type is `any` because a resolved node may be a dict, list, string, int, etc.
-fn jsonpath_get(node: any, path: string) -> any
-    let cur = node
-    let toks = jsonpath_tokens(path)
-    for tok in toks
-        let kind = type_of(cur)
-        if kind == "dict"
-            if tok in cur == false
-                return ""
-            cur = cur[tok]
-        else
-            if kind == "list"
-                if _jp_is_index(tok) == false
-                    return ""
-                let idx = parse_int(tok)
-                if idx < 0 or idx >= len(cur)
-                    return ""
-                cur = cur[idx]
-            else
-                return ""
-    cur
+// Descend ONE step. The single place that knows how a step can fail -- previously this knowledge existed twice.
+fn _jp_step(node, step: string) -> Result
+    let kind = type_of(node)
+    if kind == "dict"
+        if step not in node
+            return err(_jp_fail_text(JpNoKey(step)))
+        return ok(node[step])
+    if kind == "list"
+        if not _jp_is_index(step)
+            return err(_jp_fail_text(JpNotAnIndex(step)))
+        let idx = parse_int(step)
+        if idx < 0 or idx >= len(node)
+            return err(_jp_fail_text(JpIndexOutOfRange(step)))
+        return ok(node[idx])
+    err(_jp_fail_text(JpNotDescendable(step)))
 
-// True iff `path` resolves to an existing value in `node`. Same walk as jsonpath_get but returns false on the
-// first miss -- so it is correct even when the resolved value is legitimately "" (which jsonpath_get cannot
-// distinguish from a miss).
-fn jsonpath_has(node: any, path: string) -> bool
+// THE walk -- every entry point below is an adapter over this one function. `?` propagates the first failing
+// step's message unchanged, so the loop body is a single line and there is no error plumbing to get wrong.
+fn _jp_walk(node, path: string) -> Result
     let cur = node
-    let toks = jsonpath_tokens(path)
-    for tok in toks
-        let kind = type_of(cur)
-        if kind == "dict"
-            if tok in cur == false
-                return false
-            cur = cur[tok]
-        else
-            if kind == "list"
-                if _jp_is_index(tok) == false
-                    return false
-                let idx = parse_int(tok)
-                if idx < 0 or idx >= len(cur)
-                    return false
-                cur = cur[idx]
-            else
-                return false
-    true
+    for step in jsonpath_tokens(path)
+        cur = _jp_step(cur, step)?
+    ok(cur)
+
+// Resolve `path` against `node`, KEEPING the reason on failure:
+//   ok(value)              the value at that path (which may legitimately be "")
+//   err("no key 'title'")  why it did not resolve, naming the offending step
+fn jsonpath_resolve(node: any, path: string) -> Result
+    _jp_walk(node, path)
+
+// The value at `path`, or "" if any step does not resolve. Return type is `any` because a resolved value may be
+// a dict, list, string, int, etc.
+// NOTE: "" is ALSO a legitimate resolved value, so this signature cannot distinguish "resolved to the empty
+// string" from "did not resolve". That ambiguity is inherent to the existing contract and is PRESERVED for
+// current callers -- reach for jsonpath_resolve when the difference matters.
+fn jsonpath_get(node: any, path: string) -> any
+    unwrap_or(_jp_walk(node, path), "")
+
+// True iff `path` resolves to an existing value in `node`. Correct even when the resolved value is
+// legitimately "" -- which jsonpath_get cannot distinguish from a miss.
+fn jsonpath_has(node: any, path: string) -> bool
+    is_ok(_jp_walk(node, path))

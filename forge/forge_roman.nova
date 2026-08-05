@@ -1,50 +1,117 @@
 // forge_roman -- Roman numeral encode/decode (1994 <-> MCMXCIV). For copyright years, outline numbering, book
 // volumes, and clock faces. Valid range 1..3999 (standard subtractive notation). LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Two problems, both structural:
+//
+//   1. THE NUMERAL VALUES WERE WRITTEN DOWN TWICE. `to_roman` carried a parallel `vals`/`syms` pair
+//      ([1000,900,500,...] / ["M","CM","D",...]) and `_roman_val` carried an if-ladder saying the same
+//      thing again for the seven single characters. Two copies of one fact is two places for it to drift:
+//      a typo in either list silently breaks one direction while the other keeps working, and nothing in
+//      the module would notice. Now there is ONE literal -- the character table -- and the encoder's
+//      symbol values are DERIVED by decoding each symbol with the decoder's own rule.
+//
+//   2. BOTH DIRECTIONS FAILED WITH A SENTINEL THAT COLLIDES WITH REAL DATA. `to_roman` returned "" for an
+//      out-of-range n; `from_roman` returned 0 both for "" and for "hello". A caller could not tell "not a
+//      numeral" from "the empty numeral", and never learned WHICH character was bad. Now `roman_encode` /
+//      `roman_decode` return Result carrying a reason built from a RomanFail ADT, and the original
+//      to_roman/from_roman are two-line adapters over them with byte-identical behaviour.
 
-fn to_roman(n: int) -> string
+// Why a conversion failed. An ADT, not a bare string, so the CAUSE is a value a caller can match on:
+// out-of-range is a programmer error, a bad character is a data-validation error, and empty input is
+// usually a missing field -- flattening all three into ""/0 (as before) made them indistinguishable.
+enum RomanFail
+    OutOfRange(string)
+    EmptyInput(string)
+    BadChar(string)
+
+fn _roman_fail_text(f: RomanFail) -> string
+    match f
+        OutOfRange(t) => "{t} is outside the encodable range 1..3999"
+        EmptyInput(t) => "empty roman numeral (got '{t}')"
+        BadChar(t) => "'{t}' is not a roman numeral character"
+
+// THE table. The only place in this module where a numeral's value is written down.
+fn _roman_char_vals() -> dict
+    {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
+// Value of a single numeral character, 0 if it is not one. A dict lookup with a default replaces the
+// seven-branch if-ladder; "not a numeral" is now expressed by ABSENCE from the table rather than by
+// falling off the end of a ladder.
+fn _roman_val(c: string) -> int
+    get(_roman_char_vals(), c, 0)
+
+fn _roman_is_char(c: string) -> bool
+    c in _roman_char_vals()
+
+// The ordered subtractive symbols, largest value first -- the encoder's greedy order.
+fn _roman_syms() -> list
+    ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+
+// ...and their values, DERIVED rather than restated: each symbol is decoded by the same subtractive rule
+// the decoder uses, so "CM" is 900 because M-C is 900, not because a second list says so. This is the
+// dedup that makes the two directions incapable of disagreeing.
+fn _roman_vals() -> list
+    [_roman_raw(s) for s in _roman_syms()]
+
+// Is the numeral at index i subtracted? The subtractive rule, stated ONCE: a numeral smaller than the
+// one that follows it counts negative.
+fn _roman_signed(vals: list, i: int) -> int
+    if i + 1 < len(vals) and vals[i + 1] > vals[i]
+        return 0 - vals[i]
+    vals[i]
+
+// The subtractive sum of a string whose characters are ALL known numerals (callers validate first).
+// Written as map-then-sum rather than an accumulator loop: the rule is per-position and needs only the
+// neighbour, so there is no carried state and nothing to get wrong in the plumbing.
+fn _roman_raw(r: string) -> int
+    let vals = [_roman_val(char_at(r, i)) for i in 0..len(r)]
+    sum([_roman_signed(vals, i) for i in 0..len(vals)])
+
+// Encode `n` as a roman numeral, or say why it cannot be encoded.
+//   ok("MCMXCIV")                                 n == 1994
+//   err("4000 is outside the encodable range ...") n out of 1..3999
+fn roman_encode(n: int) -> Result
     if n < 1 or n > 3999
-        return ""
-    let vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
-    let syms = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+        return err(_roman_fail_text(OutOfRange(str(n))))
+    let syms = _roman_syms()
+    let vals = _roman_vals()
     let out_parts = []
     let v = n
-    for i in 0..len(vals)
-        while v >= vals[i]
-            push(out_parts, syms[i])
-            v -= vals[i]
-    let out = join(out_parts, "")
-    out
+    for i in 0..len(syms)
+        // How many copies of this symbol fit is plain integer division -- the old inner
+        // `while v >= vals[i]` was that one division spelled out one subtraction at a time.
+        let k = v / vals[i]
+        if k > 0
+            push(out_parts, repeat(syms[i], k))
+            v = v % vals[i]
+    ok(join(out_parts, ""))
 
-fn _roman_val(c: string) -> int
-    if c == "I"
-        return 1
-    if c == "V"
-        return 5
-    if c == "X"
-        return 10
-    if c == "L"
-        return 50
-    if c == "C"
-        return 100
-    if c == "D"
-        return 500
-    if c == "M"
-        return 1000
-    0
-
-// Decode a Roman numeral to an int (0 if it contains an invalid character). Subtractive rule.
-fn from_roman(s: string) -> int
+// Decode a roman numeral, or say why it is not one. Input is trimmed and upper-cased first.
+//   ok(1994)                                       "mcmxciv"
+//   err("'Q' is not a roman numeral character")     "MQ"
+//   err("empty roman numeral (got '  ')")           "  "
+// DELIBERATELY LENIENT about grammar, exactly as before: "IIII" decodes to 4 and "IC" to 99. Use
+// roman_is_canonical when the strict spelling matters.
+fn roman_decode(s: string) -> Result
     let r = upper(trim(s))
-    let total = 0
-    let i = 0
-    let n = len(r)
-    while i < n
-        let cur = _roman_val(char_at(r, i))
-        if cur == 0
-            return 0
-        if i + 1 < n and _roman_val(char_at(r, i + 1)) > cur
-            total -= cur
-        else
-            total += cur
-        i += 1
-    total
+    if len(r) == 0
+        return err(_roman_fail_text(EmptyInput(s)))
+    let bad = [char_at(r, i) for i in 0..len(r)].filter((c) => not _roman_is_char(c))
+    if len(bad) > 0
+        return err(_roman_fail_text(BadChar(bad[0])))
+    ok(_roman_raw(r))
+
+// The original entry points, behaviour preserved exactly: "" for an n outside 1..3999, and 0 for input
+// that is empty or contains a non-numeral character.
+fn to_roman(n: int) -> string
+    unwrap_or(roman_encode(n), "")
+
+fn from_roman(s: string) -> int
+    unwrap_or(roman_decode(s), 0)
+
+// True iff `s` is the CANONICAL spelling of the number it decodes to -- i.e. it survives a round trip
+// through the encoder. This rejects the forms from_roman accepts but no one writes ("IIII", "VV", "IC")
+// and costs two lines precisely BECAUSE encode and decode now share one table.
+fn roman_is_canonical(s: string) -> bool
+    let n = from_roman(s)
+    n > 0 and to_roman(n) == upper(trim(s))

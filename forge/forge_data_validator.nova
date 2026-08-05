@@ -1,4 +1,4 @@
-// forge_data_validator — data quality validation rules (required/min/max/pattern/enum).
+// forge_data_validator -- data quality validation rules (required/min/max/pattern/enum).
 //
 // NOTE: forge_domain_validator.nova already ships a `dv_*` API for a different purpose
 // (validating domain-name strings). To avoid a function-name collision in the flat
@@ -9,107 +9,129 @@
 // Rule params are always passed as strings so one add_rule signature covers every
 // rule type: "required" ignores param; "min"/"max" take a base-10 integer string
 // threshold (values are parsed with parse_int); "pattern" takes a required substring
-// (no regex engine in std — substring containment is the supported check); "enum"
+// (no regex engine in std -- substring containment is the supported check); "enum"
 // takes a "|"-separated list of allowed values (e.g. "red|green|blue").
+//
+// RAISED 2026-08-05. Three things were wrong before the raise:
+//   1. The rule KIND was a bare string tested by a five-deep if-ladder inside one long
+//      function, with each arm re-implementing "compute a condition, return a message or
+//      return the empty string". The empty string was the SENTINEL for "passed", so a rule
+//      that legitimately produced no text was indistinguishable from a rule that passed.
+//   2. Rules were stored key-mangled -- "r0_field", "r0_type", "r0_param" -- in a flat dict,
+//      so reading rule i meant rebuilding three strings and trusting they matched.
+//   3. `rule_count` and `field_count` were counters kept BESIDE the containers they counted:
+//      two sources of truth for one fact, which is exactly how drift starts.
+// Now the kind is an ADT parsed once by a dict of constructors, each rule is checked by ONE
+// `match` arm, failure is a Result carrying the reason, a rule is a record in a list, and both
+// counts are derived from the containers.
 
+// The CLOSED SET of rule kinds. An ADT rather than a string so the compiler -- not a reader --
+// guarantees the match below handles every kind, and so an unrecognised rule type is a NAMED
+// case (NoRule) rather than a silent fall-through off the end of an if-ladder.
+enum DqvRule
+    RequiredRule(string)
+    MinRule(string)
+    MaxRule(string)
+    PatternRule(string)
+    EnumRule(string)
+    NoRule(string)
+
+// The dispatch table that turns the stored `rule_type` string into a rule VALUE. A dict of
+// closures replaces the if-ladder: adding a rule kind is one row here plus one arm in
+// _dqv_check, and an unknown type lands on NoRule -- which passes, preserving the old
+// contract that an unrecognised rule imposes no constraint.
+fn _dqv_rule_of(rule_type: string, param: string) -> DqvRule
+    let ctors = {
+        "required": (p) => RequiredRule(p),
+        "min": (p) => MinRule(p),
+        "max": (p) => MaxRule(p),
+        "pattern": (p) => PatternRule(p),
+        "enum": (p) => EnumRule(p)
+    }
+    if rule_type not in ctors
+        return NoRule(rule_type)
+    ctors[rule_type](param)
+
+// Turn one boolean verdict into a Result. Every arm of _dqv_check is a single line because
+// this holds the ok/err shape in ONE place -- the arms state only the rule and its message.
+fn _dqv_demand(passed: bool, message: string) -> Result
+    if passed
+        return ok("valid")
+    err(message)
+
+// THE rule semantics -- one arm per kind, and the only place any rule is decided.
+// Note `parse_int` is deliberately unguarded: a non-numeric value parses to 0 under a min/max
+// rule, which is the PRE-EXISTING contract (a "min 18" rule rejects "abc" as below minimum).
+fn _dqv_check(rule: DqvRule, field_name: string, value: string) -> Result
+    match rule
+        RequiredRule(p) => _dqv_demand(value != "", "{field_name} is required")
+        MinRule(p) => _dqv_demand(parse_int(value) >= parse_int(p), "{field_name} is below minimum")
+        MaxRule(p) => _dqv_demand(parse_int(value) <= parse_int(p), "{field_name} is above maximum")
+        PatternRule(p) => _dqv_demand(contains(value, p), "{field_name} does not match pattern")
+        EnumRule(p) => _dqv_demand(value in split(p, "|"), "{field_name} is not an allowed value")
+        NoRule(t) => ok("valid")
+
+// Apply one stored rule record to a value. A rule bound to a DIFFERENT field is not a failure --
+// it simply does not apply, so it passes.
+fn _dqv_check_entry(entry: dict, field_name: string, value: string) -> Result
+    if entry["field"] != field_name
+        return ok("valid")
+    _dqv_check(_dqv_rule_of(entry["type"], entry["param"]), field_name, value)
+
+// A fresh validator. `rules` is a list of records and `fields` is the set of constrained field
+// names; both counts are DERIVED from them (see dqv_rule_count / dqv_field_count) so there is
+// no counter that can disagree with the container it counts.
 fn dqv_new() -> dict
-    let s = {}
-    s["rules"] = {}
-    s["rule_count"] = 0
-    s["fields"] = {}
-    s["field_count"] = 0
-    s["pass_count"] = 0
-    s["fail_count"] = 0
-    s
+    {"rules": [], "fields": {}, "pass_count": 0, "fail_count": 0}
 
+// Bind a rule to a field. `fields` is used as a set, so re-registering a field is idempotent --
+// the old code guarded this with an explicit contains() check purely to keep field_count right,
+// and that guard disappears now that the count is derived.
 fn dqv_add_rule(state: dict, field_name: string, rule_type: string, param: string) -> dict
-    let idx = state["rule_count"]
-    let k = "r" + str(idx)
-    state["rules"][k + "_field"] = field_name
-    state["rules"][k + "_type"] = rule_type
-    state["rules"][k + "_param"] = param
-    state["rule_count"] = idx + 1
-    let has_field = contains(state["fields"], field_name)
-    if has_field != true
-        state["fields"][field_name] = 1
-        state["field_count"] = state["field_count"] + 1
+    push(state["rules"], {"field": field_name, "type": rule_type, "param": param})
+    state["fields"][field_name] = 1
     state
 
-fn _dqv_check_one(state: dict, field_name: string, value: string, idx: int) -> string
-    let k = "r" + str(idx)
-    if state["rules"][k + "_field"] != field_name
-        return ""
-    let rule_type = state["rules"][k + "_type"]
-    let param = state["rules"][k + "_param"]
-    if rule_type == "required"
-        if value == ""
-            return field_name + " is required"
-        return ""
-    if rule_type == "min"
-        let n = parse_int(value)
-        let m = parse_int(param)
-        if n < m
-            return field_name + " is below minimum"
-        return ""
-    if rule_type == "max"
-        let n = parse_int(value)
-        let m = parse_int(param)
-        if n > m
-            return field_name + " is above maximum"
-        return ""
-    if rule_type == "pattern"
-        let has = contains(value, param)
-        if has != true
-            return field_name + " does not match pattern"
-        return ""
-    if rule_type == "enum"
-        let opts = split(param, "|")
-        let allowed = contains(opts, value)
-        if allowed != true
-            return field_name + " is not an allowed value"
-        return ""
-    ""
+// The first rule on `field_name` that `value` fails, or ok if it satisfies all of them.
+// The loop STAYS and now SHORT-CIRCUITS -- the first failure is the answer and later rules
+// cannot change it (the old code kept scanning every rule and threw the extra work away).
+// `return r` rather than `r?` is DELIBERATE: `?` rewrites the message to
+// "in <fn> at line N: ...", and these strings are shown to END USERS ("age is required").
+fn _dqv_first_failure(state: dict, field_name: string, value: string) -> Result
+    for entry in state["rules"]
+        let r = _dqv_check_entry(entry, field_name, value)
+        if is_err(r)
+            return r
+    ok("valid")
 
+// Validate one field value against every rule bound to that field, recording the outcome.
+//   ok("valid")                    every rule passed
+//   err("age is below minimum")    the first rule it failed, in end-user wording
 fn dqv_validate(state: dict, field_name: string, value: string) -> Result
-    let n = state["rule_count"]
-    let i = 0
-    let failure = ""
-    while i < n
-        if failure == ""
-            let msg = _dqv_check_one(state, field_name, value, i)
-            if msg != ""
-                failure = msg
-        i += 1
-    if failure != ""
-        state["fail_count"] = state["fail_count"] + 1
-        return err(failure)
-    state["pass_count"] = state["pass_count"] + 1
+    let outcome = _dqv_first_failure(state, field_name, value)
+    if is_err(outcome)
+        state["fail_count"] += 1
+        return outcome
+    state["pass_count"] += 1
     ok("valid")
 
+// Validate a "field=value,field=value" batch. Pairs without a "=" are skipped, not rejected.
+// NOT short-circuited, deliberately: every well-formed pair must be validated so pass_count and
+// fail_count reflect the WHOLE batch -- that is the existing contract. So run them all, then
+// report the FIRST failure. Three comprehensions replace a while loop with an index and a flag.
 fn dqv_validate_all(state: dict, field_values_csv: string) -> Result
-    let pairs = split(field_values_csv, ",")
-    let n = len(pairs)
-    let i = 0
-    let first_error = ""
-    while i < n
-        let kv = split(pairs[i], "=")
-        if len(kv) >= 2
-            let field_name = kv[0]
-            let value = kv[1]
-            let r = dqv_validate(state, field_name, value)
-            if is_err(r)
-                if first_error == ""
-                    first_error = unwrap_err(r)
-        i += 1
-    if first_error != ""
-        return err(first_error)
-    ok("valid")
+    let pairs = [split(p, "=") for p in split(field_values_csv, ",")]
+    let outcomes = [dqv_validate(state, kv[0], kv[1]) for kv in pairs if len(kv) >= 2]
+    let failures = [unwrap_err(r) for r in outcomes if is_err(r)]
+    if len(failures) == 0
+        return ok("valid")
+    err(failures[0])
 
 fn dqv_rule_count(state: dict) -> int
-    state["rule_count"]
+    len(state["rules"])
 
 fn dqv_field_count(state: dict) -> int
-    state["field_count"]
+    len(keys(state["fields"]))
 
 fn dqv_pass_count(state: dict) -> int
     state["pass_count"]
@@ -117,6 +139,8 @@ fn dqv_pass_count(state: dict) -> int
 fn dqv_fail_count(state: dict) -> int
     state["fail_count"]
 
+// Percentage of validations that passed, as an integer. err (not 0) when nothing has been
+// validated yet -- 0% and "no data" are different facts and must not share a value.
 fn dqv_pass_rate(state: dict) -> Result
     let total = state["pass_count"] + state["fail_count"]
     if total == 0

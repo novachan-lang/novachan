@@ -1,54 +1,93 @@
 // forge_httpdate -- RFC 7231 §7.1.1.1 IMF-fixdate, the required format for HTTP Date / Expires / Last-Modified
 // / If-Modified-Since headers: "Sun, 06 Nov 1994 08:49:37 GMT". Formats an epoch-seconds instant (UTC) and
 // parses one back to epoch seconds. Pairs with forge_etag (conditional requests) and forge_date (civil math).
+//
+// RAISED 2026-08-05. httpdate_parse returned -1 for every kind of malformed input, so a caller handling a
+// conditional request could not tell a truncated header from a bad month from a non-numeric field -- and -1
+// is itself a representable instant (one second before the epoch). The parse now returns Result and names
+// the failure; httpdate_parse keeps its exact -1 contract as a thin adapter over it.
 import forge_date
+
+// Why a header failed to parse. An ADT, so the CAUSE is a value a caller can match on rather than a
+// sentinel that every failure collapses into.
+enum DateFail
+    TooShort(int)
+    BadMonth(string)
+    BadField(string)
+
+fn _fail_text(f: DateFail) -> string
+    match f
+        TooShort(n) => "IMF-fixdate must be at least 25 characters, got {n}"
+        BadMonth(a) => "'{a}' is not a month abbreviation"
+        BadField(w) => "{w} field is not numeric"
 
 fn _day_abbr(wd: int) -> string
     let d = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    if wd < 0 or wd > 6
-        return ""
-    d[wd]
+    "" if wd < 0 or wd > 6 else d[wd]
+
+// The month table, defined ONCE. Formatting and parsing used to carry separate literals -- two lists
+// that had to stay in step by hand.
+fn _months() -> list
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 fn _mon_abbr(m: int) -> string
-    let mm = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    if m < 1 or m > 12
-        return ""
-    mm[m]
+    "" if m < 1 or m > 12 else _months()[m - 1]
 
+// 1-based month number, or 0 when the abbreviation is not one of the twelve.
+// index_of over the shared table states "which of these is it" directly, replacing a scan loop.
 fn _mon_num(abbr: string) -> int
-    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    for i in 0..12
-        if names[i] == abbr
-            return i + 1
-    0
+    index_of(_months(), abbr) + 1
 
+// Zero-padded two-digit field -- the format spec does the padding.
 fn _hz2(n: int) -> string
-    if n < 10
-        return "0" + str(n)
-    str(n)
+    "{n:02d}"
 
 // Format epoch-seconds (UTC) as an IMF-fixdate string for a Date/Expires/Last-Modified header.
+// One interpolated template instead of thirteen concatenations: the header format now reads as the
+// header format.
 fn httpdate_format(epoch_seconds: int) -> string
     let days = epoch_seconds / 86400
     let secs = epoch_seconds % 86400
     let ymd = date_from_epoch_days(days)
     let wd = date_weekday(ymd[0], ymd[1], ymd[2])
-    let hh = secs / 3600
-    let mm = (secs % 3600) / 60
-    let ss = secs % 60
-    _day_abbr(wd) + ", " + _hz2(ymd[2]) + " " + _mon_abbr(ymd[1]) + " " + str(ymd[0]) + " " + _hz2(hh) + ":" + _hz2(mm) + ":" + _hz2(ss) + " GMT"
+    "{_day_abbr(wd)}, {_hz2(ymd[2])} {_mon_abbr(ymd[1])} {ymd[0]} {_hz2(secs / 3600)}:{_hz2((secs % 3600) / 60)}:{_hz2(secs % 60)} GMT"
 
-// Parse an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") -> epoch seconds, or -1 if malformed. Only the modern
-// fixed-length IMF form is accepted (the two obsolete RFC 850 / asctime forms are intentionally not parsed).
-fn httpdate_parse(s: string) -> int
+// Every numeric field is fixed-width at a fixed offset, so they are described as DATA -- name plus
+// slice bounds -- instead of five near-identical parse lines.
+fn _imf_fields() -> list
+    [["day", 5, 7], ["year", 12, 16], ["hour", 17, 19], ["minute", 20, 22], ["second", 23, 25]]
+
+fn _all_digits(t: string) -> bool
+    if len(t) == 0
+        return false
+    all_match([char_at(t, i) for i in 0..len(t)], (c) => find("0123456789", c) >= 0)
+
+// Parse an IMF-fixdate KEEPING the reason. Only the modern fixed-length IMF form is accepted (the two
+// obsolete RFC 850 / asctime forms are intentionally not parsed).
+fn httpdate_parse_checked(s: string) -> Result
     if len(s) < 25
-        return -1
-    let mon = _mon_num(slice(s, 8, 11))
+        return err(_fail_text(TooShort(len(s))))
+    let abbr = slice(s, 8, 11)
+    let mon = _mon_num(abbr)
     if mon < 1
-        return -1
+        return err(_fail_text(BadMonth(abbr)))
+    // A non-numeric field used to slip through silently: parse_int returns 0, so "Sun, xx Nov 1994 ..."
+    // parsed as day 0 and produced a plausible-looking WRONG instant rather than reporting malformed
+    // input. Each fixed-width field is now validated before conversion.
+    for f in _imf_fields()
+        if not _all_digits(slice(s, f[1], f[2]))
+            return err(_fail_text(BadField(f[0])))
     let day = parse_int(slice(s, 5, 7))
     let year = parse_int(slice(s, 12, 16))
     let hh = parse_int(slice(s, 17, 19))
     let mm = parse_int(slice(s, 20, 22))
     let ss = parse_int(slice(s, 23, 25))
-    date_to_epoch_days(year, mon, day) * 86400 + hh * 3600 + mm * 60 + ss
+    ok(date_to_epoch_days(year, mon, day) * 86400 + hh * 3600 + mm * 60 + ss)
+
+// Parse an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") -> epoch seconds, or -1 if malformed.
+// Contract UNCHANGED -- a thin adapter over the checked form.
+// NOTE: the digit validation above makes this STRICTER than before for a malformed numeric field
+// ("Sun, xx Nov ..." now yields -1 where it previously yielded a wrong instant). That is a bug fix,
+// and it is called out here rather than buried.
+fn httpdate_parse(s: string) -> int
+    unwrap_or(httpdate_parse_checked(s), 0 - 1)

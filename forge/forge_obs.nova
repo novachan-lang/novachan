@@ -1,18 +1,28 @@
 // forge_obs -- observability for Forge: RED metrics, health probes, structured logs. The metrics
 // registry is a single-owner ACTOR (a spawned loop draining a request channel) -> race-free counters
 // with NO locks, N>1-safe by construction. This is the thing Spring loses across async boundaries.
+//
+// RAISED 2026-08-05. Three things were wrong with the shape, none with the maths:
+//   * parse_traceparent had SIX distinct rejection reasons and flattened all six to "". A caller
+//     that got "" could not tell "no traceparent header at all" from "an upstream is sending a
+//     malformed one" -- the second is an incident, the first is normal. Now there is ONE ADT for the
+//     cause (TraceFail), ONE Result-returning parse (trace_parse), and parse_traceparent is a
+//     one-line unwrap_or adapter over it, so the "" contract is preserved for existing callers.
+//   * readiness computed a {ready, failed} dict and _readyz_resp then re-derived the response by
+//     re-reading that dict's two fields -- the outcome was a pair of parallel fields that could
+//     disagree (ready=1 with a non-empty failed, ready=0 with an empty one: both representable).
+//     Now the outcome is an ADT (Readiness) that CANNOT represent those states, computed once, and
+//     both the legacy dict and the HTTP response are `match` arms over it.
+//   * The Prometheus exposition had FIVE hand-built `NAME{labels} value` concatenations and built
+//     its body with `+=` in a loop (O(n^2)). One _obs_prom_line + comprehensions + join now.
 import forge
 
 // ── RED metrics registry (single-owner actor) ─────────────────────────────────────────────────────
 // Keyed by "METHOD route" (the route PATTERN, so /users/1 and /users/2 fold under /users/:id). Each
 // key's entry carries: total latency across ALL statuses (totlat, for the duration histogram's _sum),
 // a nested per-status-code observation count (statuses: {"200": n, "404": m, ...}, for the counter's
-// status label -- FIX for the status signal that used to be silently dropped), and a nested cumulative
-// bucket count (buckets: {"5": n_le_5ms, "10": n_le_10ms, ...} -- FIX for the duration histogram that
-// was never exported despite totlat already being accumulated). This extends the ONE existing dict
-// instead of adding parallel structures: what was a bare int value per key is now a small record
-// value; the key scheme itself (and the route-folding it gives) is unchanged.
-// Maps are BORN IN THE LOOP (adding a new key to a spawn-deep-copied dict is broken -- see
+// status label), and a nested cumulative bucket count (buckets: {"5": n_le_5ms, "10": n_le_10ms,
+// ...}). Maps are BORN IN THE LOOP (adding a new key to a spawn-deep-copied dict is broken -- see
 // nova-otp-spawn-constraints). The snapshot is a LIST of fixed-key entries (safe to deep-copy back
 // over the channel), never the raw dynamic-key dicts.
 
@@ -27,14 +37,48 @@ fn _obs_bucket_bounds_ms() -> list
 
 // Fresh per-key record for a (method, route) never observed before.
 fn _new_stat_entry(method: string, route: string) -> any
-    let st = {}
-    st["method"] = method
-    st["route"] = route
-    st["statuses"] = {}
-    st["totlat"] = 0
-    st["buckets"] = {str(b): 0 for b in _obs_bucket_bounds_ms()}
+    let buckets = {str(b): 0 for b in _obs_bucket_bounds_ms()}
+    {"method": method, "route": route, "statuses": {}, "totlat": 0, "buckets": buckets}
+
+// Fold ONE observation into a stat record: bump that status code's counter, add the latency to the
+// running total, and bump every cumulative bucket whose bound the latency is at or under. This is
+// THE accumulation rule; it used to be inlined in the actor loop's `observe` arm, which meant the
+// loop body was 20 lines of bookkeeping and the rule could not be read (or tested) on its own.
+// Mutates and returns `st` -- deliberately NOT a {...st} spread copy, because the actor stores the
+// same record back under the same key and a copy would only add an allocation per request.
+fn _obs_stat_observe(st, status: int, latency: int) -> any
+    let statuses = st["statuses"]
+    let sk = str(status)
+    // NOT statuses.get(sk, 0): this file `import forge`s, and forge.nova owns a top-level
+    // `get(app, pattern, handler)` route fn -- same collision class as problem/obs_problem below,
+    // except THIS one doesn't hard-error at link time, it silently resolves to the wrong symbol and
+    // corrupts the result (verified live: statuses.get(k, 0) returned a garbage pointer-sized int
+    // instead of the count). Manual membership check only, everywhere in this file.
+    let sc = 0
+    if sk in statuses
+        sc = statuses[sk]
+    statuses[sk] = sc + 1
+    let buckets = st["buckets"]
+    for b in _obs_bucket_bounds_ms() if latency <= b
+        let bk = str(b)
+        buckets[bk] = buckets[bk] + 1
+    st["statuses"] = statuses
+    st["totlat"] = st["totlat"] + latency
+    st["buckets"] = buckets
     st
 
+// One snapshot row for one live key. `count` is derived (the sum of the per-status counts) rather
+// than tracked as a second field, so it cannot drift out of step with `statuses`.
+fn _obs_snapshot_entry(k: string, st) -> any
+    let statuses = st["statuses"]
+    {"key": k, "method": st["method"], "route": st["route"], "statuses": statuses, "totlat": st["totlat"], "count": sum(statuses.values()), "buckets": st["buckets"]}
+
+// The actor. `op` STAYS a string in an ordinary dict rather than becoming an ADT: this envelope is
+// the actor's WIRE FORMAT -- it is deep-copied across a channel by the runtime -- and re-encoding a
+// live message protocol is exactly the class of change this refactor does not make. The dispatch
+// ladder is now three one-liners because the real work moved into _obs_stat_observe /
+// _obs_snapshot_entry, where it can be read and reasoned about.
+// The `while` STAYS: it is an actor's receive loop, terminated by an in-band `stop` message.
 fn _metrics_loop(reg)
     let stats = {}
     let inflight = 0
@@ -46,50 +90,12 @@ fn _metrics_loop(reg)
             running = 0
         else if op == "observe"
             let key = env["method"] + " " + env["route"]
-            let st = {}
-            if key in stats
-                st = stats[key]
-            else
-                st = _new_stat_entry(env["method"], env["route"])
-            let statuses = st["statuses"]
-            let status_key = str(env["status"])
-            // NOT statuses.get(status_key, 0): this file `import forge`s, and forge.nova owns a
-            // top-level `get(app, pattern, handler)` route fn -- same collision class as
-            // problem/obs_problem above, except THIS one doesn't hard-error at link time, it silently
-            // resolves to the wrong symbol and corrupts the result (verified live: statuses.get(k, 0)
-            // returned a garbage pointer-sized int instead of the count). Manual contains-check only.
-            let sc = 0
-            if status_key in statuses
-                sc = statuses[status_key]
-            statuses[status_key] = sc + 1
-            st["statuses"] = statuses
-            st["totlat"] = st["totlat"] + env["latency"]
-            let buckets = st["buckets"]
-            for b in _obs_bucket_bounds_ms() if env["latency"] <= b
-                let bk = str(b)
-                buckets[bk] = buckets[bk] + 1
-            st["buckets"] = buckets
-            stats[key] = st
+            let st = stats[key] if key in stats else _new_stat_entry(env["method"], env["route"])
+            stats[key] = _obs_stat_observe(st, env["status"], env["latency"])
         else if op == "inflight"
             inflight += env["delta"]
         else if op == "snapshot"
-            let out = []
-            for k, st in stats
-                let statuses = st["statuses"]
-                let total = sum(statuses.values())
-                let e = {}
-                e["key"] = k
-                e["method"] = st["method"]
-                e["route"] = st["route"]
-                e["statuses"] = statuses
-                e["totlat"] = st["totlat"]
-                e["count"] = total
-                e["buckets"] = st["buckets"]
-                push(out, e)
-            let snap = {}
-            snap["entries"] = out
-            snap["inflight"] = inflight
-            send(env["reply"], snap)
+            send(env["reply"], {"entries": [_obs_snapshot_entry(k, stats[k]) for k in keys(stats)], "inflight": inflight})
 
 fn metrics_registry() -> any
     let reg = {}
@@ -97,26 +103,19 @@ fn metrics_registry() -> any
     spawn _metrics_loop(reg)
     reg
 
-// Record one request: method + route PATTERN + status + latency (ms).
-fn metric_observe(reg, method: string, route: string, status: int, latency: int) -> int
-    let env = {}
-    env["op"] = "observe"
-    env["method"] = method
-    env["route"] = route
-    env["status"] = status
-    env["latency"] = latency
-    env["reply"] = 0
+// Fire-and-forget message to the registry actor. The three public mutators built this envelope-and-
+// send by hand, three times; one of them forgetting `reply` would have been a silent shape drift.
+fn _obs_tell(reg, env) -> int
     send(reg["req"], env)
     0
 
+// Record one request: method + route PATTERN + status + latency (ms).
+fn metric_observe(reg, method: string, route: string, status: int, latency: int) -> int
+    _obs_tell(reg, {"op": "observe", "method": method, "route": route, "status": status, "latency": latency, "reply": 0})
+
 // Adjust the in-flight gauge (+1 on request start, -1 on finish).
 fn metric_inflight(reg, delta: int) -> int
-    let env = {}
-    env["op"] = "inflight"
-    env["delta"] = delta
-    env["reply"] = 0
-    send(reg["req"], env)
-    0
+    _obs_tell(reg, {"op": "inflight", "delta": delta, "reply": 0})
 
 // Read a snapshot: {entries: [{key, method, route, count, totlat, statuses, buckets}], inflight}.
 // `statuses` is a dict from status-code string ("200", "404", ...) to the observation count at that
@@ -127,84 +126,125 @@ fn metric_inflight(reg, delta: int) -> int
 // implicit "+Inf" bucket's count is always `count`).
 fn metrics_snapshot(reg) -> any
     let rc = channel()
-    let env = {}
-    env["op"] = "snapshot"
-    env["reply"] = rc
-    send(reg["req"], env)
+    send(reg["req"], {"op": "snapshot", "reply": rc})
     receive(rc)
 
-// Prometheus text exposition (/metrics body) from a snapshot. Braces/quotes are built via chr() --
-// a literal `{` in a NOVA string interpolates, so it must never appear in a template string.
-// Emits, per distinct (method, route) seen:
-//   - http_requests_total{method,route,status} counter -- one line PER STATUS observed (the status
-//     signal used to be silently dropped: metric_observe took a status arg the loop never read).
-//   - http_request_duration_ms{method,route,le} -- a REAL Prometheus histogram (bucket/sum/count
-//     grouped under one metric family, per the exposition-format spec) built from the totlat/buckets
-//     this actor was already accumulating internally but never exported before this fix.
-fn metrics_prometheus(reg) -> string
+// ── Prometheus text exposition ────────────────────────────────────────────────────────────────────
+// A literal `{` interpolates in a NOVA string, so braces and quotes are bound to lb/rb/q and then
+// INTERPOLATED back in ("{lb}") -- which reads as the exposition format it produces, instead of the
+// eight-term `+` chains this used to be.
+
+fn _obs_q(s: string) -> string
+    chr(34) + s + chr(34)
+
+// THE exposition line: `NAME{labels} value`, newline-terminated. Every metric line below goes
+// through this one function; there used to be five separate hand-built concatenations of the same
+// shape, and a stray space or a missing brace in any one of them makes a scrape silently drop that
+// series. Named _obs_prom_line, not _prom_line: forge_prometheus.nova already owns a top-level
+// `_prom_line` and NOVA gives top-level fns no per-module mangling, so the bare name would be a hard
+// link error the moment both modules reach one compiled unit.
+fn _obs_prom_line(name: string, labels: string, value: string) -> string
     let lb = chr(123)
     let rb = chr(125)
+    "{name}{lb}{labels}{rb} {value}\n"
+
+// The label set shared by every series of one snapshot entry.
+fn _obs_prom_labels(e) -> string
     let q = chr(34)
+    let m = e["method"]
+    let r = e["route"]
+    "method={q}{m}{q},route={q}{r}{q}"
+
+// One http_requests_total series PER STATUS observed (the status signal was silently dropped before
+// the histogram work: metric_observe took a status arg the loop never read).
+fn _obs_prom_counters(e) -> string
+    let labels = _obs_prom_labels(e)
+    let st = e["statuses"]
+    join([_obs_prom_line("http_requests_total", labels + ",status=" + _obs_q(sk), str(st[sk])) for sk in keys(st)], "")
+
+// The cumulative bucket series for one entry, closed by the implicit le="+Inf" bucket (whose count
+// is by definition the entry's total observation count).
+fn _obs_prom_buckets(e) -> string
+    let labels = _obs_prom_labels(e)
+    let b = e["buckets"]
+    let finite = join([_obs_prom_line("http_request_duration_ms_bucket", labels + ",le=" + _obs_q(str(bound)), str(b[str(bound)])) for bound in _obs_bucket_bounds_ms()], "")
+    finite + _obs_prom_line("http_request_duration_ms_bucket", labels + ",le=" + _obs_q("+Inf"), str(e["count"]))
+
+// Prometheus text exposition (/metrics body) from a snapshot. Emits, per distinct (method, route):
+// an http_requests_total counter per status, and a REAL http_request_duration_ms histogram
+// (bucket/sum/count grouped under one metric family, per the exposition-format spec). The four
+// series groups are emitted family-by-family (all buckets, then all sums, then all counts), which is
+// what a scraper expects and what the previous four-accumulator version produced -- except that
+// version grew each group with `+=` inside the loop, which is quadratic in the number of routes.
+fn metrics_prometheus(reg) -> string
     let snap = metrics_snapshot(reg)
     let entries = snap["entries"]
-    let bounds = _obs_bucket_bounds_ms()
-    let counters_parts = []
-    let lat_bucket = ""
-    let lat_sum = ""
-    let lat_count = ""
-    for e in entries
-        let labels = "method=" + q + e["method"] + q + ",route=" + q + e["route"] + q
-        let statuses = e["statuses"]
-        for sk, sv in statuses
-            push(counters_parts, "http_requests_total" + lb + labels + ",status=" + q + sk + q + rb + " " + str(sv) + "\n")
-        let buckets = e["buckets"]
-        for b in bounds
-            let bk = str(b)
-            lat_bucket += "http_request_duration_ms_bucket" + lb + labels + ",le=" + q + bk + q + rb + " " + str(buckets[bk]) + "\n"
-        lat_bucket += "http_request_duration_ms_bucket" + lb + labels + ",le=" + q + "+Inf" + q + rb + " " + str(e["count"]) + "\n"
-        lat_sum += "http_request_duration_ms_sum" + lb + labels + rb + " " + str(e["totlat"]) + "\n"
-        lat_count += "http_request_duration_ms_count" + lb + labels + rb + " " + str(e["count"]) + "\n"
-    let counters = join(counters_parts, "")
-    let body = "# HELP http_requests_total Total HTTP requests\n# TYPE http_requests_total counter\n" + counters
-    body += "# HELP http_request_duration_ms Observed HTTP request latency in milliseconds\n# TYPE http_request_duration_ms histogram\n" + lat_bucket + lat_sum + lat_count
-    body += "# TYPE http_inflight_requests gauge\nhttp_inflight_requests " + str(snap["inflight"]) + "\n"
-    body
+    let counters = join([_obs_prom_counters(e) for e in entries], "")
+    let buckets = join([_obs_prom_buckets(e) for e in entries], "")
+    let sums = join([_obs_prom_line("http_request_duration_ms_sum", _obs_prom_labels(e), str(e["totlat"])) for e in entries], "")
+    let counts = join([_obs_prom_line("http_request_duration_ms_count", _obs_prom_labels(e), str(e["count"])) for e in entries], "")
+    let inflight = str(snap["inflight"])
+    let head = "# HELP http_requests_total Total HTTP requests\n# TYPE http_requests_total counter\n"
+    let hist = "# HELP http_request_duration_ms Observed HTTP request latency in milliseconds\n# TYPE http_request_duration_ms histogram\n"
+    let gauge = "# TYPE http_inflight_requests gauge\nhttp_inflight_requests {inflight}\n"
+    "{head}{counters}{hist}{buckets}{sums}{counts}{gauge}"
 
 // ── Health probes (T8.5/T8.6) ─────────────────────────────────────────────────────────────────────
 // Liveness (the process runs) vs readiness (dependencies are up). readiness runs a list of
 // [name, fn()->bool] checks; the FIRST failure makes it not-ready and names the culprit -> the route
-// layer turns {ready:1} into 200 and {ready:0} into 503. Distinct probes (liveness != readiness).
+// layer turns that into 503. Distinct probes (liveness != readiness).
 
 fn health_ok() -> string
     "ok"
 
-fn readiness(checks) -> any
-    let st = {}
-    st["ready"] = 1
-    st["failed"] = ""
-    for i in 0..len(checks)
-        let c = checks[i]
+// The readiness OUTCOME as one value. Two parallel fields ({ready, failed}) could represent states
+// that cannot happen -- ready=1 with a named culprit, ready=0 with none -- and every consumer had to
+// re-derive which of the two to trust. As an ADT those states are unrepresentable and every consumer
+// is a `match`. Both variants carry a payload because a NO-FIELD enum variant currently miscompiles
+// (the match arm's tag comparison emits a malformed LLVM operand); Ready's payload is the number of
+// checks that passed, which is useful on its own.
+enum Readiness
+    Ready(int)
+    NotReady(string)
+
+// THE readiness rule -- run each check in order, stop at the first failure and name it.
+// The `for` STAYS a short-circuiting loop and is NOT all_match: `readiness` must report WHICH check
+// failed, and it must not call the remaining checks (they are live dependency probes -- a network
+// round trip each -- so evaluating them all to build a list would turn one failure into N probes).
+fn _obs_readiness(checks) -> Readiness
+    for c in checks
         let f = c[1]
-        if f() == false
-            st["ready"] = 0
-            st["failed"] = c[0]
-            return st
-    st
+        if not f()
+            return NotReady(c[0])
+    Ready(len(checks))
+
+// Legacy shape: {ready: 1|0, failed: name-or-""}. A thin `match` adapter over _obs_readiness, kept
+// byte-for-byte compatible for existing callers/tests.
+fn readiness(checks) -> any
+    match _obs_readiness(checks)
+        Ready(n) => {"ready": 1, "failed": ""}
+        NotReady(name) => {"ready": 0, "failed": name}
 
 // ── Structured JSON logs (T8.7) ───────────────────────────────────────────────────────────────────
-// One JSON object per line: {"level":..,"msg":..,<fields>}. Braces/quotes via chr() (a literal `{`
-// interpolates in a NOVA string). Prints the line and returns it (testable). fields = a dict of extras.
+// One JSON object per line: {"level":..,"msg":..,<fields>}. Prints the line and returns it (testable).
 
-fn log_json(level: string, msg: string, fields) -> string
+// THE JSON object builder: pairs are [key, ALREADY-RENDERED value] so a caller decides per field
+// whether the value is a quoted string or a bare number. log_json and obs_problem each hand-rolled
+// this brace/quote/comma dance separately.
+fn _obs_json_obj(pairs: list) -> string
     let lb = chr(123)
     let rb = chr(125)
-    let q = chr(34)
-    let line = lb + q + "level" + q + ":" + q + level + q + "," + q + "msg" + q + ":" + q + msg + q
-    let ks = keys(fields)
-    for i in 0..len(ks)
-        let k = ks[i]
-        line += "," + q + k + q + ":" + q + str(fields[k]) + q
-    line += rb
+    let body = join([_obs_q(p[0]) + ":" + p[1] for p in pairs], ",")
+    "{lb}{body}{rb}"
+
+// NOTE ON ESCAPING: field values go through str() and are quoted but NOT escaped -- a value
+// containing a quote produces a malformed line. That is the PRE-EXISTING contract of this function
+// and is preserved here deliberately (changing it changes every line this emits). forge_logger's
+// log_info/log_error are the escaping-correct path; prefer them for new code.
+fn log_json(level: string, msg: string, fields) -> string
+    let head = [["level", _obs_q(level)], ["msg", _obs_q(msg)]]
+    let tail = [[k, _obs_q(str(fields[k]))] for k in keys(fields)]
+    let line = _obs_json_obj([...head, ...tail])
     print(line)
     line
 
@@ -219,11 +259,12 @@ fn obs_routes(a, reg) -> any
     get(a, "/healthz", fn(req) resp_text(200, "ok"))
     a
 
+// The second `match` over the SAME outcome value. Previously this re-read readiness()'s dict and
+// re-tested st["ready"] == 1 -- a second decision derived from the first one's serialisation.
 fn _readyz_resp(checks) -> any
-    let st = readiness(checks)
-    if st["ready"] == 1
-        return resp_text(200, "ready")
-    resp_text(503, "not ready: " + st["failed"])
+    match _obs_readiness(checks)
+        Ready(n) => resp_text(200, "ready")
+        NotReady(name) => resp_text(503, "not ready: " + name)
 
 fn readyz_route(a, checks) -> any
     let c = checks
@@ -233,38 +274,77 @@ fn readyz_route(a, checks) -> any
 // ── W3C trace context (T8.8): parse an inbound `traceparent` to continue a distributed trace ──────
 // Format: version(2hex)-traceid(32hex)-spanid(16hex)-flags(2hex), e.g.
 //   00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
-// parse_traceparent returns the 32-hex trace_id when the header is well-formed (and not all-zero),
-// else "" -> the caller mints a fresh id. (Minting a random 32-hex id is a small follow-up; it needs a
-// public random/hex helper -- _csrf_rand_hex is module-private to forge.)
+
+// Why a traceparent was rejected. Six distinct causes used to collapse into a single "" return, so
+// an operator could not tell "this request simply has no traceparent" (normal: mint a fresh id) from
+// "an upstream is emitting a malformed one" (an incident: traces are being silently broken).
+enum TraceFail
+    BadFieldCount(string)
+    BadVersion(string)
+    BadTraceId(string)
+    BadSpanId(string)
+    BadFlags(string)
+    ZeroTraceId(string)
+
+fn _obs_trace_fail_text(f: TraceFail) -> string
+    match f
+        BadFieldCount(n) => "traceparent has {n} dash-separated fields, expected 4"
+        BadVersion(t) => "version field '{t}' is not 2 hex digits"
+        BadTraceId(t) => "trace-id field '{t}' is not 32 hex digits"
+        BadSpanId(t) => "span-id field '{t}' is not 16 hex digits"
+        BadFlags(t) => "flags field '{t}' is not 2 hex digits"
+        ZeroTraceId(t) => "trace-id is all-zero, which the spec forbids"
+
+// Which field index failed, as its own cause. Keeps the field WIDTHS (below) and the field NAMES in
+// one place each instead of four copy-pasted if-blocks that each repeated both.
+fn _obs_trace_bad_field(i: int, tok: string) -> string
+    if i == 0
+        return _obs_trace_fail_text(BadVersion(tok))
+    if i == 1
+        return _obs_trace_fail_text(BadTraceId(tok))
+    if i == 2
+        return _obs_trace_fail_text(BadSpanId(tok))
+    _obs_trace_fail_text(BadFlags(tok))
+
+// True iff `s` is exactly `n` hex digits (either case). all_match states the rule once, over every
+// character, instead of an early-return scan. The source is a RANGE comprehension, never `for c in s`
+// -- a comprehension whose source is a STRING compiles inside a module and segfaults at runtime.
 fn _obs_is_hex_str(s: string, n: int) -> bool
     if len(s) != n
         return false
-    for i in 0..n
-        let o = ord(char_at(s, i))
-        let ok = (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70)
-        if ok == false
-            return false
-    true
+    all_match([ord(char_at(s, i)) for i in 0..n], (o) => (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70))
 
-fn parse_traceparent(header: string) -> string
+// Expected hex width of each traceparent field, in order: version, trace-id, span-id, flags.
+fn _obs_trace_widths() -> list
+    [2, 32, 16, 2]
+
+// Parse a `traceparent`, KEEPING the reason on failure:
+//   ok("0af76519...")                                  the 32-hex trace-id to continue
+//   err("trace-id field 'abc' is not 32 hex digits")   why it was rejected, naming the field
+// The `for` STAYS a loop: it short-circuits on the first malformed field, and reporting WHICH field
+// failed is the whole point of this function.
+fn trace_parse(header: string) -> Result
     let parts = split(header, "-")
     if len(parts) != 4
-        return ""
-    if _obs_is_hex_str(parts[0], 2) == false
-        return ""
-    if _obs_is_hex_str(parts[1], 32) == false
-        return ""
-    if _obs_is_hex_str(parts[2], 16) == false
-        return ""
-    if _obs_is_hex_str(parts[3], 2) == false
-        return ""
+        return err(_obs_trace_fail_text(BadFieldCount(str(len(parts)))))
+    for i, w in _obs_trace_widths()
+        if not _obs_is_hex_str(parts[i], w)
+            return err(_obs_trace_bad_field(i, parts[i]))
     if parts[1] == "00000000000000000000000000000000"
-        return ""
-    parts[1]
+        return err(_obs_trace_fail_text(ZeroTraceId(parts[1])))
+    ok(parts[1])
+
+// The 32-hex trace_id when the header is well-formed (and not all-zero), else "" -> the caller mints
+// a fresh id. A thin adapter over trace_parse, preserving the original "" contract; reach for
+// trace_parse when the difference between "absent" and "malformed" matters.
+fn parse_traceparent(header: string) -> string
+    unwrap_or(trace_parse(header), "")
 
 // Mint a fresh 32-hex trace_id when a request has no inbound traceparent. A trace_id is a CORRELATION
 // id (not a secret), so high-resolution clock reads give sufficient uniqueness within a process; a
 // crypto-random mint via a future runtime rand builtin would be a strict upgrade, not a correctness fix.
+// The `for` STAYS: each step consumes the low nibble and shifts the value down, so the loop carries
+// state that no comprehension over a fixed range can express.
 fn _int_to_hex(n: int, width: int) -> string
     let digits = "0123456789abcdef"
     let v = n
@@ -283,17 +363,14 @@ fn mint_trace_id() -> string
 // ── RFC 9457 problem+json (T8.11): a structured error body ────────────────────────────────────────
 // obs_problem(status, title, detail) -> a Response with content-type application/problem+json and a body
 // {"type":"about:blank","title":..,"status":..,"detail":..}. The interoperable error shape (vs ad-hoc
-// JSON). Braces/quotes via chr() (a literal '{' interpolates in a NOVA string).
+// JSON). `status` is the ONE bare (unquoted) JSON value, which is why _obs_json_obj takes already-
+// rendered values rather than quoting everything itself.
 // Named obs_problem (not the bare `problem`) because forge.nova already owns a top-level `problem`
 // (status, detail) helper with a different arity -- NOVA gives top-level fn names no per-module
 // mangling, so two same-named top-level fns reaching the same compiled unit (forge_obs already
-// `import forge`s) is a hard link error, not an overload. Pre-existing latent collision, not
-// introduced by this change; scoped-fixed here since forge.nova is out of scope for this file.
+// `import forge`s) is a hard link error, not an overload.
 fn obs_problem(status: int, title: string, detail: string) -> Response
-    let lb = chr(123)
-    let rb = chr(125)
-    let q = chr(34)
-    let body = lb + q + "type" + q + ":" + q + "about:blank" + q + "," + q + "title" + q + ":" + q + title + q + "," + q + "status" + q + ":" + str(status) + "," + q + "detail" + q + ":" + q + detail + q + rb
+    let body = _obs_json_obj([["type", _obs_q("about:blank")], ["title", _obs_q(title)], ["status", str(status)], ["detail", _obs_q(detail)]])
     let h = {}
     h["Content-Type"] = "application/problem+json"
     Response(status, h, body, false, [])
@@ -305,15 +382,15 @@ fn obs_problem(status: int, title: string, detail: string) -> Response
 // /users/99 fold under /users/:id -- BOUNDED cardinality, the thing naive per-path metrics get wrong
 // (unbounded label explosion that kills Prometheus). dispatch_req sets req.state["route"] inside
 // nxt(req), so it is populated by the time this reads it after the downstream call returns.
+// NOT get(req.state, "route", "unmatched"): `get` is forge.nova's route-registration fn here -- see
+// the note in _obs_stat_observe. Membership check only.
 fn _t_metrics(req, nxt, reg)
     metric_inflight(reg, 1)
     let t0 = clock_ns()
     let resp = nxt(req)
     let dt = (clock_ns() - t0) / 1000000
     metric_inflight(reg, -1)
-    let route = "unmatched"
-    if "route" in req.state
-        route = req.state["route"]
+    let route = req.state["route"] if "route" in req.state else "unmatched"
     metric_observe(reg, req.method, route, resp.status, dt)
     resp
 
