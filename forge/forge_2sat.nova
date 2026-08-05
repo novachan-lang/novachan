@@ -8,93 +8,126 @@
 // literal-nodes, find its strongly connected components, and it's satisfiable exactly when no variable shares a
 // component with its own negation -- with the SCC order handing you the assignment. Clauses use signed literals
 // (+v = variable v true, -v = v false), variables numbered 1..n. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Two structural problems:
+//
+//   1. _ts_tarjan took NINE parameters, seven of which were shared mutable state, and two of those
+//      (timer, ncomp) were single-element LISTS used purely as mutable integer cells -- the C
+//      out-parameter idiom. Every recursive call re-threaded all nine in the right order, and
+//      `timer[0]` / `ncomp[0]` gave no hint what they held. That state is ONE thing: an SCC pass. It
+//      is now a struct, so the recursion carries two arguments and every field has a name.
+//   2. two_sat returned [satisfiable, assignment] -- a 1/0 flag beside a list that is empty in the
+//      unsatisfiable case. A caller had to know to test element 0 before trusting element 1, and
+//      learned nothing about WHICH variable made the instance unsatisfiable. two_sat_checked returns
+//      a Result naming the offending variable; two_sat keeps its exact tuple contract as a thin
+//      adapter (forge_2sat_test.nova reads r[0] and r[1]).
+
+// The state of one Tarjan pass: four parallel per-node arrays, the stack, and two counters that were
+// each a separate parameter describing a single traversal.
+type SccPass
+    adj: list
+    disc: list
+    low: list
+    onstk: list
+    comp: list
+    stk: list
+    timer: int
+    ncomp: int
 
 // PRIVATE: the implication-graph node for a signed literal (+v -> "v is true" node, -v -> "v is false" node).
+// The two literal nodes of a variable are adjacent, which is why negation is `^ 1` and the true node is even.
 fn _ts_node(lit: int) -> int
-    let v = lit
-    if v < 0
-        v = 0 - v
-    let base = 2 * (v - 1)
-    if lit > 0
-        base
-    else
-        base + 1
+    let base = 2 * (abs(lit) - 1)
+    base if lit > 0 else base + 1
 
-// PRIVATE: recursive Tarjan SCC. Shared state mutated in place; comp[] gets each node's component id.
-fn _ts_tarjan(u: int, adj: list, disc: list, low: list, onstk: list, stk: list, comp: list, timer: list, ncomp: list)
-    timer[0] = timer[0] + 1
-    disc[u] = timer[0]
-    low[u] = timer[0]
-    push(stk, u)
-    onstk[u] = 1
-    let nbrs = adj[u]
-    let i = 0
-    while i < len(nbrs)
-        let v = nbrs[i]
-        if disc[v] == 0 - 1
-            _ts_tarjan(v, adj, disc, low, onstk, stk, comp, timer, ncomp)
-            if low[v] < low[u]
-                low[u] = low[v]
+// PRIVATE: the node for the NEGATION of a literal. `^ 1` appeared inline at both call sites with the
+// pairing rule left implicit; naming it puts the rule in one place.
+fn _ts_not(lit: int) -> int
+    _ts_node(lit) ^ 1
+
+// PRIVATE: recursive Tarjan SCC over the implication graph. `p.comp[node]` gets each node's component id.
+fn _ts_tarjan(u: int, p: SccPass)
+    p.timer += 1
+    p.disc[u] = p.timer
+    p.low[u] = p.timer
+    push(p.stk, u)
+    p.onstk[u] = 1
+    // The neighbour list is walked whole; its index was never used for anything but reading it.
+    for v in p.adj[u]
+        if p.disc[v] == 0 - 1
+            _ts_tarjan(v, p)
+            if p.low[v] < p.low[u]
+                p.low[u] = p.low[v]
         else
-            if onstk[v] == 1 and disc[v] < low[u]
-                low[u] = disc[v]
-        i += 1
-    if low[u] == disc[u]
-        let done = false
-        while done == false
-            let w = pop(stk)
-            onstk[w] = 0
-            comp[w] = ncomp[0]
+            if p.onstk[v] == 1 and p.disc[v] < p.low[u]
+                p.low[u] = p.disc[v]
+    if p.low[u] == p.disc[u]
+        // Pop the component. The `done` flag was standing in for `break`: it was set on the iteration
+        // that popped `u` and then failed the guard on the next check.
+        while true
+            let w = pop(p.stk)
+            p.onstk[w] = 0
+            p.comp[w] = p.ncomp
             if w == u
-                done = true
-        ncomp[0] = ncomp[0] + 1
+                break
+        p.ncomp += 1
 
-// Solve a 2-SAT instance: n variables (1..n) and `clauses` (each [litA, litB] with signed literals). Returns
-// [satisfiable, assignment] where satisfiable is 1/0 and assignment[i] is the 0/1 value of variable i+1 (empty if
-// unsatisfiable).
-fn two_sat(n: int, clauses: list) -> list
+// PRIVATE: build the implication graph. A clause (a OR b) contributes (not a -> b) and (not b -> a).
+fn _ts_build(n: int, clauses: list) -> list
+    let adj = [[] for z in 0..(2 * n)]
+    for cl in clauses
+        push(adj[_ts_not(cl[0])], _ts_node(cl[1]))
+        push(adj[_ts_not(cl[1])], _ts_node(cl[0]))
+    adj
+
+// PRIVATE: run Tarjan over every node, returning the finished pass.
+fn _ts_scc(n: int, clauses: list) -> SccPass
     let nodes = 2 * n
-    // build implication graph
-    let adj = [[] for z in 0..nodes]
-    for ci in 0..len(clauses)
-        let cl = clauses[ci]
-        let a = cl[0]
-        let b = cl[1]
-        // (a OR b): (not a -> b) and (not b -> a)
-        let na = _ts_node(a) ^ 1
-        let nb = _ts_node(b) ^ 1
-        push(adj[na], _ts_node(b))
-        push(adj[nb], _ts_node(a))
-    // Tarjan over all nodes
-    let disc = []
-    let low = []
-    let onstk = []
-    let comp = []
-    for q in 0..nodes
-        push(disc, 0 - 1)
-        push(low, 0)
-        push(onstk, 0)
-        push(comp, 0 - 1)
-    let stk = []
-    let timer = [0]
-    let ncomp = [0]
+    // Each per-node array is initialised by a comprehension rather than by pushing inside one shared
+    // loop: the initial value is a property of the array, not of the loop.
+    // (Bound to locals first -- a constructor call cannot span lines, and eight inline arguments on
+    // one line is worse than eight named ones.)
+    let unvisited = [0 - 1 for z in 0..nodes]
+    let lows = [0 for z in 0..nodes]
+    let stackmark = [0 for z in 0..nodes]
+    let components = [0 - 1 for z in 0..nodes]
+    let p = SccPass(_ts_build(n, clauses), unvisited, lows, stackmark, components, [], 0, 0)
     for u in 0..nodes
-        if disc[u] == 0 - 1
-            _ts_tarjan(u, adj, disc, low, onstk, stk, comp, timer, ncomp)
-    // check satisfiability + build assignment
-    let sat = true
-    let assign = []
+        if p.disc[u] == 0 - 1
+            _ts_tarjan(u, p)
+    p
+
+// PRIVATE: the first variable (1-based) whose two literals landed in the SAME component, or 0 if none.
+// That is exactly the unsatisfiability condition, and naming it lets the error say WHICH variable.
+fn _ts_conflict(p: SccPass, n: int) -> int
     for v in 0..n
-        if comp[2 * v] == comp[2 * v + 1]
-            sat = false
-    let out = [0, []]
-    if sat
-        for vv in 0..n
-            // Tarjan numbers SCCs in reverse topological order; the literal whose component
-            // was finalized later (smaller id) is the one placed later in topo order -> chosen true.
-            if comp[2 * vv] < comp[2 * vv + 1]
-                push(assign, 1)
-            else
-                push(assign, 0)
-        out = [1, assign]
-    out
+        if p.comp[2 * v] == p.comp[2 * v + 1]
+            return v + 1
+    0
+
+// Solve a 2-SAT instance, KEEPING the reason on failure:
+//   ok([1, 0, 1])                         a satisfying assignment; element i is variable i+1
+//   err("unsatisfiable: variable 1 ...")   which variable forced the contradiction
+fn two_sat_checked(n: int, clauses: list) -> Result
+    let p = _ts_scc(n, clauses)
+    let bad = _ts_conflict(p, n)
+    if bad > 0
+        return err("unsatisfiable: variable {bad} and its negation are in the same implication component")
+    // Tarjan numbers SCCs in reverse topological order, so the literal whose component was finalized
+    // later (smaller id) is placed later in topological order and is the one chosen true.
+    ok([1 if p.comp[2 * v] < p.comp[2 * v + 1] else 0 for v in 0..n])
+
+// Returns [satisfiable, assignment] where satisfiable is 1/0 and assignment[i] is the 0/1 value of
+// variable i+1 (empty if unsatisfiable). Contract UNCHANGED -- a thin adapter over two_sat_checked.
+fn two_sat(n: int, clauses: list) -> list
+    let r = two_sat_checked(n, clauses)
+    if is_err(r)
+        return [0, []]
+    [1, unwrap(r)]
+
+// Is `assignment` (0/1 per variable, index i = variable i+1) a model of `clauses`?
+// A clause holds when EITHER literal is satisfied, and the instance holds when EVERY clause does --
+// all_match over any_match says exactly that. The module shipped no such check, so every caller wrote
+// its own (forge_2sat_test.nova carries a hand-rolled copy).
+fn two_sat_satisfies(assignment: list, clauses: list) -> bool
+    all_match(clauses, (cl) => any_match(cl, (lit) => assignment[abs(lit) - 1] == (1 if lit > 0 else 0)))
