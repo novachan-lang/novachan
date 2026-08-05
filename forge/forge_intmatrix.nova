@@ -9,154 +9,103 @@
 // the fractions of ordinary elimination and the factorial blow-up of cofactor expansion. A second, independent
 // cofactor-expansion determinant is provided so the two can be cross-checked. Integer entries; keep the matrix
 // small and entries modest so intermediate products stay within signed 64-bit (Hadamard's bound). LEAF.
+//
+// RAISED 2026-08-05 (high-level pass). Every loop in this file walked a FIXED bound, so all fourteen `while` +
+// manual-index loops are gone: the ones that BUILD a matrix (mat_mul, mat_identity, _mx_copy, _mx_minor) are now
+// nested comprehensions, the cofactor expansion is a comprehension + `sum`, and the two that carry real state --
+// the Bareiss elimination and its pivot search -- are `for ... in 0..n` with a `break`, which is what the
+// short-circuit in their old `while` conditions actually meant.
+//
+// PRESERVED ON PURPOSE (sentinels and edge answers callers can already see):
+//   * mat_mul returns the SENTINEL empty list on a dimension mismatch rather than a Result. Callers test
+//     `len(product) == 0`; converting that to ok/err is an API change, not a refactor.
+//   * det([]) is 1 (the empty product) but det_cofactor([]) is 0. They disagree, and that disagreement shipped.
+//   * Both determinants assume RECTANGULAR input -- the column count is taken from row 0. A ragged matrix
+//     indexes out of range exactly as it did before.
 
 // Multiply two integer matrices A (p x q) and B (q x r), returning the p x r product. Returns an empty list if the
 // inner dimensions do not match.
 fn mat_mul(a: list, b: list) -> list
-    let out = []
-    let p = len(a)
-    if p > 0 and len(b) > 0
-        let q = len(a[0])
-        let r = len(b[0])
-        if len(b) == q
-            let i = 0
-            while i < p
-                let row = []
-                let arow = a[i]
-                let j = 0
-                while j < r
-                    let s = 0
-                    let k = 0
-                    while k < q
-                        let brow = b[k]
-                        s = s + arow[k] * brow[j]
-                        k = k + 1
-                    push(row, s)
-                    j = j + 1
-                push(out, row)
-                i = i + 1
-    out
+    if len(a) == 0 or len(b) == 0
+        return []
+    let q = len(a[0])
+    let r = len(b[0])
+    if len(b) != q
+        return []
+    return [[_mx_dot(a[i], b, j, q) for j in 0..r] for i in 0..len(a)]
+
+// PRIVATE: the dot product of row `arow` with column `j` of `b`, over `q` terms.
+// Kept as an explicit accumulation rather than `sum([...])` so the running total stays seeded at the integer 0
+// exactly as the original inner loop did -- this module's whole point is that no value silently becomes a float.
+fn _mx_dot(arow: list, b: list, j: int, q: int) -> int
+    let s = 0
+    for k in 0..q
+        s += arow[k] * b[k][j]
+    return s
 
 // The n x n identity matrix as a list of rows.
 fn mat_identity(n: int) -> list
-    let out = []
-    let i = 0
-    while i < n
-        let row = []
-        let j = 0
-        while j < n
-            if i == j
-                push(row, 1)
-            else
-                push(row, 0)
-            j = j + 1
-        push(out, row)
-        i = i + 1
-    out
+    return [[1 if i == j else 0 for j in 0..n] for i in 0..n]
 
 // PRIVATE: deep copy of a matrix (independent rows), so elimination does not mutate the caller's data.
 fn _mx_copy(m: list) -> list
-    let out = []
-    let i = 0
-    while i < len(m)
-        let row = []
-        let src = m[i]
-        let j = 0
-        while j < len(src)
-            push(row, src[j])
-            j = j + 1
-        push(out, row)
-        i = i + 1
-    out
+    return [[x for x in row] for row in m]
 
 // The EXACT determinant of a square integer matrix via the Bareiss fraction-free algorithm. Returns 0 for a
 // singular matrix and 1 for the empty 0x0 matrix. All arithmetic is integer and every division is exact.
+// The elimination is genuinely stateful -- each pass divides by the PREVIOUS pivot -- so it stays a loop; what
+// changed is that the loop counts over its fixed range and `break`s on the singular case instead of carrying a
+// `singular == false` flag through a `while` condition and then re-testing it in the body.
 fn det(matrix: list) -> int
     let n = len(matrix)
-    let out = 1
-    if n > 0
-        let m = _mx_copy(matrix)
-        let sign = 1
-        let prev = 1
-        let singular = false
-        let k = 0
-        while k < n and singular == false
-            // ensure a nonzero pivot at (k,k), swapping a lower row up if needed
-            let pivrow = m[k]
-            if pivrow[k] == 0
-                let sw = 0 - 1
-                let r = k + 1
-                while r < n and sw < 0
-                    let rr = m[r]
-                    if rr[k] != 0
-                        sw = r
-                    r = r + 1
-                if sw < 0
-                    singular = true
-                else
-                    let tmp = m[k]
-                    m[k] = m[sw]
-                    m[sw] = tmp
-                    sign = 0 - sign
-            if singular == false
-                let rowk = m[k]
-                let pivot = rowk[k]
-                let i = k + 1
-                while i < n
-                    let rowi = m[i]
-                    let j = k + 1
-                    while j < n
-                        rowi[j] = (rowi[j] * pivot - rowi[k] * rowk[j]) / prev
-                        j = j + 1
-                    i = i + 1
-                prev = pivot
-            k = k + 1
-        if singular
-            out = 0
-        else
-            let last = m[n - 1]
-            out = sign * last[n - 1]
-    out
+    if n == 0
+        return 1
+    let m = _mx_copy(matrix)
+    let sign = 1
+    let prev = 1
+    let singular = false
+    for k in 0..n
+        // ensure a nonzero pivot at (k,k), swapping a lower row up if needed
+        if m[k][k] == 0
+            let sw = 0 - 1
+            for r in (k + 1)..n
+                if m[r][k] != 0
+                    sw = r
+                    break
+            if sw < 0
+                singular = true
+                break
+            let tmp = m[k]
+            m[k] = m[sw]
+            m[sw] = tmp
+            sign = 0 - sign
+        let rowk = m[k]
+        let pivot = rowk[k]
+        for i in (k + 1)..n
+            let rowi = m[i]
+            for j in (k + 1)..n
+                rowi[j] = (rowi[j] * pivot - rowi[k] * rowk[j]) / prev
+        prev = pivot
+    if singular
+        return 0
+    return sign * m[n - 1][n - 1]
 
 // PRIVATE: the (n-1)x(n-1) minor of `m` with row 0 and column `col` removed.
 fn _mx_minor(m: list, col: int) -> list
-    let out = []
-    let i = 1
-    while i < len(m)
-        let row = []
-        let src = m[i]
-        let j = 0
-        while j < len(src)
-            if j != col
-                push(row, src[j])
-            j = j + 1
-        push(out, row)
-        i = i + 1
-    out
+    return [[m[i][j] for j in 0..len(m[i]) if j != col] for i in 1..len(m)]
 
 // The determinant computed independently by cofactor (Laplace) expansion along the first row. Exact but O(n!), so
 // it is meant as a reference / cross-check for small matrices, not for large ones.
+// The alternating sum is a comprehension folded with `sum` -- every term is an int (this fn returns int and
+// recurses into itself), so the int-typed `sum` is exactly the accumulator the old `out` variable was.
 fn det_cofactor(matrix: list) -> int
     let n = len(matrix)
-    let out = 0
     if n == 1
-        let r0 = matrix[0]
-        out = r0[0]
-    else
-        if n == 2
-            let a = matrix[0]
-            let b = matrix[1]
-            out = a[0] * b[1] - a[1] * b[0]
-        else
-            if n > 2
-                let row0 = matrix[0]
-                let c = 0
-                while c < n
-                    let minor = _mx_minor(matrix, c)
-                    let cof = row0[c] * det_cofactor(minor)
-                    if c % 2 == 0
-                        out = out + cof
-                    else
-                        out = out - cof
-                    c = c + 1
-    out
+        return matrix[0][0]
+    if n == 2
+        return matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]
+    if n > 2
+        let row0 = matrix[0]
+        return sum([row0[c] * det_cofactor(_mx_minor(matrix, c)) * (1 if c % 2 == 0 else 0 - 1) for c in 0..n])
+    // n == 0 -- falls through to 0, which is what the original if-ladder produced. NOT the same as det([]) == 1.
+    return 0

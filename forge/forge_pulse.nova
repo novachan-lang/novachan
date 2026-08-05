@@ -5,6 +5,12 @@
 //
 // All operations are lazy where possible — they build descriptors that
 // materialize on demand. This is the "data analysis in NOVA" story.
+//
+// FLOAT DISCIPLINE: every running total here is seeded 0.0 and accumulated in an EXPLICIT loop.
+// They are deliberately NOT folded through sum()/reduce(): sum() is typed to int (it would break the
+// float contract on the empty path) and a reduce() closure doing float arithmetic corrupts raw floats
+// across the any-boxed HOF boundary. The loops are counted ranges / value iteration, never hand-rolled
+// index arithmetic.
 import std/data/dataframe
 
 // ── Convenience accessors (thin wrappers over DataFrame struct / L8 index) ─────
@@ -19,13 +25,8 @@ fn df_nrows(df: DataFrame) -> int
 
 fn pulse_describe(df: DataFrame) -> dict
     let result = {}
-    let cols = df.colnames
-    let i = 0
-    while i < len(cols)
-        let col = df_col(df, cols[i])
-        let stats = _pulse_col_stats(col)
-        result[cols[i]] = stats
-        i = i + 1
+    for name in df.colnames
+        result[name] = _pulse_col_stats(df_col(df, name))
     result
 
 fn _pulse_col_stats(col: list) -> dict
@@ -35,111 +36,79 @@ fn _pulse_col_stats(col: list) -> dict
     let s = 0.0
     let mn = col[0]
     let mx = col[0]
-    let i = 0
-    while i < n
-        let v = col[i] * 1.0
-        s = s + v
-        if col[i] < mn
-            mn = col[i]
-        if col[i] > mx
-            mx = col[i]
-        i = i + 1
-    let mean = s / (n * 1.0)
-    {"count": n, "sum": s, "mean": mean, "min": mn, "max": mx}
+    for v in col
+        s += v * 1.0
+        if v < mn
+            mn = v
+        if v > mx
+            mx = v
+    {"count": n, "sum": s, "mean": s / (n * 1.0), "min": mn, "max": mx}
 
 // ── Aggregation ────────────────────────────────────────────────────────────────
 
 fn pulse_agg(df: DataFrame, group_col: string, agg_col: string, agg_fn: string) -> dict
-    let groups = df_group_by(df, group_col)
     let result = {}
-    let i = 0
-    while i < len(groups)
-        let g = groups[i]
-        let gdf = g["rows"]
-        let vals = df_col(gdf, agg_col)
-        let agg_val = _pulse_apply_agg(vals, agg_fn)
-        result[str(g["key"])] = agg_val
-        i = i + 1
+    for g in df_group_by(df, group_col)
+        result[str(g["key"])] = _pulse_apply_agg(df_col(g["rows"], agg_col), agg_fn)
     result
 
+// The float running total that "sum" and "mean" both need -- it was written out twice, identically.
+// Typed `-> float` (not `-> any`) so the value never has to survive an any-widen on the way out.
+fn _pulse_fsum(vals: list) -> float
+    let s = 0.0
+    for v in vals
+        s += v * 1.0
+    s
+
+// Dispatch stays an if-ladder rather than a dict of closures: the five branches return DIFFERENT
+// shapes (float / int / element-typed), and routing a float result through an any-boxed closure value
+// is the exact boundary that corrupts raw floats in NOVA today.
 fn _pulse_apply_agg(vals: list, agg_fn: string) -> any
     let n = len(vals)
     if n == 0
         return 0
     if agg_fn == "sum"
-        let s = 0.0
-        let i = 0
-        while i < n
-            s = s + vals[i] * 1.0
-            i = i + 1
-        return s
+        return _pulse_fsum(vals)
     if agg_fn == "mean"
-        let s = 0.0
-        let i = 0
-        while i < n
-            s = s + vals[i] * 1.0
-            i = i + 1
-        return s / (n * 1.0)
+        return _pulse_fsum(vals) / (n * 1.0)
     if agg_fn == "count"
         return n
     if agg_fn == "min"
         let mn = vals[0]
-        let i = 1
-        while i < n
-            if vals[i] < mn
-                mn = vals[i]
-            i = i + 1
+        for v in vals
+            if v < mn
+                mn = v
         return mn
     if agg_fn == "max"
         let mx = vals[0]
-        let i = 1
-        while i < n
-            if vals[i] > mx
-                mx = vals[i]
-            i = i + 1
+        for v in vals
+            if v > mx
+                mx = v
         return mx
     0
 
 // ── Rolling window ─────────────────────────────────────────────────────────────
 
+// out[i] = agg over the trailing `window` values ending at i (short at the head). The window slice is
+// a comprehension over the clamped range; a window <= 0 yields an EMPTY range (start lands past i),
+// which _pulse_apply_agg reports as 0 -- the same as the original j <= i loop that never ran.
 fn pulse_rolling(df: DataFrame, col: string, window: int, agg_fn: string) -> list
     let vals = df_col(df, col)
-    let n = len(vals)
-    let out = []
-    let i = 0
-    while i < n
-        let start = i - window + 1
-        if start < 0
-            start = 0
-        let window_vals = []
-        let j = start
-        while j <= i
-            push(window_vals, vals[j])
-            j = j + 1
-        push(out, _pulse_apply_agg(window_vals, agg_fn))
-        i = i + 1
-    out
+    [_pulse_apply_agg([vals[j] for j in max(i - window + 1, 0)..(i + 1)], agg_fn) for i in 0..len(vals)]
 
 // ── Cross-tabulation ───────────────────────────────────────────────────────────
 
 fn pulse_crosstab(df: DataFrame, row_col: string, col_col: string) -> dict
-    let row_vals = df_col(df, row_col)
     let col_vals = df_col(df, col_col)
-    let n = len(row_vals)
     let table = {}
-    let i = 0
-    while i < n
-        let rk = str(row_vals[i])
+    for i, rv in df_col(df, row_col)
+        let rk = str(rv)
         let ck = str(col_vals[i])
-        if not contains(table, rk)
+        if rk not in table
             table[rk] = {}
         let row = table[rk]
-        if contains(row, ck)
-            row[ck] = row[ck] + 1
-        else
-            row[ck] = 1
+        row[ck] = (row[ck] + 1) if ck in row else 1
         table[rk] = row
-        i = i + 1
     table
 
 // ── Correlation ────────────────────────────────────────────────────────────────
@@ -150,31 +119,20 @@ fn pulse_corr(df: DataFrame, col_a: string, col_b: string) -> any
     let n = len(a)
     if n < 2
         return 0.0
-    let sum_a = 0.0
-    let sum_b = 0.0
-    let i = 0
-    while i < n
-        sum_a = sum_a + a[i] * 1.0
-        sum_b = sum_b + b[i] * 1.0
-        i = i + 1
-    let mean_a = sum_a / (n * 1.0)
-    let mean_b = sum_b / (n * 1.0)
+    let mean_a = _pulse_fsum(a) / (n * 1.0)
+    let mean_b = _pulse_fsum(b) / (n * 1.0)
     let cov = 0.0
     let var_a = 0.0
     let var_b = 0.0
-    i = 0
-    while i < n
+    for i in 0..n
         let da = a[i] * 1.0 - mean_a
         let db = b[i] * 1.0 - mean_b
-        cov = cov + da * db
-        var_a = var_a + da * da
-        var_b = var_b + db * db
-        i = i + 1
+        cov += da * db
+        var_a += da * da
+        var_b += db * db
     if var_a < 0.0001 or var_b < 0.0001
         return 0.0
-    let denom = var_a * var_b
-    let r = cov / sqrt(denom)
-    r
+    cov / sqrt(var_a * var_b)
 
 // ── CSV helper (quick load from string) ────────────────────────────────────────
 
@@ -182,30 +140,23 @@ fn pulse_from_csv(csv_text: string, delimiter: string) -> DataFrame
     let lines = split(csv_text, "\n")
     if len(lines) < 2
         return df_new([], [])
-    let header = split(lines[0], delimiter)
-    let cols = []
-    let i = 0
-    while i < len(header)
-        push(cols, trim(header[i]))
-        i = i + 1
+    let cols = [trim(h) for h in split(lines[0], delimiter)]
     let rows = []
-    let row_idx = 1
-    while row_idx < len(lines)
+    for row_idx in 1..len(lines)
         let line = trim(lines[row_idx])
-        if len(line) == 0
-            row_idx = row_idx + 1
-            continue
-        let fields = split(line, delimiter)
-        let row_data = []
-        i = 0
-        while i < len(cols) and i < len(fields)
-            let val = trim(fields[i])
-            let as_num = parse_int(val)
-            if str(as_num) == val
-                push(row_data, as_num)
-            else
-                push(row_data, val)
-            i = i + 1
-        push(rows, row_data)
-        row_idx = row_idx + 1
+        if len(line) > 0
+            let fields = split(line, delimiter)
+            let row_data = []
+            // A cell becomes an int only when it round-trips parse_int -> str exactly (so "007" and
+            // "1.5" stay text); otherwise the trimmed text is kept. The two push sites are inline ON
+            // PURPOSE -- lifting them into a shared `-> any` helper makes the string branch come back
+            // as a raw pointer (the int-typed return wins and the string is never boxed).
+            for i in 0..min(len(cols), len(fields))
+                let val = trim(fields[i])
+                let as_num = parse_int(val)
+                if str(as_num) == val
+                    push(row_data, as_num)
+                else
+                    push(row_data, val)
+            push(rows, row_data)
     df_new(cols, rows)

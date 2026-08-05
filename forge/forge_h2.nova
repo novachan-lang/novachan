@@ -33,27 +33,36 @@ fn h2_ACK() -> int
 fn h2_preface() -> string
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
+// ── Big-endian octet encoders ──────────────────────────────────────────────────────────────────────────
+// Every multi-octet field in this file is a big-endian integer split by /,& -- previously open-coded at
+// each of the four use sites, with the 31-bit form (top bit reserved, RFC 7540 §4.1/§6.9) written twice.
+// One named encoder per width, used everywhere.
+
+// PRIVATE: 3 octets — a frame's 24-bit Length field.
+fn _h2_be24(v: int) -> list
+    return [(v / 65536) & 255, (v / 256) & 255, v & 255]
+
+// PRIVATE: 2 octets — a 16-bit SETTINGS identifier.
+fn _h2_be16(v: int) -> list
+    return [(v / 256) & 255, v & 255]
+
+// PRIVATE: 4 octets — a 31-bit value with the reserved top bit CLEARED (a frame header's stream id, and a
+// WINDOW_UPDATE increment).
+fn _h2_be31(v: int) -> list
+    return [(v / 16777216) & 127, (v / 65536) & 255, (v / 256) & 255, v & 255]
+
+// PRIVATE: 4 octets — a full 32-bit value (a SETTINGS value).
+fn _h2_be32(v: int) -> list
+    return [(v / 16777216) & 255, (v / 65536) & 255, (v / 256) & 255, v & 255]
+
 // Encode one frame: the 9-octet header (length = len(payload)) followed by the payload bytes.
 fn h2_frame(ftype: int, flags: int, stream_id: int, payload: list) -> list
-    let length = len(payload)
-    let out = []
-    push(out, (length / 65536) & 255)
-    push(out, (length / 256) & 255)
-    push(out, length & 255)
-    push(out, ftype & 255)
-    push(out, flags & 255)
-    push(out, (stream_id / 16777216) & 127)
-    push(out, (stream_id / 65536) & 255)
-    push(out, (stream_id / 256) & 255)
-    push(out, stream_id & 255)
-    let i = 0
-    while i < length
-        push(out, payload[i])
-        i = i + 1
-    out
+    return [..._h2_be24(len(payload)), ftype & 255, flags & 255, ..._h2_be31(stream_id), ...payload]
 
 // Parse one frame from `buf` at `off`. Returns [ftype, flags, stream_id, payload_off, payload_len, next_off],
 // or [] if fewer than a full frame (header + declared payload) is available yet (caller reads more).
+// NOTE: `[]` here means "not enough bytes yet", a normal streaming outcome, NOT a failure -- so it stays a
+// list rather than becoming err(..). Turning it into a Result would also break every caller.
 fn h2_frame_parse(buf: list, off: int) -> list
     if off + 9 > len(buf)
         return []
@@ -64,41 +73,20 @@ fn h2_frame_parse(buf: list, off: int) -> list
     let payoff = off + 9
     if payoff + length > len(buf)
         return []
-    [ftype, flags, sid, payoff, length, payoff + length]
+    return [ftype, flags, sid, payoff, length, payoff + length]
 
 // Extract a frame's payload bytes (given a parse result).
 fn h2_payload(buf: list, parsed: list) -> list
-    let out = []
-    let i = 0
-    while i < parsed[4]
-        push(out, buf[parsed[3] + i])
-        i = i + 1
-    out
+    return [buf[parsed[3] + i] for i in 0..parsed[4]]
 
 // A SETTINGS frame from [id, value] pairs (each id is 16-bit, value 32-bit; RFC 7540 §6.5). ACK is a
 // zero-length SETTINGS with the ACK flag.
 fn h2_settings(pairs: list) -> list
-    let payload = []
-    let i = 0
-    while i < len(pairs)
-        let p = pairs[i]
-        push(payload, (p[0] / 256) & 255)
-        push(payload, p[0] & 255)
-        push(payload, (p[1] / 16777216) & 255)
-        push(payload, (p[1] / 65536) & 255)
-        push(payload, (p[1] / 256) & 255)
-        push(payload, p[1] & 255)
-        i = i + 1
-    h2_frame(h2_SETTINGS(), 0, 0, payload)
+    return h2_frame(h2_SETTINGS(), 0, 0, flatten([[..._h2_be16(p[0]), ..._h2_be32(p[1])] for p in pairs]))
 
 // WINDOW_UPDATE frame (RFC 7540 §6.9): a 31-bit increment on the given stream (0 = connection-level).
 fn h2_window_update(stream_id: int, increment: int) -> list
-    let payload = []
-    push(payload, (increment / 16777216) & 127)
-    push(payload, (increment / 65536) & 255)
-    push(payload, (increment / 256) & 255)
-    push(payload, increment & 255)
-    h2_frame(h2_WINDOW_UPDATE(), 0, stream_id, payload)
+    return h2_frame(h2_WINDOW_UPDATE(), 0, stream_id, _h2_be31(increment))
 
 // ── Flow control (RFC 7540 §6.9) ───────────────────────────────────────────────────────────────────────
 // A window is just its remaining credit (default 65535). The sender must not send more DATA than the
@@ -109,9 +97,7 @@ fn h2_window_init() -> int
 
 // 1 iff `size` DATA octets fit in `window` (never send past the window; a 0-size frame always fits).
 fn h2_can_send(window: int, size: int) -> int
-    if size <= window
-        return 1
-    0
+    return 1 if size <= window else 0
 
 // The window after sending `size` octets (may go to 0; never send when h2_can_send is 0).
 fn h2_window_consume(window: int, size: int) -> int

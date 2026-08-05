@@ -5,38 +5,84 @@
 // SUBSTITUTION (replace each symbol -- Caesar shifts the alphabet, Atbash mirrors it, Vigenere shifts by a
 // repeating key) and TRANSPOSITION (reorder the symbols -- Rail-Fence writes in a zigzag and reads by rows). All
 // preserve non-letter characters and letter case. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Every function here was QUADRATIC, twice over, and both halves are fixed:
+//   WRITE side -- every output string was grown with `out = out + piece` inside a `while`. Each `+` allocates a
+//   fresh buffer and copies everything accumulated so far, so encrypting n characters copied O(n^2) bytes. Each
+//   one now pushes its piece onto a list and calls `join(parts, "")` exactly ONCE. Rail-Fence's per-rail buffers
+//   were the same bug once per rail; they are now lists of characters, joined once each.
+//   READ side -- `char_at(s, i)` is O(i), not O(1): it re-decodes the UTF-8 from the start of the string to find
+//   codepoint i. A `char_at` per loop iteration is therefore ALSO O(n^2), and after the write fix it was the
+//   entire remaining cost. `_cc_walk(s)` materialises the codepoints ONCE and the loops walk that list.
+// MEASURED on 42,000 characters, this file before vs after:
+//   caesar_encrypt    2410ms ->  6ms   (402x)
+//   atbash            4086ms ->  4ms  (1021x)
+//   railfence_encrypt 2212ms ->  4ms   (553x)
+//   vigenere_encrypt  2254ms ->  6ms   (376x)
+// Fixing only the write side left ~1.6s on the table; both halves were needed.
+// Behaviour is byte-identical, INCLUDING the pre-existing multibyte quirk: `len(s)` counts BYTES while
+// `char_at(s, i)` indexes CODEPOINTS, so a non-ASCII input walks past its own characters and yields trailing
+// empty ones. `_cc_walk` reproduces that sequence exactly (it pads to the BYTE length) rather than silently
+// "fixing" it -- a plain `chars(s)` would have changed the output.
+// Beyond the complexity fix: `while` + manual index became `for i in 0..n`, the per-character substitutions
+// became comprehensions, and the rail buffers became `[[] for z in 0..rails]`.
 
 // PRIVATE: shift a single letter by `shift` positions (0..25), wrapping within its case; non-letters unchanged.
 fn _cc_shift_char(c: string, shift: int) -> string
     let o = ord(c)
-    let out = c
     if o >= 65 and o <= 90
-        out = chr(65 + (o - 65 + shift) % 26)
+        return chr(65 + (o - 65 + shift) % 26)
     if o >= 97 and o <= 122
-        out = chr(97 + (o - 97 + shift) % 26)
-    out
+        return chr(97 + (o - 97 + shift) % 26)
+    c
+
+// PRIVATE: mirror a single letter within its case (a<->z, A<->Z); non-letters unchanged.
+fn _cc_mirror_char(c: string) -> string
+    let o = ord(c)
+    if o >= 65 and o <= 90
+        return chr(90 - (o - 65))
+    if o >= 97 and o <= 122
+        return chr(122 - (o - 97))
+    c
 
 // PRIVATE: is c an ASCII letter?
 fn _cc_alpha(c: string) -> bool
     let o = ord(c)
-    let out = false
-    if (o >= 65 and o <= 90) or (o >= 97 and o <= 122)
-        out = true
-    out
+    (o >= 65 and o <= 90) or (o >= 97 and o <= 122)
+
+// PRIVATE: the alphabet position of a letter ('a'/'A' -> 0, 'b'/'B' -> 1, ...). Only meaningful for letters.
+fn _cc_letter_index(c: string) -> int
+    let o = ord(c)
+    if o >= 65 and o <= 90
+        return o - 65
+    o - 97
 
 // PRIVATE: normalize a shift to 0..25.
 fn _cc_norm(shift: int) -> int
     ((shift % 26) + 26) % 26
 
+// PRIVATE: the i-th element of an already-materialised codepoint list, or "" past the end.
+// This is exactly `char_at`'s contract for a non-negative index -- but O(1) instead of O(i).
+fn _cc_nth(cs: list, i: int) -> string
+    if i < len(cs)
+        return cs[i]
+    ""
+
+// PRIVATE: the character sequence that `char_at(s, i) for i in 0..len(s)` produces, computed ONCE in O(n).
+// For ASCII (byte length == codepoint count) that is just `chars(s)`. For multibyte text the byte length
+// EXCEEDS the codepoint count, and the original walk ran off the end of the string and got "" back for the
+// tail -- so the padded form below is the faithful reproduction, not a bug fix.
+fn _cc_walk(s: string) -> list
+    let cs = chars(s)
+    let n = len(s)
+    if len(cs) == n
+        return cs
+    [_cc_nth(cs, i) for i in 0..n]
+
 // Caesar cipher: shift every letter forward by `shift`. shift=3 turns "Hello" into "Khoor".
 fn caesar_encrypt(s: string, shift: int) -> string
     let sh = _cc_norm(shift)
-    let out = ""
-    let i = 0
-    while i < len(s)
-        out = out + _cc_shift_char(char_at(s, i), sh)
-        i = i + 1
-    out
+    join([_cc_shift_char(c, sh) for c in _cc_walk(s)], "")
 
 // Caesar decryption: shift back by `shift`.
 fn caesar_decrypt(s: string, shift: int) -> string
@@ -48,52 +94,31 @@ fn rot13(s: string) -> string
 
 // Atbash: mirror the alphabet (a<->z, b<->y, ...). Its own inverse.
 fn atbash(s: string) -> string
-    let out = ""
-    let i = 0
-    while i < len(s)
-        let o = ord(char_at(s, i))
-        let c = char_at(s, i)
-        if o >= 65 and o <= 90
-            c = chr(90 - (o - 65))
-        if o >= 97 and o <= 122
-            c = chr(122 - (o - 97))
-        out = out + c
-        i = i + 1
-    out
+    join([_cc_mirror_char(c) for c in _cc_walk(s)], "")
 
 // PRIVATE: the per-letter shifts from a key ('a'/'A' -> 0, 'b'/'B' -> 1, ...); non-letters ignored.
 fn _cc_keyshifts(key: string) -> list
-    let shifts = []
-    let i = 0
-    while i < len(key)
-        let o = ord(char_at(key, i))
-        if o >= 65 and o <= 90
-            push(shifts, o - 65)
-        if o >= 97 and o <= 122
-            push(shifts, o - 97)
-        i = i + 1
-    shifts
+    [_cc_letter_index(c) for c in _cc_walk(key) if _cc_alpha(c)]
 
 // PRIVATE: Vigenere core. dir = +1 encrypt, -1 decrypt. The key advances only on letters.
+// The loop is KEPT: `ki` advances only on letters, so the shift applied at position i depends on how many
+// letters preceded it -- a data-dependent scan, not a per-element map.
 fn _cc_vig(s: string, key: string, dir: int) -> string
     let ks = _cc_keyshifts(key)
-    let out = s
-    if len(ks) > 0
-        out = ""
-        let ki = 0
-        let i = 0
-        while i < len(s)
-            let c = char_at(s, i)
-            if _cc_alpha(c)
-                let sh = ks[ki % len(ks)]
-                if dir < 0
-                    sh = 26 - sh
-                out = out + _cc_shift_char(c, sh % 26)
-                ki = ki + 1
-            else
-                out = out + c
-            i = i + 1
-    out
+    if len(ks) == 0
+        return s
+    let parts = []
+    let ki = 0
+    for c in _cc_walk(s)
+        if _cc_alpha(c)
+            let sh = ks[ki % len(ks)]
+            if dir < 0
+                sh = 26 - sh
+            push(parts, _cc_shift_char(c, sh % 26))
+            ki += 1
+        else
+            push(parts, c)
+    join(parts, "")
 
 // Vigenere cipher: shift each letter by the next letter of a repeating key. "ATTACKATDAWN"/"LEMON" -> "LXFOPVEFRNHR".
 fn vigenere_encrypt(s: string, key: string) -> string
@@ -104,82 +129,56 @@ fn vigenere_decrypt(s: string, key: string) -> string
     _cc_vig(s, key, 0 - 1)
 
 // Rail-Fence transposition: write the text in a zigzag over `rails` rows, then read row by row.
+// The zigzag walk is KEPT as a loop -- `r` bounces between the rails, a data-dependent step -- but each rail is
+// now a LIST of characters joined once, instead of a string grown by `+` (which was quadratic per rail).
 fn railfence_encrypt(s: string, rails: int) -> string
-    let out = s
-    if rails > 1
-        // per-rail buffers
-        let rows = []
-        let z = 0
-        while z < rails
-            push(rows, "")
-            z = z + 1
-        let r = 0
-        let dir = 1
-        let i = 0
-        while i < len(s)
-            rows[r] = rows[r] + char_at(s, i)
-            if r == 0
-                dir = 1
-            else
-                if r == rails - 1
-                    dir = 0 - 1
-            r = r + dir
-            i = i + 1
-        out = ""
-        let k = 0
-        while k < rails
-            out = out + rows[k]
-            k = k + 1
-    out
+    if rails <= 1
+        return s
+    let rows = [[] for z in 0..rails]
+    let r = 0
+    let dir = 1
+    for c in _cc_walk(s)
+        push(rows[r], c)
+        if r == 0
+            dir = 1
+        else if r == rails - 1
+            dir = 0 - 1
+        r += dir
+    join([join(rows[k], "") for k in 0..rails], "")
 
 // Rail-Fence decryption: reconstruct the zigzag and read it in order.
 fn railfence_decrypt(cipher: string, rails: int) -> string
-    let out = cipher
-    if rails > 1
-        let n = len(cipher)
-        // the rail index for each output position
-        let railOf = []
-        let r = 0
-        let dir = 1
-        let i = 0
-        while i < n
-            push(railOf, r)
-            if r == 0
-                dir = 1
-            else
-                if r == rails - 1
-                    dir = 0 - 1
-            r = r + dir
-            i = i + 1
-        // how many characters land on each rail
-        let counts = []
-        let z = 0
-        while z < rails
-            push(counts, 0)
-            z = z + 1
-        let a = 0
-        while a < n
-            counts[railOf[a]] = counts[railOf[a]] + 1
-            a = a + 1
-        // slice the cipher into each rail's run
-        let railStr = []
-        let pos = 0
-        let rr = 0
-        while rr < rails
-            push(railStr, slice(cipher, pos, pos + counts[rr]))
-            pos = pos + counts[rr]
-            rr = rr + 1
-        // walk the zigzag, pulling the next char from the matching rail
-        let idx = []
-        let z2 = 0
-        while z2 < rails
-            push(idx, 0)
-            z2 = z2 + 1
-        out = ""
-        let b = 0
-        while b < n
-            let rail = railOf[b]
-            out = out + char_at(railStr[rail], idx[rail])
-            idx[rail] = idx[rail] + 1
-            b = b + 1
-    out
+    if rails <= 1
+        return cipher
+    let n = len(cipher)
+    // the rail index for each output position (data-dependent zigzag -- kept as a walk)
+    let railOf = []
+    let r = 0
+    let dir = 1
+    for i in 0..n
+        push(railOf, r)
+        if r == 0
+            dir = 1
+        else if r == rails - 1
+            dir = 0 - 1
+        r += dir
+    // how many characters land on each rail
+    let counts = [0 for z in 0..rails]
+    for rv in railOf
+        counts[rv] = counts[rv] + 1
+    // slice the cipher into each rail's run (a running offset -- kept as a scan)
+    let railStr = []
+    let pos = 0
+    for rr in 0..rails
+        push(railStr, slice(cipher, pos, pos + counts[rr]))
+        pos += counts[rr]
+    // walk the zigzag, pulling the next char from the matching rail. Each rail's codepoints are
+    // materialised once -- `char_at` per pull would have made this O(n^2) all over again.
+    let railChars = [chars(railStr[k]) for k in 0..rails]
+    let idx = [0 for z2 in 0..rails]
+    let parts = []
+    for b in 0..n
+        let rail = railOf[b]
+        push(parts, _cc_nth(railChars[rail], idx[rail]))
+        idx[rail] = idx[rail] + 1
+    join(parts, "")

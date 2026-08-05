@@ -37,22 +37,12 @@ import std/net/http2 as h2w
 // 32-bit length of payload.  Uses division + modulo (not bit-shifts) per NOVA portability rules.
 // Vector: grpc_frame([1,2,3]) -> [0, 0, 0, 0, 3, 1, 2, 3]
 fn grpc_frame(payload: list) -> list
-    let out = []
-    push(out, 0)
     let n = len(payload)
     let b0 = (n / 16777216) % 256
     let b1 = (n / 65536) % 256
     let b2 = (n / 256) % 256
     let b3 = n % 256
-    push(out, b0)
-    push(out, b1)
-    push(out, b2)
-    push(out, b3)
-    let i = 0
-    while i < len(payload)
-        push(out, payload[i])
-        i = i + 1
-    out
+    [0, b0, b1, b2, b3, ...payload]
 
 // grpc_deframe(buf, off) -> list
 // Read ONE framed gRPC message from byte-list `buf` starting at offset `off`.
@@ -74,11 +64,8 @@ fn grpc_deframe(buf: list, off: int) -> list
     let length = buf[off + 1] * 16777216 + buf[off + 2] * 65536 + buf[off + 3] * 256 + buf[off + 4]
     if off + 5 + length > n
         return [[], off, -1]
-    let payload = []
-    let i = 0
-    while i < length
-        push(payload, buf[off + 5 + i])
-        i = i + 1
+    // bounds already proven above (off+5+length <= n), so this slice can never read past the end
+    let payload = buf[off + 5:off + 5 + length]
     let next_off = off + 5 + length
     [payload, next_off, flag]
 
@@ -174,10 +161,7 @@ fn grpc_unavailable() -> int
 // Callers write these as HTTP/2 trailers on the response stream.
 // Example: grpc_trailers(grpc_ok(), "") -> grpc-status="0", grpc-message=""
 fn grpc_trailers(status: int, message: string) -> dict
-    let t = {}
-    t["grpc-status"] = str(status)
-    t["grpc-message"] = message
-    t
+    {"grpc-status": str(status), "grpc-message": message}
 
 // grpc_content_type() -> string
 // The required Content-Type for gRPC over HTTP/2.
@@ -248,13 +232,8 @@ fn grpc_register(smap: dict, path: string, handler) -> dict
 // The h2c server should write result["framed"] then grpc_trailers(status, message).
 // Unknown paths return grpc_unimplemented() (12); no try/catch — handlers are assumed sound.
 fn grpc_dispatch(smap: dict, path: string, request_body: list) -> dict
-    if contains(smap, path) == false
-        let emsg = "method not implemented: " + path
-        let miss = {}
-        miss["framed"] = []
-        miss["status"] = grpc_unimplemented()
-        miss["message"] = emsg
-        return miss
+    if path in smap == false
+        return {"framed": [], "status": grpc_unimplemented(), "message": "method not implemented: {path}"}
     let dfr = grpc_deframe(request_body, 0)
     if dfr[2] == -1
         return grpc_response_error(grpc_invalid_argument(), "malformed gRPC frame")
@@ -268,12 +247,7 @@ fn grpc_dispatch(smap: dict, path: string, request_body: list) -> dict
     let payload = dfr[0]
     let h = smap[path]
     let reply = h(payload)
-    let framed = grpc_frame(reply)
-    let res = {}
-    res["framed"] = framed
-    res["status"] = grpc_ok()
-    res["message"] = ""
-    res
+    {"framed": grpc_frame(reply), "status": grpc_ok(), "message": ""}
 
 // grpc_response_ok(reply_payload) -> dict
 // Convenience for building a success response envelope from a handler.
@@ -281,11 +255,7 @@ fn grpc_dispatch(smap: dict, path: string, request_body: list) -> dict
 // Usage inside an h2c server:
 //   let result = grpc_response_ok(encode_my_response(resp))
 fn grpc_response_ok(reply_payload: list) -> dict
-    let r = {}
-    r["framed"] = grpc_frame(reply_payload)
-    r["status"] = grpc_ok()
-    r["message"] = ""
-    r
+    {"framed": grpc_frame(reply_payload), "status": grpc_ok(), "message": ""}
 
 // grpc_response_error(status, message) -> dict
 // Convenience for building an error response envelope.
@@ -294,11 +264,7 @@ fn grpc_response_ok(reply_payload: list) -> dict
 // The "framed" field is an empty list — no DATA frame body for error responses.
 // Usage: return grpc_response_error(grpc_not_found(), "user not found")
 fn grpc_response_error(status: int, message: string) -> dict
-    let e = {}
-    e["framed"] = []
-    e["status"] = status
-    e["message"] = message
-    e
+    {"framed": [], "status": status, "message": message}
 
 // ════════════════════════════════════════════════════════════════════════════
 // ── unary CLIENT (bytes-native, HTTP/2 wire) ────────────────────────────────
@@ -452,10 +418,8 @@ fn _grpc_hpack_encode_header(name: string, value: string) -> bytes
 // already produces it correctly).
 fn grpc_hpack_encode_headers(headers: list) -> bytes
     let out = bytes(0)
-    let i = 0
-    while i < len(headers)
-        out = bytes_concat(out, _grpc_hpack_encode_header(headers[i][0], headers[i][1]))
-        i = i + 1
+    for hd in headers
+        out = bytes_concat(out, _grpc_hpack_encode_header(hd[0], hd[1]))
     out
 
 // grpc_hpack_decode_headers(buf, pos) -> list of [name, value]
@@ -548,7 +512,7 @@ fn grpc_hpack_decode_headers(buf: bytes, pos: int) -> list
 // Build the gRPC :path from a fully-qualified service name and a method name.
 // Example: grpc_client_path("echo.Echo", "Say") -> "/echo.Echo/Say"
 fn grpc_client_path(service: string, method: string) -> string
-    "/" + service + "/" + method
+    "/{service}/{method}"
 
 // grpc_client_pseudo_headers(authority, scheme, service, method) -> list
 // Build the full HEADERS field list for a gRPC unary request, in RFC 7540
@@ -564,14 +528,7 @@ fn grpc_client_path(service: string, method: string) -> string
 // Vector: grpc_client_pseudo_headers("example.com","https","echo.Echo","Say")
 //   contains [":method","POST"] and ["content-type","application/grpc+proto"]
 fn grpc_client_pseudo_headers(authority: string, scheme: string, service: string, method: string) -> list
-    let h = []
-    push(h, [":method", "POST"])
-    push(h, [":scheme", scheme])
-    push(h, [":path", grpc_client_path(service, method)])
-    push(h, [":authority", authority])
-    push(h, ["content-type", grpc_content_type()])
-    push(h, ["te", "trailers"])
-    h
+    [[":method", "POST"], [":scheme", scheme], [":path", grpc_client_path(service, method)], [":authority", authority], ["content-type", grpc_content_type()], ["te", "trailers"]]
 
 // ── frame-type / flag constants (RFC 7540 §11.2 / §6.2 / §6.1) ─────────────────
 
@@ -655,10 +612,10 @@ fn grpc_client_parse_response(buf: bytes) -> dict
                 if ftype == _grpc_h2_data_type()
                     raw_data = bytes_concat(raw_data, bytes_slice(buf, body_start, body_end))
                 else if ftype == _grpc_h2_headers_type()
-                    let hs = grpc_hpack_decode_headers(buf, body_start)
-                    let j = 0
-                    while j < len(hs)
-                        if hs[j][0] == "grpc-status"
+                    // `hs` is ALREADY-decoded header text (the wire scan above is untouched), so this
+                    // is a plain value iteration: every header is inspected, last one wins, no early exit.
+                    for hd in grpc_hpack_decode_headers(buf, body_start)
+                        if hd[0] == "grpc-status"
                             // SENTINEL/ABSENT-VALUE COLLISION hardening: plain
                             // parse_int() is atoi/atoll semantics — it silently
                             // returns 0 for a non-numeric, empty, or garbage
@@ -672,20 +629,15 @@ fn grpc_client_parse_response(buf: bytes) -> dict
                             // malformed value keeps `status` at its current
                             // sentinel (defaults to -1 = "no valid grpc-status
                             // trailer seen") instead of coercing to OK.
-                            let sr = parse_int_safe(hs[j][1])
+                            let sr = parse_int_safe(hd[1])
                             if is_ok(sr)
                                 status = unwrap(sr)
                             else
                                 status = 0 - 1
-                        else if hs[j][0] == "grpc-message"
-                            message = hs[j][1]
-                        j = j + 1
+                        else if hd[0] == "grpc-message"
+                            message = hd[1]
                 pos = body_end
-    let res = {}
-    res["status"] = status
-    res["message"] = message
-    res["data"] = raw_data
-    res
+    {"status": status, "message": message, "data": raw_data}
 
 // grpc_client_response_message(res) -> bytes
 // Deframe the accumulated DATA payload from grpc_client_parse_response() down to

@@ -9,8 +9,10 @@
 // child, the containing subtree at least doubles), the total work is O(n log n).
 //
 // This module computes, for every node, the NUMBER OF DISTINCT VALUES (colors) in its subtree, and the
-// count of the MOST FREQUENT value in its subtree -- the two canonical DSU-on-tree outputs. The core
-// add/remove-over-Euler-order machinery is structured so other aggregates can reuse the same pattern.
+// count of the MOST FREQUENT value in its subtree -- the two canonical DSU-on-tree outputs. The
+// small-to-large traversal itself lives ONCE, in `_dot_run`, parameterised by three strategy functions
+// (add / erase / after-erase) -- so a new aggregate is three small functions, not another copy of the
+// 70-line skeleton.
 //
 // Tree: n nodes 0..n-1, parent array (parent[root] = -1), a per-node integer value ("color"), and a root.
 //
@@ -20,268 +22,158 @@
 // LEAF (imports nothing).
 
 fn _dot_children(n: int, parent: list) -> list
-    let children = []
-    let i = 0
-    while i < n
-        push(children, [])
-        i = i + 1
-    let v = 0
-    while v < n
+    let children = [[] for i in 0..n]
+    for v in 0..n
         if parent[v] >= 0
             push(children[parent[v]], v)
-        v = v + 1
     return children
 
 // Iterative subtree sizes + heavy child, and an Euler order (tin) so a subtree is a contiguous range.
 // Returns [size, heavy, tin, euler] where euler[tin[v] .. tin[v]+size[v]-1] are the nodes of subtree(v).
 fn _dot_prep(n: int, root: int, children: list) -> list
-    let size = []
-    let heavy = []
-    let tin = []
-    let i = 0
-    while i < n
-        push(size, 1)
-        push(heavy, 0 - 1)
-        push(tin, 0)
-        i = i + 1
+    let size = [1 for i in 0..n]
+    let heavy = [0 - 1 for i in 0..n]
+    let tin = [0 for i in 0..n]
     // post-order for sizes/heavy
     let post = []
     let stack = [root]
     while len(stack) > 0
-        let node = stack[len(stack) - 1]
-        let ns = []
-        let si = 0
-        while si < len(stack) - 1
-            push(ns, stack[si])
-            si = si + 1
-        stack = ns
+        let node = pop(stack)
         push(post, node)
-        let ch = children[node]
-        let ci = 0
-        while ci < len(ch)
-            push(stack, ch[ci])
-            ci = ci + 1
-    let idx = len(post) - 1
-    while idx >= 0
-        let node = post[idx]
-        let ch = children[node]
+        for c in children[node]
+            push(stack, c)
+    // walk `post` backwards: a node's children are always seen before the node itself
+    for k in 0..len(post)
+        let node = post[len(post) - 1 - k]
         let maxsz = 0
         let hc = 0 - 1
-        let ci = 0
-        while ci < len(ch)
-            let c = ch[ci]
+        for c in children[node]
             size[node] = size[node] + size[c]
             if size[c] > maxsz
                 maxsz = size[c]
                 hc = c
-            ci = ci + 1
         heavy[node] = hc
-        idx = idx - 1
     // Euler order (pre-order DFS) so subtree(v) = euler[tin[v] .. tin[v]+size[v]-1]
     let euler = []
-    let timer_box = [0]
+    let timer = 0
     let stack2 = [root]
     while len(stack2) > 0
-        let node = stack2[len(stack2) - 1]
-        let ns = []
-        let si = 0
-        while si < len(stack2) - 1
-            push(ns, stack2[si])
-            si = si + 1
-        stack2 = ns
-        tin[node] = timer_box[0]
+        let node = pop(stack2)
+        tin[node] = timer
         push(euler, node)
-        timer_box[0] = timer_box[0] + 1
+        timer += 1
         // push children in reverse so pre-order is left-to-right
         let ch = children[node]
-        let ci = len(ch) - 1
-        while ci >= 0
-            push(stack2, ch[ci])
-            ci = ci - 1
+        for k in 0..len(ch)
+            push(stack2, ch[len(ch) - 1 - k])
     return [size, heavy, tin, euler]
 
-// DSU-on-tree computing #distinct colors per subtree. Iterative (explicit work stack), small-to-large.
-fn dot_distinct_per_subtree(n: int, parent: list, root: int, color: list) -> list
+// ── the aggregate strategies ────────────────────────────────────────────────────────────────────────
+// Every strategy shares one contract: `freq` is the color->count table of the ACTIVE window, and box[0]
+// is the running aggregate that gets recorded as answer[node]. add/erase fold ONE color in/out;
+// after-erase runs once per erased subtree, for aggregates that cannot be maintained incrementally.
+
+// distinct: box[0] = number of colors with a non-zero count
+fn _dot_add_one(freq: dict, box: list, col: int)
+    let key = str(col)
+    let f = get(freq, key, 0)
+    if f == 0
+        box[0] = box[0] + 1
+    freq[key] = f + 1
+
+fn _dot_erase_one(freq: dict, box: list, col: int)
+    let key = str(col)
+    let f = get(freq, key, 0)
+    freq[key] = f - 1
+    if f - 1 == 0
+        box[0] = box[0] - 1
+
+// the distinct counter is exact incrementally, so it needs no rescan after an erase
+fn _dot_after_erase_none(freq: dict, box: list) -> int
+    return 0
+
+// mode: box[0] = the largest count in `freq`
+fn _dot_add_mode(freq: dict, box: list, col: int)
+    let key = str(col)
+    let f = get(freq, key, 0) + 1
+    freq[key] = f
+    box[0] = max(box[0], f)
+
+fn _dot_erase_mode(freq: dict, box: list, col: int)
+    let key = str(col)
+    freq[key] = get(freq, key, 0) - 1
+
+// a running MAX cannot be decremented incrementally (removing the current mode leaves an unknown
+// runner-up), so the mode aggregate rescans the surviving counts once per erased subtree
+fn _dot_after_erase_mode(freq: dict, box: list) -> int
+    box[0] = _dot_recompute_max(freq)
+    return 0
+
+fn _dot_recompute_max(freq: dict) -> int
+    return reduce(values(freq), (mx, v) => max(mx, v), 0)
+
+// ── the shared small-to-large traversal ─────────────────────────────────────────────────────────────
+// Iterative (explicit work stack), with a frame [node, phase]:
+//   phase 0 = enter    -- schedule light children (compute THEN erase), then the heavy child (kept)
+//   phase 1 = finalize -- heavy child's data is already present; add this node + every light subtree
+//   phase 2 = erase    -- undo a light child's whole subtree contribution
+// answer[node] is box[0] at finalize time, i.e. the aggregate over the FULL subtree of `node`.
+fn _dot_run(n: int, parent: list, root: int, color: list, add_one, erase_one, after_erase) -> list
     let children = _dot_children(n, parent)
     let prep = _dot_prep(n, root, children)
     let size = prep[0]
     let heavy = prep[1]
     let tin = prep[2]
     let euler = prep[3]
-    let answer = []
-    let i = 0
-    while i < n
-        push(answer, 0)
-        i = i + 1
-    // Global frequency table (by color) shared across the recursion, with a running distinct count.
+    let answer = [0 for i in 0..n]
+    // Global frequency table (by color) shared across the recursion, plus the running aggregate box.
     let freq = {}
-    let distinct_box = [0]
-    // We simulate the recursion with an explicit stack of frames.
-    // Each frame: [node, phase] phase 0 = enter, 1 = after processing children (compute answer).
-    // We process light children first (adding then REMOVING their contribution), keep the heavy child.
+    let box = [0]
     let stack = [[root, 0]]
     while len(stack) > 0
-        let top = stack[len(stack) - 1]
-        let ns = []
-        let si = 0
-        while si < len(stack) - 1
-            push(ns, stack[si])
-            si = si + 1
-        stack = ns
+        let top = pop(stack)
         let node = top[0]
         let phase = top[1]
         if phase == 0
-            // Enter: first recurse into LIGHT children (each fully computed then erased),
-            // then recurse into the HEAVY child (kept), then finalize this node in phase 1.
-            // We push in reverse order of desired execution.
-            // desired: light children (compute+erase) ... then heavy (keep) ... then finalize(node)
-            // Because stack is LIFO, push finalize last-executed items first.
+            // Because the stack is LIFO, push in REVERSE order of desired execution:
+            // light children (compute+erase) ... then heavy (keep) ... then finalize(node).
             push(stack, [node, 1])
             let hc = heavy[node]
-            // heavy child: recurse but KEEP its data (no erase)
             if hc != 0 - 1
                 push(stack, [hc, 0])
-            // light children: each is a "compute then erase" episode. We encode erase as phase 2.
             let ch = children[node]
-            let ci = len(ch) - 1
-            while ci >= 0
-                let c = ch[ci]
+            for k in 0..len(ch)
+                let c = ch[len(ch) - 1 - k]
                 if c != hc
                     // erase marker first (executes AFTER the child subtree is computed), then enter child
                     push(stack, [c, 2])
                     push(stack, [c, 0])
-                ci = ci - 1
         else
             if phase == 2
-                // Erase: remove the whole subtree(node) contribution from freq/distinct.
-                let start = tin[node]
-                let end = tin[node] + size[node] - 1
-                let p = start
-                while p <= end
-                    let col = color[euler[p]]
-                    let key = str(col)
-                    let f = get(freq, key, 0)
-                    freq[key] = f - 1
-                    if f - 1 == 0
-                        distinct_box[0] = distinct_box[0] - 1
-                    p = p + 1
+                let estart = tin[node]
+                let eend = tin[node] + size[node]
+                for p in estart..eend
+                    erase_one(freq, box, color[euler[p]])
+                after_erase(freq, box)
             else
-                // phase 1 finalize: at this point, the heavy child's data is already present,
-                // and all light children were computed+erased. Now ADD this node's own light-subtree
-                // contributions: the node itself plus all LIGHT children's subtrees (heavy already in).
-                // Add node itself:
-                _dot_add_one(freq, distinct_box, color[node])
-                // Add each light child's ENTIRE subtree:
+                // finalize: add this node itself, then every LIGHT child's ENTIRE subtree
+                // (the heavy child's contribution is already in `freq`).
+                add_one(freq, box, color[node])
                 let hc = heavy[node]
-                let ch = children[node]
-                let ci = 0
-                while ci < len(ch)
-                    let c = ch[ci]
+                for c in children[node]
                     if c != hc
-                        let start = tin[c]
-                        let end = tin[c] + size[c] - 1
-                        let p = start
-                        while p <= end
-                            _dot_add_one(freq, distinct_box, color[euler[p]])
-                            p = p + 1
-                    ci = ci + 1
-                // Now freq/distinct reflect the FULL subtree(node); record the answer.
-                answer[node] = distinct_box[0]
+                        let astart = tin[c]
+                        let aend = tin[c] + size[c]
+                        for p in astart..aend
+                            add_one(freq, box, color[euler[p]])
+                // Now freq/box reflect the FULL subtree(node); record the answer.
+                answer[node] = box[0]
     return answer
 
-fn _dot_add_one(freq: dict, distinct_box: list, col: int)
-    let key = str(col)
-    let f = get(freq, key, 0)
-    if f == 0
-        distinct_box[0] = distinct_box[0] + 1
-    freq[key] = f + 1
+// DSU-on-tree computing #distinct colors per subtree.
+fn dot_distinct_per_subtree(n: int, parent: list, root: int, color: list) -> list
+    return _dot_run(n, parent, root, color, _dot_add_one, _dot_erase_one, _dot_after_erase_none)
 
 // DSU-on-tree computing the MODE count (frequency of the most common color) per subtree.
-// Same small-to-large skeleton but tracks a running max-frequency alongside freq.
 fn dot_mode_count_per_subtree(n: int, parent: list, root: int, color: list) -> list
-    let children = _dot_children(n, parent)
-    let prep = _dot_prep(n, root, children)
-    let size = prep[0]
-    let heavy = prep[1]
-    let tin = prep[2]
-    let euler = prep[3]
-    let answer = []
-    let i = 0
-    while i < n
-        push(answer, 0)
-        i = i + 1
-    let freq = {}
-    // max_box[0] = current max frequency in the active window
-    let max_box = [0]
-    let stack = [[root, 0]]
-    while len(stack) > 0
-        let top = stack[len(stack) - 1]
-        let ns = []
-        let si = 0
-        while si < len(stack) - 1
-            push(ns, stack[si])
-            si = si + 1
-        stack = ns
-        let node = top[0]
-        let phase = top[1]
-        if phase == 0
-            push(stack, [node, 1])
-            let hc = heavy[node]
-            if hc != 0 - 1
-                push(stack, [hc, 0])
-            let ch = children[node]
-            let ci = len(ch) - 1
-            while ci >= 0
-                let c = ch[ci]
-                if c != hc
-                    push(stack, [c, 2])
-                    push(stack, [c, 0])
-                ci = ci - 1
-        else
-            if phase == 2
-                // erase subtree(node) AND recompute max from scratch over remaining freq
-                let start = tin[node]
-                let end = tin[node] + size[node] - 1
-                let p = start
-                while p <= end
-                    let key = str(color[euler[p]])
-                    freq[key] = get(freq, key, 0) - 1
-                    p = p + 1
-                // recompute max (simple: scan the values that remain non-zero)
-                max_box[0] = _dot_recompute_max(freq)
-            else
-                // finalize: add node + light children subtrees, tracking max
-                _dot_add_mode(freq, max_box, color[node])
-                let hc = heavy[node]
-                let ch = children[node]
-                let ci = 0
-                while ci < len(ch)
-                    let c = ch[ci]
-                    if c != hc
-                        let start = tin[c]
-                        let end = tin[c] + size[c] - 1
-                        let p = start
-                        while p <= end
-                            _dot_add_mode(freq, max_box, color[euler[p]])
-                            p = p + 1
-                    ci = ci + 1
-                answer[node] = max_box[0]
-    return answer
-
-fn _dot_add_mode(freq: dict, max_box: list, col: int)
-    let key = str(col)
-    let f = get(freq, key, 0) + 1
-    freq[key] = f
-    if f > max_box[0]
-        max_box[0] = f
-
-fn _dot_recompute_max(freq: dict) -> int
-    let ks = keys(freq)
-    let mx = 0
-    let i = 0
-    while i < len(ks)
-        let v = get(freq, ks[i], 0)
-        if v > mx
-            mx = v
-        i = i + 1
-    return mx
+    return _dot_run(n, parent, root, color, _dot_add_mode, _dot_erase_mode, _dot_after_erase_mode)

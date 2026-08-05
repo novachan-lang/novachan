@@ -25,7 +25,23 @@
 //   xb_rank(basis) -> int                   number of independent vectors
 //   xb_span_size(basis) -> int              number of distinct reachable XOR values = 2^rank
 //   xb_kth(basis, k) -> int                 k-th smallest distinct XOR value (1-based; k=1 -> 0)
-// LEAF (imports nothing).
+//
+// RAISED 2026-08-05 (high-level pass). Every `while` + manual index here walked a FIXED bound, so all
+// eleven became `for ... in 0..n` (the three that scan high-bit-to-low-bit index as `bits - 1 - k`, which
+// is the honest way to say "descending over a fixed range" -- NOVA ranges only ascend). List-building
+// loops became comprehensions, the two folds became `min` / `reduce`, and `_xb_sort` -- a byte-for-byte
+// duplicate of std/core/sort's insertion sort -- now delegates to it. `_xb_pow2` went from an O(p) repeated
+// multiply to a single shift.
+//
+// NOT a leaf any more: it imports std/core/sort (that is the ONLY import).
+//
+// TWO THINGS DELIBERATELY LEFT ALONE, because changing them would change answers:
+//   * `xb_kth` still returns the SENTINEL -1 when k is out of range rather than a Result. Callers depend
+//     on the int contract; converting it is an API decision, not a refactor.
+//   * The bit test stays `(cur / _xb_pow2(p)) % 2` and is NOT rewritten as `(cur >> p) & 1`. They agree
+//     for non-negative values only: division truncates toward zero, `>>` floors, so for a negative input
+//     the two disagree. The division is what shipped, so the division stays.
+import std/core/sort
 
 // We use BITS = 62 to stay safely within signed i64 (bit 63 is the sign bit; NOVA ints are i64).
 fn _xb_bits() -> int
@@ -33,20 +49,17 @@ fn _xb_bits() -> int
 
 // Create an empty basis: a list of BITS zero slots.
 fn xb_new() -> list
-    let b = []
-    let i = 0
-    let bits = _xb_bits()
-    while i < bits
-        push(b, 0)
-        i = i + 1
-    return b
+    return [0 for _ in 0.._xb_bits()]
 
 // Insert value v into the basis (in place; also returns whether rank increased).
 // Reduces v against existing slots from the highest bit down.
+// The loop STAYS a loop -- it short-circuits the moment it finds an empty slot -- but the bound is fixed,
+// so it is a `for` over the range with the index mirrored to walk high bit -> low bit.
 fn xb_insert(basis: list, v: int) -> bool
     let cur = v
-    let p = _xb_bits() - 1
-    while p >= 0
+    let bits = _xb_bits()
+    for k in 0..bits
+        let p = bits - 1 - k
         let bit = (cur / _xb_pow2(p)) % 2
         if bit == 1
             let slot = basis[p]
@@ -54,60 +67,44 @@ fn xb_insert(basis: list, v: int) -> bool
                 // Empty slot: cur becomes a new independent basis vector here
                 basis[p] = cur
                 return true
-            else
-                // Reduce cur by the slot (XOR)
-                cur = _xb_xor(cur, slot)
-        p = p - 1
+            // Reduce cur by the slot (XOR)
+            cur = _xb_xor(cur, slot)
     // cur reduced to 0 -> already in span, rank unchanged
     return false
 
 // Build a basis from a list of numbers.
 fn xb_build(nums: list) -> list
     let b = xb_new()
-    let i = 0
-    while i < len(nums)
-        let ignore = xb_insert(b, nums[i])
-        i = i + 1
+    for v in nums
+        let ignore = xb_insert(b, v)
     return b
 
 // Can `target` be written as an XOR of a subset of the inserted numbers?
-// Reduce target by the basis; if it collapses to 0, yes.
+// Reduce target by the basis; if it collapses to 0, yes. Short-circuits on a missing pivot, so it stays
+// a loop -- but over the fixed range.
 fn xb_can_represent(basis: list, target: int) -> bool
     let cur = target
-    let p = _xb_bits() - 1
-    while p >= 0
+    let bits = _xb_bits()
+    for k in 0..bits
+        let p = bits - 1 - k
         let bit = (cur / _xb_pow2(p)) % 2
         if bit == 1
             let slot = basis[p]
             if slot == 0
                 return false
             cur = _xb_xor(cur, slot)
-        p = p - 1
     return cur == 0
 
-// Maximum XOR value achievable from any subset.
+// Maximum XOR value achievable from any subset: fold the slots high-bit-to-low, keeping each XOR that
+// raises the running value. That is exactly `max(acc, acc ^ slot)`, and an EMPTY slot is already a no-op
+// under it (acc ^ 0 == acc, so the max keeps acc) -- which is why the old `if slot != 0` guard is gone
+// rather than lost. `reverse` returns a NEW list, so the caller's basis is untouched.
 fn xb_max_xor(basis: list) -> int
-    let res = 0
-    let p = _xb_bits() - 1
-    while p >= 0
-        let slot = basis[p]
-        if slot != 0
-            // If XOR-ing slot increases res, do it
-            let cand = _xb_xor(res, slot)
-            if cand > res
-                res = cand
-        p = p - 1
-    return res
+    return reduce(reverse(basis), (acc, slot) => max(acc, acc ^ slot), 0)
 
-// Number of independent basis vectors (rank).
+// Number of independent basis vectors (rank) = how many slots are occupied.
 fn xb_rank(basis: list) -> int
-    let cnt = 0
-    let p = 0
-    while p < _xb_bits()
-        if basis[p] != 0
-            cnt = cnt + 1
-        p = p + 1
-    return cnt
+    return len([slot for slot in basis if slot != 0])
 
 // Number of distinct reachable XOR values = 2^rank.
 fn xb_span_size(basis: list) -> int
@@ -124,44 +121,31 @@ fn xb_min_xor(basis: list) -> int
     if len(reduced) == 0
         return 0
     // The minimum nonzero XOR is the smallest reduced vector.
-    let mn = reduced[0]
-    let i = 1
-    while i < len(reduced)
-        if reduced[i] < mn
-            mn = reduced[i]
-        i = i + 1
-    return mn
+    return min(reduced)
 
 // k-th smallest DISTINCT XOR value in the span (1-based). k=1 gives 0 (empty subset).
 // Method: reduce basis to RREF, sort pivots ascending; the j-th bit of (k-1) selects the j-th
-// smallest reduced independent vector. If k exceeds span size, return -1.
+// smallest reduced independent vector. If k exceeds span size, return -1 (SENTINEL -- preserved).
 fn xb_kth(basis: list, k: int) -> int
     let reduced = _xb_reduced_vectors(basis)
     let r = len(reduced)
     let span = _xb_pow2(r)
     if k < 1 or k > span
         return 0 - 1
-    // Sort reduced vectors ascending
+    // Sort reduced vectors ascending, then XOR together the ones (k-1) selects bit by bit.
     let sorted = _xb_sort(reduced)
     let idx = k - 1
-    let res = 0
-    let bitpos = 0
-    while bitpos < r
-        let bit = (idx / _xb_pow2(bitpos)) % 2
-        if bit == 1
-            res = _xb_xor(res, sorted[bitpos])
-        bitpos = bitpos + 1
-    return res
+    let chosen = [sorted[b] for b in 0..r if (idx / _xb_pow2(b)) % 2 == 1]
+    return reduce(chosen, (acc, v) => acc ^ v, 0)
 
 // --- private helpers ---
 
+// 2^p. A single shift instead of the old O(p) repeated multiply. Guarded at p <= 0 both to reproduce the
+// old answer (the old loop never ran, so it returned 1) and because shifting by a negative amount is UB.
 fn _xb_pow2(p: int) -> int
-    let r = 1
-    let i = 0
-    while i < p
-        r = r * 2
-        i = i + 1
-    return r
+    if p <= 0
+        return 1
+    return 1 << p
 
 // Bitwise XOR of two non-negative ints (both < 2^62). We use the native bit ops.
 fn _xb_xor(a: int, b: int) -> int
@@ -169,54 +153,31 @@ fn _xb_xor(a: int, b: int) -> int
 
 // Produce the list of reduced independent vectors (RREF): each nonzero slot reduced so that no two
 // share any set bit that is a pivot of another. Returns a list of nonzero vectors.
+// Both passes walk a FIXED range descending, so both are `for` loops with a mirrored index. The mutation
+// of `work` inside is genuinely stateful (a slot XORs into other slots), which is why this is not a
+// comprehension -- only the initial copy and the final collect are.
 fn _xb_reduced_vectors(basis: list) -> list
-    // Copy nonzero slots into a working array indexed by pivot bit.
-    let work = []
-    let i = 0
     let bits = _xb_bits()
-    while i < bits
-        push(work, basis[i])
-        i = i + 1
-    // For each pivot bit p (high to low), clear bit p from all higher pivots' vectors.
+    // Copy the slots into a working array indexed by pivot bit.
+    let work = [basis[i] for i in 0..bits]
+    // For each pivot bit p (high to low), clear bit p from every OTHER slot's vector.
     // Standard RREF over GF(2): for each pivot slot, for every other slot that has bit p set, XOR it.
-    let p = bits - 1
-    while p >= 0
+    for kp in 0..bits
+        let p = bits - 1 - kp
         if work[p] != 0
-            // clear bit p in all other slots
-            let q = bits - 1
-            while q >= 0
+            for kq in 0..bits
+                let q = bits - 1 - kq
                 if q != p
                     let val = work[q]
                     if val != 0
                         let bit = (val / _xb_pow2(p)) % 2
                         if bit == 1
                             work[q] = _xb_xor(val, work[p])
-                q = q - 1
-        p = p - 1
     // Collect nonzero
-    let out = []
-    let j = 0
-    while j < bits
-        if work[j] != 0
-            push(out, work[j])
-        j = j + 1
-    return out
+    return [v for v in work if v != 0]
 
-// Simple insertion sort ascending (small lists, <= 62 elements).
+// Ascending sort of the (at most 62) reduced vectors. This was a hand-written insertion sort identical
+// line for line to std/core/sort's `sort_ints` -- same stability, same non-mutating copy-first contract,
+// same behaviour on empty / single-element / negative inputs -- so it now delegates there.
 fn _xb_sort(arr: list) -> list
-    let a = []
-    let i = 0
-    while i < len(arr)
-        push(a, arr[i])
-        i = i + 1
-    let n = len(a)
-    let k = 1
-    while k < n
-        let key = a[k]
-        let j = k - 1
-        while j >= 0 and a[j] > key
-            a[j + 1] = a[j]
-            j = j - 1
-        a[j + 1] = key
-        k = k + 1
-    return a
+    return sort_ints(arr)

@@ -14,12 +14,7 @@
 // child (one_for_all / rest_for_one land in T4.3). A Sup is an opaque dict handle (like the app object).
 
 fn sup_new(strategy: string, max_restarts: int, in_seconds: int) -> any
-    let s = {}
-    s["strategy"] = strategy
-    s["max_restarts"] = max_restarts
-    s["in_seconds"] = in_seconds
-    s["specs"] = []
-    s
+    {"strategy": strategy, "max_restarts": max_restarts, "in_seconds": in_seconds, "specs": []}
 
 // Add a child spec: name, a NO-ARG start_fn (the child's entry point), restart policy, and a
 // shutdown budget (ms, advisory -- NOVA has no preemptive kill, so it bounds a cooperative drain
@@ -49,13 +44,7 @@ fn _run_child(start_fn)
 // limit (each ages out of the window), so they restart indefinitely -- the correct OTP behaviour, and
 // why this replaces a naive cumulative counter. Pure + public -> directly testable with a fake clock.
 fn restart_intensity_exceeded(stamps, now_ms: int, max_restarts: int, window_ms: int) -> bool
-    let count = 0
-    let i = 0
-    while i < len(stamps)
-        if (now_ms - stamps[i]) <= window_ms
-            count = count + 1
-        i = i + 1
-    count > max_restarts
+    len([t for t in stamps if (now_ms - t) <= window_ms]) > max_restarts
 
 fn _supervise_one(sup, idx)
     let spec = sup["specs"][idx]
@@ -96,10 +85,8 @@ fn sup_start(sup) -> int
     if strategy == "one_for_all" or strategy == "rest_for_one"
         spawn _supervise_multi(sup)
         return n
-    let i = 0
-    while i < n
+    for i in 0..n
         spawn _supervise_one(sup, i)
-        i = i + 1
     n
 
 // ── one_for_all / rest_for_one supervision (T4.3) ────────────────────────────────────────────────
@@ -131,10 +118,7 @@ fn _child_watcher(p, idx, gen, down_ch)
 // _child_should_restart(restart_policy, exit_status): true when this child's policy demands restart
 // given exit_status (0=normal, 1=crash). Mirrors the one_for_one logic.
 fn _child_should_restart(restart_policy: string, exit_status: int) -> bool
-    if exit_status == 0
-        restart_policy == "permanent"
-    else
-        restart_policy != "temporary"
+    restart_policy == "permanent" if exit_status == 0 else restart_policy != "temporary"
 
 // The centralized multi-strategy supervisor loop. Tracks per-child generation counters, restart
 // stamps, and alive status. When all children have permanently retired the loop exits.
@@ -153,28 +137,18 @@ fn _supervise_multi(sup)
     let strategy = sup["strategy"]
     let down_ch = channel()
     // stamps: per-child restart timestamp history (for windowed intensity)
-    let stamps = []
+    let stamps = [[] for si in 0..n]
     // gens: per-child generation counter (incremented each restart)
-    let gens = []
+    let gens = [0 for gi in 0..n]
     // alive: per-child boolean (1=active slot, 0=permanently retired)
-    let alive = []
+    let alive = [1 for ai in 0..n]
     // pids: per-child CURRENT process handle, so a force-replace can kill() the old instance
-    let pids = []
-    let i = 0
-    while i < n
-        push(stamps, [])
-        push(gens, 0)
-        push(alive, 1)
-        push(pids, 0)
-        i = i + 1
+    let pids = [0 for pi in 0..n]
     // Start all children; each child gets gen=0 watcher
-    let k = 0
-    while k < n
-        let start_fn = specs[k][1]
-        let p = spawn _run_child(start_fn)
+    for k in 0..n
+        let p = spawn _run_child(specs[k][1])
         pids[k] = p
         spawn _child_watcher(p, k, 0, down_ch)
-        k = k + 1
     // Central supervision loop
     let active = n
     while active > 0
@@ -190,7 +164,7 @@ fn _supervise_multi(sup)
         if live_evt == 1
             // This child slot is now vacant
             alive[cidx] = 0
-            active = active - 1
+            active -= 1
             let crashed_pol = specs[cidx][2]
             // Does the crashed child itself want to restart given the exit_status?
             // (Erlang OTP: the cascade -- affecting siblings -- only fires when the crashed
@@ -198,41 +172,23 @@ fn _supervise_multi(sup)
             // without touching siblings, even under one_for_all / rest_for_one.)
             let crashed_wants_restart = _child_should_restart(crashed_pol, exit_status)
             // Collect which child slots to restart
+            // ONE cascade loop for BOTH strategies -- they differ only in WHICH siblings are in
+            // scope: one_for_all sweeps every sibling, rest_for_one only those started AFTER the
+            // crashed child (spec order). Same ascending push order as the two loops it replaces.
             let restart_indices = []
-            if strategy == "one_for_all"
-                if crashed_wants_restart == true
-                    // Restart the crashed child + ALL alive siblings (force-replace them)
-                    let oi = 0
-                    while oi < n
-                        let pol = specs[oi][2]
-                        if oi == cidx
-                            push(restart_indices, oi)
-                        else
-                            // Force-replace running sibling if policy allows
-                            if alive[oi] == 1 and pol != "temporary"
-                                push(restart_indices, oi)
-                                // Actually stop the old instance (LOCK-5 safepoint kill) instead of
-                                // letting it linger; best-effort/cooperative, see the fn header note.
-                                kill(pids[oi])
-                                // Pre-emptively retire so stale DOWNs are discarded (gen check)
-                                alive[oi] = 0
-                                active = active - 1
-                        oi = oi + 1
-            else
-                if crashed_wants_restart == true
-                    // rest_for_one: restart crashed child + all children STARTED AFTER it
-                    let ri = 0
-                    while ri < n
-                        let pol = specs[ri][2]
-                        if ri == cidx
-                            push(restart_indices, ri)
-                        else if ri > cidx
-                            if alive[ri] == 1 and pol != "temporary"
-                                push(restart_indices, ri)
-                                kill(pids[ri])
-                                alive[ri] = 0
-                                active = active - 1
-                        ri = ri + 1
+            if crashed_wants_restart == true
+                for oi in 0..n
+                    if oi == cidx
+                        push(restart_indices, oi)
+                    else if (strategy == "one_for_all" or oi > cidx) and alive[oi] == 1 and specs[oi][2] != "temporary"
+                        // Force-replace a running sibling: actually stop the old instance (LOCK-5
+                        // safepoint kill) instead of letting it linger; best-effort/cooperative,
+                        // see the fn header note. Then pre-emptively retire the slot so the stale
+                        // DOWN is discarded by the generation check.
+                        push(restart_indices, oi)
+                        kill(pids[oi])
+                        alive[oi] = 0
+                        active -= 1
             // Windowed intensity check for the crashed child
             let intensity_ok = 1
             let cstamps = stamps[cidx]
@@ -242,18 +198,14 @@ fn _supervise_multi(sup)
                 intensity_ok = 0
             // (Re)start each child in restart_indices
             if intensity_ok == 1
-                let rk = 0
-                while rk < len(restart_indices)
-                    let ridx = restart_indices[rk]
+                for ridx in restart_indices
                     let new_gen = gens[ridx] + 1
                     gens[ridx] = new_gen
-                    let sfn = specs[ridx][1]
-                    let np = spawn _run_child(sfn)
+                    let np = spawn _run_child(specs[ridx][1])
                     pids[ridx] = np
                     spawn _child_watcher(np, ridx, new_gen, down_ch)
                     alive[ridx] = 1
-                    active = active + 1
-                    rk = rk + 1
+                    active += 1
 
 // ── GenServer (typed-message dispatch over a request channel) ─────────────────────────────────────
 // A stateful server process. Messages are dispatched to handlers by their RUNTIME TYPE (type_of(msg),
@@ -263,18 +215,30 @@ fn _supervise_multi(sup)
 // reply; a `cast` is fire-and-forget but still ordered. The loop is a SPAWNED process, so messages
 // serialize through its request channel -> race-free state by construction (the actor model).
 
+// Every actor in this module (GenServer, Agent, Registry, Presence) talks over its request channel
+// with exactly TWO shapes, written out 13 times before this refactor. They are now ONE pair:
+//   _rpc  -- allocate a reply channel, stamp it into the envelope, hand it over, BLOCK for the reply
+//   _tell -- fire-and-forget (reply slot 0), return immediately
+// Callers build the envelope as a dict LITERAL that already carries a "reply" key, so the stamp is a
+// reassignment of a PRE-EXISTING key -- never a new key on a dict that may have crossed a spawn/send
+// deep-copy (see the _reg_loop note for why that distinction matters at runtime).
+fn _rpc(req_ch, env) -> any
+    let rc = channel()
+    env["reply"] = rc
+    send(req_ch, env)
+    receive(rc)
+
+fn _tell(req_ch, env) -> int
+    send(req_ch, env)
+    0
+
 // A server is created with its initial state + ONE handler. The handler MATCHES on the message to
 // dispatch by type -- this is Erlang's handle_call shape, and it is the ONLY way to type-dispatch in
 // NOVA: type_of(struct) returns the generic "struct" (not the type name) and __type_hash isn't
 // readable from user code, but `match msg { TypeA(..) => .. TypeB(..) => .. }` dispatches correctly
 // on an any-typed value (verified). handler: fn(state, msg) -> [new_state, reply].
 fn server(initial_state, handler) -> any
-    let srv = {}
-    srv["req"] = channel()
-    srv["handler"] = handler
-    srv["state"] = initial_state
-    srv["terminate"] = 0
-    srv
+    {"req": channel(), "handler": handler, "state": initial_state, "terminate": 0}
 
 // Register a cleanup callback run when the server stops cleanly: terminate(state, reason). Set BEFORE
 // gen_start (it's captured into the spawned loop's snapshot). Used for releasing resources / dropping
@@ -310,31 +274,15 @@ fn gen_start(srv) -> any
 
 // Synchronous request: send {call, msg} and BLOCK for the handler's reply (the actor serializes it).
 fn call(srv, msg) -> any
-    let rc = channel()
-    let env = {}
-    env["kind"] = "call"
-    env["msg"] = msg
-    env["reply"] = rc
-    send(srv["req"], env)
-    receive(rc)
+    _rpc(srv["req"], {"kind": "call", "msg": msg, "reply": 0})
 
 // Asynchronous request: send {cast, msg}, return immediately. State still advances in arrival order.
 fn cast(srv, msg) -> any
-    let env = {}
-    env["kind"] = "cast"
-    env["msg"] = msg
-    env["reply"] = 0
-    send(srv["req"], env)
-    0
+    _tell(srv["req"], {"kind": "cast", "msg": msg, "reply": 0})
 
 // Stop the server loop (after any already-queued messages).
 fn gen_stop(srv) -> any
-    let env = {}
-    env["kind"] = "stop"
-    env["msg"] = 0
-    env["reply"] = 0
-    send(srv["req"], env)
-    0
+    _tell(srv["req"], {"kind": "stop", "msg": 0, "reply": 0})
 
 // ── Agent (a serialized single-value state cell) ─────────────────────────────────────────────────
 // The simplest stateful process: hold ONE value, serialize get/update through an actor loop -> no
@@ -361,45 +309,23 @@ fn _agent_loop(ag)
 
 // Create an agent holding `init` and start its loop (spawned directly per the monitor/spawn rule).
 fn agent(init) -> any
-    let ag = {}
-    ag["req"] = channel()
-    ag["state"] = init
+    let ag = {"req": channel(), "state": init}
     spawn _agent_loop(ag)
     ag
 
 fn agent_get(ag) -> any
-    let rc = channel()
-    let env = {}
-    env["op"] = "get"
-    env["reply"] = rc
-    send(ag["req"], env)
-    receive(rc)
+    _rpc(ag["req"], {"op": "get", "reply": 0})
 
 // Apply `f: fn(v)->v` to the state (serialized -> concurrent updaters never lose an update).
 fn agent_update(ag, f) -> any
-    let env = {}
-    env["op"] = "update"
-    env["fn"] = f
-    env["reply"] = 0
-    send(ag["req"], env)
-    0
+    _tell(ag["req"], {"op": "update", "fn": f, "reply": 0})
 
 // Apply `f: fn(v)->[new_v, reply]` and return `reply` (read-modify-write in one serialized step).
 fn agent_get_and(ag, f) -> any
-    let rc = channel()
-    let env = {}
-    env["op"] = "getand"
-    env["fn"] = f
-    env["reply"] = rc
-    send(ag["req"], env)
-    receive(rc)
+    _rpc(ag["req"], {"op": "getand", "fn": f, "reply": 0})
 
 fn agent_stop(ag) -> any
-    let env = {}
-    env["op"] = "stop"
-    env["reply"] = 0
-    send(ag["req"], env)
-    0
+    _tell(ag["req"], {"op": "stop", "reply": 0})
 
 // ── Task / async-await (crash-safe futures) ──────────────────────────────────────────────────────
 // async(f) runs f in a MONITORED process + returns a Future. await(f) BLOCKS and returns ok(value)
@@ -411,12 +337,9 @@ fn _async_run(f, rc)
 
 // Spawn `f` (a no-arg fn) as a monitored task. Returns a Future handle.
 fn async(f) -> any
-    let fut = {}
     let rc = channel()
-    fut["rc"] = rc
     let p = spawn _async_run(f, rc)
-    fut["mon"] = monitor(p)
-    fut
+    {"rc": rc, "mon": monitor(p)}
 
 // Block for the task's result. ok(value) on normal completion; err on a panic (crash-safe).
 // Annotate the binding (`let r: Result<any> = await(f)`) so the match dispatches (a bare Result
@@ -430,13 +353,7 @@ fn await(fut) -> Result<any>
 
 // Await a list of futures -> a list of Results (each ok/err), preserving order.
 fn await_all(futs) -> any
-    let out = []
-    let i = 0
-    while i < len(futs)
-        let r: Result<any> = await(futs[i])
-        push(out, r)
-        i = i + 1
-    out
+    [await(f) for f in futs]
 
 // ── Nursery (structured concurrency) ─────────────────────────────────────────────────────────────
 // A scope that spawns child tasks and JOINS them ALL before returning -> no orphans, no leaked tasks.
@@ -444,9 +361,7 @@ fn await_all(futs) -> any
 // a child that panicked) -- one bad child never aborts the others. Like Trio's nursery.
 
 fn nursery() -> any
-    let nur = {}
-    nur["futs"] = []
-    nur
+    {"futs": []}
 
 // Launch a child (a no-arg fn) into the nursery scope (monitored via async).
 fn nursery_go(nur, f) -> any
@@ -480,43 +395,25 @@ fn _reg_loop(reg)
             m[env["name"]] = env["pid"]
         else if op == "get"
             let pid = 0
-            if contains(m, env["name"])
+            if env["name"] in m
                 pid = m[env["name"]]
             send(env["reply"], pid)
         else if op == "drop"
             m[env["name"]] = 0
 
 fn registry() -> any
-    let reg = {}
-    reg["req"] = channel()
+    let reg = {"req": channel()}
     spawn _reg_loop(reg)
     reg
 
 fn reg_put(reg, name: string, pid) -> any
-    let env = {}
-    env["op"] = "put"
-    env["name"] = name
-    env["pid"] = pid
-    env["reply"] = 0
-    send(reg["req"], env)
-    0
+    _tell(reg["req"], {"op": "put", "name": name, "pid": pid, "reply": 0})
 
 fn reg_get(reg, name: string) -> any
-    let rc = channel()
-    let env = {}
-    env["op"] = "get"
-    env["name"] = name
-    env["reply"] = rc
-    send(reg["req"], env)
-    receive(rc)
+    _rpc(reg["req"], {"op": "get", "name": name, "reply": 0})
 
 fn reg_drop(reg, name: string) -> any
-    let env = {}
-    env["op"] = "drop"
-    env["name"] = name
-    env["reply"] = 0
-    send(reg["req"], env)
-    0
+    _tell(reg["req"], {"op": "drop", "name": name, "reply": 0})
 
 // ── Application (the OTP app root: a supervisor + a registry) ─────────────────────────────────────
 // The top of an app: one supervisor (its children) + one registry (name->pid lookup). Declare children
@@ -524,11 +421,7 @@ fn reg_drop(reg, name: string) -> any
 // you boot + query -- like an Elixir Application / OTP application callback.
 
 fn application(name: string) -> any
-    let app = {}
-    app["name"] = name
-    app["sup"] = sup_new("one_for_one", 5, 10)
-    app["reg"] = 0
-    app
+    {"name": name, "sup": sup_new("one_for_one", 5, 10), "reg": 0}
 
 fn app_supervisor(app) -> any
     app["sup"]
@@ -552,15 +445,10 @@ fn app_start(app) -> any
 // handler(kind, payload) per job. Zero-infra background processing (no Redis/Celery) -- on the runtime.
 
 fn jobs(capacity: int) -> any
-    let jq = {}
-    jq["ch"] = channel_bounded(capacity)
-    jq
+    {"ch": channel_bounded(capacity)}
 
 fn enqueue(jq, kind: string, payload) -> int
-    let job = {}
-    job["kind"] = kind
-    job["payload"] = payload
-    send(jq["ch"], job)
+    send(jq["ch"], {"kind": kind, "payload": payload})
     1
 
 fn _job_worker(jq, handler)
@@ -574,18 +462,14 @@ fn _job_worker(jq, handler)
 
 // Spawn `num_workers` workers draining the queue. Each runs handler(kind, payload) per job.
 fn jobs_run(jq, num_workers: int, handler) -> int
-    let i = 0
-    while i < num_workers
+    for i in 0..num_workers
         spawn _job_worker(jq, handler)
-        i = i + 1
     num_workers
 
 // Tell `num_workers` workers to stop (enqueue that many stop sentinels) -- for clean shutdown/tests.
 fn jobs_stop(jq, num_workers: int) -> int
-    let i = 0
-    while i < num_workers
+    for i in 0..num_workers
         enqueue(jq, "__stop__", 0)
-        i = i + 1
     num_workers
 
 // ── monitor_into (out-of-band DOWN -> a server's handler; the on_info / LiveView+Presence hook) ────
@@ -613,7 +497,7 @@ fn monitor_into(srv, child_fn, down_msg) -> any
 fn _cron_field(f: string)
     if f == "*"
         return ["any", 0]
-    if len(f) >= 2 and ord(char_at(f, 0)) == 42 and ord(char_at(f, 1)) == 47
+    if starts_with(f, "*/")
         return ["step", parse_int(slice(f, 2, len(f)))]
     ["exact", parse_int(f)]
 
@@ -627,27 +511,17 @@ fn _cron_field_due(spec, val: int) -> bool
     spec[1] == val
 
 fn cron_parse(expr: string)
-    let parts = split(expr, " ")
-    let out = []
-    let i = 0
-    while i < len(parts)
-        push(out, _cron_field(parts[i]))
-        i = i + 1
-    out
+    [_cron_field(f) for f in split(expr, " ")]
 
 fn cron_due(parsed, minute: int, hour: int, day: int, month: int, weekday: int) -> bool
     if len(parsed) != 5
         return false
-    if _cron_field_due(parsed[0], minute) == false
-        return false
-    if _cron_field_due(parsed[1], hour) == false
-        return false
-    if _cron_field_due(parsed[2], day) == false
-        return false
-    if _cron_field_due(parsed[3], month) == false
-        return false
-    if _cron_field_due(parsed[4], weekday) == false
-        return false
+    // The five field checks were five copies of the same three lines. One loop, same order
+    // (minute hour day month weekday), same short-circuit on the FIRST field that does not match.
+    let vals = [minute, hour, day, month, weekday]
+    for i in 0..5
+        if _cron_field_due(parsed[i], vals[i]) == false
+            return false
     true
 
 // ── Presence (S5 real-time): who is in each topic, tracked by a single-owner actor ────────────────
@@ -665,61 +539,36 @@ fn _presence_loop(pr)
         else if op == "join"
             let t = env["topic"]
             let members = []
-            if contains(topics, t)
+            if t in topics
                 members = topics[t]
-            if contains(members, env["who"]) == false
+            if env["who"] in members == false
                 push(members, env["who"])
             topics[t] = members
         else if op == "leave"
             let t = env["topic"]
-            if contains(topics, t)
-                let cur = topics[t]
-                let out = []
-                let i = 0
-                while i < len(cur)
-                    if cur[i] != env["who"]
-                        push(out, cur[i])
-                    i = i + 1
-                topics[t] = out
+            if t in topics
+                let who = env["who"]
+                topics[t] = [m for m in topics[t] if m != who]
         else if op == "list"
             let t = env["topic"]
             let members = []
-            if contains(topics, t)
+            if t in topics
                 members = topics[t]
             send(env["reply"], members)
 
 fn presence() -> any
-    let pr = {}
-    pr["req"] = channel()
+    let pr = {"req": channel()}
     spawn _presence_loop(pr)
     pr
 
 fn presence_join(pr, topic: string, who: string) -> any
-    let env = {}
-    env["op"] = "join"
-    env["topic"] = topic
-    env["who"] = who
-    env["reply"] = 0
-    send(pr["req"], env)
-    0
+    _tell(pr["req"], {"op": "join", "topic": topic, "who": who, "reply": 0})
 
 fn presence_leave(pr, topic: string, who: string) -> any
-    let env = {}
-    env["op"] = "leave"
-    env["topic"] = topic
-    env["who"] = who
-    env["reply"] = 0
-    send(pr["req"], env)
-    0
+    _tell(pr["req"], {"op": "leave", "topic": topic, "who": who, "reply": 0})
 
 fn presence_list(pr, topic: string) -> any
-    let rc = channel()
-    let env = {}
-    env["op"] = "list"
-    env["topic"] = topic
-    env["reply"] = rc
-    send(pr["req"], env)
-    receive(rc)
+    _rpc(pr["req"], {"op": "list", "topic": topic, "reply": 0})
 
 // Number of members currently in a topic.
 fn presence_count(pr, topic: string) -> int

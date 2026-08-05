@@ -6,76 +6,67 @@
 // first point, then repeatedly add the point farthest from all chosen centers), which spreads the seeds across
 // the data and converges reliably on well-separated clusters without a random seed. Reuses forge_knn's squared
 // distance. Imports forge_knn.
+//
+// NOT delegated to std/ml/kmeans on purpose: that module seeds the centroids with the FIRST K ROWS, this one
+// uses the farthest-point spread, so the two produce different clusterings on the same input. Same name,
+// different contract -- delegating would silently change every caller's result.
 
 import forge_knn
 
 // PRIVATE: index of the centroid nearest to point p.
+// KEPT as a loop (min-tracking scan). Crashes on an EMPTY centroid list -- preserved: the only alternative
+// is a sentinel index, which a caller cannot distinguish from a real cluster 0.
 fn _km_nearest(centroids: list, p: list) -> int
     let best = 0
     let bestd = knn_distance_sq(centroids[0], p)
-    let c = 1
-    while c < len(centroids)
+    for c in 1..len(centroids)
         let d = knn_distance_sq(centroids[c], p)
         if d < bestd
             bestd = d
             best = c
-        c = c + 1
     best
+
+// PRIVATE: distance from p to the NEAREST centroid. Was inlined a second time inside _km_init.
+fn _km_mindist(centroids: list, p: list) -> float
+    let mind = knn_distance_sq(centroids[0], p)
+    for c in 1..len(centroids)
+        let dd = knn_distance_sq(centroids[c], p)
+        if dd < mind
+            mind = dd
+    mind
 
 // PRIVATE: deterministic farthest-point initial centroids (a k-means++ style spread without randomness).
 fn _km_init(points: list, k: int) -> list
     let centroids = []
     push(centroids, points[0])
+    // KEPT as a while: the loop grows `centroids`, so the bound changes every iteration.
     while len(centroids) < k
         let bestp = 0
         let bestd = 0.0 - 1.0
-        let i = 0
-        while i < len(points)
-            let mind = knn_distance_sq(centroids[0], points[i])
-            let c = 1
-            while c < len(centroids)
-                let dd = knn_distance_sq(centroids[c], points[i])
-                if dd < mind
-                    mind = dd
-                c = c + 1
+        for i in 0..len(points)
+            let mind = _km_mindist(centroids, points[i])
             if mind > bestd
                 bestd = mind
                 bestp = i
-            i = i + 1
         push(centroids, points[bestp])
     centroids
 
 // PRIVATE: recompute each centroid as the mean of its assigned points; empty clusters keep their old centroid.
 fn _km_recompute(points: list, assignments: list, k: int, dim: int, old: list) -> list
     let centroids = []
-    let c = 0
-    while c < k
-        let sumv = []
-        let d0 = 0
-        while d0 < dim
-            push(sumv, 0.0)
-            d0 = d0 + 1
+    for c in 0..k
+        let sumv = [0.0 for d0 in 0..dim]
         let count = 0
-        let i = 0
-        while i < len(points)
+        for i in 0..len(points)
             if assignments[i] == c
-                let j = 0
-                while j < dim
+                // KEPT as an in-place float accumulation: `reduce`/`sum` over floats is unsound here.
+                for j in 0..dim
                     sumv[j] = sumv[j] * 1.0 + points[i][j] * 1.0
-                    j = j + 1
-                count = count + 1
-            i = i + 1
+                count += 1
         if count == 0
             push(centroids, old[c])
         else
-            let cent = []
-            let j2 = 0
-            while j2 < dim
-                let m = (sumv[j2] * 1.0) / (count * 1.0)
-                push(cent, m)
-                j2 = j2 + 1
-            push(centroids, cent)
-        c = c + 1
+            push(centroids, [(sumv[j2] * 1.0) / (count * 1.0) for j2 in 0..dim])
     centroids
 
 // Cluster `points` into k groups (max_iters Lloyd iterations, stops early on convergence). Returns
@@ -83,42 +74,28 @@ fn _km_recompute(points: list, assignments: list, k: int, dim: int, old: list) -
 fn kmeans(points: list, k: int, max_iters: int) -> list
     let dim = len(points[0])
     let centroids = _km_init(points, k)
-    let assignments = []
-    let a = 0
-    while a < len(points)
-        push(assignments, 0)
-        a = a + 1
-    let iter = 0
-    let running = true
-    while running and iter < max_iters
+    let assignments = [0 for a in 0..len(points)]
+    for iter in 0..max_iters
         let changed = false
-        let p = 0
-        while p < len(points)
-            let nc = _km_nearest(centroids, points[p])
+        for p, pt in points
+            let nc = _km_nearest(centroids, pt)
             if nc != assignments[p]
                 changed = true
             assignments[p] = nc
-            p = p + 1
         centroids = _km_recompute(points, assignments, k, dim, centroids)
-        iter = iter + 1
+        // Converged: no point moved cluster this sweep.
         if changed == false
-            running = false
+            break
     [centroids, assignments]
 
 // Assign each point to its nearest centroid; returns the assignment list.
 fn kmeans_assign(points: list, centroids: list) -> list
-    let out = []
-    let i = 0
-    while i < len(points)
-        push(out, _km_nearest(centroids, points[i]))
-        i = i + 1
-    out
+    [_km_nearest(centroids, p) for p in points]
 
 // Total within-cluster squared distance (inertia) -- lower is tighter; use it to compare k (elbow method).
+// KEPT as an explicit float accumulation: `reduce` over a float closure corrupts raw floats, `sum` returns int.
 fn kmeans_inertia(points: list, centroids: list, assignments: list) -> float
     let total = 0.0
-    let i = 0
-    while i < len(points)
-        total = total + knn_distance_sq(centroids[assignments[i]], points[i])
-        i = i + 1
+    for i, pt in points
+        total += knn_distance_sq(centroids[assignments[i]], pt)
     total

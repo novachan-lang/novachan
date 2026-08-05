@@ -9,37 +9,31 @@
 import forge_crypto
 // forge_pg (not just for its own sake -- see the extern-dedup note by the TLS externs below).
 import forge_pg
+// str_pad_left(s, width, "0") -- read before delegating: it no-ops when len(s) >= width, exactly like the
+// hand-rolled zero-padders it replaces below.
+import std/core/str
 
 // ---- little-endian helpers --------------------------------------------------------------------------
+// n little-endian bytes of `v` as a plain int list -- the ONE place the LE byte order is written.
+// _my_p3/_my_p4 were the same three/four lines at two widths; they are now this at w=3 / w=4.
+fn _my_le_list(v: int, w: int) -> list
+    [(v >> (i * 8)) & 255 for i in 0..w]
+
+// Read an n-byte little-endian unsigned integer. Folded most-significant byte first so the fold is the
+// same wrapping i64 arithmetic the byte*256^i sum was (verified bit-exact incl. the 8-byte/float cases).
 fn _my_u(b, off: int, n: int) -> int
-    let v = 0
-    let i = 0
-    let mul = 1
-    while i < n
-        v = v + bytes_get(b, off + i) * mul
-        mul = mul * 256
-        i = i + 1
-    v
+    reduce([bytes_get(b, off + n - 1 - i) for i in 0..n], (acc, v) => (acc << 8) | v, 0)
 
 fn _my_p3(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, n & 255)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, (n >> 16) & 255)
-    b
+    bytes_from_list(_my_le_list(n, 3))
 
 fn _my_p4(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, n & 255)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, (n >> 16) & 255)
-    b = bytes_append(b, (n >> 24) & 255)
-    b
+    bytes_from_list(_my_le_list(n, 4))
 
 fn _my_cstr(b, off: int) -> any
     let endp = off
     while endp < bytes_len(b) and bytes_get(b, endp) != 0
-        endp = endp + 1
+        endp += 1
     [bytes_to_str(bytes_slice(b, off, endp)), endp + 1]
 
 // length-encoded integer -> [value, next_off].
@@ -66,19 +60,11 @@ fn _my_lenenc_str(b, off: int) -> any
 
 // length-encoded INTEGER writer (for COM_STMT_EXECUTE param values/lengths).
 fn _my_wr_lenenc(n: int) -> any
-    let b = bytes(0)
     if n < 251
-        return bytes_append(b, n)
+        return bytes_from_list([n])
     if n < 65536
-        b = bytes_append(b, 252)
-        b = bytes_append(b, n & 255)
-        b = bytes_append(b, (n >> 8) & 255)
-        return b
-    b = bytes_append(b, 253)
-    b = bytes_append(b, n & 255)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, (n >> 16) & 255)
-    b
+        return bytes_from_list([252, ..._my_le_list(n, 2)])
+    bytes_from_list([253, ..._my_le_list(n, 3)])
 
 // length-encoded STRING writer (lenenc length + raw bytes).
 fn _my_wr_lenstr(sb) -> any
@@ -139,71 +125,54 @@ fn _my_read_packet(conn, buf) -> any
     [seq, bytes_slice(buf, 4, total), bytes_slice(buf, total, bytes_len(buf))]
 
 fn _my_write_packet(conn, seq: int, payload)
-    let hdr = _my_p3(bytes_len(payload))
-    hdr = bytes_append(hdr, seq & 255)
+    let hdr = bytes_from_list([..._my_le_list(bytes_len(payload), 3), seq & 255])
     _my_send(conn, bytes_concat(hdr, payload))
 
-// ---- auth (mysql_native_password) -------------------------------------------------------------------
-// token = SHA1(pw) XOR SHA1( scramble(20) ++ SHA1(SHA1(pw)) ). Empty password -> empty token.
-fn _my_native_pw(password: string, scramble) -> any
+// ---- auth (mysql_native_password / caching_sha2_password) -------------------------------------------
+// Both MySQL challenge-response plugins are the SAME shape -- h1 = H(pw); h3 = H(salted H(h1)); token =
+// h1 XOR h3, len(h1) bytes -- differing only in the hash and in which side of the concat the scramble
+// sits on. One helper, the hash passed as a closure, `h2_first` picking the concat order. The XOR width
+// is len(h1), which is exactly the 20 (SHA-1) / 32 (SHA-256) the two open-coded versions used.
+fn _my_xor_auth_token(password: string, scramble, hashfn, h2_first: int) -> any
     if len(password) == 0
         return bytes(0)
-    let pw = str_to_blist(password)
-    let h1 = sha1_bytes(pw)
-    let h2 = sha1_bytes(h1)
-    let cat = []
-    let i = 0
-    while i < len(scramble)
-        push(cat, scramble[i])
-        i = i + 1
-    i = 0
-    while i < len(h2)
-        push(cat, h2[i])
-        i = i + 1
-    let h3 = sha1_bytes(cat)
-    let out = bytes(0)
-    i = 0
-    while i < 20
-        out = bytes_append(out, (h1[i] ^ h3[i]) & 255)
-        i = i + 1
-    out
+    let h1 = hashfn(str_to_blist(password))
+    let h2 = hashfn(h1)
+    let cat = [...h2, ...scramble] if h2_first == 1 else [...scramble, ...h2]
+    let h3 = hashfn(cat)
+    bytes_from_list([(h1[i] ^ h3[i]) & 255 for i in 0..len(h1)])
+
+// token = SHA1(pw) XOR SHA1( scramble(20) ++ SHA1(SHA1(pw)) ). Empty password -> empty token.
+fn _my_native_pw(password: string, scramble) -> any
+    _my_xor_auth_token(password, scramble, (m) => sha1_bytes(m), 0)
 
 // caching_sha2_password fast-path token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ scramble(20) ), 32 bytes.
 fn _my_caching_sha2_pw(password: string, scramble) -> any
-    if len(password) == 0
-        return bytes(0)
-    let pw = str_to_blist(password)
-    let h1 = sha256_bytes(pw)
-    let h2 = sha256_bytes(h1)
-    let cat = []
-    let i = 0
-    while i < len(h2)
-        push(cat, h2[i])
-        i = i + 1
-    i = 0
-    while i < len(scramble)
-        push(cat, scramble[i])
-        i = i + 1
-    let h3 = sha256_bytes(cat)
-    let out = bytes(0)
-    i = 0
-    while i < 32
-        out = bytes_append(out, (h1[i] ^ h3[i]) & 255)
-        i = i + 1
-    out
+    _my_xor_auth_token(password, scramble, (m) => sha256_bytes(m), 1)
+
+// PRIVATE: format a MySQL ERR packet (byte0 = 0xff) -> "mysql: <code> <message>". Layout: 0xff,
+// error_code(2 LE), then a 6-byte SQL-state marker+state, then the human-readable message. This exact
+// three-line shape appeared at five call sites (connect, fast-auth, query, prepare, execute).
+fn _my_err_msg(p) -> string
+    let code = _my_u(p, 1, 2)
+    let msg = bytes_to_str(bytes_slice(p, 9, bytes_len(p)))
+    "mysql: {code} {msg}"
+
+// PRIVATE: skip n consecutive length-encoded strings starting at `off` -> [nth string, next off].
+// A column-definition packet is a run of these, and both readers below walk it the same way.
+fn _my_lenenc_str_n(b, off: int, n: int) -> any
+    let o = off
+    let s = ["", off]
+    for i in 0..n
+        s = _my_lenenc_str(b, o)
+        o = s[1]
+    s
 
 // ---- connect ----------------------------------------------------------------------------------------
 // PRIVATE: the HandshakeResponse41 header shared by both the abbreviated SSLRequest and the full
 // response: capability flags(4) + max-packet-size(4) + charset(1) + 23 reserved zero bytes.
 fn _my_handshake_header(flags: int) -> any
-    let b = _my_p4(flags)
-    b = bytes_concat(b, _my_p4(16777215))
-    b = bytes_append(b, 33)
-    let zi = 0
-    while zi < 23
-        b = bytes_append(b, 0)
-        zi = zi + 1
-    b
+    bytes_from_list([..._my_le_list(flags, 4), ..._my_le_list(16777215, 4), 33, ...[0 for zi in 0..23]])
 
 // PRIVATE: shared by mysql_connect (use_tls=0) and mysql_connect_tls (use_tls=1) -- ok(conn) authenticated
 // + ready for queries, or err. conn = [is_tls, handle] (is_tls 0 = plaintext, handle = tcp fd; is_tls 1 =
@@ -220,7 +189,7 @@ fn _my_handshake_header(flags: int) -> any
 fn _my_connect_impl(host: string, port: int, user: string, db: string, password: string, use_tls: int) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
-        return err("mysql: cannot connect to " + host + ":" + str(port))
+        return err("mysql: cannot connect to {host}:{port}")
     let conn = [0, sock]
     let pkt = _my_read_packet(conn, bytes(0))
     if pkt[0] == 0 - 1
@@ -232,25 +201,17 @@ fn _my_connect_impl(host: string, port: int, user: string, db: string, password:
         return err("mysql: unsupported protocol version")
     let svr = _my_cstr(payload, 1)
     let off = svr[1]
-    off = off + 4
+    off += 4
     let scr1off = off
-    off = off + 8 + 1
-    off = off + 2 + 1 + 2 + 2
+    off += 8 + 1
+    off += 2 + 1 + 2 + 2
     let adl = bytes_get(payload, off)
-    off = off + 1 + 10
+    off += 1 + 10
     let part2 = adl - 8
     if part2 < 13
         part2 = 13
     let scr2off = off
-    let scramble = []
-    let si = 0
-    while si < 8
-        push(scramble, bytes_get(payload, scr1off + si))
-        si = si + 1
-    si = 0
-    while si < 12
-        push(scramble, bytes_get(payload, scr2off + si))
-        si = si + 1
+    let scramble = [...[bytes_get(payload, scr1off + si) for si in 0..8], ...[bytes_get(payload, scr2off + si) for si in 0..12]]
     let plugin_res = _my_cstr(payload, scr2off + part2)
     let srv_plugin = plugin_res[0]
     let token = bytes(0)
@@ -298,10 +259,9 @@ fn _my_connect_impl(host: string, port: int, user: string, db: string, password:
     let rp = r2[1]
     let first = bytes_get(rp, 0)
     if first == 255
-        let errcode = _my_u(rp, 1, 2)
-        let msg = bytes_to_str(bytes_slice(rp, 9, bytes_len(rp)))
+        let emsg = _my_err_msg(rp)
         _my_close_transport(conn)
-        return err("mysql: " + str(errcode) + " " + msg)
+        return err(emsg)
     if first == 1
         let status = bytes_get(rp, 1)
         if status == 3
@@ -310,9 +270,9 @@ fn _my_connect_impl(host: string, port: int, user: string, db: string, password:
                 _my_close_transport(conn)
                 return err("mysql: connection closed after caching_sha2 fast-auth")
             if bytes_get(r3[1], 0) == 255
-                let ec = _my_u(r3[1], 1, 2)
+                let e3 = _my_err_msg(r3[1])
                 _my_close_transport(conn)
-                return err("mysql: " + str(ec) + " " + bytes_to_str(bytes_slice(r3[1], 9, bytes_len(r3[1]))))
+                return err(e3)
             return ok(conn)
         _my_close_transport(conn)
         return err("mysql: caching_sha2 full authentication required (cold cache) -- needs TLS or RSA, not yet supported; prime the cache or use mysql_native_password")
@@ -345,9 +305,7 @@ fn mysql_ok_affected(pkt) -> int
     (_my_lenenc_int(pkt, 1))[0]
 
 fn mysql_query(conn, sql: string) -> any
-    let q = bytes(0)
-    q = bytes_append(q, 3)
-    q = bytes_concat(q, str_to_bytes(sql))
+    let q = bytes_concat(bytes_from_list([3]), str_to_bytes(sql))
     _my_write_packet(conn, 0, q)
     let buf = bytes(0)
     let p1 = _my_read_packet(conn, buf)
@@ -357,8 +315,7 @@ fn mysql_query(conn, sql: string) -> any
     let head = p1[1]
     let fb = bytes_get(head, 0)
     if fb == 255
-        let errcode = _my_u(head, 1, 2)
-        return err("mysql: " + str(errcode) + " " + bytes_to_str(bytes_slice(head, 9, bytes_len(head))))
+        return err(_my_err_msg(head))
     if fb == 0
         // OK packet (INSERT/UPDATE/DELETE/DDL): byte0=0x00, then affected_rows as a lenenc-int.
         // SELECT returns a result set (fb = column count) and takes the row-reading path below, so
@@ -366,24 +323,12 @@ fn mysql_query(conn, sql: string) -> any
         return ok(mysql_ok_affected(head))
     let ccr = _my_lenenc_int(head, 0)
     let ncols = ccr[0]
+    // one column-definition packet per column; the 5th length-encoded string is the column NAME
     let colnames = []
-    let ci = 0
-    while ci < ncols
+    for ci in 0..ncols
         let cp = _my_read_packet(conn, buf)
         buf = cp[2]
-        let cdef = cp[1]
-        let o = 0
-        let s = _my_lenenc_str(cdef, o)
-        o = s[1]
-        s = _my_lenenc_str(cdef, o)
-        o = s[1]
-        s = _my_lenenc_str(cdef, o)
-        o = s[1]
-        s = _my_lenenc_str(cdef, o)
-        o = s[1]
-        s = _my_lenenc_str(cdef, o)
-        push(colnames, s[0])
-        ci = ci + 1
+        push(colnames, (_my_lenenc_str_n(cp[1], 0, 5))[0])
     let ep = _my_read_packet(conn, buf)
     buf = ep[2]
     let rows = []
@@ -403,32 +348,24 @@ fn mysql_query(conn, sql: string) -> any
             else
                 let d = {}
                 let o = 0
-                let k = 0
-                while k < ncols
+                for k in 0..ncols
                     if bytes_get(row, o) == 251
                         d[colnames[k]] = ""
-                        o = o + 1
+                        o += 1
                     else
                         let sv = _my_lenenc_str(row, o)
                         d[colnames[k]] = sv[0]
                         o = sv[1]
-                    k = k + 1
                 push(rows, d)
     ok(rows)
 
 // ---- prepared statements (binary protocol) ----------------------------------------------------------
 // PRIVATE: left-pad an int to at least 2 / exactly 6 digits (temporal formatting).
 fn _my_z2(n: int) -> string
-    let s = str(n)
-    if len(s) < 2
-        return "0" + s
-    s
+    str_pad_left(str(n), 2, "0")
 
 fn _my_z6(n: int) -> string
-    let s = str(n)
-    while len(s) < 6
-        s = "0" + s
-    s
+    str_pad_left(str(n), 6, "0")
 
 // Decode ONE binary-protocol value at `off` for column type `t` -> [string, next_off]. Integers ->
 // decimal string; string/decimal/blob/json -> lenenc string; DATE/DATETIME/TIMESTAMP/TIME decode to
@@ -465,19 +402,19 @@ fn _my_bin_val(b, off: int, t: int) -> any
         let yr = _my_u(b, dp, 2)
         let mo = _my_u(b, dp + 2, 1)
         let dy = _my_u(b, dp + 3, 1)
-        let dstr = str(yr) + "-" + _my_z2(mo) + "-" + _my_z2(dy)
+        let dstr = "{yr}-{_my_z2(mo)}-{_my_z2(dy)}"
         if dlen == 4
             if has_time
-                return [dstr + " 00:00:00", dp + 4]
+                return ["{dstr} 00:00:00", dp + 4]
             return [dstr, dp + 4]
         let hh = _my_u(b, dp + 4, 1)
         let mi = _my_u(b, dp + 5, 1)
         let se = _my_u(b, dp + 6, 1)
-        let tstr = dstr + " " + _my_z2(hh) + ":" + _my_z2(mi) + ":" + _my_z2(se)
+        let tstr = "{dstr} {_my_z2(hh)}:{_my_z2(mi)}:{_my_z2(se)}"
         if dlen == 7
             return [tstr, dp + 7]
         let dus = _my_u(b, dp + 7, 4)
-        return [tstr + "." + _my_z6(dus), dp + 11]
+        return ["{tstr}.{_my_z6(dus)}", dp + 11]
     // binary TIME(11): length byte then sign(1) days(4 LE) hour(1) min(1) sec(1) [micros(4 LE)] (0/8/12).
     // MySQL TIME can exceed 24h (up to 838:59:59), so total hours = days*24 + hour (may be >2 digits).
     if t == 11
@@ -490,14 +427,12 @@ fn _my_bin_val(b, off: int, t: int) -> any
         let th = _my_u(b, tp + 5, 1)
         let tmi = _my_u(b, tp + 6, 1)
         let tse = _my_u(b, tp + 7, 1)
-        let sign = ""
-        if neg == 1
-            sign = "-"
-        let base = sign + _my_z2(days * 24 + th) + ":" + _my_z2(tmi) + ":" + _my_z2(tse)
+        let sign = "-" if neg == 1 else ""
+        let base = "{sign}{_my_z2(days * 24 + th)}:{_my_z2(tmi)}:{_my_z2(tse)}"
         if tlen == 8
             return [base, tp + 8]
         let tus = _my_u(b, tp + 8, 4)
-        return [base + "." + _my_z6(tus), tp + 12]
+        return ["{base}.{_my_z6(tus)}", tp + 12]
     let sres = _my_lenenc_str(b, off)
     [sres[0], sres[1]]
 
@@ -509,28 +444,16 @@ fn mysql_bin_val(b, off: int, t: int) -> any
 fn _my_read_coldefs(conn, buf, n: int) -> any
     let names = []
     let types = []
-    let ci = 0
-    while ci < n
+    for ci in 0..n
         let cp = _my_read_packet(conn, buf)
         buf = cp[2]
         let cdef = cp[1]
-        let o = 0
-        let st = _my_lenenc_str(cdef, o)
-        o = st[1]
-        st = _my_lenenc_str(cdef, o)
-        o = st[1]
-        st = _my_lenenc_str(cdef, o)
-        o = st[1]
-        st = _my_lenenc_str(cdef, o)
-        o = st[1]
-        st = _my_lenenc_str(cdef, o)
-        let cname = st[0]
-        o = st[1]
-        st = _my_lenenc_str(cdef, o)
-        o = st[1]
-        push(names, cname)
+        // catalog, schema, table, org_table, NAME -- the 5th length-encoded string is the column name
+        let st = _my_lenenc_str_n(cdef, 0, 5)
+        push(names, st[0])
+        // then org_name; the column TYPE byte sits past charset(2) + column_length(4) after it
+        let o = (_my_lenenc_str(cdef, st[1]))[1]
         push(types, bytes_get(cdef, o + 1 + 2 + 4))
-        ci = ci + 1
     if n > 0
         let e = _my_read_packet(conn, buf)
         buf = e[2]
@@ -542,19 +465,14 @@ fn _my_read_coldefs(conn, buf, n: int) -> any
 // only SEND it, never follow with a _my_read_packet -- doing so would block waiting for a reply that
 // never comes and desync every read after it.
 fn _my_stmt_close(conn, stmt_id: int)
-    let cp = bytes(0)
-    cp = bytes_append(cp, 25)
-    cp = bytes_concat(cp, _my_p4(stmt_id))
-    _my_write_packet(conn, 0, cp)
+    _my_write_packet(conn, 0, bytes_from_list([25, ..._my_le_list(stmt_id, 4)]))
 
 // Parameterized query via a PREPARED STATEMENT (COM_STMT_PREPARE + COM_STMT_EXECUTE, binary protocol).
 // Every param is bound as MYSQL_TYPE_VAR_STRING and the server coerces it to the column type -> NO string
 // inlining/escaping, injection-safe, and numeric-correct. Returns ok(name-keyed string row dicts) /
 // ok([]) for a no-result-set statement / err.
 fn mysql_query_params(conn, sql: string, params) -> any
-    let pq = bytes(0)
-    pq = bytes_append(pq, 22)
-    pq = bytes_concat(pq, str_to_bytes(sql))
+    let pq = bytes_concat(bytes_from_list([22]), str_to_bytes(sql))
     _my_write_packet(conn, 0, pq)
     let buf = bytes(0)
     let pr = _my_read_packet(conn, buf)
@@ -563,7 +481,7 @@ fn mysql_query_params(conn, sql: string, params) -> any
     buf = pr[2]
     let pp = pr[1]
     if bytes_get(pp, 0) == 255
-        return err("mysql: " + str(_my_u(pp, 1, 2)) + " " + bytes_to_str(bytes_slice(pp, 9, bytes_len(pp))))
+        return err(_my_err_msg(pp))
     let stmt_id = _my_u(pp, 1, 4)
     // The statement is now live server-side -- close it on EVERY path below (row-set, OK-packet, or an
     // execute error) via defer, so a parameterized query never leaks a server-side prepared-statement
@@ -575,28 +493,16 @@ fn mysql_query_params(conn, sql: string, params) -> any
     buf = pd[2]
     let cd = _my_read_coldefs(conn, buf, num_cols)
     buf = cd[2]
-    let ex = bytes(0)
-    ex = bytes_append(ex, 23)
-    ex = bytes_concat(ex, _my_p4(stmt_id))
-    ex = bytes_append(ex, 0)
-    ex = bytes_concat(ex, _my_p4(1))
+    // COM_STMT_EXECUTE(23) || stmt_id(4 LE) || flags(0) || iteration_count(1)
+    let ex = bytes_from_list([23, ..._my_le_list(stmt_id, 4), 0, ..._my_le_list(1, 4)])
     let np = len(params)
     if np > 0
+        // null bitmap (all-zero: no NULLs) || new_params_bound=1 || (type, unsigned-flag) per param,
+        // every param bound as MYSQL_TYPE_VAR_STRING (253) with the unsigned flag clear.
         let nbm = (np + 7) / 8
-        let bi = 0
-        while bi < nbm
-            ex = bytes_append(ex, 0)
-            bi = bi + 1
-        ex = bytes_append(ex, 1)
-        let ti = 0
-        while ti < np
-            ex = bytes_append(ex, 253)
-            ex = bytes_append(ex, 0)
-            ti = ti + 1
-        let vi = 0
-        while vi < np
-            ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(params[vi]))))
-            vi = vi + 1
+        ex = bytes_concat(ex, bytes_from_list([...[0 for bi in 0..nbm], 1, ...[253 if ti % 2 == 0 else 0 for ti in 0..(np * 2)]]))
+        for pv in params
+            ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(pv))))
     _my_write_packet(conn, 0, ex)
     let xr = _my_read_packet(conn, buf)
     if xr[0] == 0 - 1
@@ -605,7 +511,7 @@ fn mysql_query_params(conn, sql: string, params) -> any
     let xp = xr[1]
     let xf = bytes_get(xp, 0)
     if xf == 255
-        return err("mysql: " + str(_my_u(xp, 1, 2)) + " " + bytes_to_str(bytes_slice(xp, 9, bytes_len(xp))))
+        return err(_my_err_msg(xp))
     if xf == 0
         // OK packet: affected_rows is a lenenc-int right after the 0x00 marker (same as text protocol).
         return ok(mysql_ok_affected(xp))
@@ -633,8 +539,7 @@ fn mysql_query_params(conn, sql: string, params) -> any
                 let nbmlen = (rncols + 7 + 2) / 8
                 let o = 1 + nbmlen
                 let d = {}
-                let k = 0
-                while k < rncols
+                for k in 0..rncols
                     let bytei = 1 + ((k + 2) / 8)
                     let biti = (k + 2) % 8
                     if ((bytes_get(row, bytei) >> biti) & 1) == 1
@@ -643,7 +548,6 @@ fn mysql_query_params(conn, sql: string, params) -> any
                         let dec = _my_bin_val(row, o, rtypes[k])
                         d[rnames[k]] = dec[0]
                         o = dec[1]
-                    k = k + 1
                 push(rows, d)
     ok(rows)
 
@@ -658,22 +562,18 @@ fn mysql_query_params(conn, sql: string, params) -> any
 fn mysql_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
     let ch = channel()
     let opened = 0
-    let i = 0
-    while i < n
+    for i in 0..n
         let r = mysql_connect(host, port, user, db, password)
         // is_ok/unwrap (runtime Result-tag checks) -- matches pg_pool_open's convention (a `match`
         // Ok/Err on an any-typed connect result mis-resolves the constructor in a couple of these
         // driver modules; the runtime tag ops are unaffected).
         if is_ok(r)
             send(ch, unwrap(r))
-            opened = opened + 1
+            opened += 1
         else
-            let j = 0
-            while j < opened
+            for j in 0..opened
                 mysql_close(recv(ch))
-                j = j + 1
             return r
-        i = i + 1
     ok(ch)
 
 fn mysql_pool_acquire(pool)
@@ -715,7 +615,5 @@ fn mysql_with_tx(pool, body_fn) -> any
 
 // Close all n pooled connections (drain + close each).
 fn mysql_pool_close(pool, n: int)
-    let i = 0
-    while i < n
+    for i in 0..n
         mysql_close(recv(pool))
-        i = i + 1

@@ -4,72 +4,47 @@
 // and hex (&#xHH;) numeric refs, emitting correct UTF-8 for code points beyond ASCII. LEAF -- imports NOTHING.
 
 // PRIVATE: encode a Unicode code point to its UTF-8 byte string (via /,% -- no bit-shifts). BMP coverage.
+// NOT delegated to the `from_codepoint` builtin, deliberately. MEASURED: the two are byte-identical for
+// every cp in 1..65535, but they DIVERGE above the BMP -- this always emits 3 bytes, from_codepoint emits
+// the correct 4. So `&#128512;` (an emoji) decodes to mojibake today. That is a real latent bug, but
+// FIXING it is a behaviour change on live input, not a raise; left as-is and flagged. Swapping in
+// from_codepoint is a one-line change once someone owns that decision.
 fn _ent_utf8(cp: int) -> string
     if cp < 128
         return chr(cp)
     if cp < 2048
         return chr(192 + (cp / 64)) + chr(128 + (cp % 64))
-    chr(224 + (cp / 4096)) + chr(128 + ((cp / 64) % 64)) + chr(128 + (cp % 64))
+    return chr(224 + (cp / 4096)) + chr(128 + ((cp / 64) % 64)) + chr(128 + (cp % 64))
 
-// PRIVATE: code point for a named entity, or -1 if unknown.
+// PRIVATE: code point for a named entity, or -1 if unknown. A 17-branch if-ladder over string constants
+// IS a dictionary -- written as one.
+// NOTE: the table is deliberately NOT hoisted to a module-level `let`. A module-level `let` bound to a
+// dict or list LITERAL reads back EMPTY once the module is IMPORTED (verified: `len()` == 0 from an
+// importing program, correct when called inside its own file; module-level ints are fine). Hoisting it
+// silently disabled every named entity here -- caught by the behaviour diff, not by the compiler.
 fn _ent_named(name: string) -> int
-    if name == "amp"
-        return 38
-    if name == "lt"
-        return 60
-    if name == "gt"
-        return 62
-    if name == "quot"
-        return 34
-    if name == "apos"
-        return 39
-    if name == "nbsp"
-        return 160
-    if name == "copy"
-        return 169
-    if name == "reg"
-        return 174
-    if name == "trade"
-        return 8482
-    if name == "mdash"
-        return 8212
-    if name == "ndash"
-        return 8211
-    if name == "hellip"
-        return 8230
-    if name == "euro"
-        return 8364
-    if name == "pound"
-        return 163
-    if name == "cent"
-        return 162
-    if name == "deg"
-        return 176
-    if name == "bull"
-        return 8226
-    -1
+    let table = {"amp": 38, "lt": 60, "gt": 62, "quot": 34, "apos": 39, "nbsp": 160, "copy": 169, "reg": 174, "trade": 8482, "mdash": 8212, "ndash": 8211, "hellip": 8230, "euro": 8364, "pound": 163, "cent": 162, "deg": 176, "bull": 8226}
+    return get(table, name, 0 - 1)
 
-fn _ent_hex(s: string) -> int
+// PRIVATE: parse an unsigned integer in the given base from `s`. Returns ok(value), or err(..) on any
+// character that is not a digit of that base (previously a -1 sentinel indistinguishable from a real value).
+// Empty input is ok(0), exactly as before.
+fn _ent_digits(s: string, digits: string) -> Result
+    let base = len(digits)
     let v = 0
-    let i = 0
-    while i < len(s)
-        let d = find("0123456789abcdef", lower(char_at(s, i)))
+    // KEPT as a loop: it SHORT-CIRCUITS out on the first non-digit.
+    for i in 0..len(s)
+        let d = find(digits, lower(char_at(s, i)))
         if d < 0
-            return -1
-        v = v * 16 + d
-        i = i + 1
-    v
+            return err("bad digit in numeric character reference")
+        v = v * base + d
+    return ok(v)
 
-fn _ent_dec(s: string) -> int
-    let v = 0
-    let i = 0
-    while i < len(s)
-        let d = find("0123456789", char_at(s, i))
-        if d < 0
-            return -1
-        v = v * 10 + d
-        i = i + 1
-    v
+fn _ent_hex(s: string) -> Result
+    return _ent_digits(s, "0123456789abcdef")
+
+fn _ent_dec(s: string) -> Result
+    return _ent_digits(s, "0123456789")
 
 // PRIVATE: decode the text BETWEEN & and ; -> the character(s), or "" if not a recognized entity.
 fn _ent_decode_body(body: string) -> string
@@ -81,22 +56,26 @@ fn _ent_decode_body(body: string) -> string
             return ""
         let cp = 0
         if char_at(numpart, 0) == "x" or char_at(numpart, 0) == "X"
-            cp = _ent_hex(slice(numpart, 1, len(numpart)))
+            cp = _ent_hex(slice(numpart, 1, len(numpart))) else 0 - 1
         else
-            cp = _ent_dec(numpart)
+            cp = _ent_dec(numpart) else 0 - 1
         if cp <= 0
             return ""
         return _ent_utf8(cp)
     let named = _ent_named(body)
     if named < 0
         return ""
-    _ent_utf8(named)
+    return _ent_utf8(named)
 
 // Decode all HTML entities in `s`. An unrecognized "&...;" (or a lone &) is passed through literally.
 fn html_decode(s: string) -> string
-    let out = ""
+    // PARTS + one join. `out = out + c` per character reallocated and recopied the ENTIRE output on every
+    // character: quadratic in the input length. Pushing pieces and joining once is linear.
+    let parts = []
     let i = 0
     let n = len(s)
+    // KEPT as `while`: `i` advances by a DATA-DEPENDENT amount -- 1 for a plain character, or past a whole
+    // "&entity;" when one is recognized. Not a fixed-stride range.
     while i < n
         let c = char_at(s, i)
         if c == "&"
@@ -105,15 +84,15 @@ fn html_decode(s: string) -> string
             if semi > 1 and semi <= 12
                 let decoded = _ent_decode_body(slice(s, i + 1, i + semi))
                 if len(decoded) > 0
-                    out = out + decoded
-                    i = i + semi + 1
+                    push(parts, decoded)
+                    i += semi + 1
                 else
-                    out = out + c
-                    i = i + 1
+                    push(parts, c)
+                    i += 1
             else
-                out = out + c
-                i = i + 1
+                push(parts, c)
+                i += 1
         else
-            out = out + c
-            i = i + 1
-    out
+            push(parts, c)
+            i += 1
+    return join(parts, "")

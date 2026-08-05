@@ -7,46 +7,53 @@
 // CRC32 (IEEE), not CRC32C -- CRC32C only appears in the modern RecordBatch v2 container.
 import std/hash/crc32
 
+// ---- frame assembly ------------------------------------------------------------------------------------
+// Concatenate a list of `bytes` pieces. `acc = bytes_concat(acc, piece)` inside a loop is QUADRATIC:
+// bytes_concat allocates a fresh buffer and memcpys EVERYTHING accumulated so far on every step, so a
+// k-piece frame of n total bytes copies n*k/2 bytes (a 10k-message ProduceRequest copies gigabytes).
+// Pairwise halving merges neighbours and halves the list each round: O(n log k) copied, still at memcpy
+// speed (unlike a per-byte bytes_append loop, which would be linear but ~100x slower per byte).
+// Empty list -> empty bytes; a single piece is returned as-is (safe: nothing in this module mutates
+// bytes, every value here is build-once-then-read).
+fn _kf_cat(pieces: list) -> any
+    if len(pieces) == 0
+        return bytes(0)
+    let cur = pieces
+    while len(cur) > 1
+        let n = len(cur)
+        let half = (n + 1) / 2
+        cur = [bytes_concat(cur[2 * k], cur[2 * k + 1]) if 2 * k + 1 < n else cur[2 * k] for k in 0..half]
+    cur[0]
+
 // ---- big-endian integer codecs -----------------------------------------------------------------------
-// Shift+mask extraction is sign-agnostic: bit (8*k .. 8*k+7) of a 64-bit two's-complement value never
-// depends on how the shift fills vacated high bits, so this is correct for negative n (e.g. the -1
-// null-length markers) without any overflow-prone modulo-offset arithmetic.
+// ONE width-parameterized encoder backs be16/be32/be64 (the three were byte-for-byte the same shift ladder
+// at three lengths). Shift+mask extraction is sign-agnostic: bit (8*k .. 8*k+7) of a 64-bit two's-complement
+// value never depends on how the shift fills vacated high bits, so this is correct for negative n (e.g. the
+// -1 null-length markers) without any overflow-prone modulo-offset arithmetic.
+fn _kf_be(n: int, width: int) -> any
+    bytes_from_list([(n >> (8 * (width - 1 - i))) & 255 for i in 0..width])
+
 fn kf_be16(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, n & 255)
-    b
+    _kf_be(n, 2)
 
 fn kf_be32(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, (n >> 24) & 255)
-    b = bytes_append(b, (n >> 16) & 255)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, n & 255)
-    b
+    _kf_be(n, 4)
 
 fn kf_be64(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, (n >> 56) & 255)
-    b = bytes_append(b, (n >> 48) & 255)
-    b = bytes_append(b, (n >> 40) & 255)
-    b = bytes_append(b, (n >> 32) & 255)
-    b = bytes_append(b, (n >> 24) & 255)
-    b = bytes_append(b, (n >> 16) & 255)
-    b = bytes_append(b, (n >> 8) & 255)
-    b = bytes_append(b, n & 255)
-    b
+    _kf_be(n, 8)
 
 // Unsigned 16-bit read (0..65535) -- raw big-endian bit pattern, no sign extension.
+// The reads below stay as explicit inline arithmetic ON PURPOSE: they are the hottest instructions in the
+// module (every field of every record of a multi-megabyte FetchResponse goes through them), and a
+// width-parameterized reduce(...) form would replace 4 inline multiplies with a list allocation plus 4
+// any-boxed closure calls.
 fn kf_rd_u16(b, off: int) -> int
     (bytes_get(b, off) * 256) + bytes_get(b, off + 1)
 
 // Signed 16-bit read (Kafka string lengths use -1 as the null sentinel).
 fn kf_rd_i16(b, off: int) -> int
     let u = kf_rd_u16(b, off)
-    if u >= 32768
-        return u - 65536
-    u
+    u - 65536 if u >= 32768 else u
 
 // Unsigned 32-bit read (0..4294967295) -- fits an i64 with room to spare.
 fn kf_rd_u32(b, off: int) -> int
@@ -55,19 +62,15 @@ fn kf_rd_u32(b, off: int) -> int
 // Signed 32-bit read (correlation ids, error codes, bytes/array lengths use -1 as a sentinel).
 fn kf_rd_i32(b, off: int) -> int
     let u = kf_rd_u32(b, off)
-    if u >= 2147483648
-        return u - 4294967296
-    u
+    u - 4294967296 if u >= 2147483648 else u
 
 // Signed 64-bit read (offsets, timestamps). Built by shift+or across all 8 bytes -- this naturally lands on
 // the correct two's-complement i64 result (positive or negative) since the accumulator is exactly 64 bits
 // wide, so no separate unsigned-then-rebase step is needed (unlike the 16/32-bit reads above).
 fn kf_rd_i64(b, off: int) -> int
     let v = 0
-    let i = 0
-    while i < 8
+    for i in 0..8
         v = (v << 8) | bytes_get(b, off + i)
-        i = i + 1
     v
 
 // ---- Kafka strings / bytes ----------------------------------------------------------------------------
@@ -78,9 +81,7 @@ fn kf_wr_string(s: string) -> any
 
 // NULLABLE_STRING: -1 (two 0xFF bytes) if `s` is null, else the same as kf_wr_string.
 fn kf_wr_nullable_string(s) -> any
-    if s == null
-        return kf_be16(0 - 1)
-    kf_wr_string(s)
+    kf_be16(0 - 1) if s == null else kf_wr_string(s)
 
 // -> [string, next_off]. Non-nullable (a -1 length here is a protocol violation of the caller's contract).
 // SOUNDNESS: `n` comes straight off the wire (any int16 value, including negative-but-not-(-1)
@@ -91,21 +92,17 @@ fn kf_wr_nullable_string(s) -> any
 // the whole parse. Clamping n to >= 0 guarantees next_off is always >= start (forward progress),
 // matching the read as an empty string instead of corrupting the cursor.
 fn kf_rd_string(b, off: int) -> any
-    let n = kf_rd_i16(b, off)
-    if n < 0
-        n = 0
+    let raw = kf_rd_i16(b, off)
+    let n = 0 if raw < 0 else raw
     let start = off + 2
     [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
 
-// -> [string_or_null, next_off].
+// -> [string_or_null, next_off]. Only -1 means null; every other length (including other negatives) is
+// handled exactly as kf_rd_string handles it, so the two share ONE body.
 fn kf_rd_nullable_string(b, off: int) -> any
-    let n = kf_rd_i16(b, off)
-    if n == 0 - 1
+    if kf_rd_i16(b, off) == 0 - 1
         return [null, off + 2]
-    if n < 0
-        n = 0
-    let start = off + 2
-    [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
+    kf_rd_string(b, off)
 
 // BYTES: int32 length + raw bytes.
 fn kf_wr_bytes(bs) -> any
@@ -116,36 +113,28 @@ fn kf_wr_bytes(bs) -> any
 fn kf_wr_nullable_bytes(v) -> any
     if v == null
         return kf_be32(0 - 1)
-    if type_of(v) == "string"
-        return kf_wr_bytes(str_to_bytes(v))
-    kf_wr_bytes(v)
+    kf_wr_bytes(str_to_bytes(v) if type_of(v) == "string" else v)
 
 // -> [bytes_or_null, next_off]. SOUNDNESS: same negative-non-sentinel clamp as kf_rd_string above --
 // only -1 means null; any other negative length is malformed input and must not push next_off
 // backward past `start`.
 fn kf_rd_bytes(b, off: int) -> any
-    let n = kf_rd_i32(b, off)
-    if n == 0 - 1
+    let raw = kf_rd_i32(b, off)
+    if raw == 0 - 1
         return [null, off + 4]
-    if n < 0
-        n = 0
+    let n = 0 if raw < 0 else raw
     let start = off + 4
     [bytes_slice(b, start, start + n), start + n]
 
 // -> [string_or_null, next_off] (bytes decoded as UTF-8; convenience mirror of kf_rd_bytes for text payloads).
 fn kf_rd_nullable_bytes_str(b, off: int) -> any
     let r = kf_rd_bytes(b, off)
-    if r[0] == null
-        return [null, r[1]]
-    [bytes_to_str(r[0]), r[1]]
+    [null, r[1]] if r[0] == null else [bytes_to_str(r[0]), r[1]]
 
 // ---- request header + outer size-prefixed framing ------------------------------------------------------
 // RequestHeader (v1) => api_key(int16) api_version(int16) correlation_id(int32) client_id(nullable string).
 fn kf_request_header(api_key: int, api_version: int, correlation_id: int, client_id) -> any
-    let h = kf_be16(api_key)
-    h = bytes_concat(h, kf_be16(api_version))
-    h = bytes_concat(h, kf_be32(correlation_id))
-    bytes_concat(h, kf_wr_nullable_string(client_id))
+    _kf_cat([kf_be16(api_key), kf_be16(api_version), kf_be32(correlation_id), kf_wr_nullable_string(client_id)])
 
 // -> [api_key, api_version, correlation_id, client_id_or_null, next_off]. Inverse of kf_request_header,
 // reading starting at `off` (NOT including any outer size prefix).
@@ -175,27 +164,18 @@ fn kf_parse_response_header(b) -> any
 // Message => Crc(int32) MagicByte(int8=0) Attributes(int8=0, no compression) Key(nullable bytes) Value(nullable bytes).
 // Crc is CRC32(IEEE) of everything from MagicByte onward.
 fn _kf_message_bytes(key, value) -> any
-    let body = bytes(0)
-    body = bytes_append(body, 0)
-    body = bytes_append(body, 0)
-    body = bytes_concat(body, kf_wr_nullable_bytes(key))
-    body = bytes_concat(body, kf_wr_nullable_bytes(value))
-    let crc = h_crc32_bytes(body)
-    bytes_concat(kf_be32(crc), body)
+    let body = _kf_cat([bytes_from_list([0, 0]), kf_wr_nullable_bytes(key), kf_wr_nullable_bytes(value)])
+    bytes_concat(kf_be32(h_crc32_bytes(body)), body)
+
+// One MessageSet entry: Offset(int64) MessageSize(int32) Message. `m` = [key, value].
+fn _kf_message_entry(m) -> any
+    let mb = _kf_message_bytes(m[0], m[1])
+    _kf_cat([kf_be64(0), kf_be32(bytes_len(mb)), mb])
 
 // MessageSet: back-to-back { Offset(int64) MessageSize(int32) Message } entries, no outer count (the
 // caller wraps it in a length-prefixed field). `messages` = list of [key, value] (each any: string or null).
 fn _kf_message_set(messages: list) -> any
-    let out = bytes(0)
-    let i = 0
-    while i < len(messages)
-        let m = messages[i]
-        let mb = _kf_message_bytes(m[0], m[1])
-        out = bytes_concat(out, kf_be64(0))
-        out = bytes_concat(out, kf_be32(bytes_len(mb)))
-        out = bytes_concat(out, mb)
-        i = i + 1
-    out
+    _kf_cat([_kf_message_entry(m) for m in messages])
 
 // Parse a MessageSet occupying b[off:end] -> list of [offset, key_or_null, value_or_null] where key/value
 // are raw `bytes` (or null) -- NOT decoded as UTF-8 text. Kafka record keys/values are arbitrary binary
@@ -205,6 +185,8 @@ fn _kf_message_set(messages: list) -> any
 // may convert explicitly with bytes_to_str() themselves. A trailing message whose declared size runs past
 // `end` is a normal, expected truncation (brokers may cut a FetchResponse mid-record to respect MaxBytes)
 // -- it is silently dropped rather than treated as an error.
+// The `while` stays: `p` advances by a DATA-DEPENDENT, wire-declared step and the loop short-circuits on
+// the first malformed/truncated record -- not a counted loop.
 fn _kf_parse_message_set(b, off: int, end: int) -> any
     let out = []
     let p = off
@@ -235,28 +217,20 @@ fn _kf_parse_message_set(b, off: int, end: int) -> any
     out
 
 // ---- Produce request (api_key 0) / response ------------------------------------------------------------
+// One produce partition entry: Partition(int32) MessageSetSize(int32) MessageSet. `p` = [partition, messages].
+fn _kf_produce_partition(p) -> any
+    let mset = _kf_message_set(p[1])
+    _kf_cat([kf_be32(p[0]), kf_be32(bytes_len(mset)), mset])
+
+// One produce topic entry: TopicName(string) PartitionCount(int32) partitions...
+fn _kf_produce_topic(t) -> any
+    let parts = t[1]
+    _kf_cat([kf_wr_string(t[0]), kf_be32(len(parts)), _kf_cat([_kf_produce_partition(p) for p in parts])])
+
 // topics = list of [name: string, partitions: list]; partitions = list of [partition: int, messages: list];
 // messages = list of [key, value] (each any: string or null).
 fn kf_produce_request(acks: int, timeout_ms: int, topics: list) -> any
-    let b = kf_be16(acks)
-    b = bytes_concat(b, kf_be32(timeout_ms))
-    b = bytes_concat(b, kf_be32(len(topics)))
-    let i = 0
-    while i < len(topics)
-        let t = topics[i]
-        let parts = t[1]
-        b = bytes_concat(b, kf_wr_string(t[0]))
-        b = bytes_concat(b, kf_be32(len(parts)))
-        let j = 0
-        while j < len(parts)
-            let p = parts[j]
-            let mset = _kf_message_set(p[1])
-            b = bytes_concat(b, kf_be32(p[0]))
-            b = bytes_concat(b, kf_be32(bytes_len(mset)))
-            b = bytes_concat(b, mset)
-            j = j + 1
-        i = i + 1
-    b
+    _kf_cat([kf_be16(acks), kf_be32(timeout_ms), kf_be32(len(topics)), _kf_cat([_kf_produce_topic(t) for t in topics])])
 
 // -> [topics, next_off]; topics = list of [name, partition_responses]; partition_responses = list of
 // [partition, error_code, base_offset].
@@ -271,64 +245,43 @@ fn kf_produce_request(acks: int, timeout_ms: int, topics: list) -> any
 // using each entry's minimum wire footprint (topic >= 2-byte string-len + 4-byte partition-count = 6;
 // partition entry == fixed 14 bytes). Any well-formed response always has strictly MORE than the
 // minimum-footprint bytes per real entry, so this can never truncate legitimate data -- it only rejects
-// counts that are provably impossible given the bytes on hand.
+// counts that are provably impossible given the bytes on hand. (A negative clamp is safe as a `for`
+// bound: `0..negative` is an empty range, exactly like the `while i < n` it replaced.)
 fn kf_parse_produce_response(b, off: int) -> any
     let blen = bytes_len(b)
-    let n = kf_rd_i32(b, off)
-    if n < 0
-        n = 0
+    let raw_n = kf_rd_i32(b, off)
     let p = off + 4
     let max_topics = (blen - p) / 6
-    if n > max_topics
-        n = max_topics
+    let n = min(0 if raw_n < 0 else raw_n, max_topics)
     let topics = []
-    let i = 0
-    while i < n
+    for i in 0..n
         let nr = kf_rd_string(b, p)
         p = nr[1]
-        let pn = kf_rd_i32(b, p)
-        if pn < 0
-            pn = 0
-        p = p + 4
+        let raw_pn = kf_rd_i32(b, p)
+        p += 4
         let max_parts = (blen - p) / 14
-        if pn > max_parts
-            pn = max_parts
+        let pn = min(0 if raw_pn < 0 else raw_pn, max_parts)
         let prs = []
-        let j = 0
-        while j < pn
-            let partition = kf_rd_i32(b, p)
-            let err = kf_rd_i16(b, p + 4)
-            let offset = kf_rd_i64(b, p + 6)
-            push(prs, [partition, err, offset])
-            p = p + 14
-            j = j + 1
+        for j in 0..pn
+            push(prs, [kf_rd_i32(b, p), kf_rd_i16(b, p + 4), kf_rd_i64(b, p + 6)])
+            p += 14
         push(topics, [nr[0], prs])
-        i = i + 1
     [topics, p]
 
 // ---- Fetch request (api_key 1) / response ----------------------------------------------------------------
+// One fetch partition entry: Partition(int32) FetchOffset(int64) MaxBytes(int32).
+fn _kf_fetch_partition(p) -> any
+    _kf_cat([kf_be32(p[0]), kf_be64(p[1]), kf_be32(p[2])])
+
+// One fetch topic entry: TopicName(string) PartitionCount(int32) partitions...
+fn _kf_fetch_topic(t) -> any
+    let parts = t[1]
+    _kf_cat([kf_wr_string(t[0]), kf_be32(len(parts)), _kf_cat([_kf_fetch_partition(p) for p in parts])])
+
 // topics = list of [name: string, partitions: list]; partitions = list of [partition: int, fetch_offset:
 // int, max_bytes: int].
 fn kf_fetch_request(replica_id: int, max_wait_ms: int, min_bytes: int, topics: list) -> any
-    let b = kf_be32(replica_id)
-    b = bytes_concat(b, kf_be32(max_wait_ms))
-    b = bytes_concat(b, kf_be32(min_bytes))
-    b = bytes_concat(b, kf_be32(len(topics)))
-    let i = 0
-    while i < len(topics)
-        let t = topics[i]
-        let parts = t[1]
-        b = bytes_concat(b, kf_wr_string(t[0]))
-        b = bytes_concat(b, kf_be32(len(parts)))
-        let j = 0
-        while j < len(parts)
-            let p = parts[j]
-            b = bytes_concat(b, kf_be32(p[0]))
-            b = bytes_concat(b, kf_be64(p[1]))
-            b = bytes_concat(b, kf_be32(p[2]))
-            j = j + 1
-        i = i + 1
-    b
+    _kf_cat([kf_be32(replica_id), kf_be32(max_wait_ms), kf_be32(min_bytes), kf_be32(len(topics)), _kf_cat([_kf_fetch_topic(t) for t in topics])])
 
 // -> [topics, next_off]; topics = list of [name, partition_responses]; partition_responses = list of
 // [partition, error_code, high_watermark, messages] where messages = list of [offset, key, value] and
@@ -347,44 +300,30 @@ fn kf_fetch_request(replica_id: int, max_wait_ms: int, min_bytes: int, topics: l
 // bytes, so the clamp never fires for real data).
 fn kf_parse_fetch_response(b, off: int) -> any
     let blen = bytes_len(b)
-    let n = kf_rd_i32(b, off)
-    if n < 0
-        n = 0
+    let raw_n = kf_rd_i32(b, off)
     let p = off + 4
     let max_topics = (blen - p) / 6
-    if n > max_topics
-        n = max_topics
+    let n = min(0 if raw_n < 0 else raw_n, max_topics)
     let topics = []
-    let i = 0
-    while i < n
+    for i in 0..n
         let nr = kf_rd_string(b, p)
         p = nr[1]
-        let pn = kf_rd_i32(b, p)
-        if pn < 0
-            pn = 0
-        p = p + 4
+        let raw_pn = kf_rd_i32(b, p)
+        p += 4
         let max_parts = (blen - p) / 18
-        if pn > max_parts
-            pn = max_parts
+        let pn = min(0 if raw_pn < 0 else raw_pn, max_parts)
         let prs = []
-        let j = 0
-        while j < pn
+        for j in 0..pn
             let partition = kf_rd_i32(b, p)
             let err = kf_rd_i16(b, p + 4)
             let hw = kf_rd_i64(b, p + 6)
             let msize = kf_rd_i32(b, p + 14)
             let mset_off = p + 18
-            let mset_end = mset_off + msize
-            if msize < 0
-                mset_end = mset_off
-            if mset_end > blen
-                mset_end = mset_off
-            let msgs = _kf_parse_message_set(b, mset_off, mset_end)
-            push(prs, [partition, err, hw, msgs])
+            let cand_end = mset_off + msize
+            let mset_end = mset_off if (msize < 0 or cand_end > blen) else cand_end
+            push(prs, [partition, err, hw, _kf_parse_message_set(b, mset_off, mset_end)])
             p = mset_end
-            j = j + 1
         push(topics, [nr[0], prs])
-        i = i + 1
     [topics, p]
 
 // ---- TCP transport ---------------------------------------------------------------------------------------
@@ -398,13 +337,23 @@ fn kf_close(sock)
 fn kf_send_request(sock, header, body)
     tcp_send_bytes(sock, kf_frame_request(header, body))
 
+// Read from `sock` until `buf` holds at least `need` bytes (or the peer closes). The `while` stays: it is
+// a data-dependent I/O drain that short-circuits on EOF. What changed is the ACCUMULATION -- chunks are
+// collected into a list and merged ONCE via _kf_cat instead of `buf = bytes_concat(buf, chunk)` per
+// chunk, which recopied the whole buffer on every read (a 10 MB response arriving in 64 KB chunks copied
+// ~800 MB). A running `have` counter replaces the bytes_len(buf) test, so the merge happens exactly once.
 fn _kf_recv_at_least(sock: int, buf, need: int) -> any
-    while bytes_len(buf) < need
+    if bytes_len(buf) >= need
+        return buf
+    let parts = [buf]
+    let have = bytes_len(buf)
+    while have < need
         let chunk = tcp_recv_bytes(sock)
         if bytes_len(chunk) == 0
-            return buf
-        buf = bytes_concat(buf, chunk)
-    buf
+            return _kf_cat(parts)
+        push(parts, chunk)
+        have += bytes_len(chunk)
+    _kf_cat(parts)
 
 // Read one full size-prefixed response frame -> [correlation_id, body_bytes, leftover_buf]. body_bytes
 // excludes the size prefix AND the correlation_id (i.e. starts at the API-specific response body).

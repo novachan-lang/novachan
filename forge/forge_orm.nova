@@ -26,50 +26,37 @@ let _ORM_ACQUIRE_TIMEOUT_MS = 5000
 
 // ---- internal helpers -------------------------------------------------------------------------------
 
-// First index of `sub` in `s`, or -1. (Self-contained; no dependency on a stdlib index_of.)
-fn _orm_find(s: string, sub: string) -> int
-    let sl = len(s)
-    let bl = len(sub)
-    if bl == 0
-        return 0
-    let i = 0
-    while i + bl <= sl
-        if s[i:i + bl] == sub
-            return i
-        i = i + 1
-    -1
+// NOTE: the private `_orm_find(s, sub)` that used to live here was a byte-for-byte duplicate of the
+// `find` builtin -- verified equal on every edge case before deleting it (empty needle -> 0, empty
+// haystack -> -1, both empty -> 0, needle longer than haystack -> -1, match at 0, match at the last
+// index, no match -> -1). Every call site below now uses `find` directly.
 
 // Translate portable `?` placeholders to PostgreSQL `$1,$2,...`. Skips `?` inside single-quoted string
 // literals (a `?` in 'a?b' is data, not a placeholder; '' escaped-quotes stay balanced through the toggle).
+// Pieces are pushed to a list and joined ONCE: `out = out + ch` per character is QUADRATIC (each += copies
+// the whole accumulated SQL), which on a long statement dominated the entire rewrite.
 fn _orm_pg_sql(sql: string) -> string
-    let out = ""
+    let parts = []
     let n = 0
-    let i = 0
     let inq = 0
-    while i < len(sql)
+    for i in 0..len(sql)
         let ch = sql[i:i + 1]
         if ch == "'"
             if inq == 0
                 inq = 1
             else
                 inq = 0
-            out = out + ch
+            push(parts, ch)
         else if ch == "?" and inq == 0
-            n = n + 1
-            out = out + "$" + str(n)
+            n += 1
+            push(parts, "$" + str(n))
         else
-            out = out + ch
-        i = i + 1
-    out
+            push(parts, ch)
+    join(parts, "")
 
 // PostgreSQL binds parameters in text format -> stringify every value uniformly.
 fn _orm_pg_params(params) -> list
-    let out = []
-    let i = 0
-    while i < len(params)
-        push(out, str(params[i]))
-        i = i + 1
-    out
+    [str(p) for p in params]
 
 // ---- NULL params -----------------------------------------------------------------------------------
 // NOVA has no nullable value, so orm_null() returns a control-char-delimited sentinel string that no real
@@ -87,39 +74,32 @@ fn _orm_is_null_val(p) -> bool
     type_name(p) == "string" and p == _orm_null_marker()
 
 fn _orm_apply_nulls(sql: string, params) -> any
-    let has = 0
-    let i = 0
-    while i < len(params)
-        if _orm_is_null_val(params[i])
-            has = 1
-        i = i + 1
-    if has == 0
+    if not any([_orm_is_null_val(p) for p in params])
         return [sql, params]
-    let out = ""
+    // Same single-quote-aware scan as _orm_pg_sql; pieces joined ONCE (see the quadratic note there).
+    let parts = []
     let newp = []
     let pi = 0
     let inq = 0
-    let j = 0
-    while j < len(sql)
+    for j in 0..len(sql)
         let ch = sql[j:j + 1]
         if ch == "'"
             if inq == 0
                 inq = 1
             else
                 inq = 0
-            out = out + ch
+            push(parts, ch)
         else if ch == "?" and inq == 0
             if pi < len(params) and _orm_is_null_val(params[pi])
-                out = out + "NULL"
+                push(parts, "NULL")
             else
-                out = out + "?"
+                push(parts, "?")
                 if pi < len(params)
                     push(newp, params[pi])
-            pi = pi + 1
+            pi += 1
         else
-            out = out + ch
-        j = j + 1
-    [out, newp]
+            push(parts, ch)
+    [join(parts, ""), newp]
 
 
 // ---- connection -------------------------------------------------------------------------------------
@@ -148,6 +128,42 @@ fn orm_open(url: string) -> any
 fn orm_open_with_pool(url: string, pool_size: int) -> any
     _orm_open_impl(url, pool_size)
 
+// Parse the `user:password@host:port/dbname?query` body of a network DSN -- the part after the scheme.
+// PostgreSQL and MySQL differ ONLY in their default port and default database name, so this is written
+// ONCE and both drivers call it (it was two byte-identical 25-line copies). Returns
+//   ok([user, password, host, port, dbname])  /  err(msg) when there is no `@`.
+// Every split is FIRST-occurrence (find), matching the original character-scan exactly: a password may
+// contain `:` (only the first `:` in the credentials splits user from password), a dbname may follow the
+// first `/`, and a `?query` suffix is dropped.
+fn _orm_parse_dsn(rest: string, default_port: int, default_db: string, scheme: string) -> any
+    let at = find(rest, "@")
+    if at < 0
+        return err("orm: {scheme} url must be {scheme}://user:password@host:port/dbname")
+    let creds = rest[0:at]
+    let loc = rest[at + 1:len(rest)]
+    let user = creds
+    let password = ""
+    let ci = find(creds, ":")
+    if ci >= 0
+        user = creds[0:ci]
+        password = creds[ci + 1:len(creds)]
+    let hostport = loc
+    let dbname = default_db
+    let slash = find(loc, "/")
+    if slash >= 0
+        hostport = loc[0:slash]
+        dbname = loc[slash + 1:len(loc)]
+    let q = find(dbname, "?")
+    if q >= 0
+        dbname = dbname[0:q]
+    let host = hostport
+    let port = default_port
+    let pi = find(hostport, ":")
+    if pi >= 0
+        host = hostport[0:pi]
+        port = parse_int(hostport[pi + 1:len(hostport)])
+    ok([user, password, host, port, dbname])
+
 fn _orm_open_impl(url: string, pool_size: int) -> any
     if starts_with(url, "sqlite://")
         let path = url[9:len(url)]
@@ -157,65 +173,23 @@ fn _orm_open_impl(url: string, pool_size: int) -> any
         let rest = url[11:len(url)]
         if starts_with(url, "postgresql://")
             rest = url[13:len(url)]
-        let at = _orm_find(rest, "@")
-        if at < 0
-            return err("orm: postgres url must be postgres://user:password@host:port/dbname")
-        let creds = rest[0:at]
-        let loc = rest[at + 1:len(rest)]
-        let user = creds
-        let password = ""
-        let ci = _orm_find(creds, ":")
-        if ci >= 0
-            user = creds[0:ci]
-            password = creds[ci + 1:len(creds)]
-        let hostport = loc
-        let dbname = "postgres"
-        let slash = _orm_find(loc, "/")
-        if slash >= 0
-            hostport = loc[0:slash]
-            dbname = loc[slash + 1:len(loc)]
-        let q = _orm_find(dbname, "?")
-        if q >= 0
-            dbname = dbname[0:q]
-        let host = hostport
-        let port = 5432
-        let pi = _orm_find(hostport, ":")
-        if pi >= 0
-            host = hostport[0:pi]
-            port = parse_int(hostport[pi + 1:len(hostport)])
-        let r = forge_pg.pg_pool_open(host, port, user, dbname, password, pool_size)
+        // NOT `_orm_parse_dsn(...)?` -- `?` re-wraps the error with an "in <fn> at line N:" prefix,
+        // which would change the exact err() text callers already match on. Propagate it verbatim.
+        let pdsn = _orm_parse_dsn(rest, 5432, "postgres", "postgres")
+        if is_err(pdsn)
+            return pdsn
+        let dsn = unwrap(pdsn)
+        let r = forge_pg.pg_pool_open(dsn[2], dsn[3], dsn[0], dsn[4], dsn[1], pool_size)
         if is_ok(r)
             return ok(["orm", "postgres", unwrap(r), pool_size])
         return r
     if starts_with(url, "mysql://")
         let rest = url[8:len(url)]
-        let at = _orm_find(rest, "@")
-        if at < 0
-            return err("orm: mysql url must be mysql://user:password@host:port/dbname")
-        let creds = rest[0:at]
-        let loc = rest[at + 1:len(rest)]
-        let user = creds
-        let password = ""
-        let ci = _orm_find(creds, ":")
-        if ci >= 0
-            user = creds[0:ci]
-            password = creds[ci + 1:len(creds)]
-        let hostport = loc
-        let dbname = ""
-        let slash = _orm_find(loc, "/")
-        if slash >= 0
-            hostport = loc[0:slash]
-            dbname = loc[slash + 1:len(loc)]
-        let q = _orm_find(dbname, "?")
-        if q >= 0
-            dbname = dbname[0:q]
-        let host = hostport
-        let port = 3306
-        let pi = _orm_find(hostport, ":")
-        if pi >= 0
-            host = hostport[0:pi]
-            port = parse_int(hostport[pi + 1:len(hostport)])
-        let r = forge_mysql.mysql_connect(host, port, user, dbname, password)
+        let mdsn = _orm_parse_dsn(rest, 3306, "", "mysql")
+        if is_err(mdsn)
+            return mdsn
+        let dsn = unwrap(mdsn)
+        let r = forge_mysql.mysql_connect(dsn[2], dsn[3], dsn[0], dsn[4], dsn[1])
         if is_ok(r)
             return ok(["orm", "mysql", unwrap(r)])
         return r
@@ -337,9 +311,8 @@ fn _orm_qident(kind: string, name: string) -> string
 
 // COUNT rows, optional WHERE (pass "" for none). orm_count(db, "users", "age > ?", [18]).
 fn orm_count(db, table: string, where: string, params) -> int
-    let sql = "SELECT count(*) AS n FROM " + _orm_qident(db[1], table)
-    if len(where) > 0
-        sql = sql + " WHERE " + where
+    let tbl = _orm_qident(db[1], table)
+    let sql = "SELECT count(*) AS n FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT count(*) AS n FROM {tbl}"
     let rows = orm_all(db, sql, params)
     if len(rows) > 0
         return parse_int(rows[0]["n"])
@@ -363,9 +336,9 @@ fn _orm_is_valid_agg_fn(fn_name: string) -> bool
 fn orm_agg(db, fn_name: string, col: string, table: string, where: string, params) -> string
     if not _orm_is_valid_agg_fn(fn_name)
         return ""
-    let sql = "SELECT " + fn_name + "(" + _orm_qident(db[1], col) + ") AS a FROM " + _orm_qident(db[1], table)
-    if len(where) > 0
-        sql = sql + " WHERE " + where
+    let cq = _orm_qident(db[1], col)
+    let tbl = _orm_qident(db[1], table)
+    let sql = "SELECT {fn_name}({cq}) AS a FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT {fn_name}({cq}) AS a FROM {tbl}"
     let rows = orm_all(db, sql, params)
     if len(rows) > 0
         return str(rows[0]["a"])
@@ -378,57 +351,34 @@ fn orm_agg(db, fn_name: string, col: string, table: string, where: string, param
 // an auto/serial key, use orm_exec with custom SQL). Returns ok(affected) / err(msg).
 fn orm_insert(db, table: string, row) -> any
     let kind = db[1]
-    let names = field_names(row)
-    let cols = ""
-    let placeholders = ""
-    let params = []
-    let i = 0
-    while i < len(names)
-        let nm = names[i]
-        // Skip an UNSET id (id == 0) so the DB auto-assigns the primary key (the "insert a new row, get its
-        // id" hero flow). A non-zero id is inserted verbatim (explicit-id inserts still work). No id field
-        // -> nothing skipped.
-        let skip = 0
-        if nm == "id"
-            if field_get(row, nm) == 0
-                skip = 1
-        if skip == 0
-            if len(params) == 0
-                cols = _orm_qident(kind, nm)
-                placeholders = "?"
-            else
-                cols = cols + ", " + _orm_qident(kind, nm)
-                placeholders = placeholders + ", ?"
-            push(params, field_get(row, nm))
-        i = i + 1
-    orm_exec(db, "INSERT INTO " + _orm_qident(kind, table) + " (" + cols + ") VALUES (" + placeholders + ")", params)
+    // Skip an UNSET id (id == 0) so the DB auto-assigns the primary key (the "insert a new row, get its
+    // id" hero flow). A non-zero id is inserted verbatim (explicit-id inserts still work). No id field
+    // -> nothing skipped.
+    let use = [nm for nm in field_names(row) if nm != "id" or field_get(row, nm) != 0]
+    let cols = join([_orm_qident(kind, nm) for nm in use], ", ")
+    let placeholders = join(["?" for nm in use], ", ")
+    let params = [field_get(row, nm) for nm in use]
+    let tbl = _orm_qident(kind, table)
+    orm_exec(db, "INSERT INTO {tbl} ({cols}) VALUES ({placeholders})", params)
 
 // UPDATE a struct by its `id` field: SET every non-id column WHERE id = the struct's id. The struct MUST
 // have an id field. Returns ok(affected) (driver-reported where available) / err(msg).
 fn orm_update(db, table: string, row) -> any
     let kind = db[1]
     let names = field_names(row)
-    let setclause = ""
-    let params = []
-    let idval = 0
-    let i = 0
-    while i < len(names)
-        let nm = names[i]
-        if nm == "id"
-            idval = field_get(row, nm)
-        else
-            if len(params) == 0
-                setclause = _orm_qident(kind, nm) + " = ?"
-            else
-                setclause = setclause + ", " + _orm_qident(kind, nm) + " = ?"
-            push(params, field_get(row, nm))
-        i = i + 1
+    let cols = [nm for nm in names if nm != "id"]
+    let setclause = join([_orm_qident(kind, nm) + " = ?" for nm in cols], ", ")
+    let params = [field_get(row, nm) for nm in cols]
+    // a struct with no `id` field binds 0, exactly as before (orm_modify refuses that case up front)
+    let idval = field_get(row, "id") if "id" in names else 0
     push(params, idval)
-    orm_exec(db, "UPDATE " + _orm_qident(kind, table) + " SET " + setclause + " WHERE id = ?", params)
+    let tbl = _orm_qident(kind, table)
+    orm_exec(db, "UPDATE {tbl} SET {setclause} WHERE id = ?", params)
 
 // DELETE by id. Returns ok(affected) / err(msg).
 fn orm_delete(db, table: string, id) -> any
-    orm_exec(db, "DELETE FROM " + _orm_qident(db[1], table) + " WHERE id = ?", [id])
+    let tbl = _orm_qident(db[1], table)
+    orm_exec(db, "DELETE FROM {tbl} WHERE id = ?", [id])
 
 // ── Zero-annotation, zero-table-name persistence: the struct's TYPE *is* the table ───────────────────
 // No @Entity, no @Table, no @Column, no table-name strings, no SQL. type_name(row) derives the table name;
@@ -459,7 +409,8 @@ fn orm_fetch(db) -> list
 // rows. This is the target of the orm_fetch compiler rewrite (so reserved-word type names are legal SQL),
 // and is also usable directly: `let xs: list<Todo> = orm_fetch_all(db, "Todo")` when the table is dynamic.
 fn orm_fetch_all(db, table: string) -> list
-    orm_all(db, "SELECT * FROM " + _orm_qident(db[1], table), [])
+    let tbl = _orm_qident(db[1], table)
+    orm_all(db, "SELECT * FROM {tbl}", [])
 
 // Create the struct-type's table if it doesn't already exist (columns + SQL types derived from the fields).
 fn orm_ensure(db, sample) -> any
@@ -474,13 +425,15 @@ fn orm_save(db, row) -> any
 // non-existent column (which would silently affect the wrong rows or error opaquely at the driver).
 fn orm_modify(db, row) -> any
     if not contains(field_names(row), "id")
-        return err("orm_modify: struct '" + type_name(row) + "' has no 'id' field")
+        let tn = type_name(row)
+        return err("orm_modify: struct '{tn}' has no 'id' field")
     orm_update(db, type_name(row), row)
 
 // Delete a struct (by its id field) from its own type's table. Same id-field requirement as orm_modify.
 fn orm_remove(db, row) -> any
     if not contains(field_names(row), "id")
-        return err("orm_remove: struct '" + type_name(row) + "' has no 'id' field")
+        let tn = type_name(row)
+        return err("orm_remove: struct '{tn}' has no 'id' field")
     orm_delete(db, type_name(row), field_get(row, "id"))
 
 // ---- fluent query builder (NOVA's answer to JPA Criteria: zero annotations, transparent SQL) --------
@@ -507,20 +460,8 @@ fn OrmQuery.columns(cols: string) -> OrmQuery
     OrmQuery { table: self.table, cols: cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: self.lim, off: self.off }
 
 fn OrmQuery.where(cond: string, ps) -> OrmQuery
-    let np = []
-    let i = 0
-    while i < len(self.params)
-        push(np, self.params[i])
-        i = i + 1
-    let j = 0
-    while j < len(ps)
-        push(np, ps[j])
-        j = j + 1
-    let w = self.wheres
-    if len(w) > 0
-        w = w + " AND " + cond
-    else
-        w = cond
+    let np = [...self.params, ...ps]
+    let w = self.wheres + " AND " + cond if len(self.wheres) > 0 else cond
     OrmQuery { table: self.table, cols: self.cols, wheres: w, joins: self.joins, params: np, order: self.order, lim: self.lim, off: self.off }
 
 fn OrmQuery.inner_join(other: string, on: string) -> OrmQuery
@@ -546,18 +487,18 @@ fn OrmQuery.paginate(page: int, per_page: int) -> OrmQuery
     OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: per_page, off: (p - 1) * per_page }
 
 fn OrmQuery.sql() -> string
-    let s = "SELECT " + self.cols + " FROM " + self.table
+    let parts = ["SELECT " + self.cols + " FROM " + self.table]
     if len(self.joins) > 0
-        s = s + self.joins
+        push(parts, self.joins)
     if len(self.wheres) > 0
-        s = s + " WHERE " + self.wheres
+        push(parts, " WHERE " + self.wheres)
     if len(self.order) > 0
-        s = s + " ORDER BY " + self.order
+        push(parts, " ORDER BY " + self.order)
     if self.lim > 0
-        s = s + " LIMIT " + str(self.lim)
+        push(parts, " LIMIT " + str(self.lim))
     if self.off > 0
-        s = s + " OFFSET " + str(self.off)
-    s
+        push(parts, " OFFSET " + str(self.off))
+    join(parts, "")
 
 // Run the built query and return untyped rows. For typed results use orm_all(db, q.sql(), q.params).
 fn OrmQuery.run(db) -> list
@@ -569,48 +510,45 @@ fn OrmQuery.run(db) -> list
 // Relations need no special API or annotations: has-many = orm_where on the child's FK column;
 // belongs-to = orm_get on the parent table by the FK value. Both are ONE typed call, no SQL ceremony.
 fn orm_get(db, table: string, id) -> any
-    orm_one(db, "SELECT * FROM " + _orm_qident(db[1], table) + " WHERE id = ?", [id])
+    let tbl = _orm_qident(db[1], table)
+    orm_one(db, "SELECT * FROM {tbl} WHERE id = ?", [id])
 
 fn orm_where(db, table: string, cond: string, params) -> list
-    orm_all(db, "SELECT * FROM " + _orm_qident(db[1], table) + " WHERE " + cond, params)
+    let tbl = _orm_qident(db[1], table)
+    orm_all(db, "SELECT * FROM {tbl} WHERE {cond}", params)
 
 // ---- migrations: schema generated from a struct (JPA's ddl-auto, zero annotations) ------------------
 // orm_create_table(db, "users", User(0,"",0,false)) reflects a sample struct's field names + types and
 // emits CREATE TABLE IF NOT EXISTS with portable per-driver column types. An `id` field becomes PRIMARY
 // KEY. No annotations, no migration DSL -- the struct IS the schema.
+// NOVA type -> portable SQL column type. A table lookup rather than an if-ladder; float is the only
+// dialect-dependent entry, and any unmapped NOVA type falls back to TEXT (unchanged).
+// The table is built HERE, not hoisted to a module-level `let`: a module-level dict literal reads back
+// EMPTY at call time on the current toolchain, which silently made every column TEXT -- caught by the
+// behaviour diff (an INTEGER id stopped being an alias for the sqlite rowid, so auto-PK assignment
+// vanished, and `age > ?` started comparing as text: "30" > "1000"). Module-level ints are fine; a
+// module-level dict is NOT.
+fn _orm_sql_type_table() -> dict
+    {"int": "INTEGER", "bool": "INTEGER", "string": "TEXT"}
+
 fn _orm_sql_type(nova_type: string, kind: string, col: string) -> string
-    let base = "TEXT"
-    if nova_type == "int"
-        base = "INTEGER"
-    else if nova_type == "float"
-        if kind == "postgres"
-            base = "DOUBLE PRECISION"
-        else
-            base = "REAL"
-    else if nova_type == "bool"
-        base = "INTEGER"
-    else if nova_type == "string"
-        base = "TEXT"
+    let base = get(_orm_sql_type_table(), nova_type, "TEXT")
+    if nova_type == "float"
+        base = "DOUBLE PRECISION" if kind == "postgres" else "REAL"
     if col == "id"
-        return base + " PRIMARY KEY"
+        return "{base} PRIMARY KEY"
     base
 
 fn orm_create_table(db, table: string, sample) -> any
     let names = field_names(sample)
     let types = field_types(sample)
     let kind = db[1]
-    let cols = ""
-    let i = 0
-    while i < len(names)
-        // quote the column identifier (keyword-safe); _orm_sql_type still sees the RAW name so its
-        // `col == "id"` PRIMARY-KEY check is unaffected.
-        let coldef = _orm_qident(kind, names[i]) + " " + _orm_sql_type(types[i], kind, names[i])
-        if i == 0
-            cols = coldef
-        else
-            cols = cols + ", " + coldef
-        i = i + 1
-    orm_exec(db, "CREATE TABLE IF NOT EXISTS " + _orm_qident(kind, table) + " (" + cols + ")", [])
+    // quote the column identifier (keyword-safe); _orm_sql_type still sees the RAW name so its
+    // `col == "id"` PRIMARY-KEY check is unaffected.
+    let cols = join([_orm_qident(kind, names[i]) + " " + _orm_sql_type(types[i], kind, names[i]) for i in 0..len(names)], ", ")
+    let tbl = _orm_qident(kind, table)
+    orm_exec(db, "CREATE TABLE IF NOT EXISTS {tbl} ({cols})", [])
 
 fn orm_drop_table(db, table: string) -> any
-    orm_exec(db, "DROP TABLE IF EXISTS " + _orm_qident(db[1], table), [])
+    let tbl = _orm_qident(db[1], table)
+    orm_exec(db, "DROP TABLE IF EXISTS {tbl}", [])

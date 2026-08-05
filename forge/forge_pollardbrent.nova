@@ -16,12 +16,18 @@
 //   pb_is_prime(n) -> bool     deterministic Miller-Rabin (exact for all n < 3.3e18)
 // LEAF (imports nothing).
 
+// The 12 deterministic Miller-Rabin witnesses (exact for all n < 3.3e18). The SAME list doubles as the
+// trial-division wheel in pb_factor, so it is defined once here instead of being spelled out twice.
+fn _pb_witnesses() -> list
+    [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+
 fn _pb_addmod(a: int, b: int, m: int) -> int
     if a >= m - b
         return a - (m - b)
     return a + b
 
-// overflow-safe (a*b) mod m via double-and-add
+// overflow-safe (a*b) mod m via double-and-add. The halving loop is data-dependent (state machine on
+// the bits of y) -- it stays a `while`.
 fn _pb_mulmod(a: int, b: int, m: int) -> int
     let r = 0
     let x = ((a % m) + m) % m
@@ -44,57 +50,49 @@ fn _pb_powmod(base: int, exp: int, m: int) -> int
         e = e / 2
     return r
 
+// Kept as a module-local helper rather than the `abs` builtin on purpose: the argument here is an
+// arbitrary residue mod n, and the builtin inspects its operand for a boxed-float tag first -- pure
+// integer arithmetic keeps that lookup (and any pointer-aliasing hazard) out of the hot inner loop.
+fn _pb_abs(x: int) -> int
+    if x < 0 0 - x else x
+
+// Euclid: the step is data-dependent (x % y), never a counted range -- stays a `while`.
 fn _pb_gcd(a: int, b: int) -> int
-    let x = a
-    let y = b
-    if x < 0
-        x = 0 - x
-    if y < 0
-        y = 0 - y
+    let x = _pb_abs(a)
+    let y = _pb_abs(b)
     while y != 0
         let t = y
         y = x % y
         x = t
     return x
 
-fn _pb_abs(x: int) -> int
-    if x < 0
-        return 0 - x
-    return x
-
 // Deterministic Miller-Rabin (12 witnesses -> exact for all n < 3.3e18).
 fn pb_is_prime(n: int) -> bool
     if n < 2
         return false
-    let small = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
-    let i = 0
-    while i < len(small)
-        if n == small[i]
+    let small = _pb_witnesses()
+    for p in small
+        if n == p
             return true
-        if n % small[i] == 0
+        if n % p == 0
             return false
-        i = i + 1
-    // write n-1 = d * 2^s
+    // write n-1 = d * 2^s -- data-dependent halving, stays a `while`
     let d = n - 1
     let s = 0
     while d % 2 == 0
         d = d / 2
-        s = s + 1
-    let wi = 0
-    while wi < len(small)
-        let a = small[wi]
+        s += 1
+    for a in small
         let x = _pb_powmod(a, d, n)
         if x != 1 and x != n - 1
             let composite = true
-            let r = 1
-            while r < s and composite
+            for r in 1..s
                 x = _pb_mulmod(x, x, n)
                 if x == n - 1
                     composite = false
-                r = r + 1
+                    break
             if composite
                 return false
-        wi = wi + 1
     return true
 
 // f(x) = x^2 + c mod n
@@ -106,8 +104,7 @@ fn pb_rho(n: int) -> int
     if n % 2 == 0
         return 2
     // try increasing constants c and starting y until a factor emerges
-    let attempt = 1
-    while attempt <= 50
+    for attempt in 1..51
         let c = attempt
         let y = attempt % n
         let m = 128
@@ -116,35 +113,30 @@ fn pb_rho(n: int) -> int
         let q = 1
         let x = y
         let ys = y
+        // episode loop: runs until the batched gcd stops being 1 -- data-dependent, stays a `while`
         while g == 1
             x = y
-            let i = 0
-            while i < r
+            for i in 0..r
                 y = _pb_f(y, c, n)
-                i = i + 1
+            // k advances by the BATCH size m, not by 1 -- not a counted 0..n range, stays a `while`
             let k = 0
             while k < r and g == 1
                 ys = y
-                let lim = m
-                if r - k < lim
-                    lim = r - k
-                let j = 0
-                while j < lim
+                let lim = min(m, r - k)
+                for j in 0..lim
                     y = _pb_f(y, c, n)
                     q = _pb_mulmod(q, _pb_abs(x - y), n)
-                    j = j + 1
                 g = _pb_gcd(q, n)
-                k = k + m
+                k += m
             r = r * 2
         if g == n
-            // backtrack step-by-step from ys
+            // backtrack step-by-step from ys -- data-dependent, stays a `while`
             g = 1
             while g == 1
                 ys = _pb_f(ys, c, n)
                 g = _pb_gcd(_pb_abs(x - ys), n)
         if g != n and g != 1
             return g
-        attempt = attempt + 1
     return n
 
 // Factor n fully. Returns sorted prime factors with multiplicity.
@@ -153,27 +145,18 @@ fn pb_factor(n: int) -> list
     if n <= 1
         return factors
     // strip small primes first (fast + ensures rho gets a composite)
-    let small = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
     let m = n
-    let i = 0
-    while i < len(small)
-        let p = small[i]
+    for p in _pb_witnesses()
         while m % p == 0
             push(factors, p)
             m = m / p
-        i = i + 1
-    // recursively split the rest using a work stack
+    // recursively split the rest using a work stack (worklist -> genuine `while`; pop() replaces the
+    // old copy-all-but-last rebuild, which made every pop O(len) i.e. the whole drain quadratic)
     let stack = []
     if m > 1
         push(stack, m)
     while len(stack) > 0
-        let v = stack[len(stack) - 1]
-        let new_stack = []
-        let si = 0
-        while si < len(stack) - 1
-            push(new_stack, stack[si])
-            si = si + 1
-        stack = new_stack
+        let v = pop(stack)
         if pb_is_prime(v)
             push(factors, v)
         else
@@ -184,16 +167,6 @@ fn pb_factor(n: int) -> list
             else
                 push(stack, d)
                 push(stack, v / d)
-    // sort ascending (insertion sort)
-    let a = factors
-    let n2 = len(a)
-    let k = 1
-    while k < n2
-        let key = a[k]
-        let j = k - 1
-        while j >= 0 and a[j] > key
-            a[j + 1] = a[j]
-            j = j - 1
-        a[j + 1] = key
-        k = k + 1
-    return a
+    // sort ascending (the builtin int sort -- same total order as the old hand-rolled insertion sort,
+    // O(n log n) instead of O(n^2), and it sorts in place so the returned handle is unchanged)
+    sort(factors)

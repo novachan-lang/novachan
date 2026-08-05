@@ -6,109 +6,97 @@
 // shares the name) measures inequality of a set of values -- income distribution, load imbalance, wealth
 // concentration (0 = perfectly equal, ->1 = one holder has everything). Entropy is in BITS (log base 2).
 // LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05 (high-level pass). All nine index-`while` loops became `for`: the four that only add up
+// integer counts are now the `sum` builtin, the "how many non-empty categories" count is a filtered
+// comprehension, the sorted copy is a comprehension, and gini_coefficient's rank-weighted pass is
+// `for i, v in sorted` -- it needs BOTH index and value, and that is the construct for it.
+//
+// TWO CONTRACTS THIS RAISE PINS DOWN RATHER THAN CHANGES:
+//   * counts ARE INTEGERS. shannon_entropy / normalized_entropy / gini_impurity / information_gain total their
+//     input into an INT accumulator, exactly as before (`sum` is int-typed, and the loops it replaced were
+//     seeded with the integer 0). Handing them a FLOAT list was never supported and never worked -- the old
+//     int-seeded accumulation summed the raw 64-bit representations and returned a heap-address-shaped number.
+//     `values` in gini_coefficient is the opposite case: it is documented as real-valued, its accumulators are
+//     float-seeded, and the sorted copy coerces every element with `* 1.0`. That path is float-clean and stays
+//     float-clean.
+//   * The per-element FLOAT folds (entropy's `h`, impurity's `sumsq`, the weighted child entropy, and the two
+//     Gini running totals) stay explicit loops and are deliberately NOT `reduce`. A float accumulator crossing
+//     NOVA's any-boxed HOF boundary corrupts the raw double; these are the exact values the module exists to
+//     compute, so they are not going through a closure.
+//   * `_it_sorted` is NOT delegated to std/core/sort's `sort_by` even though the shapes match, because the
+//     comparison differs where it matters: this one compares `(out[b] * 1.0) > cur`, i.e. both sides coerced to
+//     float, while `sort_by` compares through an `any`-boxed closure with no coercion -- the known-unsound
+//     float/int comparison. Same shape, different edge behaviour, so no delegation.
 
-// PRIVATE: log base 2 of x (x > 0).
+// PRIVATE: log base 2 of x (x > 0). Defined as 0.0 at and below zero rather than trapping.
 fn _log2(x: float) -> float
-    let l = 0.0
-    if x > 0.0
-        l = log(x) / log(2.0)
-    l
+    return log(x) / log(2.0) if x > 0.0 else 0.0
 
-// PRIVATE: insertion-sort a copy of a scalar list ascending.
+// PRIVATE: insertion-sort a copy of a scalar list ascending, coercing every element to float on the way in.
+// The OUTER pass counts over a fixed range, so it is a `for`; the INNER shift walks backwards by a
+// data-dependent number of steps and stops early, which is exactly what `while` is for.
 fn _it_sorted(xs: list) -> list
-    let out = []
-    let i = 0
-    while i < len(xs)
-        push(out, xs[i] * 1.0)
-        i = i + 1
-    let a = 1
-    while a < len(out)
+    let out = [x * 1.0 for x in xs]
+    for a in 1..len(out)
         let cur = out[a] * 1.0
         let b = a - 1
         while b >= 0 and (out[b] * 1.0) > cur
             out[b + 1] = out[b]
-            b = b - 1
+            b -= 1
         out[b + 1] = cur
-        a = a + 1
-    out
+    return out
 
 // Shannon entropy (in bits) of a distribution given as category counts. 0 for a pure/empty distribution.
 fn shannon_entropy(counts: list) -> float
-    let total = 0
-    let i = 0
-    while i < len(counts)
-        total = total + counts[i]
-        i = i + 1
+    let total = sum(counts)
     let h = 0.0
     if total > 0
-        let j = 0
-        while j < len(counts)
-            let c = counts[j]
+        for c in counts
             if c > 0
                 let p = (c * 1.0) / (total * 1.0)
-                h = h - p * _log2(p)
-            j = j + 1
-    h
+                h -= p * _log2(p)
+    return h
 
 // Normalized entropy in [0,1]: entropy divided by the maximum possible (log2 of the number of non-empty
 // categories). 0 for a single category.
 fn normalized_entropy(counts: list) -> float
-    let nz = 0
-    let i = 0
-    while i < len(counts)
-        if counts[i] > 0
-            nz = nz + 1
-        i = i + 1
-    let out = 0.0
+    let nz = len([c for c in counts if c > 0])
     if nz > 1
-        out = shannon_entropy(counts) / _log2(nz * 1.0)
-    out
+        return shannon_entropy(counts) / _log2(nz * 1.0)
+    return 0.0
 
 // Gini impurity: 1 - sum(p_i^2). 0 = pure; higher = more mixed. The split criterion in CART decision trees.
+// Every category contributes, including empty ones -- p = 0 there, so the term is 0 and the answer is
+// unchanged; that is why there is no `if c > 0` guard here where shannon_entropy needs one (log(0) is not 0).
 fn gini_impurity(counts: list) -> float
-    let total = 0
-    let i = 0
-    while i < len(counts)
-        total = total + counts[i]
-        i = i + 1
+    let total = sum(counts)
     let g = 0.0
     if total > 0
         let sumsq = 0.0
-        let j = 0
-        while j < len(counts)
-            let p = (counts[j] * 1.0) / (total * 1.0)
-            sumsq = sumsq + p * p
-            j = j + 1
+        for c in counts
+            let p = (c * 1.0) / (total * 1.0)
+            sumsq += p * p
         g = 1.0 - sumsq
-    g
+    return g
 
 // Information gain of a split: parent entropy minus the weighted average entropy of the child groups.
 // `parent_counts` is the class distribution before the split; `children` is a list of child class-count lists.
 fn information_gain(parent_counts: list, children: list) -> float
-    let parent_total = 0
-    let i = 0
-    while i < len(parent_counts)
-        parent_total = parent_total + parent_counts[i]
-        i = i + 1
+    let parent_total = sum(parent_counts)
     let gain = 0.0
     if parent_total > 0
         let after = 0.0
-        let c = 0
-        while c < len(children)
-            let child = children[c]
-            let child_total = 0
-            let k = 0
-            while k < len(child)
-                child_total = child_total + child[k]
-                k = k + 1
-            let weight = (child_total * 1.0) / (parent_total * 1.0)
-            after = after + weight * shannon_entropy(child)
-            c = c + 1
+        for child in children
+            let weight = (sum(child) * 1.0) / (parent_total * 1.0)
+            after += weight * shannon_entropy(child)
         gain = shannon_entropy(parent_counts) - after
-    gain
+    return gain
 
 // Gini COEFFICIENT of inequality for a list of non-negative values (income, load, wealth). 0 = perfectly
 // equal, approaching 1 = maximally concentrated. Uses the sorted-rank formula.
+// The pass needs the rank AND the value, so it is `for i, v in sorted` -- index and value straight from the
+// iteration, no index arithmetic and no separate counter.
 fn gini_coefficient(values: list) -> float
     let n = len(values)
     let g = 0.0
@@ -116,12 +104,10 @@ fn gini_coefficient(values: list) -> float
         let sorted = _it_sorted(values)
         let total = 0.0
         let weighted = 0.0
-        let i = 0
-        while i < n
-            total = total + sorted[i] * 1.0
-            weighted = weighted + ((i + 1) * 1.0) * (sorted[i] * 1.0)
-            i = i + 1
+        for i, v in sorted
+            total += v * 1.0
+            weighted += ((i + 1) * 1.0) * (v * 1.0)
         if total > 0.0
             let num = 2.0 * weighted - ((n + 1) * 1.0) * total
             g = num / ((n * 1.0) * total)
-    g
+    return g

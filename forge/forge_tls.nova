@@ -6,30 +6,13 @@ import forge_rsa
 import forge_p256
 
 fn _tls_zeros(n: int) -> list
-    let o = []
-    let i = 0
-    while i < n
-        push(o, 0)
-        i = i + 1
-    o
+    [0 for i in 0..n]
 
 // HKDF-Expand-Label(Secret, Label, Context, Length) per RFC 8446 7.1.
 // HkdfLabel = uint16(Length) || opaque("tls13 "+Label)<1-byte len> || opaque(Context)<1-byte len>.
 fn tls13_hkdf_expand_label(secret, label_str, context, length: int) -> list
-    let full = str_to_blist("tls13 " + label_str)
-    let info = []
-    push(info, (length >> 8) & 255)
-    push(info, length & 255)
-    push(info, len(full))
-    let i = 0
-    while i < len(full)
-        push(info, full[i])
-        i = i + 1
-    push(info, len(context))
-    let j = 0
-    while j < len(context)
-        push(info, context[j])
-        j = j + 1
+    let full = str_to_blist("tls13 {label_str}")
+    let info = [(length >> 8) & 255, length & 255, len(full), ...full, len(context), ...context]
     hkdf_expand(secret, info, length)
 
 // Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), 32).
@@ -66,159 +49,83 @@ fn tls13_finished_verify(secret, th) -> list
 
 // per-record AEAD nonce = write_iv XOR (seq as 8-byte big-endian, left-padded to iv length)
 fn tls13_record_nonce(iv, seq: int) -> list
-    let out = []
-    let i = 0
-    while i < len(iv)
-        push(out, iv[i])
-        i = i + 1
+    let out = [...iv]
     // XOR the 8-byte big-endian seq into the low 8 bytes
-    let b = 0
-    while b < 8
+    for b in 0..8
         let pos = len(iv) - 1 - b
-        let sbyte = (seq >> (b * 8)) & 255
-        out[pos] = out[pos] ^ sbyte
-        b = b + 1
+        out[pos] = out[pos] ^ ((seq >> (b * 8)) & 255)
     out
 
 // ── TLS 1.3 record layer (RFC 8446 §5.2), AES-128-GCM ────────────────────────────────────────────────
 // Seal: TLSInnerPlaintext = content || content_type || zeros(pad); AEAD over it with AAD = record header
 // (opaque_type 0x17 || 0x0303 || uint16 ciphertext+tag length). Returns the full on-the-wire record bytes.
 fn tls13_record_seal(key, iv, seq: int, content, content_type: int, pad: int) -> list
-    let inner = []
-    let i = 0
-    while i < len(content)
-        push(inner, content[i])
-        i = i + 1
-    push(inner, content_type)
-    let z = 0
-    while z < pad
-        push(inner, 0)
-        z = z + 1
+    let padding = _tls_zeros(pad)
+    let inner = [...content, content_type, ...padding]
     let total = len(inner) + 16
-    let aad = []
-    push(aad, 23)
-    push(aad, 3)
-    push(aad, 3)
-    push(aad, (total >> 8) & 255)
-    push(aad, total & 255)
+    let aad = [23, 3, 3, (total >> 8) & 255, total & 255]
     let nonce = tls13_record_nonce(iv, seq)
     let r = aes_gcm_encrypt(key, nonce, inner, aad)
-    let wire = []
-    let a = 0
-    while a < 5
-        push(wire, aad[a])
-        a = a + 1
-    let c = 0
-    while c < len(r[0])
-        push(wire, r[0][c])
-        c = c + 1
-    let t = 0
-    while t < len(r[1])
-        push(wire, r[1][t])
-        t = t + 1
-    wire
+    [...aad, ...r[0], ...r[1]]
 
 // Open: parse the wire record, AEAD-decrypt (AAD = the 5-byte header), strip trailing zeros + the
 // content_type byte. Returns [ok(bool), content, content_type].
 fn tls13_record_open(key, iv, seq: int, wire) -> list
-    let aad = []
-    let a = 0
-    while a < 5
-        push(aad, wire[a])
-        a = a + 1
+    let aad = [wire[i] for i in 0..5]
     let bodylen = (wire[3] << 8) | wire[4]
-    let ct = []
-    let i = 0
-    while i < bodylen - 16
-        push(ct, wire[5 + i])
-        i = i + 1
-    let tag = []
-    let j = 0
-    while j < 16
-        push(tag, wire[5 + bodylen - 16 + j])
-        j = j + 1
+    let ctlen = bodylen - 16
+    let ct = [wire[5 + i] for i in 0..ctlen]
+    let tag = [wire[5 + ctlen + j] for j in 0..16]
     let nonce = tls13_record_nonce(iv, seq)
     let dec = aes_gcm_decrypt(key, nonce, ct, aad, tag)
-    let res = []
     if dec[0] != true
-        push(res, false)
-        push(res, [])
-        push(res, 0)
-        return res
+        return [false, [], 0]
     let inner = dec[1]
+    // Trailing-zero strip: a data-dependent backwards scan that must stop at the first non-zero, so it
+    // stays a `while` (a for-range cannot express the early stop).
     let p = len(inner) - 1
     while p >= 0 and inner[p] == 0
-        p = p - 1
-    let content = []
-    let k = 0
-    while k < p
-        push(content, inner[k])
-        k = k + 1
-    push(res, true)
-    push(res, content)
-    push(res, inner[p])
-    res
+        p -= 1
+    [true, [inner[k] for k in 0..p], inner[p]]
 
 // ── TLS 1.3 handshake messages (RFC 8446 §4) ─────────────────────────────────────────────────────────
 fn _tls_u16(n: int) -> list
-    let o = []
-    push(o, (n >> 8) & 255)
-    push(o, n & 255)
-    o
+    [(n >> 8) & 255, n & 255]
 
-fn _tls_cat(a, b) -> list
-    let o = []
-    let i = 0
-    while i < len(a)
-        push(o, a[i])
-        i = i + 1
-    let j = 0
-    while j < len(b)
-        push(o, b[j])
-        j = j + 1
-    o
+// (the old private `_tls_cat` is gone: it was byte-for-byte forge_x509's `x_cat`, and every call site
+//  is now a spread literal, so nothing referenced it.)
 
 // 2-byte length-prefixed
 fn _tls_lp16(data) -> list
-    _tls_cat(_tls_u16(len(data)), data)
+    [..._tls_u16(len(data)), ...data]
 
 // 1-byte length-prefixed
 fn _tls_lp8(data) -> list
-    let o = []
-    push(o, len(data))
-    let i = 0
-    while i < len(data)
-        push(o, data[i])
-        i = i + 1
-    o
+    [len(data), ...data]
 
 // handshake header: msg_type(1) || uint24 length -> [type, length, body_start, next]
 fn tls13_hs_header(b, off: int) -> list
-    let t = b[off]
     let length = (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]
-    let r = []
-    push(r, t)
-    push(r, length)
-    push(r, off + 4)
-    push(r, off + 4 + length)
-    r
+    [b[off], length, off + 4, off + 4 + length]
 
 // Parse a ServerHello handshake message -> [cipher_suite, keyshare_group, keyshare_pubkey, selected_version]
 fn tls13_parse_server_hello(sh) -> list
     let p = 4                       // skip handshake header (type + uint24 len)
-    p = p + 2                       // legacy_version
-    p = p + 32                      // random
+    p += 2                       // legacy_version
+    p += 32                      // random
     let sidlen = sh[p]
-    p = p + 1 + sidlen              // legacy_session_id
+    p += 1 + sidlen              // legacy_session_id
     let cipher_suite = (sh[p] << 8) | sh[p + 1]
-    p = p + 2
-    p = p + 1                       // legacy_compression_method
+    p += 2
+    p += 1                       // legacy_compression_method
     let extlen = (sh[p] << 8) | sh[p + 1]
-    p = p + 2
+    p += 2
     let extend = p + extlen
     let group = 0
     let keyshare = []
     let version = 0
+    // Extension walk: the step is the parsed extension length, so this is a wire state machine and
+    // stays a `while` by design.
     while p < extend
         let etype = (sh[p] << 8) | sh[p + 1]
         let elen = (sh[p + 2] << 8) | sh[p + 3]
@@ -226,51 +133,35 @@ fn tls13_parse_server_hello(sh) -> list
         if etype == 51
             group = (sh[edata] << 8) | sh[edata + 1]
             let kelen = (sh[edata + 2] << 8) | sh[edata + 3]
-            let ks = []
-            let i = 0
-            while i < kelen
-                push(ks, sh[edata + 4 + i])
-                i = i + 1
-            keyshare = ks
+            keyshare = der_slice(sh, edata + 4, edata + 4 + kelen)
         if etype == 43
             version = (sh[edata] << 8) | sh[edata + 1]
         p = edata + elen
-    let r = []
-    push(r, cipher_suite)
-    push(r, group)
-    push(r, keyshare)
-    push(r, version)
-    r
+    [cipher_suite, group, keyshare, version]
 
 // Build a minimal TLS 1.3 ClientHello handshake message offering TLS_AES_128_GCM_SHA256 + X25519.
 // random = 32 bytes, pub = the client's 32-byte X25519 public key.
 fn tls13_make_client_hello(random, pub) -> list
-    let body = []
-    body = _tls_cat(body, _tls_u16(771))                  // legacy_version 0x0303
-    body = _tls_cat(body, random)                         // 32-byte random
-    body = _tls_cat(body, _tls_lp8([]))                   // legacy_session_id (empty)
-    body = _tls_cat(body, _tls_lp16(_tls_u16(4865)))      // cipher_suites: 1 suite 0x1301
-    body = _tls_cat(body, _tls_lp8([0]))                  // legacy_compression_methods: null
-    // extensions
-    let exts = []
-    // supported_versions (0x002b): ProtocolVersionList = lp8(0x0304)
-    exts = _tls_cat(exts, _tls_cat(_tls_u16(43), _tls_lp16(_tls_lp8(_tls_u16(772)))))
-    // supported_groups (0x000a): NamedGroupList = lp16(0x001d x25519)
-    exts = _tls_cat(exts, _tls_cat(_tls_u16(10), _tls_lp16(_tls_lp16(_tls_u16(29)))))
-    // signature_algorithms (0x000d): ecdsa_secp256r1_sha256, ed25519, rsa_pss_rsae_sha256, rsa_pkcs1_sha256
-    let sa = _tls_cat(_tls_cat(_tls_u16(1027), _tls_u16(2055)), _tls_cat(_tls_u16(2052), _tls_u16(1025)))
-    exts = _tls_cat(exts, _tls_cat(_tls_u16(13), _tls_lp16(_tls_lp16(sa))))
-    // key_share (0x0033): client_shares = lp16( group(0x001d) || key_exchange lp16(pub) )
-    let entry = _tls_cat(_tls_u16(29), _tls_lp16(pub))
-    exts = _tls_cat(exts, _tls_cat(_tls_u16(51), _tls_lp16(_tls_lp16(entry))))
-    body = _tls_cat(body, _tls_lp16(exts))
+    // signature_algorithms: ecdsa_secp256r1_sha256, ed25519, rsa_pss_rsae_sha256, rsa_pkcs1_sha256
+    let sa = [..._tls_u16(1027), ..._tls_u16(2055), ..._tls_u16(2052), ..._tls_u16(1025)]
+    // key_share entry: group(0x001d x25519) || key_exchange lp16(pub)
+    let entry = [..._tls_u16(29), ..._tls_lp16(pub)]
+    let exts = [
+        ..._tls_u16(43), ..._tls_lp16(_tls_lp8(_tls_u16(772))),      // supported_versions -> 0x0304
+        ..._tls_u16(10), ..._tls_lp16(_tls_lp16(_tls_u16(29))),      // supported_groups -> x25519
+        ..._tls_u16(13), ..._tls_lp16(_tls_lp16(sa)),                // signature_algorithms
+        ..._tls_u16(51), ..._tls_lp16(_tls_lp16(entry))              // key_share
+    ]
+    let body = [
+        ..._tls_u16(771),                   // legacy_version 0x0303
+        ...random,                          // 32-byte random
+        ..._tls_lp8([]),                    // legacy_session_id (empty)
+        ..._tls_lp16(_tls_u16(4865)),       // cipher_suites: 1 suite 0x1301
+        ..._tls_lp8([0]),                   // legacy_compression_methods: null
+        ..._tls_lp16(exts)
+    ]
     // handshake header: type 0x01 || uint24 length
-    let hdr = []
-    push(hdr, 1)
-    push(hdr, (len(body) >> 16) & 255)
-    push(hdr, (len(body) >> 8) & 255)
-    push(hdr, len(body) & 255)
-    _tls_cat(hdr, body)
+    [1, (len(body) >> 16) & 255, (len(body) >> 8) & 255, len(body) & 255, ...body]
 
 // ── TLS 1.3 Finished verification (RFC 8446 §4.4.4) ──────────────────────────────────────────────────
 // Transcript-Hash over a buffer of concatenated handshake messages.
@@ -286,11 +177,8 @@ fn tls13_verify_server_finished(secret, th, recv) -> int
     let expected = tls13_finished_verify(secret, th)
     if len(expected) != len(recv)
         return 0
-    let diff = 0
-    let i = 0
-    while i < len(expected)
-        diff = diff | (expected[i] ^ recv[i])
-        i = i + 1
+    // Deliberately NOT short-circuiting: every byte is OR-folded so the compare stays constant-time.
+    let diff = reduce([expected[i] ^ recv[i] for i in 0..len(expected)], (acc, v) => acc | v, 0)
     if diff != 0
         return 0
     1
@@ -299,89 +187,56 @@ fn tls13_verify_server_finished(secret, th, recv) -> int
 // Extract the leaf certificate DER from a Certificate message BODY (after the handshake header).
 fn tls13_cert_leaf_der(cert_body) -> list
     let ctxlen = cert_body[0]
-    let p = 1 + ctxlen                  // skip certificate_request_context
-    p = p + 3                           // skip certificate_list length (uint24)
+    let p = 1 + ctxlen + 3              // skip certificate_request_context, then certificate_list len (uint24)
     let clen = (cert_body[p] << 16) | (cert_body[p + 1] << 8) | cert_body[p + 2]
-    p = p + 3
-    der_slice(cert_body, p, p + clen)
+    der_slice(cert_body, p + 3, p + 3 + clen)
 
 // The content signed by CertificateVerify: 0x20*64 || context_string || 0x00 || transcript_hash.
 fn tls13_certverify_content(label_str, th) -> list
-    let out = []
-    let i = 0
-    while i < 64
-        push(out, 32)
-        i = i + 1
-    let lbl = str_to_blist(label_str)
-    let j = 0
-    while j < len(lbl)
-        push(out, lbl[j])
-        j = j + 1
-    push(out, 0)
-    let k = 0
-    while k < len(th)
-        push(out, th[k])
-        k = k + 1
-    out
+    let spaces = [32 for i in 0..64]
+    [...spaces, ...str_to_blist(label_str), 0, ...th]
 
 // Parse a CertificateVerify message BODY -> [signature_scheme, signature_bytes].
 fn tls13_certverify_parse(cv_body) -> list
-    let scheme = (cv_body[0] << 8) | cv_body[1]
     let siglen = (cv_body[2] << 8) | cv_body[3]
-    let sig = der_slice(cv_body, 4, 4 + siglen)
-    let out = []
-    push(out, scheme)
-    push(out, sig)
-    out
+    [(cv_body[0] << 8) | cv_body[1], der_slice(cv_body, 4, 4 + siglen)]
 
 // Parse an RSAPublicKey DER (SEQUENCE { n INTEGER, e INTEGER }) -> the bare modulus n (no leading 0x00).
 fn tls13_rsa_pubkey_n(spki_key) -> list
     let seq = der_tlv(spki_key, 0)
     let ntlv = der_tlv(spki_key, seq[2])
-    let start = ntlv[2]
-    if spki_key[start] == 0
-        start = start + 1
+    let start = ntlv[2] + 1 if spki_key[ntlv[2]] == 0 else ntlv[2]
     der_slice(spki_key, start, ntlv[3])
 
 // Extract a DER INTEGER value as a fixed 32-byte big-endian field (strip leading zeros, left-pad).
 fn _tls_der_int32(b, vstart: int, vend: int) -> list
+    // Leading-zero strip stops at the first non-zero byte -> short-circuiting scan, stays a `while`.
     let s = vstart
     while s < vend and b[s] == 0
-        s = s + 1
-    let out = []
-    let pad = 32 - (vend - s)
-    let i = 0
-    while i < pad
-        push(out, 0)
-        i = i + 1
-    let j = s
-    while j < vend
-        push(out, b[j])
-        j = j + 1
-    out
+        s += 1
+    let pad = [0 for i in 0..(32 - (vend - s))]
+    [...pad, ...der_slice(b, s, vend)]
 
 // Parse an ECDSA DER signature (SEQUENCE { r INTEGER, s INTEGER }) -> [r32, s32].
 fn _tls_parse_ecdsa_sig(sig) -> list
     let seq = der_tlv(sig, 0)
     let rtlv = der_tlv(sig, seq[2])
     let stlv = der_tlv(sig, rtlv[3])
-    let out = []
-    push(out, _tls_der_int32(sig, rtlv[2], rtlv[3]))
-    push(out, _tls_der_int32(sig, stlv[2], stlv[3]))
-    out
+    [_tls_der_int32(sig, rtlv[2], rtlv[3]), _tls_der_int32(sig, stlv[2], stlv[3])]
+
+// ecdsa_secp256r1_sha256 over an uncompressed-point SPKI key (0x04 || Qx32 || Qy32).
+fn _tls_verify_ecdsa_p256(spki_key, content, sig) -> int
+    let qx = der_slice(spki_key, 1, 33)
+    let qy = der_slice(spki_key, 33, 65)
+    let rs = _tls_parse_ecdsa_sig(sig)
+    ecdsa_p256_verify(qx, qy, sha256_bytes(content), rs[0], rs[1])
 
 // Verify a TLS 1.3 signature (CertificateVerify) given the SignatureScheme, the leaf SPKI key bytes,
 // the signed content, and the signature. Dispatches to the right algorithm. Returns 1/0.
 fn tls13_verify_cert_signature(sig_scheme: int, spki_key, content, sig) -> int
-    if sig_scheme == 2052                       // 0x0804 rsa_pss_rsae_sha256
-        return rsa_pss_sha256_verify(tls13_rsa_pubkey_n(spki_key), sha256_bytes(content), sig)
-    if sig_scheme == 1027                       // 0x0403 ecdsa_secp256r1_sha256
-        let qx = der_slice(spki_key, 1, 33)
-        let qy = der_slice(spki_key, 33, 65)
-        let rs = _tls_parse_ecdsa_sig(sig)
-        return ecdsa_p256_verify(qx, qy, sha256_bytes(content), rs[0], rs[1])
-    if sig_scheme == 2055                       // 0x0807 ed25519 (signs the content directly)
-        return ed25519_verify(spki_key, content, sig)
-    if sig_scheme == 1025                       // 0x0401 rsa_pkcs1_sha256
-        return rsa_pkcs1_sha256_verify(tls13_rsa_pubkey_n(spki_key), sha256_bytes(content), sig)
-    0
+    match sig_scheme
+        2052 => rsa_pss_sha256_verify(tls13_rsa_pubkey_n(spki_key), sha256_bytes(content), sig)     // 0x0804 rsa_pss_rsae_sha256
+        1027 => _tls_verify_ecdsa_p256(spki_key, content, sig)                                      // 0x0403 ecdsa_secp256r1_sha256
+        2055 => ed25519_verify(spki_key, content, sig)                                              // 0x0807 ed25519 (signs content directly)
+        1025 => rsa_pkcs1_sha256_verify(tls13_rsa_pubkey_n(spki_key), sha256_bytes(content), sig)   // 0x0401 rsa_pkcs1_sha256
+        _ => 0

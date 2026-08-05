@@ -25,31 +25,38 @@
 //
 // Braces/quotes are built via chr() -- a literal `{` in a NOVA string interpolates, so it must never
 // appear in a template string (see forge_obs.nova, forge_admin.nova for the same pattern).
+//
+// STRING BUILDING: every rendered block accumulates into a LIST joined ONCE. `out = out + line` in a
+// loop reallocates and recopies the entire document per line -- quadratic in the series/bucket count,
+// which is exactly the dimension a scrape endpoint grows in.
 
-// ── Label-value escaping (Prometheus text format spec) ────────────────────────────────────────────
-// Within a quoted label value: backslash -> \\, double-quote -> \", newline -> \n. Order does not
-// matter here because this is a single left-to-right character scan (not a sequence of global
-// replaces), so an escape sequence produced for one input character can never be re-scanned and
-// double-escaped by a later rule.
+// ── Escaping (Prometheus text format spec) ────────────────────────────────────────────────────────
+// ONE left-to-right character scan, parameterized by an escape TABLE keyed by the character's byte
+// value (NOVA dicts are string-keyed, hence str(o)); anything not in the table passes through
+// verbatim. Order within the table cannot matter because this is a single scan, not a sequence of
+// global replaces -- an escape sequence produced for one input character is never re-scanned and
+// double-escaped by a later rule. The two public escapers below differ ONLY in their table, so the
+// scan itself is written once instead of twice.
+fn _prom_escape(s: string, ent: dict) -> string
+    let parts = []
+    let n = len(s)
+    for i in 0..n
+        let c = char_at(s, i)
+        push(parts, get(ent, str(ord(c)), c))
+    join(parts, "")
+
+// Within a quoted label value: backslash -> \\, double-quote -> \", newline -> \n.
 fn prom_escape_label(s: string) -> string
     let bs = chr(92)
     let q = chr(34)
-    let out = ""
-    let i = 0
-    let n = len(s)
-    while i < n
-        let c = char_at(s, i)
-        let o = ord(c)
-        if o == 92
-            out = out + bs + bs
-        else if o == 34
-            out = out + bs + q
-        else if o == 10
-            out = out + bs + "n"
-        else
-            out = out + c
-        i = i + 1
-    out
+    _prom_escape(s, {"92": bs + bs, "34": bs + q, "10": bs + "n"})
+
+// Escape HELP docstring text: backslash -> \\, newline -> \n. UNLIKE prom_escape_label, the
+// double-quote is NOT escaped here -- a HELP line is not a quoted label value, so an embedded `"` is
+// legal and must pass through verbatim. That single difference is the missing "34" table entry.
+fn prom_escape_help(s: string) -> string
+    let bs = chr(92)
+    _prom_escape(s, {"92": bs + bs, "10": bs + "n"})
 
 // Render a label-pair list as `{k1="v1",k2="v2"}`, or "" when there are no labels (a bare metric
 // name+value line, valid Prometheus text for the unlabeled case).
@@ -59,65 +66,33 @@ fn prom_label_str(labels: list) -> string
     let q = chr(34)
     let lb = chr(123)
     let rb = chr(125)
-    let out = lb
-    let i = 0
-    while i < len(labels)
-        let p = labels[i]
-        if i > 0
-            out = out + ","
-        out = out + p[0] + "=" + q + prom_escape_label(p[1]) + q
-        i = i + 1
-    out + rb
+    lb + join([str(p[0]) + "=" + q + prom_escape_label(p[1]) + q for p in labels], ",") + rb
 
 // A COPY of `labels` with (key, value) appended -- never mutates the caller's list (a histogram
 // series's shared `labels` list is read once per bucket; appending "le" in place would corrupt it
-// for every later bucket in the same series).
+// for every later bucket in the same series). Spread builds the copy in one step.
 fn _prom_with_label(labels: list, key: string, value: string) -> list
-    let out = []
-    let i = 0
-    while i < len(labels)
-        push(out, labels[i])
-        i = i + 1
-    push(out, [key, value])
-    out
+    [...labels, [key, value]]
 
-// Escape HELP docstring text per the Prometheus text format spec: backslash -> \\, newline -> \n.
-// UNLIKE prom_escape_label, the double-quote is NOT escaped here -- a HELP line is not a quoted
-// label value, so an embedded `"` is legal and must pass through verbatim. Same single left-to-right
-// scan reasoning as prom_escape_label: an escape produced for one input char is never re-scanned.
-fn prom_escape_help(s: string) -> string
-    let bs = chr(92)
-    let out = ""
-    let i = 0
-    let n = len(s)
-    while i < n
-        let c = char_at(s, i)
-        let o = ord(c)
-        if o == 92
-            out = out + bs + bs
-        else if o == 10
-            out = out + bs + "n"
-        else
-            out = out + c
-        i = i + 1
-    out
+// PRIVATE: one exposition line -- `name{labels} value\n`. Shared by the counter/gauge series lines
+// and by all three histogram line kinds (_bucket / _sum / _count), which differ only in the metric
+// name suffix and which number they carry.
+fn _prom_line(name: string, labels: list, value: any) -> string
+    let lbl = prom_label_str(labels)
+    let val = str(value)
+    "{name}{lbl} {val}\n"
 
 // `# HELP name help\n# TYPE name mtype\n` -- HELP text is opaque caller-supplied prose. Prometheus
 // forbids a literal, unescaped newline in a HELP line (it would break the line-oriented exposition
 // format), so any backslash or newline in `help` is escaped (prom_escape_help) before rendering --
 // the caller may pass arbitrary prose, including text with embedded newlines, safely.
 fn _prom_help_type(name: string, help: string, mtype: string) -> string
-    "# HELP " + name + " " + prom_escape_help(help) + "\n# TYPE " + name + " " + mtype + "\n"
+    let h = prom_escape_help(help)
+    "# HELP {name} {h}\n# TYPE {name} {mtype}\n"
 
 // One `name{labels} value\n` line per series.
 fn _prom_series_lines(name: string, series: list) -> string
-    let out = ""
-    let i = 0
-    while i < len(series)
-        let s = series[i]
-        out = out + name + prom_label_str(s["labels"]) + " " + str(s["value"]) + "\n"
-        i = i + 1
-    out
+    join([_prom_line(name, s["labels"], s["value"]) for s in series], "")
 
 // Render a counter metric family: HELP + TYPE counter + one line per series. `series` may be empty
 // (renders just the HELP/TYPE header, a valid -- if pointless -- exposition for a metric with no
@@ -134,42 +109,31 @@ fn prom_gauge(name: string, help: string, series: list) -> string
 // le order, which is the caller's responsibility to supply), then `name_sum{...} sum` and
 // `name_count{...} count`.
 fn prom_histogram(name: string, help: string, series: list) -> string
-    let out = _prom_help_type(name, help, "histogram")
-    let si = 0
-    while si < len(series)
-        let s = series[si]
+    let parts = [_prom_help_type(name, help, "histogram")]
+    for s in series
         let labels = s["labels"]
-        let buckets = s["buckets"]
-        let bi = 0
-        while bi < len(buckets)
-            let b = buckets[bi]
-            let blabels = _prom_with_label(labels, "le", b[0])
-            out = out + name + "_bucket" + prom_label_str(blabels) + " " + str(b[1]) + "\n"
-            bi = bi + 1
-        out = out + name + "_sum" + prom_label_str(labels) + " " + str(s["sum"]) + "\n"
-        out = out + name + "_count" + prom_label_str(labels) + " " + str(s["count"]) + "\n"
-        si = si + 1
-    out
+        extend(parts, [_prom_line(name + "_bucket", _prom_with_label(labels, "le", b[0]), b[1]) for b in s["buckets"]])
+        push(parts, _prom_line(name + "_sum", labels, s["sum"]))
+        push(parts, _prom_line(name + "_count", labels, s["count"]))
+    join(parts, "")
 
 // Turn raw per-bucket tallies (how many observations landed in EACH bucket individually) into the
 // cumulative counts Prometheus histograms require (how many observations are <= this bucket's le,
 // i.e. a running sum). Empty input returns an empty list.
+//
+// NOT delegated to std/core/collect's `scan`: scan is a seeded scanl that returns len(xs)+1 entries
+// with `init` prepended ([0] for empty input), so its edge cases do NOT agree with this contract --
+// adapting it would cost a second list pass to drop the seed, and would turn a LEAF module into a
+// dependent one.
 fn prom_cumulative(raw_counts: list) -> list
     let out = []
     let running = 0
-    let i = 0
-    while i < len(raw_counts)
-        running = running + raw_counts[i]
+    for v in raw_counts
+        running += v
         push(out, running)
-        i = i + 1
     out
 
 // Concatenate already-rendered metric-family blocks (each ending in "\n", as every function above
 // produces) into one exposition document. Empty input returns "".
 fn prom_document(blocks: list) -> string
-    let out = ""
-    let i = 0
-    while i < len(blocks)
-        out = out + blocks[i]
-        i = i + 1
-    out
+    join(blocks, "")

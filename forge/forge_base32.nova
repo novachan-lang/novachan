@@ -2,36 +2,25 @@
 // TOTP shared secrets, DNS records, and Crockford-style ids). Operates on a string (each char as a byte via
 // ord); decode is case-insensitive and stops at '=' padding. A bit accumulator masked to the leftover bits
 // after each symbol keeps everything in i64 range (no overflow, no reliance on 1<<64). LEAF -- imports NOTHING.
+//
+// STRUCTURE: there is ONE encoder (base32_encode_bytes, over octets) and ONE decoder
+// (base32_decode_bytes, to octets). The two string-facing entry points are thin adapters over them --
+// they used to be full second copies of the same bit-accumulator loop, which is how a fix to one could
+// silently miss the other.
 
 fn _p2(k: int) -> int
     let v = 1
-    let i = 0
-    while i < k
+    for i in 0..k
         v = v * 2
-        i = i + 1
     v
 
 // Encode: 5 input bytes -> 8 base32 symbols, '=' padded to a multiple of 8.
+// Each char is taken as a byte via ord(char_at(...)) over the BYTE length of `s` -- byte-for-byte the
+// same reads the inline loop did (NOVA's char_at is codepoint-indexed while len() is byte-counted, so a
+// non-ASCII input has always encoded its first bytes plus zero padding; that behaviour is preserved
+// exactly, not "fixed" -- callers with binary/non-ASCII data must use base32_encode_bytes).
 fn base32_encode(s: string) -> string
-    let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    let out = ""
-    let bits = 0
-    let nbits = 0
-    let i = 0
-    let n = len(s)
-    while i < n
-        bits = bits * 256 + ord(char_at(s, i))
-        nbits = nbits + 8
-        while nbits >= 5
-            nbits = nbits - 5
-            out = out + char_at(alpha, (bits / _p2(nbits)) % 32)
-        bits = bits % _p2(nbits)
-        i = i + 1
-    if nbits > 0
-        out = out + char_at(alpha, (bits * _p2(5 - nbits)) % 32)
-    while len(out) % 8 != 0
-        out = out + "="
-    out
+    base32_encode_bytes([ord(char_at(s, i)) for i in 0..len(s)])
 
 // base32_encode_bytes -- BINARY-SAFE base32 encode. Takes the input octets as a LIST of int byte values
 // (0..255), never a NOVA string. base32 always encodes raw bytes, and building the input as a string via
@@ -40,52 +29,34 @@ fn base32_encode(s: string) -> string
 // keys/secrets/any binary payload.
 fn base32_encode_bytes(data: list) -> string
     let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    let out = ""
+    // Symbols are PUSHED to a list and joined ONCE at the end. `out = out + symbol` inside the loop is
+    // QUADRATIC in NOVA: every concatenation allocates a fresh buffer and recopies everything emitted so
+    // far, so encoding n bytes copied ~n^2/2 characters.
+    let parts = []
     let bits = 0
     let nbits = 0
-    let i = 0
-    let n = len(data)
-    while i < n
+    for i in 0..len(data)
         bits = bits * 256 + (data[i] % 256)
-        nbits = nbits + 8
+        nbits += 8
+        // Data-dependent drain of the bit accumulator (0, 1 or 2 symbols per input byte) -- stays a while.
         while nbits >= 5
-            nbits = nbits - 5
-            out = out + char_at(alpha, (bits / _p2(nbits)) % 32)
+            nbits -= 5
+            push(parts, char_at(alpha, (bits / _p2(nbits)) % 32))
         bits = bits % _p2(nbits)
-        i = i + 1
     if nbits > 0
-        out = out + char_at(alpha, (bits * _p2(5 - nbits)) % 32)
-    while len(out) % 8 != 0
-        out = out + "="
-    out
+        push(parts, char_at(alpha, (bits * _p2(5 - nbits)) % 32))
+    // '=' pad to a multiple of 8 symbols: index a constant table by the deficit instead of appending one
+    // character at a time (every alphabet symbol is exactly 1 char, so the symbol count IS the length).
+    let pads = ["", "=", "==", "===", "====", "=====", "======", "======="]
+    join(parts, "") + pads[(8 - len(parts) % 8) % 8]
 
 // Decode: case-insensitive base32 -> the original bytes as a string. Stops at the first '='. Non-alphabet
 // chars are skipped (lenient). Trailing partial bits are discarded (RFC canonical).
+// NOTE (unchanged behaviour, verified against the pre-refactor version): a decoded 0x00 byte does not
+// survive the string form -- chr(0) contributes nothing -- so the NUL is silently dropped and the
+// octet stream no longer matches what was encoded. That is exactly why base32_decode_bytes exists.
 fn base32_decode(s: string) -> string
-    let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    let lalpha = "abcdefghijklmnopqrstuvwxyz234567"
-    let out = ""
-    let bits = 0
-    let nbits = 0
-    let i = 0
-    let n = len(s)
-    while i < n
-        let c = char_at(s, i)
-        if c == "="
-            i = n
-        else
-            let v = find(alpha, c)
-            if v < 0
-                v = find(lalpha, c)
-            if v >= 0
-                bits = bits * 32 + v
-                nbits = nbits + 5
-                if nbits >= 8
-                    nbits = nbits - 8
-                    out = out + chr((bits / _p2(nbits)) % 256)
-                    bits = bits % _p2(nbits)
-            i = i + 1
-    out
+    join([chr(b) for b in base32_decode_bytes(s)], "")
 
 // base32_decode_bytes -- BINARY-SAFE base32 decode. Returns the decoded octets as a LIST of
 // int byte values (0..255), never a NOVA string. base32 always decodes to raw bytes, and a
@@ -98,22 +69,19 @@ fn base32_decode_bytes(s: string) -> list
     let out = []
     let bits = 0
     let nbits = 0
-    let i = 0
-    let n = len(s)
-    while i < n
+    // Short-circuits at the first '=' (padding ends the data) -- a counted range with an explicit break,
+    // not a hand-rolled index with a sentinel assignment.
+    for i in 0..len(s)
         let c = char_at(s, i)
         if c == "="
-            i = n
-        else
-            let v = find(alpha, c)
-            if v < 0
-                v = find(lalpha, c)
-            if v >= 0
-                bits = bits * 32 + v
-                nbits = nbits + 5
-                if nbits >= 8
-                    nbits = nbits - 8
-                    push(out, (bits / _p2(nbits)) % 256)
-                    bits = bits % _p2(nbits)
-            i = i + 1
+            break
+        let upper = find(alpha, c)
+        let v = find(lalpha, c) if upper < 0 else upper
+        if v >= 0
+            bits = bits * 32 + v
+            nbits += 5
+            if nbits >= 8
+                nbits -= 8
+                push(out, (bits / _p2(nbits)) % 256)
+                bits = bits % _p2(nbits)
     out

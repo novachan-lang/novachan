@@ -41,46 +41,46 @@ fn _gql_tokenize(q: string) -> list
     while i < n
         let c = q[i]
         if c == " " or c == chr(9) or c == chr(10) or c == chr(13) or c == ","
-            i = i + 1
+            i += 1
         else if c == chr(123)
             push(toks, ["lbrace", c])
-            i = i + 1
+            i += 1
         else if c == chr(125)
             push(toks, ["rbrace", c])
-            i = i + 1
+            i += 1
         else if c == "(" or c == ")" or c == ":"
             push(toks, [c, c])
-            i = i + 1
+            i += 1
         else if c == chr(34)
             let start = i + 1
             let j = start
             while j < n and q[j] != chr(34)
-                j = j + 1
+                j += 1
             push(toks, ["str", slice(q, start, j)])
             i = j + 1
         else if _gql_is_digit(c) or c == "-"
             let start = i
             let j = i + 1
             while j < n and _gql_is_digit(q[j])
-                j = j + 1
+                j += 1
             push(toks, ["int", slice(q, start, j)])
             i = j
         else if c == "$"
             let start = i + 1
             let j = start
             while j < n and _gql_is_name_char(q[j])
-                j = j + 1
+                j += 1
             push(toks, ["var", slice(q, start, j)])
             i = j
         else if _gql_is_name_start(c)
             let start = i
             let j = i + 1
             while j < n and _gql_is_name_char(q[j])
-                j = j + 1
+                j += 1
             push(toks, ["name", slice(q, start, j)])
             i = j
         else
-            i = i + 1
+            i += 1
     push(toks, ["end", ""])
     toks
 
@@ -99,9 +99,7 @@ fn _gql_arg_value(tok) -> any
     if tok[0] == "int"
         return parse_int(tok[1])
     if tok[0] == "var"
-        let m = {}
-        m["__var"] = tok[1]
-        return m
+        return {"__var": tok[1]}
     tok[1]
 
 // "(" name ":" value ("," name ":" value)* ")"  -> dict of arg name -> value.
@@ -120,7 +118,6 @@ fn _gql_parse_args(st) -> dict
 
 // A field: [alias ":"] name [args] [selection-set]. Returns dict {name, alias, args, selections}.
 fn _gql_parse_field(st) -> dict
-    let f = {}
     let name1 = _gql_advance(st)
     let fname = name1[1]
     let alias = fname
@@ -128,17 +125,13 @@ fn _gql_parse_field(st) -> dict
         _gql_advance(st)
         let name2 = _gql_advance(st)
         fname = name2[1]
-    f["name"] = fname
-    f["alias"] = alias
     let args = {}
     if _gql_peek(st)[0] == "("
         args = _gql_parse_args(st)
-    f["args"] = args
     let sels = []
     if _gql_peek(st)[0] == "lbrace"
         sels = _gql_parse_selset(st)
-    f["selections"] = sels
-    f
+    {"name": fname, "alias": alias, "args": args, "selections": sels}
 
 // selection set: lbrace field+ rbrace -> list of field dicts.
 fn _gql_parse_selset(st) -> list
@@ -166,28 +159,17 @@ fn gql_parse(query: string) -> list
 // Nesting depth of the selection tree (a flat query = 1). Reject before executing to bound work.
 fn gql_depth(fields: list) -> int
     let maxd = 0
-    let i = 0
-    while i < len(fields)
-        let d = 1
-        let subs = fields[i]["selections"]
-        if len(subs) > 0
-            d = 1 + gql_depth(subs)
+    for f in fields
+        let subs = f["selections"]
+        let d = 1 if len(subs) == 0 else 1 + gql_depth(subs)
         if d > maxd
             maxd = d
-        i = i + 1
     maxd
 
 // Total number of fields in the query (a crude complexity/cost measure) — bounds fan-out.
+// gql_complexity([]) == 0, so the leaf case needs no guard: 1 + <cost of an empty selection set> == 1.
 fn gql_complexity(fields: list) -> int
-    let total = 0
-    let i = 0
-    while i < len(fields)
-        total = total + 1
-        let subs = fields[i]["selections"]
-        if len(subs) > 0
-            total = total + gql_complexity(subs)
-        i = i + 1
-    total
+    sum([1 + gql_complexity(f["selections"]) for f in fields])
 
 // ── variable substitution ($var) ─────────────────────────────────────────────────────────────────
 // GraphQL clients send `query GetUser($id: Int) { user(id: $id) { name } }` + a variables JSON
@@ -197,36 +179,28 @@ fn gql_complexity(fields: list) -> int
 // stays variable-agnostic. Arg values are otherwise scalars, so a dict value unambiguously = a var marker.
 fn _gql_subst_one(val, variables: dict) -> any
     if type_of(val) == "dict"
-        if contains(val, "__var")
+        if "__var" in val
             let name = val["__var"]
-            if contains(variables, name)
+            if name in variables
                 return variables[name]
             return ""
     val
 
+// One field, with every {"__var": n} marker in its args (and recursively in its sub-selections)
+// replaced by the concrete variable value.
+fn _gql_subst_field(f: dict, variables: dict) -> dict
+    let newargs = {k: _gql_subst_one(f["args"][k], variables) for k in keys(f["args"])}
+    {"name": f["name"], "alias": f["alias"], "args": newargs, "selections": _gql_apply_vars(f["selections"], variables)}
+
 fn _gql_apply_vars(fields: list, variables: dict) -> list
-    let out = []
-    let i = 0
-    while i < len(fields)
-        let f = fields[i]
-        let nf = {}
-        nf["name"] = f["name"]
-        nf["alias"] = f["alias"]
-        let newargs = {}
-        for k in keys(f["args"])
-            newargs[k] = _gql_subst_one(f["args"][k], variables)
-        nf["args"] = newargs
-        nf["selections"] = _gql_apply_vars(f["selections"], variables)
-        push(out, nf)
-        i = i + 1
-    out
+    [_gql_subst_field(f, variables) for f in fields]
 
 // ── executor ──────────────────────────────────────────────────────────────────────────────────────
 // The trivial resolver: read `name` off `parent` when the field has no explicit resolver.
 fn _gql_field_from_parent(parent, name: string) -> any
     let t = type_of(parent)
     if t == "dict"
-        if contains(parent, name)
+        if name in parent
             return parent[name]
         return ""
     if len(field_names(parent)) > 0
@@ -236,23 +210,16 @@ fn _gql_field_from_parent(parent, name: string) -> any
 // Apply a sub-selection to a resolved value: map over a list, else resolve the single object.
 fn _gql_apply_selections(sels: list, resolvers: dict, value) -> any
     if type_of(value) == "list"
-        let out = []
-        let i = 0
-        while i < len(value)
-            push(out, _gql_resolve(sels, resolvers, value[i]))
-            i = i + 1
-        return out
+        return [_gql_resolve(sels, resolvers, v) for v in value]
     _gql_resolve(sels, resolvers, value)
 
 // Resolve a selection list against a parent, producing a result dict keyed by field alias.
 fn _gql_resolve(fields: list, resolvers: dict, parent) -> dict
     let out = {}
-    let i = 0
-    while i < len(fields)
-        let f = fields[i]
+    for f in fields
         let name = f["name"]
         let value = 0
-        if contains(resolvers, name)
+        if name in resolvers
             let r = resolvers[name]
             value = r(parent, f["args"])
         else
@@ -260,15 +227,12 @@ fn _gql_resolve(fields: list, resolvers: dict, parent) -> dict
         if len(f["selections"]) > 0
             value = _gql_apply_selections(f["selections"], resolvers, value)
         out[f["alias"]] = value
-        i = i + 1
     out
 
 // gql_execute_vars(query, resolvers, root, variables) -> dict — with $variable substitution.
 fn gql_execute_vars(query: string, resolvers: dict, root, variables: dict) -> dict
     let ast = _gql_apply_vars(gql_parse(query), variables)
-    let out = {}
-    out["data"] = _gql_resolve(ast, resolvers, root)
-    out
+    {"data": _gql_resolve(ast, resolvers, root)}
 
 // gql_execute(query, resolvers, root) -> dict — GraphQL-shaped {"data": {...}}. No variables.
 fn gql_execute(query: string, resolvers: dict, root) -> dict
@@ -279,15 +243,11 @@ fn gql_execute(query: string, resolvers: dict, root) -> dict
 // resolver (a maliciously nested query cannot force unbounded work).
 fn gql_execute_limited_vars(query: string, resolvers: dict, root, variables: dict, max_depth: int, max_complexity: int) -> dict
     let ast = _gql_apply_vars(gql_parse(query), variables)
-    let out = {}
     if gql_depth(ast) > max_depth
-        out["errors"] = ["query exceeds max depth " + str(max_depth)]
-        return out
+        return {"errors": ["query exceeds max depth {max_depth}"]}
     if gql_complexity(ast) > max_complexity
-        out["errors"] = ["query exceeds max complexity " + str(max_complexity)]
-        return out
-    out["data"] = _gql_resolve(ast, resolvers, root)
-    out
+        return {"errors": ["query exceeds max complexity {max_complexity}"]}
+    {"data": _gql_resolve(ast, resolvers, root)}
 
 // gql_execute_limited(query, resolvers, root, max_depth, max_complexity) -> dict — DoS guard, no variables.
 fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max_complexity: int) -> dict
@@ -314,38 +274,21 @@ fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max
 //   Create a loader dict with the batch function and an empty per-request cache.
 //   batch_fn is a first-class fn: fn(keys: list) -> list.
 fn gql_loader(batch_fn) -> dict
-    let L = {}
-    L["batch"] = batch_fn
-    L["cache"] = {}
-    L
+    {"batch": batch_fn, "cache": {}}
 
 // gql_load_many(loader, keys) -> list
 //   Core batching operation: resolve a list of keys, calling batch_fn at most ONCE for any
 //   uncached keys, then returning all values in the same order as the input keys list.
 fn gql_load_many(loader, keys: list) -> list
     let cache = loader["cache"]
-    let missing = []
-    let ki = 0
-    while ki < len(keys)
-        let sk = str(keys[ki])
-        if not contains(cache, sk)
-            push(missing, keys[ki])
-        ki = ki + 1
+    // cache keys are str(key) so int and string keys coexist in one STRING-keyed dict
+    let missing = [k for k in keys if not contains(cache, str(k))]
     if len(missing) > 0
         let bfn = loader["batch"]
         let results = bfn(missing)
-        let mi = 0
-        while mi < len(missing)
-            let msk = str(missing[mi])
-            cache[msk] = results[mi]
-            mi = mi + 1
-    let out = []
-    let oi = 0
-    while oi < len(keys)
-        let osk = str(keys[oi])
-        push(out, cache[osk])
-        oi = oi + 1
-    out
+        for mi, mk in missing
+            cache[str(mk)] = results[mi]
+    [cache[str(k)] for k in keys]
 
 // gql_load(loader, key) -> any
 //   Convenience wrapper for a single key lookup. Delegates to gql_load_many so the cache
