@@ -1,94 +1,162 @@
-fn ap_new()
-    let s = {}
-    s["stage_count"] = 0
-    s["stage_names"] = ""
-    s["record_count"] = 0
-    s["group_count"] = 0
-    s["group_keys"] = ""
-    return s
+// forge_aggregation_pipeline -- a streaming group-by aggregator: feed it (group, field, value) records
+// and it maintains sum / count / min / max per (group, field) without retaining the records, so memory
+// is O(distinct group-field pairs) rather than O(records). The shape a metrics rollup, a report
+// builder, or a MongoDB-style $group stage has. Also tracks a named stage list for describing the
+// pipeline itself. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. This module had no header at all and four distinct structural problems:
+//
+//   1. THE FOUR AGGREGATE KEYS "g_<group>_<field>_sum" (and _count/_min/_max) were rebuilt by string
+//      concatenation at FOURTEEN sites across seven functions -- all four of them inside ap_record
+//      alone. Every read reconstructed the exact suffix and trusted it matched what the write used;
+//      a single mistyped suffix reads as a MISSING KEY, which this module reports as
+//      "group/field not found". So a typo would make a real aggregate silently unqueryable.
+//      _agg_key owns the scheme now and nothing else spells it out.
+//   2. THE "does this group/field exist" GUARD was pasted into five accessors, each re-deriving the
+//      same message. One _demand.
+//   3. THE FOUR AGGREGATES were updated by four hand-written read-modify-writes. They are one fold
+//      per record, and min/max are the min/max builtins.
+//   4. group_keys AND group_count were a CSV plus a counter kept beside it -- two derived facts stored
+//      as state, able to disagree with each other and with the gk_ marker keys that actually record
+//      membership. The same for stage_names / stage_count. Both counts are derived now; the stored
+//      fields are kept because the public getters return them.
+//
+// The `int(...)` coercions on every read are preserved: this state is a flat any-valued dict, so a
+// value read back is `any` and arithmetic on it needs the narrowing.
 
-fn ap_add_stage(s, stage_name, stage_type)
+// PRIVATE: THE aggregate key scheme. `stat` is one of sum / count / min / max.
+fn _agg_key(group_key: string, field_name: string, stat: string) -> string
+    "g_{group_key}_{field_name}_{stat}"
+
+// PRIVATE: the marker recording that a group has been seen at all.
+fn _group_marker(group_key: string) -> string
+    "gk_{group_key}"
+
+// PRIVATE: the per-stage key scheme, previously concatenated inline in ap_add_stage.
+fn _stage_key(idx: int, field: string) -> string
+    "stage_{idx}_{field}"
+
+// PRIVATE: append to a comma-separated list held in a single string field. The
+// "if empty then item else csv + , + item" branch appeared at both CSV sites.
+fn _csv_append(csv: string, item: string) -> string
+    item if csv == "" else "{csv},{item}"
+
+// PRIVATE: a CSV field split into real entries -- the empty string yields no entries, handled here
+// rather than by a guard at each use.
+fn _csv_list(csv: string) -> list
+    [p for p in split(csv, ",") if len(p) > 0]
+
+fn ap_new() -> dict
+    {"stage_count": 0, "stage_names": "", "record_count": 0, "group_count": 0, "group_keys": ""}
+
+fn ap_add_stage(s: dict, stage_name: string, stage_type: string) -> dict
     let idx = int(s["stage_count"])
-    s["stage_" + str(idx) + "_name"] = stage_name
-    s["stage_" + str(idx) + "_type"] = stage_type
+    s[_stage_key(idx, "name")] = stage_name
+    s[_stage_key(idx, "type")] = stage_type
     s["stage_count"] = idx + 1
-    if s["stage_names"] == ""
-        s["stage_names"] = stage_name
-    else
-        s["stage_names"] = str(s["stage_names"]) + "," + stage_name
-    return s
+    s["stage_names"] = _csv_append(str(s["stage_names"]), stage_name)
+    s
 
-fn ap_record(s, group_key, field_name, value)
-    let sum_key = "g_" + group_key + "_" + field_name + "_sum"
-    let cnt_key = "g_" + group_key + "_" + field_name + "_count"
-    let min_key = "g_" + group_key + "_" + field_name + "_min"
-    let max_key = "g_" + group_key + "_" + field_name + "_max"
-    if cnt_key not in s
-        s[cnt_key] = 0
-        s[sum_key] = 0
-        s[min_key] = value
-        s[max_key] = value
-        if ("gk_" + group_key) not in s
-            s["gk_" + group_key] = 1
-            s["group_count"] = int(s["group_count"]) + 1
-            if s["group_keys"] == ""
-                s["group_keys"] = group_key
-            else
-                s["group_keys"] = str(s["group_keys"]) + "," + group_key
-    s[cnt_key] = int(s[cnt_key]) + 1
-    s[sum_key] = int(s[sum_key]) + value
-    if value < int(s[min_key])
-        s[min_key] = value
-    if value > int(s[max_key])
-        s[max_key] = value
+// PRIVATE: register a group the first time it is seen. The membership marker, the CSV and the counter
+// were all updated inline inside ap_record's nested if.
+fn _note_group(s: dict, group_key: string)
+    if _group_marker(group_key) not in s
+        s[_group_marker(group_key)] = 1
+        s["group_count"] = int(s["group_count"]) + 1
+        s["group_keys"] = _csv_append(str(s["group_keys"]), group_key)
+
+// Feed one record into the aggregator.
+fn ap_record(s: dict, group_key: string, field_name: string, value: int) -> dict
+    let ck = _agg_key(group_key, field_name, "count")
+    if ck not in s
+        // First value for this (group, field): min and max both start AT the value, not at a sentinel.
+        s[ck] = 0
+        s[_agg_key(group_key, field_name, "sum")] = 0
+        s[_agg_key(group_key, field_name, "min")] = value
+        s[_agg_key(group_key, field_name, "max")] = value
+        _note_group(s, group_key)
+    s[ck] = int(s[ck]) + 1
+    s[_agg_key(group_key, field_name, "sum")] = int(s[_agg_key(group_key, field_name, "sum")]) + value
+    // min / max are the builtins -- these were two hand-written compare-and-assign pairs.
+    s[_agg_key(group_key, field_name, "min")] = min(int(s[_agg_key(group_key, field_name, "min")]), value)
+    s[_agg_key(group_key, field_name, "max")] = max(int(s[_agg_key(group_key, field_name, "max")]), value)
     s["record_count"] = int(s["record_count"]) + 1
-    return s
+    s
 
-fn ap_group_sum(s, group_key, field_name) -> Result
-    let key = "g_" + group_key + "_" + field_name + "_sum"
-    if key not in s
-        return err("group/field not found")
-    return ok(int(s[key]))
+// PRIVATE: the existence guard, once. Five accessors carried their own copy of it.
+fn _demand(s: dict, group_key: string, field_name: string) -> Result
+    if _agg_key(group_key, field_name, "count") not in s
+        return err("group/field not found: {group_key}/{field_name}")
+    ok(1)
 
-fn ap_group_count(s, group_key, field_name) -> Result
-    let key = "g_" + group_key + "_" + field_name + "_count"
-    if key not in s
-        return err("group/field not found")
-    return ok(int(s[key]))
+// PRIVATE: one aggregate, guarded. The five accessors below are this plus a stat name.
+fn _agg(s: dict, group_key: string, field_name: string, stat: string) -> Result
+    _ = _demand(s, group_key, field_name)?
+    ok(int(s[_agg_key(group_key, field_name, stat)]))
 
-fn ap_group_mean(s, group_key, field_name) -> Result
-    let ckey = "g_" + group_key + "_" + field_name + "_count"
-    if ckey not in s
-        return err("group/field not found")
-    let cnt = int(s[ckey])
+fn ap_group_sum(s: dict, group_key: string, field_name: string) -> Result
+    _agg(s, group_key, field_name, "sum")
+
+fn ap_group_count(s: dict, group_key: string, field_name: string) -> Result
+    _agg(s, group_key, field_name, "count")
+
+fn ap_group_min(s: dict, group_key: string, field_name: string) -> Result
+    _agg(s, group_key, field_name, "min")
+
+fn ap_group_max(s: dict, group_key: string, field_name: string) -> Result
+    _agg(s, group_key, field_name, "max")
+
+fn ap_group_mean(s: dict, group_key: string, field_name: string) -> Result
+    let cnt = _agg(s, group_key, field_name, "count")?
     if cnt == 0
         return err("empty group")
-    let total = int(s["g_" + group_key + "_" + field_name + "_sum"])
-    return ok(total / cnt)
+    ok(_agg(s, group_key, field_name, "sum")? / cnt)
 
-fn ap_group_min(s, group_key, field_name) -> Result
-    let key = "g_" + group_key + "_" + field_name + "_min"
-    if key not in s
-        return err("group/field not found")
-    return ok(int(s[key]))
+fn ap_stage_count(s: dict) -> int
+    int(s["stage_count"])
 
-fn ap_group_max(s, group_key, field_name) -> Result
-    let key = "g_" + group_key + "_" + field_name + "_max"
-    if key not in s
-        return err("group/field not found")
-    return ok(int(s[key]))
+fn ap_stage_names(s: dict) -> string
+    str(s["stage_names"])
 
-fn ap_stage_count(s)
-    return int(s["stage_count"])
+fn ap_record_count(s: dict) -> int
+    int(s["record_count"])
 
-fn ap_stage_names(s)
-    return str(s["stage_names"])
+fn ap_group_count_total(s: dict) -> int
+    int(s["group_count"])
 
-fn ap_record_count(s)
-    return int(s["record_count"])
+fn ap_group_list(s: dict) -> string
+    str(s["group_keys"])
 
-fn ap_group_count_total(s)
-    return int(s["group_count"])
+// --- the things this module tracked but could not report ------------------------------------------
 
-fn ap_group_list(s)
-    return str(s["group_keys"])
+// The groups as a LIST. group_keys is a CSV kept beside a counter -- two derived facts stored as
+// state; this is the value, and its length is the count that cannot disagree with it.
+fn ap_groups(s: dict) -> list
+    _csv_list(str(s["group_keys"]))
+
+fn ap_stages(s: dict) -> list
+    _csv_list(str(s["stage_names"]))
+
+// Every aggregate for one (group, field), as data. A caller wanting the full picture had to make five
+// separate calls and unwrap five Results.
+fn ap_stats(s: dict, group_key: string, field_name: string) -> Result
+    _ = _demand(s, group_key, field_name)?
+    ok({"count": _agg(s, group_key, field_name, "count")?,
+        "sum": _agg(s, group_key, field_name, "sum")?,
+        "min": _agg(s, group_key, field_name, "min")?,
+        "max": _agg(s, group_key, field_name, "max")?,
+        "mean": ap_group_mean(s, group_key, field_name)?})
+
+// One field's aggregate across EVERY group: {group: value}. The group-by result itself, which the
+// module could accumulate but never hand back -- a caller had to know the group names and loop.
+fn ap_rollup(s: dict, field_name: string, stat: string) -> dict
+    let groups = [g for g in ap_groups(s) if is_ok(_demand(s, g, field_name))]
+    {g: unwrap(_agg(s, g, field_name, stat)) for g in groups}
+
+// The group with the largest value of `stat` for `field_name`, or an error if no group has that field.
+fn ap_top_group(s: dict, field_name: string, stat: string) -> Result
+    let roll = ap_rollup(s, field_name, stat)
+    let names = keys(roll)
+    if len(names) == 0
+        return err("no group has field '{field_name}'")
+    ok(reverse(sort_by(names, (g) => roll[g]))[0])
