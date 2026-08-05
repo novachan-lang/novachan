@@ -5,26 +5,68 @@
 // cryptographic hash, which is why zlib chose Adler-32 for every compressed block. Use them for cheap error
 // detection on streams/files/messages where you need to notice damage, not defend against a malicious forger
 // (for that use an HMAC). Input is a string (bytes via character codes). LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Adler-32 and Fletcher-16 are THE SAME ALGORITHM: a running byte sum and a running
+// sum-of-sums, both reduced by a modulus, then packed as (b << shift) + a. They differ only in the
+// modulus (65521 vs 255), the initial value of a (1 vs 0), and the pack shift (16 vs 8). Both were
+// written out in full, so a fix to one -- a modulus, an initial value, an overflow guard -- would not
+// have reached the other. _rolling_sums computes the pair once and each checksum is its parameters
+// plus a pack.
+//
+// The accumulation loops STAY loops: each step feeds the next (b depends on the running a), so there
+// is no per-element map to turn into a comprehension. What changed is that there is now ONE of them.
 
-// Adler-32 checksum of a string (the algorithm zlib appends to every deflate stream). Returns a 32-bit integer.
-fn adler32(s: string) -> int
-    let mod_adler = 65521
-    let a = 1
+// PRIVATE: the shared core -- [a, b] where a is the running byte sum and b the running sum of a,
+// both taken modulo `m`. This is the whole of both algorithms.
+fn _rolling_sums(s: string, a0: int, m: int) -> list
+    let a = a0
     let b = 0
     for i in 0..len(s)
-        a = (a + ord(char_at(s, i))) % mod_adler
-        b = (b + a) % mod_adler
-    (b << 16) + a
+        a = (a + ord(char_at(s, i))) % m
+        b = (b + a) % m
+    [a, b]
+
+// Adler-32 checksum of a string (the algorithm zlib appends to every deflate stream). Returns a 32-bit
+// integer. Modulus 65521 is the largest prime below 2^16; a starts at 1 so a leading NUL byte is not
+// invisible.
+fn adler32(s: string) -> int
+    let ab = _rolling_sums(s, 1, 65521)
+    (ab[1] << 16) + ab[0]
 
 // Fletcher-16 checksum of a string. Returns a 16-bit integer.
 fn fletcher16(s: string) -> int
-    let sum1 = 0
-    let sum2 = 0
-    for i in 0..len(s)
-        sum1 = (sum1 + ord(char_at(s, i))) % 255
-        sum2 = (sum2 + sum1) % 255
-    (sum2 << 8) + sum1
+    let ab = _rolling_sums(s, 0, 255)
+    (ab[1] << 8) + ab[0]
 
 // True if `data` still matches a previously-computed Adler-32 checksum (an integrity check).
 fn adler32_verify(s: string, expected: int) -> bool
     adler32(s) == expected
+
+// ...and the Fletcher counterpart. The module shipped a verify for one of its two checksums, so a
+// caller using Fletcher had to write the comparison itself.
+fn fletcher16_verify(s: string, expected: int) -> bool
+    fletcher16(s) == expected
+
+// The two halves of an Adler-32, which is what a caller combining checksums or debugging a mismatch
+// actually needs -- the packed integer hides them.
+fn adler32_parts(s: string) -> list
+    _rolling_sums(s, 1, 65521)
+
+// Adler-32 of every string in `parts` -- a comprehension, so checksumming a batch of chunks does not
+// need a loop at the call site.
+fn adler32_all(parts: list) -> list
+    [adler32(p) for p in parts]
+
+// Do all of these strings still match their expected checksums? `zip_with` pairs each string with its
+// expected value and all_match short-circuits on the first mismatch, which is what a bulk integrity
+// check wants -- it should stop at the first damaged chunk, not score every one.
+fn adler32_verify_all(parts: list, expected: list) -> bool
+    len(parts) == len(expected) and all_match(zip(parts, expected), (pair) => adler32(pair[0]) == pair[1])
+
+// The index of the first string whose checksum does not match, or -1 if all match. Locating the
+// damaged chunk is the point of checksumming a stream in pieces.
+fn adler32_first_mismatch(parts: list, expected: list) -> int
+    for i in 0..min(len(parts), len(expected))
+        if adler32(parts[i]) != expected[i]
+            return i
+    0 - 1

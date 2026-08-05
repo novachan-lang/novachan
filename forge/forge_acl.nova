@@ -2,28 +2,81 @@
 // string with GLOB wildcards, FIRST-MATCH-WINS (the model AWS IAM, firewalls, and .htaccess use). Complements
 // forge_rbac (coarse roles) with fine-grained resource patterns. Default-deny when no rule matches. Composes
 // forge_wildcard. Imports forge_wildcard.
+//
+// RAISED 2026-08-05. A rule was a two-element LIST ["allow", pattern] with the layout implicit, and
+// the effect was recovered by comparing rule[0] against the literal "allow" -- so any string that is
+// not exactly "allow" reads as DENY. That is the safe direction for an access-control list, but it
+// means a typo in a rule constructor fails CLOSED silently rather than being rejected. The rule is
+// now a struct with a named effect, built only by acl_allow / acl_deny, so the effect cannot be
+// misspelled at all.
+//
+// The evaluation loop indexed `rules` to reach each element; first-match-wins genuinely must
+// SHORT-CIRCUIT, so it stays a loop -- but over the values, not the indices.
 import forge_wildcard
 
+// A rule: its effect and the glob it matches. The effect is a bool rather than a string because there
+// are exactly two effects and "is this an allow" is the only question ever asked of it.
+type AclRule
+    allow: bool
+    pattern: string
+
 fn acl_new() -> dict
-    let a = {}
-    a["rules"] = []
-    a
+    {"rules": []}
 
 // Append an ALLOW rule (glob like "read:posts/*"). Order matters -- put specific denies BEFORE broad allows.
 fn acl_allow(a: dict, pattern: string) -> dict
-    push(a["rules"], ["allow", pattern])
+    push(a["rules"], AclRule(true, pattern))
     a
 
 // Append a DENY rule. Fluent.
 fn acl_deny(a: dict, pattern: string) -> dict
-    push(a["rules"], ["deny", pattern])
+    push(a["rules"], AclRule(false, pattern))
     a
 
-// Evaluate `action` against the rules in order; the FIRST matching rule decides. No match -> denied (default-deny).
+// Append several rules at once: acl_add_all(a, [[true, "read:*"], [false, "read:secret/*"]]).
+// Building a policy from configuration previously meant calling acl_allow / acl_deny in a loop the
+// caller wrote itself.
+fn acl_add_all(a: dict, rules: list) -> dict
+    for r in rules
+        push(a["rules"], AclRule(r[0], r[1]))
+    a
+
+// PRIVATE: the first rule matching `action`, or a Result saying nothing matched. The search is shared
+// by acl_check and acl_explain, so "which rule decided" and "what was the decision" cannot disagree.
+// The loop STAYS: first-match-wins must short-circuit, and a comprehension would evaluate every
+// wildcard_match in the policy.
+fn _acl_first_match(a: dict, action: string) -> Result
+    for rule in a["rules"]
+        if wildcard_match(rule.pattern, action)
+            return ok(rule)
+    err("no rule matched '{action}' (default-deny)")
+
+// Evaluate `action` against the rules in order; the FIRST matching rule decides. No match -> denied
+// (default-deny).
 fn acl_check(a: dict, action: string) -> bool
-    let rules = a["rules"]
-    for i in 0..len(rules)
-        let rule = rules[i]
-        if wildcard_match(rule[1], action)
-            return rule[0] == "allow"
-    false
+    let r = _acl_first_match(a, action)
+    is_ok(r) and unwrap(r).allow
+
+// WHY an action was allowed or denied -- the pattern that decided, or the default-deny reason.
+// An access-control list that cannot explain itself is untestable in production; this is the same
+// search acl_check runs, so an explanation always matches the decision.
+fn acl_explain(a: dict, action: string) -> string
+    let r = _acl_first_match(a, action)
+    if is_err(r)
+        return unwrap_err(r)
+    let rule = unwrap(r)
+    "{"allow" if rule.allow else "deny"} by '{rule.pattern}'"
+
+fn acl_rule_count(a: dict) -> int
+    len(a["rules"])
+
+// Every action in `actions` that the policy permits -- a filtered comprehension over the check.
+fn acl_permitted(a: dict, actions: list) -> list
+    [x for x in actions if acl_check(a, x)]
+
+// Does the policy permit ALL of these actions? / ANY of them? Short-circuiting.
+fn acl_permits_all(a: dict, actions: list) -> bool
+    all_match(actions, (x) => acl_check(a, x))
+
+fn acl_permits_any(a: dict, actions: list) -> bool
+    any_match(actions, (x) => acl_check(a, x))
