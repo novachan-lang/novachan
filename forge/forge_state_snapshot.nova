@@ -26,12 +26,25 @@
 //      unchecked dict read: the old label path indexed s["snapshots"] without proving the key was there.)
 //
 // Storage note, unchanged: a snapshot is flattened into the same dict under "<idx>_<key>". The REAL
-// collision is not "_" in a key (the prefix is anchored, so "x_y" round-trips fine -- verified) but a live
-// key named EXACTLY "label" or "key_count": ss_take_snapshot writes its metadata after the values, so the
-// user's value is overwritten and then hidden by the reserved-name filter. Verified at runtime:
-// set("key_count","USER-VALUE") -> snapshot_value(...,"key_count") == "" and the key is absent from
-// ss_snapshot_keys. That hazard predates this raise; fixing it means changing the storage layout, which is
-// a redesign, not a raise -- so it is documented precisely here and at _ss_reserved rather than papered over.
+// collision is not "_" in a key (the prefix is anchored, so "x_y", "0_x" and even "_" all round-trip
+// fine -- measured) but a live key named EXACTLY "label" or "key_count": ss_take_snapshot writes its
+// metadata AFTER the values, so the user's value is overwritten by the metadata and the key is then
+// hidden from ss_snapshot_keys by the reserved-name filter.
+//
+// MEASURED, on both the pre-raise base (a7cd9a9c) and now -- identical, so this is pre-existing and NOT
+// introduced by the raise. With current = key_count="USER-VALUE", label="USER-LABEL", ok="fine":
+//     ss_snapshot_value(h, 0, "key_count") -> 3            (the metadata COUNT, not "" and not the value)
+//     ss_snapshot_value(h, 0, "label")     -> "meta"       (the snapshot LABEL, not the user's value)
+//     ss_snapshot_keys(h, 0)               -> ["ok"]       (both names filtered out)
+//     ss_snapshot_key_count(h, 0) == 3  but  len(ss_snapshot_keys(h, 0)) == 1
+// Note what the first line means and why it is worse than returning "": ss_snapshot_value is declared
+// -> string, and in this one case it hands back the metadata INT. A caller doing string work on that
+// result is operating on an int. Do not read "" out of this note -- an earlier revision of it claimed
+// "" and that was never true.
+//
+// That hazard predates this raise; fixing it means changing the storage layout (nest the values, or
+// prefix metadata with a character no key may contain), which is a redesign, not a raise -- so it is
+// documented precisely here and at _ss_reserved rather than papered over.
 
 // Why a lookup failed. An ADT so the CAUSE is a value: a missing key is a client error, a bad index is a
 // programmer error, and both used to arrive as "".
@@ -115,7 +128,10 @@ fn ss_snapshot_value(s: dict, index: int, key: string) -> string
     unwrap_or(ss_snapshot_value_checked(s, index, key), "")
 
 // How many keys the snapshot captured. ss_take_snapshot has always STORED this and nothing could read it
-// back -- dead storage. It is also the cheap cross-check on ss_snapshot_keys.
+// back -- dead storage. It counts keys AS CAPTURED, i.e. len(keys(current)) at snapshot time, so it is a
+// cheap cross-check on ss_snapshot_keys only when no key is shadowed: a live key named "label" or
+// "key_count" is counted here but filtered out of ss_snapshot_keys, and the two then differ by design
+// (measured: 3 vs 1 -- see the storage note in the header). Do not assert equality of the two.
 fn ss_snapshot_key_count_checked(s: dict, index: int) -> Result
     _ss_snap_raw(s, index, "key_count")
 

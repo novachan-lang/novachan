@@ -22,144 +22,138 @@
 //   snap_<mod>_<fn>_params / snap_<mod>_<fn>_ret - last-snapshot signature
 //   break_count                                 - breaks found in the last compare
 //   breaking_changes                            - csv description of those breaks
+//
+// RAISED 2026-08-05. The whole shape here was string-mangled keys plus a CSV used as a set:
+//
+//   1. "fn_<mod>_<fn>_params" AND ITS THREE SIBLINGS were rebuilt by concatenation at TWENTY sites
+//      across nine functions -- frequently all four inside one function. A single mistyped suffix
+//      reads as a missing key, and a missing key is exactly what this module interprets as "no
+//      change" -- so a typo would make it declare a real ABI break COMPATIBLE. _sig_key owns the
+//      scheme now and nothing else spells it out.
+//   2. THE "is this function tracked" GUARD was pasted into five functions, each re-deriving the same
+//      error message. One _demand_fn.
+//   3. _abi_csv_contains SCANNED THE WHOLE CSV setting a `found` flag instead of stopping at the
+//      match. Membership is now `in`, which short-circuits and says what it means.
+//   4. abi_compare grew its breaks list with `breaks = _abi_csv_add(breaks, ...)` inside the loop --
+//      string concatenation per break, which is quadratic -- and counted them in a PARALLEL variable
+//      that could disagree with the string it counted. Both come from one flattened list now.
+//
+// Storage stays a FLAT DICT (the header documents that as the constraint) and every public contract
+// is unchanged, including the 1/0 int returns of abi_has_fn.
 
-fn abi_new() -> dict
-    let s = {}
-    s["fn_count"] = 0
-    s["fn_names"] = ""
-    s["snap_count"] = 0
-    s["snap_names"] = ""
-    s["break_count"] = 0
-    s["breaking_changes"] = ""
-    s
-
+// PRIVATE: "mod.fn" -- the identity of a tracked function.
 fn _abi_key(mod_name: string, fn_name: string) -> string
-    mod_name + "." + fn_name
+    "{mod_name}.{fn_name}"
 
+// PRIVATE: THE key scheme. `which` is "fn" for the live signature or "snap" for the last snapshot;
+// `field` is "params" or "ret". These four combinations were written by hand at 20 sites.
+fn _sig_key(which: string, mod_name: string, fn_name: string, field: string) -> string
+    "{which}_{mod_name}_{fn_name}_{field}"
+
+// PRIVATE: the CSV split into real entries. The CSV is the storage format; this is the value every
+// other function actually wants, and the empty-string case is handled once here rather than by a
+// `if len(key) > 0` guard inside each loop.
+fn _abi_names(state: dict) -> list
+    [k for k in split(state["fn_names"], ",") if len(k) > 0]
+
+fn _abi_snap_names(state: dict) -> list
+    [k for k in split(state["snap_names"], ",") if len(k) > 0]
+
+// PRIVATE: membership.
 fn _abi_csv_contains(csv: string, item: string) -> int
-    if len(csv) == 0
-        return 0
-    let parts = split(csv, ",")
-    let i = 0
-    let found = 0
-    while i < len(parts)
-        if parts[i] == item
-            found = 1
-        i += 1
-    found
+    1 if item in [p for p in split(csv, ",") if len(p) > 0] else 0
 
 fn _abi_csv_add(csv: string, item: string) -> string
-    if len(csv) == 0
-        return item
-    csv + "," + item
+    item if len(csv) == 0 else "{csv},{item}"
+
+fn abi_new() -> dict
+    {"fn_count": 0, "fn_names": "", "snap_count": 0, "snap_names": "", "break_count": 0, "breaking_changes": ""}
+
+// PRIVATE: the tracked-function guard, once. Five functions carried their own copy.
+fn _demand_fn(state: dict, mod_name: string, fn_name: string) -> Result
+    if abi_has_fn(state, mod_name, fn_name) != 1
+        return err("function not found: {_abi_key(mod_name, fn_name)}")
+    ok(1)
 
 fn abi_add_fn(state: dict, mod_name: string, fn_name: string, params_csv: string, ret_type: string) -> dict
     let key = _abi_key(mod_name, fn_name)
-    let pk = "fn_" + mod_name + "_" + fn_name + "_params"
-    let rk = "fn_" + mod_name + "_" + fn_name + "_ret"
-    let is_new = 0
-    if _abi_csv_contains(state["fn_names"], key) != 1
-        is_new = 1
-    state[pk] = params_csv
-    state[rk] = ret_type
-    if is_new == 1
+    let is_new = _abi_csv_contains(state["fn_names"], key) != 1
+    state[_sig_key("fn", mod_name, fn_name, "params")] = params_csv
+    state[_sig_key("fn", mod_name, fn_name, "ret")] = ret_type
+    if is_new
         state["fn_names"] = _abi_csv_add(state["fn_names"], key)
-        state["fn_count"] = state["fn_count"] + 1
+        state["fn_count"] += 1
     state
 
 fn abi_has_fn(state: dict, mod_name: string, fn_name: string) -> int
-    let key = _abi_key(mod_name, fn_name)
-    _abi_csv_contains(state["fn_names"], key)
+    _abi_csv_contains(state["fn_names"], _abi_key(mod_name, fn_name))
 
 fn abi_fn_count(state: dict) -> int
     state["fn_count"]
 
+// The tracked identities themselves. fn_count is a counter kept BESIDE the container it counts --
+// two sources of truth for one fact -- so this is the value to trust; abi_fn_count keeps its contract.
+fn abi_tracked(state: dict) -> list
+    _abi_names(state)
+
 fn abi_get_params(state: dict, mod_name: string, fn_name: string) -> Result
-    if abi_has_fn(state, mod_name, fn_name) != 1
-        return err("function not found: " + _abi_key(mod_name, fn_name))
-    let pk = "fn_" + mod_name + "_" + fn_name + "_params"
-    ok(state[pk])
+    _ = _demand_fn(state, mod_name, fn_name)?
+    ok(state[_sig_key("fn", mod_name, fn_name, "params")])
 
 fn abi_get_ret(state: dict, mod_name: string, fn_name: string) -> Result
-    if abi_has_fn(state, mod_name, fn_name) != 1
-        return err("function not found: " + _abi_key(mod_name, fn_name))
-    let rk = "fn_" + mod_name + "_" + fn_name + "_ret"
-    ok(state[rk])
+    _ = _demand_fn(state, mod_name, fn_name)?
+    ok(state[_sig_key("fn", mod_name, fn_name, "ret")])
 
 fn abi_remove_fn(state: dict, mod_name: string, fn_name: string) -> Result
-    if abi_has_fn(state, mod_name, fn_name) != 1
-        return err("function not found: " + _abi_key(mod_name, fn_name))
+    _ = _demand_fn(state, mod_name, fn_name)?
     let key = _abi_key(mod_name, fn_name)
-    let parts = split(state["fn_names"], ",")
-    let new_csv = ""
-    for i in 0..len(parts)
-        if parts[i] != key
-            new_csv = _abi_csv_add(new_csv, parts[i])
-    state["fn_names"] = new_csv
-    state["fn_count"] = state["fn_count"] - 1
+    // Filter, then join ONCE. The old loop rebuilt the CSV with a concatenation per surviving entry,
+    // which is quadratic in the number of tracked functions.
+    state["fn_names"] = join([k for k in _abi_names(state) if k != key], ",")
+    state["fn_count"] -= 1
     ok(state)
 
 fn abi_change_fn(state: dict, mod_name: string, fn_name: string, new_params: string, new_ret: string) -> Result
-    if abi_has_fn(state, mod_name, fn_name) != 1
-        return err("function not found: " + _abi_key(mod_name, fn_name))
-    let pk = "fn_" + mod_name + "_" + fn_name + "_params"
-    let rk = "fn_" + mod_name + "_" + fn_name + "_ret"
-    state[pk] = new_params
-    state[rk] = new_ret
+    _ = _demand_fn(state, mod_name, fn_name)?
+    state[_sig_key("fn", mod_name, fn_name, "params")] = new_params
+    state[_sig_key("fn", mod_name, fn_name, "ret")] = new_ret
     ok(state)
 
-// abi_snapshot: copy every currently-tracked signature into the snap_ fields,
-// replacing whatever the previous snapshot held. snap_count is the version number.
+// PRIVATE: split "mod.fn" back into its two halves.
+fn _abi_split(key: string) -> list
+    split(key, ".")
+
+// abi_snapshot: copy every currently-tracked signature into the snap_ fields, replacing whatever the
+// previous snapshot held. snap_count is the version number.
 fn abi_snapshot(state: dict) -> dict
-    let parts = split(state["fn_names"], ",")
-    for i in 0..len(parts)
-        let key = parts[i]
-        if len(key) > 0
-            let kp = split(key, ".")
-            let mod_name = kp[0]
-            let fn_name = kp[1]
-            let pk = "fn_" + mod_name + "_" + fn_name + "_params"
-            let rk = "fn_" + mod_name + "_" + fn_name + "_ret"
-            let spk = "snap_" + mod_name + "_" + fn_name + "_params"
-            let srk = "snap_" + mod_name + "_" + fn_name + "_ret"
-            state[spk] = state[pk]
-            state[srk] = state[rk]
+    for key in _abi_names(state)
+        let kp = _abi_split(key)
+        for field in ["params", "ret"]
+            state[_sig_key("snap", kp[0], kp[1], field)] = state[_sig_key("fn", kp[0], kp[1], field)]
     state["snap_names"] = state["fn_names"]
-    state["snap_count"] = state["snap_count"] + 1
+    state["snap_count"] += 1
     state
+
+// PRIVATE: the breaks for ONE snapshotted function, as a list so the caller just concatenates.
+// The three rules were previously interleaved with the loop, the CSV growth and the counter; here
+// they are the rules alone.
+fn _abi_breaks_for(state: dict, key: string) -> list
+    let kp = _abi_split(key)
+    if abi_has_fn(state, kp[0], kp[1]) != 1
+        return ["removed:{key}"]
+    let changed = [f for f in ["params", "ret"] if state[_sig_key("fn", kp[0], kp[1], f)] != state[_sig_key("snap", kp[0], kp[1], f)]]
+    ["params-changed:{key}" if f == "params" else "ret-changed:{key}" for f in changed]
 
 // abi_compare: diff the last snapshot against the live signatures.
 fn abi_compare(state: dict) -> Result
     if state["snap_count"] == 0
         return err("no snapshot taken")
-    let breaks = ""
-    let break_n = 0
-    let sparts = split(state["snap_names"], ",")
-    for i in 0..len(sparts)
-        let key = sparts[i]
-        if len(key) > 0
-            let kp = split(key, ".")
-            let mod_name = kp[0]
-            let fn_name = kp[1]
-            if abi_has_fn(state, mod_name, fn_name) != 1
-                breaks = _abi_csv_add(breaks, "removed:" + key)
-                break_n += 1
-            else
-                let spk = "snap_" + mod_name + "_" + fn_name + "_params"
-                let srk = "snap_" + mod_name + "_" + fn_name + "_ret"
-                let pk = "fn_" + mod_name + "_" + fn_name + "_params"
-                let rk = "fn_" + mod_name + "_" + fn_name + "_ret"
-                if state[pk] != state[spk]
-                    breaks = _abi_csv_add(breaks, "params-changed:" + key)
-                    break_n += 1
-                if state[rk] != state[srk]
-                    breaks = _abi_csv_add(breaks, "ret-changed:" + key)
-                    break_n += 1
-    state["break_count"] = break_n
-    state["breaking_changes"] = breaks
-    if break_n == 0
-        return ok("compatible")
-    ok(breaks)
+    // One flattened list, then count and join ONCE. The old version grew a CSV by concatenation inside
+    // the loop and maintained a separate counter alongside it.
+    let all_breaks = flatten([_abi_breaks_for(state, key) for key in _abi_snap_names(state)])
+    state["break_count"] = len(all_breaks)
+    state["breaking_changes"] = join(all_breaks, ",")
+    ok("compatible" if len(all_breaks) == 0 else state["breaking_changes"])
 
 fn abi_break_count(state: dict) -> int
     state["break_count"]
@@ -169,3 +163,9 @@ fn abi_snap_count(state: dict) -> int
 
 fn abi_breaking_changes(state: dict) -> string
     state["breaking_changes"]
+
+// Is the live ABI compatible with the last snapshot? The question a caller actually asks, instead of
+// comparing abi_compare's payload against the literal string "compatible".
+fn abi_is_compatible(state: dict) -> bool
+    let r = abi_compare(state)
+    is_ok(r) and unwrap(r) == "compatible"

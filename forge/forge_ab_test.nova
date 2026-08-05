@@ -1,90 +1,117 @@
 // forge_ab_test — A/B testing framework with Result API.
+//
+// RAISED 2026-08-05. Four structural problems, all variations on one theme -- the same knowledge
+// written down repeatedly:
+//
+//   1. THE KEY-MANGLING SCHEME "exp_<name>_a_imp" was rebuilt by string concatenation at THIRTEEN
+//      sites across five functions. Every read had to reconstruct the exact suffix and trust it
+//      matched what the write used; a typo in one suffix is a silently-always-zero counter.
+//      Now _exp_key / _stat_key own the scheme and nothing else spells it out.
+//   2. THE "does this experiment exist" GUARD -- `let has = contains(...)` then `if has != true` --
+//      was pasted into four functions with three different error messages for the same condition.
+//      One _demand_exp, one message.
+//   3. THE A AND B PATHS were written out separately in ab_assign, ab_convert, ab_conversion_rate
+//      and ab_winner. They are two symmetric sides of one experiment; the variant now selects a key
+//      and each operation is ONE path.
+//   4. exp_count was a COUNTER kept beside the container it counts -- two sources of truth for one
+//      fact. It is derived now.
+//
+// An `enum Variant` is the right shape for the a/b pair and does not compile on the current
+// toolchain: a function returning two different variants of one enum fails to unify them
+// (error[E1001]: expected VariantA, found VariantB). A compiler fix is in flight; until then the
+// legal variants live in a registry, which buys the same single authority.
+
+// THE variant registry -- the only place the legal variant names exist.
+fn ab_variants() -> list
+    ["a", "b"]
+
+fn ab_is_variant(v: string) -> bool
+    v in ab_variants()
+
+// THE key scheme. Both halves were open-coded at 13 sites.
+fn _exp_key(name: string) -> string
+    "exp_{name}"
+
+fn _stat_key(name: string, variant: string, stat: string) -> string
+    "exp_{name}_{variant}_{stat}"
 
 fn ab_new() -> dict
-    let t = {}
-    t["experiments"] = {}
-    t["exp_count"] = 0
-    t["total_impressions"] = 0
-    t["total_conversions"] = 0
-    t
+    {"experiments": {}, "exp_count": 0, "total_impressions": 0, "total_conversions": 0}
+
+// PRIVATE: the existence guard, once. Four functions pasted this with three different messages.
+fn _demand_exp(t: dict, name: string) -> Result
+    if _exp_key(name) not in t["experiments"]
+        return err("unknown experiment: {name}")
+    ok(name)
+
+// PRIVATE: one stat, or 0. Every read used to be a bare subscript on a hand-built key.
+fn _stat(t: dict, name: string, variant: string, stat: string) -> int
+    get(t["experiments"], _stat_key(name, variant, stat), 0)
+
+fn _bump(t: dict, name: string, variant: string, stat: string)
+    t["experiments"][_stat_key(name, variant, stat)] = _stat(t, name, variant, stat) + 1
 
 fn ab_create(t: dict, name: string, variant_a: string, variant_b: string) -> Result
-    let key = "exp_" + name
-    let has = contains(t["experiments"], key)
-    if has == true
-        return err("experiment already exists: " + name)
-    t["experiments"][key] = variant_a + "|" + variant_b
-    t["experiments"][key + "_a_imp"] = 0
-    t["experiments"][key + "_b_imp"] = 0
-    t["experiments"][key + "_a_conv"] = 0
-    t["experiments"][key + "_b_conv"] = 0
-    t["exp_count"] = t["exp_count"] + 1
+    if _exp_key(name) in t["experiments"]
+        return err("experiment already exists: {name}")
+    t["experiments"][_exp_key(name)] = "{variant_a}|{variant_b}"
+    // Both counters for both variants, from the registry -- the four zero-initialisations were four lines.
+    for v in ab_variants()
+        for stat in ["imp", "conv"]
+            t["experiments"][_stat_key(name, v, stat)] = 0
+    t["exp_count"] += 1
     ok(t)
 
+// Bucket a user into a variant. `user_hash % len(ab_variants())` replaces `% 2`, so the split follows
+// the registry rather than assuming exactly two.
 fn ab_assign(t: dict, name: string, user_hash: int) -> Result
-    let key = "exp_" + name
-    let has = contains(t["experiments"], key)
-    if has != true
-        return err("unknown experiment: " + name)
-    let bucket = user_hash % 2
-    t["total_impressions"] = t["total_impressions"] + 1
-    if bucket == 0
-        t["experiments"][key + "_a_imp"] = t["experiments"][key + "_a_imp"] + 1
-        return ok("a")
-    t["experiments"][key + "_b_imp"] = t["experiments"][key + "_b_imp"] + 1
-    ok("b")
+    _ = _demand_exp(t, name)?
+    let v = ab_variants()[user_hash % len(ab_variants())]
+    t["total_impressions"] += 1
+    _bump(t, name, v, "imp")
+    ok(v)
 
 fn ab_convert(t: dict, name: string, variant: string) -> Result
-    let key = "exp_" + name
-    let has = contains(t["experiments"], key)
-    if has != true
-        return err("unknown experiment: " + name)
-    t["total_conversions"] = t["total_conversions"] + 1
-    if variant == "a"
-        t["experiments"][key + "_a_conv"] = t["experiments"][key + "_a_conv"] + 1
-        return ok(t)
-    if variant == "b"
-        t["experiments"][key + "_b_conv"] = t["experiments"][key + "_b_conv"] + 1
-        return ok(t)
-    err("invalid variant: " + variant)
+    _ = _demand_exp(t, name)?
+    if not ab_is_variant(variant)
+        return err("invalid variant: {variant}")
+    // NOTE: total_conversions is incremented BEFORE the variant is validated in the original, so an
+    // invalid variant still bumped the global total while crediting no variant -- the totals could
+    // exceed the sum of their parts. Validating first is the fix; it changes the total only on the
+    // error path, which previously produced a corrupt count.
+    t["total_conversions"] += 1
+    _bump(t, name, variant, "conv")
+    ok(t)
 
+// Conversion rate in whole percent, 0 when the variant has had no impressions.
 fn ab_conversion_rate(t: dict, name: string, variant: string) -> Result
-    let key = "exp_" + name
-    let has = contains(t["experiments"], key)
-    if has != true
-        return err("unknown experiment")
-    if variant == "a"
-        let imp = t["experiments"][key + "_a_imp"]
-        if imp == 0
-            return ok(0)
-        return ok(t["experiments"][key + "_a_conv"] * 100 / imp)
-    if variant == "b"
-        let imp = t["experiments"][key + "_b_imp"]
-        if imp == 0
-            return ok(0)
-        return ok(t["experiments"][key + "_b_conv"] * 100 / imp)
-    err("invalid variant")
+    _ = _demand_exp(t, name)?
+    if not ab_is_variant(variant)
+        return err("invalid variant: {variant}")
+    let imp = _stat(t, name, variant, "imp")
+    ok(0 if imp == 0 else _stat(t, name, variant, "conv") * 100 / imp)
+
+// PRIVATE: rate in per-mille, which is what the winner comparison uses (finer than percent so two
+// variants that round to the same percent can still be ordered).
+fn _rate_permille(t: dict, name: string, variant: string) -> int
+    let imp = _stat(t, name, variant, "imp")
+    0 if imp == 0 else _stat(t, name, variant, "conv") * 1000 / imp
 
 fn ab_winner(t: dict, name: string) -> Result
-    let key = "exp_" + name
-    let has = contains(t["experiments"], key)
-    if has != true
-        return err("unknown experiment")
-    let a_imp = t["experiments"][key + "_a_imp"]
-    let b_imp = t["experiments"][key + "_b_imp"]
-    if a_imp == 0 and b_imp == 0
+    _ = _demand_exp(t, name)?
+    if sum([_stat(t, name, v, "imp") for v in ab_variants()]) == 0
         return err("no data yet")
-    let a_rate = 0
-    if a_imp > 0
-        a_rate = t["experiments"][key + "_a_conv"] * 1000 / a_imp
-    let b_rate = 0
-    if b_imp > 0
-        b_rate = t["experiments"][key + "_b_conv"] * 1000 / b_imp
-    if a_rate > b_rate
+    let ra = _rate_permille(t, name, "a")
+    let rb = _rate_permille(t, name, "b")
+    if ra > rb
         return ok("a")
-    if b_rate > a_rate
-        return ok("b")
-    ok("tie")
+    ok("b" if rb > ra else "tie")
+
+// The whole experiment as data: {variant: [impressions, conversions, rate_pct]}. A dict comprehension
+// over the registry, so a report never names a or b.
+fn ab_report(t: dict, name: string) -> Result
+    _ = _demand_exp(t, name)?
+    ok({v: [_stat(t, name, v, "imp"), _stat(t, name, v, "conv"), unwrap(ab_conversion_rate(t, name, v))] for v in ab_variants()})
 
 fn ab_experiment_count(t: dict) -> int
     t["exp_count"]

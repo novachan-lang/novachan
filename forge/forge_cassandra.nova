@@ -448,34 +448,83 @@ fn cql_options_frame(stream: int) -> bytes
 // ── opcode / consistency registries ──────────────────────────────────────────
 
 // THE opcode registry — the only place in this module where an opcode number is written down.
-// Was 32 `if` branches across two functions holding two independent copies of this table.
-fn _cql_opcodes() -> dict
-    {"ERROR": 0x00, "STARTUP": 0x01, "READY": 0x02, "AUTHENTICATE": 0x03, "OPTIONS": 0x05, "SUPPORTED": 0x06, "QUERY": 0x07, "RESULT": 0x08, "PREPARE": 0x09, "EXECUTE": 0x0A, "REGISTER": 0x0B, "EVENT": 0x0C, "BATCH": 0x0D, "AUTH_CHALLENGE": 0x0E, "AUTH_RESPONSE": 0x0F, "AUTH_SUCCESS": 0x10}
+// Was 32 `if` branches across two functions holding TWO INDEPENDENT COPIES of this table; there
+// is now one copy, and the number→name and name→number directions both read it, so they can no
+// longer drift.
+//
+// WHY A DISPATCH AND NOT A DICT LITERAL. A dict literal is the obvious way to write a registry
+// and it is the wrong one HERE, because in NOVA a container built inside a function body is
+// rebuilt on EVERY call — and a module-level `let TBL = {...}` in an imported module does not
+// bake at all (it silently reads back EMPTY; probed 2026-08-05, see the note in the verify log).
+// So `get({...literal...}, name, -1)` allocates a 16-entry dict per lookup, and deriving the
+// reverse direction by inverting it allocates a second one plus 16 `str()` calls. MEASURED over
+// 200k lookups: dict form 2766 ms vs this dispatch 9 ms — 307x. `cql_opcode_name` is called
+// once per RECEIVED FRAME by any driver that logs or dispatches on opcode, so that is 14 µs of
+// allocation on the frame path. String literals, unlike containers, are baked constants: a
+// dispatch returning literals allocates nothing. The dedup goal is fully met either way — this
+// form just does not pay 307x for it.
+fn _cql_opcode_at(op: int) -> string
+    if op == 0x00 then return "ERROR"
+    if op == 0x01 then return "STARTUP"
+    if op == 0x02 then return "READY"
+    if op == 0x03 then return "AUTHENTICATE"
+    if op == 0x05 then return "OPTIONS"
+    if op == 0x06 then return "SUPPORTED"
+    if op == 0x07 then return "QUERY"
+    if op == 0x08 then return "RESULT"
+    if op == 0x09 then return "PREPARE"
+    if op == 0x0A then return "EXECUTE"
+    if op == 0x0B then return "REGISTER"
+    if op == 0x0C then return "EVENT"
+    if op == 0x0D then return "BATCH"
+    if op == 0x0E then return "AUTH_CHALLENGE"
+    if op == 0x0F then return "AUTH_RESPONSE"
+    if op == 0x10 then return "AUTH_SUCCESS"
+    ""
 
 // THE consistency registry — likewise, was 22 `if` branches across two functions.
-fn _cql_consistencies() -> dict
-    {"ANY": 0x0000, "ONE": 0x0001, "TWO": 0x0002, "THREE": 0x0003, "QUORUM": 0x0004, "ALL": 0x0005, "LOCAL_QUORUM": 0x0006, "EACH_QUORUM": 0x0007, "SERIAL": 0x0008, "LOCAL_SERIAL": 0x0009, "LOCAL_ONE": 0x000A}
+fn _cql_consistency_at(c: int) -> string
+    if c == 0x0000 then return "ANY"
+    if c == 0x0001 then return "ONE"
+    if c == 0x0002 then return "TWO"
+    if c == 0x0003 then return "THREE"
+    if c == 0x0004 then return "QUORUM"
+    if c == 0x0005 then return "ALL"
+    if c == 0x0006 then return "LOCAL_QUORUM"
+    if c == 0x0007 then return "EACH_QUORUM"
+    if c == 0x0008 then return "SERIAL"
+    if c == 0x0009 then return "LOCAL_SERIAL"
+    if c == 0x000A then return "LOCAL_ONE"
+    ""
 
-// number -> name, DERIVED by inverting a name -> number registry rather than restated. Both
-// registries have distinct values, so the inverse is total and unambiguous; keys are
-// stringified because the lookup key arrives as an int and a dict keyed by str(n) is the one
-// shape both directions can share. An opcode absent from the registry (e.g. 0x04, CREDENTIALS,
-// removed after protocol v1) simply has no entry, which is exactly the old "" answer.
-fn _cql_by_value(m: dict) -> dict
-    {str(m[k]): k for k in keys(m)}
-
-// Name of an opcode, or "" if it is not a known opcode.
+// Name of an opcode, or "" if it is not a known opcode (e.g. 0x04, CREDENTIALS, removed after
+// protocol v1 — absence from the registry IS the "" answer, it is not a separate rule).
 fn cql_opcode_name(op: int) -> string
-    get(_cql_by_value(_cql_opcodes()), str(op), "")
+    _cql_opcode_at(op)
 
-// Number of a named opcode, or -1 if the name is not known.
+// Number of a named opcode, or -1 if the name is not known. DERIVED by scanning the one
+// registry above rather than restating it — 17 string compares, zero allocation.
+// The empty-name guard is LOAD-BEARING: 0x04 is a hole whose registry entry is "", so without
+// it `cql_opcode_num("")` would answer 4 instead of -1.
 fn cql_opcode_num(name: string) -> int
-    get(_cql_opcodes(), name, 0 - 1)
+    if name == ""
+        return 0 - 1
+    for op in 0..0x11
+        if _cql_opcode_at(op) == name
+            return op
+    0 - 1
 
 // Name of a consistency level, or "" if it is not a known level.
 fn cql_consistency_name(c: int) -> string
-    get(_cql_by_value(_cql_consistencies()), str(c), "")
+    _cql_consistency_at(c)
 
-// Number of a named consistency level, or -1 if the name is not known.
+// Number of a named consistency level, or -1 if the name is not known. DERIVED, same as opcodes.
+// The consistency table has no holes today, but the guard costs nothing and keeps the two
+// registries' contracts identical.
 fn cql_consistency_num(name: string) -> int
-    get(_cql_consistencies(), name, 0 - 1)
+    if name == ""
+        return 0 - 1
+    for c in 0..0x0B
+        if _cql_consistency_at(c) == name
+            return c
+    0 - 1
