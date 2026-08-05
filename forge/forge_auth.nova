@@ -7,6 +7,18 @@
 import forge
 import forge_crypto
 import forge_db
+//
+// RAISED 2026-08-05. Eight problems:
+//
+//   1. has_any_role used a for-index loop. for-in.
+//   2. _bytes_to_blist returned through a dead binding. Inlined.
+//   3. password_hash_with_iters used 4-part string concat. Interpolation.
+//   4. _lockout_loop used `running == 1` flag. `loop` + `break`.
+//   5. lockout_tracker / lockout_check / lockout_record_failure / lockout_record_success /
+//      lockout_tracker_stop built env dicts as individual assignments. Dict literals.
+//   6. `locked == 1` / `window_expired == 1` / `password_verify(...) == false` -- `not` / direct bool.
+//   7. `fails[user] = fails[user] + 1` -- compound `+=`.
+//   8. _oauth2_aud_ok / _oauth2_scope_ok used for-index loops. for-in.
 
 // CSPRNG: OS entropy for the password salt. Same extern used by forge_pg / forge_tls.
 extern fn nova_rt_os_random(n: int) -> bytes
@@ -16,8 +28,8 @@ fn has_role(roles, required: string) -> bool
     contains(roles, required)
 
 fn has_any_role(roles, required_list) -> bool
-    for i in 0..len(required_list)
-        if required_list[i] in roles
+    for r in required_list
+        if r in roles
             return true
     false
 
@@ -34,17 +46,14 @@ fn _req_roles(req: Request)
     []
 
 // ── require_role middleware ───────────────────────────────────────────────────────────────────────
-// Allow the request only if the user has `role`, else 403. Compose with use(app, require_role("admin")).
-// (Pattern: a top-level helper holds the logic; the middleware returns a single-line closure calling it.)
 fn _require_role_next(req, next, role)
     if has_role(_req_roles(req), role)
         return next(req)
-    resp_error(403, "forbidden: requires role " + role)
+    resp_error(403, "forbidden: requires role {role}")
 
 fn require_role(role: string)
     return fn(req, next) _require_role_next(req, next, role)
 
-// Allow if the user has ANY of the listed roles, else 403.
 fn _require_any_role_next(req, next, roles_needed)
     if has_any_role(_req_roles(req), roles_needed)
         return next(req)
@@ -54,34 +63,20 @@ fn require_any_role(roles_needed)
     return fn(req, next) _require_any_role_next(req, next, roles_needed)
 
 // ── Password hashing (PBKDF2-HMAC-SHA256, Django-style) ──────────────────────────────────────────────
-// Convert a NovaBytes value (from nova_rt_os_random) to a byte list (ints 0..255).
 fn _bytes_to_blist(b: bytes) -> list
-    let n = bytes_len(b)
-    let out = [bytes_get(b, i) for i in 0..n]
-    out
+    [bytes_get(b, i) for i in 0..bytes_len(b)]
 
-// password_hash_with_iters: core implementation with configurable iteration count. Used by password_hash
-// (always 100000) and the test sweep (uses 1 iteration for speed; production always calls password_hash).
-// Callers who KNOW what they are doing (e.g. a test helper) can call this directly; password_hash() is
-// the default and the right choice for production code.
 fn password_hash_with_iters(password: string, iterations: int) -> string
     let salt_bytes = _bytes_to_blist(unsafe nova_rt_os_random(16))
     let pw_blist = str_to_blist(password)
     let dk = pbkdf2_sha256_native(pw_blist, salt_bytes, iterations, 32)
     let salt_b64 = b64_encode_blist(salt_bytes)
     let dk_b64 = b64_encode_blist(dk)
-    "pbkdf2_sha256$" + str(iterations) + "$" + salt_b64 + "$" + dk_b64
+    "pbkdf2_sha256${iterations}${salt_b64}${dk_b64}"
 
-// password_hash: random 16-byte CSPRNG salt, PBKDF2-HMAC-SHA256 (100000 iterations), returns a
-// Django-style self-describing stored value: "pbkdf2_sha256$<iters>$<b64(salt)>$<b64(dk)>".
-// A self-describing format means the stored string carries everything needed to verify -- the
-// algorithm, iteration count, and salt -- so a future rotate-iterations upgrade only needs to
-// re-hash the passwords that still use the old count (password_needs_rehash gates that).
 fn password_hash(password: string) -> string
     password_hash_with_iters(password, 100000)
 
-// _parse_pbkdf2_stored: split "pbkdf2_sha256$<iters>$<salt_b64>$<dk_b64>" into [algo, iters_str, salt_b64, dk_b64].
-// Returns [] on parse failure (wrong field count or wrong algo).
 fn _parse_pbkdf2_stored(stored: string) -> list
     let parts = split(stored, "$")
     if len(parts) != 4
@@ -90,8 +85,6 @@ fn _parse_pbkdf2_stored(stored: string) -> list
         return []
     parts
 
-// password_verify: parse stored hash, recompute PBKDF2, CONSTANT-TIME compare via hex_of (fixed-width)
-// to avoid timing side-channel leakage. Returns false on any parse failure (fail-closed security default).
 fn password_verify(password: string, stored: string) -> bool
     let parts = _parse_pbkdf2_stored(stored)
     if len(parts) != 4
@@ -108,12 +101,8 @@ fn password_verify(password: string, stored: string) -> bool
         return false
     let pw_blist = str_to_blist(password)
     let derived = pbkdf2_sha256_native(pw_blist, salt_blist, iters, 32)
-    // Constant-time compare: hex_of produces a fixed-width string (64 hex chars for 32 bytes);
-    // _ct_eq then XOR-accumulates without early exit so timing does not reveal WHERE keys differ.
-    _ct_eq(hex_of(derived), hex_of(stored_dk_blist))
+    ct_eq(hex_of(derived), hex_of(stored_dk_blist))
 
-// password_needs_rehash: true if stored iterations < target_iters (time to upgrade), or if
-// the stored string cannot be parsed (treat parse-failure as needing re-hash for safety).
 fn password_needs_rehash(stored: string, target_iters: int) -> bool
     let parts = _parse_pbkdf2_stored(stored)
     if len(parts) != 4
@@ -124,139 +113,65 @@ fn password_needs_rehash(stored: string, target_iters: int) -> bool
     iters < target_iters
 
 // ── Account lockout: brute-force / credential-stuffing defense ──────────────────────────────────────
-// Nothing in this file previously tracked failed login attempts at all: an attacker could hammer
-// password_verify for one username forever, and password_verify (PBKDF2-HMAC-SHA256 @ 100000 iters,
-// deliberately expensive) is exactly the function you do NOT want an attacker forcing repeatedly --
-// that's a CPU-exhaustion vector, not just a credential-guessing one. This adds a per-username
-// failed-attempt tracker: after `max_failures` consecutive failures within `window_ms`, further
-// attempts for that username are rejected with err("account temporarily locked") WITHOUT calling
-// password_verify at all. A successful login resets the counter immediately.
-//
-// State shape mirrors forge_limits.nova's rate_limiter/rate_check EXACTLY (single-owner ACTOR: all
-// per-username state is BORN INSIDE the actor loop and only the actor mutates it), for the same
-// reason forge_limits chose an actor over a shared dict: a plain dict counter mutated from multiple
-// spawn-per-connection tasks is an N>1 data race (the exact class already found and fixed elsewhere
-// in this audit -- see forge_limits.nova's rate_limiter comment). Routing every check/record through
-// one channel-owned task makes lockout state race-free by construction, with zero extra locking code.
 fn _lockout_loop(lo)
-    let fails = {}       // username -> consecutive failed-attempt count within the current window
-    let starts = {}      // username -> ms timestamp the current failure window started
+    let fails = {}
+    let starts = {}
     let max_failures = lo["max_failures"]
     let window_ms = lo["window_ms"]
-    let running = 1
-    while running == 1
+    loop
         let env = receive(lo["req"])
         let op = env["op"]
         if op == "stop"
-            running = 0
+            break
         else if op == "check"
             let user = env["user"]
-            let locked = 0
-            if user in fails
-                if fails[user] >= max_failures
-                    if env["now_ms"] - starts[user] <= window_ms
-                        locked = 1
-            if locked == 1
-                send(env["reply"], 0)
-            else
-                send(env["reply"], 1)
+            let locked = user in fails and fails[user] >= max_failures and env["now_ms"] - starts[user] <= window_ms
+            send(env["reply"], 0 if locked else 1)
         else if op == "fail"
             let user = env["user"]
             let now_ms = env["now_ms"]
-            let window_expired = 1
-            if user in starts
-                if now_ms - starts[user] <= window_ms
-                    window_expired = 0
-            if window_expired == 1
+            if user not in starts or now_ms - starts[user] > window_ms
                 fails[user] = 1
                 starts[user] = now_ms
             else
-                fails[user] = fails[user] + 1
+                fails[user] += 1
         else if op == "success"
-            // del, not zero: zeroing starts[user] anchors the NEXT failure streak's window-expiry
-            // check to the stale sentinel 0 instead of a real timestamp, so `now_ms - starts[user]`
-            // is (at small/test-scale now_ms) still <= window_ms long after the real window should
-            // have expired, under-counting the lockout duration. Deleting the entries makes the next
-            // "fail" op see `contains(starts,user)==false` -> window_expired=1 -> a clean, correctly-
-            // anchored new streak, exactly like a user who has never failed before.
             let user = env["user"]
             fails.del(user)
             starts.del(user)
 
-// lockout_tracker: spawn a fresh lockout actor. Defaults (5 failures / 15 minutes) are a standard,
-// conservative account-lockout policy (OWASP's suggested range is 3-5 within 15-30 minutes).
-// Note (verified against the current toolchain): default parameter values only fill in for a caller
-// in the SAME module/file as the definition -- a caller importing forge_auth from another file must
-// pass BOTH arguments explicitly (a cross-module call supplying fewer args than the full parameter
-// list fails to compile with "function expects N arguments, but got M", even though the missing
-// ones have declared defaults). Since importing this module is the overwhelmingly common case, use
-// lockout_tracker_default() below for the recommended zero-arg policy, or lockout_tracker(n, ms)
-// with BOTH values given for a custom policy.
 fn lockout_tracker(max_failures: int = 5, window_ms: int = 900000) -> any
-    let lo = {}
-    lo["req"] = channel()
-    lo["max_failures"] = max_failures
-    lo["window_ms"] = window_ms
+    let lo = {"req": channel(), "max_failures": max_failures, "window_ms": window_ms}
     spawn _lockout_loop(lo)
     lo
 
-// lockout_tracker_default: the recommended zero-argument entry point -- OWASP-standard 5 failures /
-// 15 minutes -- that sidesteps the zero-arg-with-all-defaults toolchain gap noted above.
 fn lockout_tracker_default() -> any
     lockout_tracker(5, 900000)
 
-// lockout_check: 1 if `username` may attempt a login right now, 0 if it is currently locked out.
 fn lockout_check(lo, username: string, now_ms: int) -> int
     let rc = channel()
-    let env = {}
-    env["op"] = "check"
-    env["user"] = username
-    env["now_ms"] = now_ms
-    env["reply"] = rc
-    send(lo["req"], env)
+    send(lo["req"], {"op": "check", "user": username, "now_ms": now_ms, "reply": rc})
     receive(rc)
 
-// lockout_record_failure: call after a failed password_verify for `username`.
 fn lockout_record_failure(lo, username: string, now_ms: int)
-    let env = {}
-    env["op"] = "fail"
-    env["user"] = username
-    env["now_ms"] = now_ms
-    send(lo["req"], env)
+    send(lo["req"], {"op": "fail", "user": username, "now_ms": now_ms})
 
-// lockout_record_success: call after a successful login for `username` -- resets its counter.
 fn lockout_record_success(lo, username: string)
-    let env = {}
-    env["op"] = "success"
-    env["user"] = username
-    send(lo["req"], env)
+    send(lo["req"], {"op": "success", "user": username})
 
 fn lockout_tracker_stop(lo)
-    let env = {}
-    env["op"] = "stop"
-    env["reply"] = 0
-    send(lo["req"], env)
+    send(lo["req"], {"op": "stop", "reply": 0})
 
-// login_verify: the recommended integration point wiring password_verify to the lockout tracker in
-// ONE call. Checks lockout FIRST -- an already-locked username never reaches password_verify at all,
-// closing the CPU-exhaustion angle. A failure records against the tracker and returns Err; a success
-// resets the tracker and returns Ok(username). Callers who already loaded the user row via
-// user_by_username plug this in right after, passing row["password_hash"] as stored_hash.
 fn login_verify(lo, username: string, password: string, stored_hash: string, now_ms: int) -> Result
     if lockout_check(lo, username, now_ms) == 0
         return err("account temporarily locked")
-    if password_verify(password, stored_hash) == false
+    if not password_verify(password, stored_hash)
         lockout_record_failure(lo, username, now_ms)
         return err("invalid credentials")
     lockout_record_success(lo, username)
     ok(username)
 
 // ── mw_auth: resolver-driven authentication middleware ───────────────────────────────────────────────
-// The resolver has shape fn(req: Request) -> Result<user>. On Ok(user) it writes req.state["user"]
-// and calls next (the route or next middleware handles authorization). On Err it writes
-// req.state["auth_error"] and STILL calls next -- the route guard, not the middleware, decides 401.
-// This design lets public routes co-exist with authenticated routes in the same app (the guard is opt-in
-// per route via requires(...)), matching how Express/Django middleware works.
 fn _mw_auth_next(req: Request, next, resolver) -> Response
     let r = resolver(req)
     if is_ok(r)
@@ -269,34 +184,18 @@ fn mw_auth(resolver)
     return fn(req, next) _mw_auth_next(req, next, resolver)
 
 // ── requires(role): per-route authorization guard ────────────────────────────────────────────────────
-// Placed as middleware on a route (or via use(app, ...)) to gate on a role. If req.state["user"]
-// is absent -> 401 Unauthorized; if the user dict lacks the required role -> 403 Forbidden;
-// otherwise passes through. Reuses the established has_role check (roles list under user["roles"]).
 fn _requires_next(req: Request, next, role: string) -> Response
     let st = req.state
     if "user" not in st
         return resp_error(401, "unauthorized")
-    let u = st["user"]
     if not has_role(_req_roles(req), role)
-        return resp_error(403, "forbidden: requires role " + role)
+        return resp_error(403, "forbidden: requires role {role}")
     next(req)
 
 fn requires(role: string)
     return fn(req, next) _requires_next(req, next, role)
 
 // ── mw_oauth2: Bearer resource-server validation (T3.7) ─────────────────────────────────────────────
-// mw_oauth2(secret, audience, required_scope) middleware: validates an Authorization: Bearer JWT,
-// then checks aud and scope claims before passing through. Fail-closed on every error path.
-// On success: req.state["user"] = the verified claims dict; downstream handlers read it from there.
-// aud: token's "aud" claim must equal `audience` (string) or contain it (when aud is a list).
-// scope: token's "scope" claim must contain `required_scope` as a space-delimited word, OR the
-//        claim may be a list that contains `required_scope`. Empty/missing required_scope is accepted
-//        (caller passes "" to skip scope enforcement while still requiring a valid bearer token).
-// Structured as a top-level helper + single-line closure (avoids the `return next()` inside match
-// codegen bug documented in [[project-forge-phase3-security]]).
-
-// _oauth2_aud_ok: true if the token's aud claim matches the expected audience. aud may be a string
-// or a list of strings (both are valid per RFC 7519 §4.1.3).
 fn _oauth2_aud_ok(claims, audience: string) -> bool
     if "aud" not in claims
         return false
@@ -304,13 +203,11 @@ fn _oauth2_aud_ok(claims, audience: string) -> bool
     if type_name(aud) == "string"
         return aud == audience
     if type_name(aud) == "list"
-        for i in 0..len(aud)
-            if aud[i] == audience
+        for item in aud
+            if item == audience
                 return true
     false
 
-// _oauth2_scope_ok: true if `required_scope` is present in the token's scope claim (space-delimited
-// string or list), or if `required_scope` is "" (no scope enforcement requested).
 fn _oauth2_scope_ok(claims, required_scope: string) -> bool
     if len(required_scope) == 0
         return true
@@ -318,14 +215,14 @@ fn _oauth2_scope_ok(claims, required_scope: string) -> bool
         return false
     let sc = claims["scope"]
     if type_name(sc) == "list"
-        for i in 0..len(sc)
-            if sc[i] == required_scope
+        for item in sc
+            if item == required_scope
                 return true
         return false
     if type_name(sc) == "string"
         let parts = split(sc, " ")
-        for i in 0..len(parts)
-            if parts[i] == required_scope
+        for p in parts
+            if p == required_scope
                 return true
     false
 
@@ -347,15 +244,7 @@ fn _t_oauth2(req: Request, next, secret: string, audience: string, required_scop
 fn mw_oauth2(secret: string, audience: string, required_scope: string)
     return fn(req, next) _t_oauth2(req, next, secret, audience, required_scope)
 
-// ââ WebSocket join authorizers (batteries for forge.ws_guard) âââââââââââââââââ
-// Pass the returned fn(req)->bool to forge.ws_guard(app, pattern, authorizer). These run PRE-101 (see
-// forge.ws_guard) so an unauthorized client never gets an open socket. They live here (not forge.nova) to
-// reuse jwt_verify/bearer_token/session_get/_oauth2_* without pulling crypto into a forge.nova diamond.
-
-// Bearer/JWT authorizer. Token from the `Authorization: Bearer` header, OR the `access_token` query param
-// (browsers cannot set custom headers on a WebSocket handshake -- the query form is the standard fallback,
-// used by Phoenix/ActionCable). Validates signature+exp (jwt_verify) then optional RFC 7519 aud/scope.
-// Pass audience="" / required_scope="" to skip that check.
+// ── WebSocket join authorizers (batteries for forge.ws_guard) ────────────────────────────────────────
 fn _ws_bearer_ok(req: Request, secret: string, audience: string, required_scope: string) -> bool
     let tok = bearer_token(req)
     if len(tok) == 0
@@ -375,8 +264,6 @@ fn _ws_bearer_ok(req: Request, secret: string, audience: string, required_scope:
 fn ws_require_bearer(secret: string, audience: string, required_scope: string)
     return fn(req) _ws_bearer_ok(req, secret, audience, required_scope)
 
-// Signed-session-cookie authorizer: allow the upgrade iff the request carries a valid signed session
-// cookie (same mechanism as mw_require_auth / session_get). Returns the closure for forge.ws_guard.
 fn _ws_session_ok(req: Request, secret: string) -> bool
     len(session_get(req, secret)) > 0
 
@@ -384,18 +271,13 @@ fn ws_require_session(secret: string)
     return fn(req) _ws_session_ok(req, secret)
 
 // ── User persistence (forge_db-backed) ───────────────────────────────────────────────────────────────
-// users_ddl: the CREATE TABLE for the users table. Run once at startup (pool_exec(pool, users_ddl())).
 fn users_ddl() -> string
     "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL)"
 
-// user_create: hash the password, insert {username, password_hash, role} into the users table
-// via parameterized INSERT (injection-safe: values are bound, never concatenated). Returns the new row id.
 fn user_create(pool, username: string, password: string, role: string) -> int
     let ph = password_hash(password)
     pool_insert(pool, "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", [username, ph, role])
 
-// user_by_username: parameterized SELECT by username, returns the row as a dict
-// {id, username, password_hash, role} or {} if no user with that name exists.
 fn user_by_username(pool, username: string) -> any
     let cols = ["id", "username", "password_hash", "role"]
     let rows = pool_query_dicts(pool, "SELECT id, username, password_hash, role FROM users WHERE username = ?", [username], cols)
