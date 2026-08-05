@@ -7,9 +7,15 @@
 // with bytes_get) indexes into an ASCII ALPHABET via char_at(alpha, byteval % alphabet_len) -- the same
 // NUL-safe mapping forge_nanoid / forge_ulid use. LEAF -- imports NOTHING.
 //
-// Modulo bias: our default 94-char and 62-char alphabets do not divide 256 evenly, so a uniform byte maps
+// Modulo bias: our default 83-char and 62-char alphabets do not divide 256 evenly, so a uniform byte maps
 // slightly non-uniformly onto the last few symbols. For passwords this bias is cryptographically negligible
 // (it costs a tiny fraction of a bit of entropy per char); it is documented per-function where it matters.
+//
+// The "94" in this note and at pwgen() was WRONG and is corrected to 83 -- measured, not counted by eye:
+// len(pwgen_alphabet()) == 83 (62 alnum + 21 symbols). The error predates the raise. It matters because 94
+// is the number people use to size a password: log2(94) = 6.55 bits/char vs log2(83) = 6.37, so a "16 chars
+// = 105 bits" estimate off this comment overstated the real 101.9 bits. Not a code defect -- a strength
+// claim that was too generous, in the one kind of module where that is never acceptable.
 //
 // RAISED 2026-08-05. Every generator returned "" for a bad argument -- and "" is also what a zero-length
 // password looks like, so a caller could not tell "you asked for 0 characters" from "the wordlist was empty"
@@ -26,12 +32,14 @@ enum PwFail
     BadLength(int)
     EmptyAlphabet()
     EmptyWordlist()
+    NoSuchAlphabet(string)
 
 fn _pw_fail_text(f) -> string
     match f
         BadLength(n) => "length must be positive, got {n}"
         EmptyAlphabet() => "alphabet is empty"
         EmptyWordlist() => "wordlist is empty"
+        NoSuchAlphabet(n) => "no such alphabet '{n}'"
 
 // PRIVATE: the symbol pool for the default alphabet. Built as a plain literal -- no literal { or } appears (the
 // only two characters forbidden in a NOVA string literal). Deliberately excludes braces AND quotes/backslash so
@@ -47,7 +55,12 @@ fn _pwgen_alnum() -> string
 // alpha non-empty (pwgen_over guards).
 // A comprehension joined ONCE: `out += char_at(...)` per character reallocated and recopied the whole
 // password every iteration, which is quadratic in the length.
-fn _pwgen_from(alpha: string, alen: int, length: int) -> string
+// The alphabet length is DERIVED here rather than passed in. It used to be a third parameter (alen), and a
+// caller passing an alen larger than len(alpha) would make char_at read past the end of the string -- an
+// out-of-bounds index driven by a CSPRNG byte. No caller did, but the only way that stays true is to make
+// it unrepresentable.
+fn _pwgen_from(alpha: string, length: int) -> string
+    let alen = len(alpha)
     let b = secure_bytes(length)
     join([char_at(alpha, bytes_get(b, i) % alen) for i in 0..length], "")
 
@@ -57,40 +70,64 @@ fn pwgen_over(alpha: string, length: int) -> Result
         return err(_pw_fail_text(BadLength(length)))
     if len(alpha) == 0
         return err(_pw_fail_text(EmptyAlphabet()))
-    ok(_pwgen_from(alpha, len(alpha), length))
+    ok(_pwgen_from(alpha, length))
 
-// The strong default alphabet: A-Z a-z 0-9 plus a safe symbol set (94 symbols).
+// The NAMED alphabet registry -- the single authority for which character pools this module offers. The
+// three pools used to be spread over four sites (pwgen and pwgen_checked each concatenated the default,
+// pwgen_alnum and pwgen_alnum_checked each called _pwgen_alnum, and the literal "0123456789" was written
+// out TWICE). Every public entry point below is now one row of this table plus a choice of wrapper, so a
+// pool cannot be changed in one path and missed in another.
+fn pwgen_alphabets() -> dict
+    {
+        "full": _pwgen_alnum() + _pwgen_symbols(),
+        "alnum": _pwgen_alnum(),
+        "digits": "0123456789"
+    }
+
+fn pwgen_alphabet_names() -> list
+    keys(pwgen_alphabets())
+
+// Generate over a NAMED alphabet, so a password POLICY can live in configuration ("alnum", 24) instead of
+// choosing a function at compile time. An unknown name is a named failure, never a silent fallback.
+fn pwgen_named(name: string, length: int) -> Result
+    let table = pwgen_alphabets()
+    if name not in table
+        return err(_pw_fail_text(NoSuchAlphabet(name)))
+    pwgen_over(table[name], length)
+
+// The strong default alphabet: A-Z a-z 0-9 plus a safe symbol set (83 chars -- see the header note; the
+// "94" this comment used to claim was measurably wrong).
 fn pwgen_alphabet() -> string
-    _pwgen_alnum() + _pwgen_symbols()
+    pwgen_alphabets()["full"]
 
 // A random password of `length` chars over the strong default alphabet. Slight modulo bias --
 // cryptographically negligible. Returns "" for length <= 0.
 fn pwgen(length: int) -> string
-    unwrap_or(pwgen_over(pwgen_alphabet(), length), "")
+    unwrap_or(pwgen_named("full", length), "")
 
 // A random password over ONLY A-Z a-z 0-9 (62 symbols, no punctuation) -- URL-safe and copy-paste-safe, ideal
 // for API keys / tokens that flow through shells, headers, and query strings. Returns "" for length <= 0.
 fn pwgen_alnum(length: int) -> string
-    unwrap_or(pwgen_over(_pwgen_alnum(), length), "")
+    unwrap_or(pwgen_named("alnum", length), "")
 
 // A numeric-only code of `length` digits (OTP / PIN style). Returns "" for length <= 0.
 // NOTE: 256 is not divisible by 10, so byte % 10 has a small modulo bias (values 0..5 are marginally more
 // likely than 6..9). This is fine for short human-facing PINs; do NOT use this to mint cryptographic secrets --
 // use pwgen / pwgen_alnum for those.
 fn pwgen_digits(length: int) -> string
-    unwrap_or(pwgen_over("0123456789", length), "")
+    unwrap_or(pwgen_named("digits", length), "")
 
 // The CHECKED forms -- reach for these when minting a credential, so an empty result can never be mistaken
 // for a generated secret:
 //     let pw = pwgen_checked(16)?
 fn pwgen_checked(length: int) -> Result
-    pwgen_over(pwgen_alphabet(), length)
+    pwgen_named("full", length)
 
 fn pwgen_alnum_checked(length: int) -> Result
-    pwgen_over(_pwgen_alnum(), length)
+    pwgen_named("alnum", length)
 
 fn pwgen_digits_checked(length: int) -> Result
-    pwgen_over("0123456789", length)
+    pwgen_named("digits", length)
 
 // A Diceware-style passphrase: pick `count` random words from the caller-supplied `words` list (one CSPRNG byte
 // per word chooses the index) and join them with `separator`.

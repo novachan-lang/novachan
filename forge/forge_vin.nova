@@ -3,55 +3,110 @@
 // transliterates to a value, is multiplied by a fixed positional weight, and the weighted sum mod 11 gives the
 // check digit at position 9 (10 -> the letter 'X'). Useful for automotive/logistics/insurance intake -- joins
 // forge's ISIN/CUSIP/IBAN/card validators. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Three structural problems, all in the same place -- the module knew exactly why a VIN was
+// rejected and then threw that knowledge away:
+//
+//   1. THE TRANSLITERATION TABLE WAS CONTROL FLOW, NOT DATA. `_vin_val` was an eleven-branch if-ladder of
+//      `if c == "B" or c == "K" or c == "S" then 2`. That is a lookup table written as branches: it cannot be
+//      inspected, inverted, counted or tested as a table, and a mistyped letter is invisible because nothing
+//      else in the module states the same fact. It is now ONE dict literal -- value -> the letters that
+//      transliterate to it, exactly as the standard's table prints it -- from which the per-character lookup
+//      is DERIVED. "Illegal character" is now ABSENCE from the derived table, not falling off the end of a
+//      ladder, which is why I/O/Q need no special-casing anywhere: they are simply in no group.
+//
+//   2. FAILURE WAS A SENTINEL THAT LOST THE REASON. `vin_check_char` returned "" for a wrong length AND for
+//      an illegal character AND (via `_vin_val` -> -1) for a character it could not transliterate;
+//      `vin_valid` returned bare `false`. An intake form could tell the user nothing beyond "invalid". The
+//      rule now lives in `vin_checksum` / `vin_validate` returning Result with a reason built from a VinFail
+//      ADT, and the original two entry points are one-line adapters with byte-identical behaviour.
+//
+//   3. `_vin_weight(i)` REBUILT ITS 17-ELEMENT LIST ON EVERY CALL and indexed it with an UNCHECKED `w[i]`.
+//      It was called 17 times per VIN and was one out-of-range caller away from an OOB read. It is gone: the
+//      weight list is built once per checksum and indexed inside the comprehension that consumes it, so the
+//      unchecked-index helper no longer exists to be misused.
 
-// PRIVATE: transliterated value of a VIN character, or -1 if it is not a legal VIN character (I/O/Q rejected).
-fn _vin_val(c: string) -> int
-    if c >= "0" and c <= "9"
-        return ord(c) - 48
-    if c == "A" or c == "J"
-        return 1
-    if c == "B" or c == "K" or c == "S"
-        return 2
-    if c == "C" or c == "L" or c == "T"
-        return 3
-    if c == "D" or c == "M" or c == "U"
-        return 4
-    if c == "E" or c == "N" or c == "V"
-        return 5
-    if c == "F" or c == "W"
-        return 6
-    if c == "G" or c == "P" or c == "X"
-        return 7
-    if c == "H" or c == "Y"
-        return 8
-    if c == "R" or c == "Z"
-        return 9
-    0 - 1
+// Why a VIN was rejected. An ADT rather than a bare string so the CAUSE is a value a caller can match on:
+// a wrong length is a truncated/padded field, an illegal character is usually an O/0 or I/1 transcription
+// slip worth telling the user about specifically, and a check-digit mismatch means the digits are all legal
+// but one of them is wrong. Flattening all three into ""/false (as before) made them indistinguishable.
+enum VinFail
+    BadLength(string)
+    BadChar(string)
+    CheckMismatch(string)
 
-// PRIVATE: the positional weight for VIN position i (0-indexed). Position 9 (index 8) has weight 0 (the check
-// digit does not weight itself).
-fn _vin_weight(i: int) -> int
-    let w = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
-    w[i]
+fn _vin_fail_text(f) -> string
+    match f
+        BadLength(t) => "a VIN is 17 characters, got {t}"
+        BadChar(t) => "'{t}' is not a legal VIN character (I, O and Q are forbidden)"
+        CheckMismatch(t) => "check digit mismatch: {t}"
+
+// The characters of `s` as a list. A for-range comprehension, NOT `[c for c in s]` -- a comprehension whose
+// source is a string compiles inside a module and segfaults at runtime.
+fn _vin_chars(s: string) -> list
+    [char_at(s, i) for i in 0..len(s)]
+
+// THE table -- the only place in this module where a transliteration value is written down. Keyed by the
+// value, holding the letters that map to it, because that is the shape the standard publishes and the shape
+// the old if-ladder was imitating ("A or J -> 1").
+fn _vin_letter_groups() -> dict
+    {"1": "AJ", "2": "BKS", "3": "CLT", "4": "DMU", "5": "ENV", "6": "FW", "7": "GPX", "8": "HY", "9": "RZ"}
+
+// character -> transliterated value, for EVERY legal VIN character, DERIVED from the table above. Digits are
+// their own value (ISO 3779 transliterates "0".."9" to 0..9). I, O and Q are in no group, so they are absent
+// here -- membership in this dict IS the definition of "legal VIN character", stated once and used by both
+// the validator and the checksum.
+fn _vin_values() -> dict
+    let groups = _vin_letter_groups()
+    let out = {str(d): d for d in 0..10}
+    for g in keys(groups)
+        for c in _vin_chars(groups[g])
+            out[c] = parse_int(g)
+    out
+
+// The positional weights, most significant first. Position 9 (index 8) has weight 0 -- the check digit does
+// not weight itself. A literal because these are authoritative data with no closed form worth deriving.
+fn _vin_weights() -> list
+    [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
+
+// The computed check character for a VIN, or WHY it cannot be computed:
+//   ok("X")                                        the weighted sum mod 11 was 10
+//   err("a VIN is 17 characters, got 16")           wrong length
+//   err("'Q' is not a legal VIN character ...")     first illegal character, named
+fn vin_checksum(vin: string) -> Result
+    if len(vin) != 17
+        return err(_vin_fail_text(BadLength(str(len(vin)))))
+    let table = _vin_values()
+    let chars = _vin_chars(vin)
+    // Validate ALL characters before summing, rather than bailing mid-sum as the old loop did. Costs one
+    // extra pass over 17 characters and buys the ability to NAME the offending character; `filter` keeps
+    // source order, so bad[0] is the same character the old early-return would have stopped on.
+    let bad = chars.filter((c) => c not in table)
+    if len(bad) > 0
+        return err(_vin_fail_text(BadChar(bad[0])))
+    // Every character is legal, so the weighted sum has no failure case left and is a plain expression --
+    // the old accumulator loop existed only to carry the abandoned early return.
+    let w = _vin_weights()
+    let total = sum([table[chars[i]] * w[i] for i in 0..17])
+    let r = total % 11
+    let cc = if r == 10 "X" else str(r)
+    ok(cc)
 
 // The computed check character for a 17-char VIN ("0".."9" or "X"), or "" if the VIN has a bad length/char.
+// Behaviour preserved exactly; reach for vin_checksum when the reason matters.
 fn vin_check_char(vin: string) -> string
-    if len(vin) != 17
-        return ""
-    let sum = 0
-    for i in 0..17
-        let v = _vin_val(char_at(vin, i))
-        if v < 0
-            return ""
-        sum += v * _vin_weight(i)
-    let r = sum % 11
-    if r == 10
-        return "X"
-    str(r)
+    unwrap_or(vin_checksum(vin), "")
+
+// Validate `vin` completely, KEEPING the reason on failure:
+//   ok("1HGCM82633A004352")                        valid -- the VIN itself, so this composes in a pipeline
+//   err("check digit mismatch: position 9 is ...")  17 legal characters but the check digit is wrong
+fn vin_validate(vin: string) -> Result
+    let cc = vin_checksum(vin)?
+    let actual = char_at(vin, 8)
+    if cc != actual
+        return err(_vin_fail_text(CheckMismatch("position 9 is '{actual}', computed '{cc}'")))
+    ok(vin)
 
 // True iff `vin` is 17 valid characters AND its position-9 character matches the computed check digit.
 fn vin_valid(vin: string) -> bool
-    let cc = vin_check_char(vin)
-    if len(cc) == 0
-        return false
-    cc == char_at(vin, 8)
+    is_ok(vin_validate(vin))

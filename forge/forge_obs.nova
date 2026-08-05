@@ -15,6 +15,9 @@
 //     both the legacy dict and the HTTP response are `match` arms over it.
 //   * The Prometheus exposition had FIVE hand-built `NAME{labels} value` concatenations and built
 //     its body with `+=` in a loop (O(n^2)). One _obs_prom_line + comprehensions + join now.
+//   * (second pass) The traceparent field WIDTHS and the traceparent field CAUSES were two structures
+//     ordered by the same implicit index -- a `[2,32,16,2]` list and an `if i == 0/1/2` ladder. Now
+//     one _obs_trace_fields table of {width, cause-closure} rows, so a field is one row.
 import forge
 
 // ── RED metrics registry (single-owner actor) ─────────────────────────────────────────────────────
@@ -253,10 +256,13 @@ fn log_json(level: string, msg: string, fields) -> string
 // (liveness, always 200). readyz_route(app, checks) adds GET /readyz (503 if any check fails). Call
 // after app(). The handlers capture the registry's channel, which is shared across the
 // spawn-per-connection boundary, so live requests reach the metrics actor.
+// health_ok() is called rather than re-writing the literal "ok": the liveness body was spelled out
+// twice (once as this route's response, once as health_ok's return) and a caller probing health_ok to
+// predict what /healthz serves would have been believing a second copy.
 fn obs_routes(a, reg) -> any
     let r = reg
     get(a, "/metrics", fn(req) resp_text(200, metrics_prometheus(r)))
-    get(a, "/healthz", fn(req) resp_text(200, "ok"))
+    get(a, "/healthz", fn(req) resp_text(200, health_ok()))
     a
 
 // The second `match` over the SAME outcome value. Previously this re-read readiness()'s dict and
@@ -295,17 +301,6 @@ fn _obs_trace_fail_text(f) -> string
         BadFlags(t) => "flags field '{t}' is not 2 hex digits"
         ZeroTraceId(t) => "trace-id is all-zero, which the spec forbids"
 
-// Which field index failed, as its own cause. Keeps the field WIDTHS (below) and the field NAMES in
-// one place each instead of four copy-pasted if-blocks that each repeated both.
-fn _obs_trace_bad_field(i: int, tok: string) -> string
-    if i == 0
-        return _obs_trace_fail_text(BadVersion(tok))
-    if i == 1
-        return _obs_trace_fail_text(BadTraceId(tok))
-    if i == 2
-        return _obs_trace_fail_text(BadSpanId(tok))
-    _obs_trace_fail_text(BadFlags(tok))
-
 // True iff `s` is exactly `n` hex digits (either case). all_match states the rule once, over every
 // character, instead of an early-return scan. The source is a RANGE comprehension, never `for c in s`
 // -- a comprehension whose source is a STRING compiles inside a module and segfaults at runtime.
@@ -314,31 +309,49 @@ fn _obs_is_hex_str(s: string, n: int) -> bool
         return false
     all_match([ord(char_at(s, i)) for i in 0..n], (o) => (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70))
 
-// Expected hex width of each traceparent field, in order: version, trace-id, span-id, flags.
-fn _obs_trace_widths() -> list
-    [2, 32, 16, 2]
+// THE traceparent field table, in wire order: each field's expected hex width paired with a CLOSURE
+// that builds the TraceFail to report when that field is malformed.
+// This replaces TWO structures ordered by the same implicit index -- a bare `[2, 32, 16, 2]` width
+// list and a separate `if i == 0 / 1 / 2` cause ladder. Two parallel lists keyed by position are a
+// drift pair by construction: inserting a field into one and not the other silently reports the wrong
+// field name for the wrong width, and nothing in the type system objects. Now a field IS one row, so
+// its width and its diagnostic cannot be edited apart.
+fn _obs_trace_fields() -> list
+    [{"w": 2, "cause": (t) => BadVersion(t)}, {"w": 32, "cause": (t) => BadTraceId(t)}, {"w": 16, "cause": (t) => BadSpanId(t)}, {"w": 2, "cause": (t) => BadFlags(t)}]
 
 // Parse a `traceparent`, KEEPING the reason on failure:
 //   ok("0af76519...")                                  the 32-hex trace-id to continue
 //   err("trace-id field 'abc' is not 32 hex digits")   why it was rejected, naming the field
 // The `for` STAYS a loop: it short-circuits on the first malformed field, and reporting WHICH field
 // failed is the whole point of this function.
-fn trace_parse(header: string) -> Result
+//
+// Named obs_trace_parse, NOT the bare `trace_parse`: forge.nova already owns a top-level
+// `trace_parse(tp) -> dict` and NOVA gives top-level fns no per-module mangling, so the bare name is a
+// HARD LINK ERROR ("invalid redefinition of function 'trace_parse'") the instant anything imports
+// forge_obs -- which imports forge. This was live and unnoticed: the bare name made EVERY program that
+// imports forge_obs unlinkable, so no caller could ever have reached it. Same class as obs_problem vs
+// forge's `problem` and _obs_prom_line vs forge_prometheus's `_prom_line`, both already noted below.
+// NOTE the DUPLICATION this exposes: forge.nova's trace_parse parses the SAME W3C traceparent into a
+// {valid, version, trace_id, span_id, flags, sampled} dict, accepting >=4 fields and lowercasing.
+// Two implementations of one wire format is a drift pair; merging them is a forge.nova change and so
+// out of this file's scope, but it is the right follow-up.
+fn obs_trace_parse(header: string) -> Result
     let parts = split(header, "-")
     if len(parts) != 4
         return err(_obs_trace_fail_text(BadFieldCount(str(len(parts)))))
-    for i, w in _obs_trace_widths()
-        if not _obs_is_hex_str(parts[i], w)
-            return err(_obs_trace_bad_field(i, parts[i]))
+    for i, f in _obs_trace_fields()
+        if not _obs_is_hex_str(parts[i], f["w"])
+            let mk_cause = f["cause"]
+            return err(_obs_trace_fail_text(mk_cause(parts[i])))
     if parts[1] == "00000000000000000000000000000000"
         return err(_obs_trace_fail_text(ZeroTraceId(parts[1])))
     ok(parts[1])
 
 // The 32-hex trace_id when the header is well-formed (and not all-zero), else "" -> the caller mints
-// a fresh id. A thin adapter over trace_parse, preserving the original "" contract; reach for
-// trace_parse when the difference between "absent" and "malformed" matters.
+// a fresh id. A thin adapter over obs_trace_parse, preserving the original "" contract; reach for
+// obs_trace_parse when the difference between "absent" and "malformed" matters.
 fn parse_traceparent(header: string) -> string
-    unwrap_or(trace_parse(header), "")
+    unwrap_or(obs_trace_parse(header), "")
 
 // Mint a fresh 32-hex trace_id when a request has no inbound traceparent. A trace_id is a CORRELATION
 // id (not a secret), so high-resolution clock reads give sufficient uniqueness within a process; a

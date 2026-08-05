@@ -5,59 +5,119 @@
 // suppressed call is free of the merge/escape/build work. `log_with` returns a child logger whose
 // fields are the parent's fields overlaid with the new ones (dict_merge, RHS wins) -- the standard
 // context-propagation pattern (`logger.With("request_id", id)` in slog). LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Four shape problems, none of them in the JSON:
+//   * log_debug/log_info/log_warn/log_error were FOUR byte-identical copies of "check the filter, then
+//     format", differing only in a level literal -- four places for the filter-then-format order to
+//     drift, and four places to fix a bug in. Now ONE log_at carries the rule and the four are
+//     one-line adapters over it.
+//   * Those four returned "" to mean "suppressed", a sentinel with no way to ask WHY nothing came
+//     back. log_at returns a Result naming the level and the threshold that dropped the call.
+//   * The level ORDER lived in an if-ladder over four string literals, and an unknown level silently
+//     became "info" with no way for a caller to detect the typo. The order is now an ADT + one
+//     exhaustive match, the legal names are ONE dict table, and log_level_of reports an unknown name.
+//   * _log_entry built ONE JSON object with TWO different mechanisms -- a `+=` chr(34) chain for the
+//     four fixed keys, a push-into-list loop for the variable ones -- so the two halves had to agree
+//     on comma placement by hand. One _log_json_obj + a comprehension + a spread now.
 
-// PRIVATE: total ordering over the 4 levels for the min-level filter. Unknown strings fall back to
-// "info" (1) rather than silently passing everything or blocking everything.
+// The closed set of severities, ORDERED. An ADT rather than four bare strings: the ordering IS what a
+// level is, and an if-ladder states each name twice (once to test for, once by its position) with
+// nothing checking that the ladder covers the set or that the ranks stay distinct.
+// Every variant carries its canonical name because a NO-FIELD enum variant currently miscompiles (the
+// match arm's tag comparison emits a malformed LLVM operand); the name is useful on its own anyway.
+enum LogLevel
+    Debug(string)
+    Info(string)
+    Warn(string)
+    Error(string)
+
+// PRIVATE: severity rank -- the total order over the four levels, stated ONCE and exhaustively.
+// The param is deliberately UNANNOTATED: annotating it `l: LogLevel` makes the inferrer type a
+// constructor argument as the VARIANT type and reject the call with E1001.
+fn _log_rank(l) -> int
+    match l
+        Debug(n) => 0
+        Info(n) => 1
+        Warn(n) => 2
+        Error(n) => 3
+
+// PRIVATE: THE level table, name -> level. A dict dispatch table replaces the if-ladder, so the set of
+// legal level names has exactly one definition and log_level_of can report a name outside it.
+fn _log_level_table() -> dict
+    {"debug": Debug("debug"), "info": Info("info"), "warn": Warn("warn"), "error": Error("error")}
+
+// Resolve a level NAME, KEEPING the reason on failure:
+//   ok(Info("info"))                               a known level
+//   err("unknown log level 'verbose' (expected ...)")  the name is not one of the four
+// This exists because the silent fall-back below is a trap: log_set_level(lg, "verbbose") is accepted
+// and then behaves as "info" forever, so a typo in config silently changes what gets logged and
+// nothing ever says so. log_set_level's leniency is a PRESERVED contract (see there); validate with
+// this first when the level comes from config or a request.
+fn log_level_of(name: string) -> Result
+    let t = _log_level_table()
+    if name not in t
+        return err("unknown log level '{name}' (expected debug, info, warn or error)")
+    ok(t[name])
+
+// PRIVATE: rank of a level NAME. Unknown strings fall back to "info" (1) rather than silently passing
+// everything or blocking everything -- the ORIGINAL contract, now expressed as the unwrap_or default
+// it always was instead of an if-ladder's trailing `else`.
 fn _log_level_num(level: string) -> int
-    if level == "debug"
-        0
-    else if level == "info"
-        1
-    else if level == "warn"
-        2
-    else if level == "error"
-        3
-    else
-        1
+    _log_rank(unwrap_or(log_level_of(level), Info("info")))
+
+// PRIVATE: THE JSON escape table, byte value -> replacement text. A dict dispatch table replaces a
+// five-arm if-ladder over byte constants: adding an escape is a row, not another arm. Built once per
+// escaped string (hoisted out of the byte loop, so it is one small allocation per string, not per
+// byte) -- a module-level `let` would be the natural home but a module-level literal only gets its
+// bake-init run in the ENTRY file's prologue and reads back EMPTY from an importing module.
+fn _log_escape_table() -> dict
+    let bs = chr(92)
+    {34: bs + chr(34), 92: bs + bs, 10: bs + "n", 13: bs + "r", 9: bs + "t"}
 
 // PRIVATE: JSON-escape a string body (no surrounding quotes). Operates over raw bytes (str_to_bytes
 // + bytes_get, O(1) per index) so it's O(n) total and passes multi-byte UTF-8 sequences through
 // untouched -- only '"', '\', and the C0 control range (<0x20) need escaping in a JSON string.
+// The `for` STAYS a byte loop and is NOT a comprehension-plus-join: the output is a BYTE buffer whose
+// length differs from the input's, and routing bytes >= 0x80 through chr() and string concatenation
+// would re-encode them instead of passing the UTF-8 through byte-for-byte.
 fn _log_json_escape(s: string) -> string
+    let esc = _log_escape_table()
     let b = str_to_bytes(s)
     let n = bytes_len(b)
     let out = bytes(0)
     for i in 0..n
         let c = bytes_get(b, i)
-        if c == 34
-            out = bytes_append(out, 92)
-            out = bytes_append(out, 34)
-        else if c == 92
-            out = bytes_append(out, 92)
-            out = bytes_append(out, 92)
-        else if c == 10
-            out = bytes_append(out, 92)
-            out = bytes_append(out, 110)
-        else if c == 13
-            out = bytes_append(out, 92)
-            out = bytes_append(out, 114)
-        else if c == 9
-            out = bytes_append(out, 92)
-            out = bytes_append(out, 116)
+        if c in esc
+            out = bytes_concat(out, str_to_bytes(esc[c]))
         else if c < 32
             out = bytes_concat(out, str_to_bytes(chr(92) + "u00{c:02x}"))
         else
             out = bytes_append(out, c)
     bytes_to_str(out)
 
+// PRIVATE: wrap in JSON double quotes.
+fn _log_quote(s: string) -> string
+    chr(34) + s + chr(34)
+
+// PRIVATE: a complete JSON string token. Written as the PIPE it is -- escape, then quote, in that
+// order (quoting first would escape the quotes we just added).
+fn _log_json_str(s: string) -> string
+    s |> _log_json_escape |> _log_quote
+
 // PRIVATE: render one field value as a JSON value. Strings are quoted+escaped; everything else
 // (int, float, bool-as-int, etc.) is rendered via str() as a bare JSON number/literal token, the
 // same "coerce to its natural token" rule forge_logfmt uses for non-string values.
 fn _log_field_value_json(v: any) -> string
-    if type_of(v) == "string"
-        chr(34) + _log_json_escape(v) + chr(34)
-    else
-        str(v)
+    _log_json_str(v) if type_of(v) == "string" else str(v)
+
+// PRIVATE: THE JSON object builder. Pairs are [key, ALREADY-RENDERED value] so each call site decides
+// whether its value is a quoted string or a bare token -- `ts` is the one bare number, which is why
+// this cannot just quote everything itself. One place owns the braces, the colons and the commas.
+fn _log_json_obj(pairs: list) -> string
+    let lb = chr(123)
+    let rb = chr(125)
+    let body = join([_log_json_str(p[0]) + ":" + p[1] for p in pairs], ",")
+    "{lb}{body}{rb}"
 
 // Create a logger: a name, a default min-level of "info", and no inherited fields.
 fn log_new(name: string) -> dict
@@ -65,53 +125,60 @@ fn log_new(name: string) -> dict
 
 // Return a copy of `logger` with its min-level filter changed to `level` ("debug"/"info"/"warn"/
 // "error"). Non-mutating -- loggers are values, callers rebind: `let lg = log_set_level(lg, "debug")`.
+// An unrecognised `level` is ACCEPTED and thereafter behaves as "info". That leniency is the
+// pre-existing contract and is preserved deliberately (a logger must never be the thing that fails a
+// request); call log_level_of first if you want to reject a bad level instead of absorbing it.
 fn log_set_level(logger: dict, level: string) -> dict
     {...logger, "level": level}
 
 // 1 if a call at `level` would pass `logger`'s min-level filter, 0 if it would be suppressed.
+// Returns int, not bool, because that is the published contract callers compare against `== 1`.
 fn log_should_log(logger: dict, level: string) -> int
     1 if _log_level_num(level) >= _log_level_num(logger["level"]) else 0
 
 // Return a child logger that inherits `logger`'s fields overlaid with `fields` (new keys win on
 // collision) -- the context-propagation pattern for request-scoped/component-scoped loggers.
+// The pipe puts the parent's fields FIRST, so the overlay direction (RHS wins) reads left to right.
 fn log_with(logger: dict, fields: dict) -> dict
-    {...logger, "fields": dict_merge(logger["fields"], fields)}
+    {...logger, "fields": logger["fields"] |> dict_merge(fields)}
 
 // PRIVATE: format one JSON log line -- fixed ts/level/logger/msg keys followed by the logger's
 // inherited fields merged with this call's fields (call-site fields win on collision).
+// The head and the tail are now the SAME kind of thing (a [key, rendered-value] pair) joined by the
+// SAME builder; they used to be a `+=` chr(34) chain and a push loop that agreed on comma placement
+// only by hand.
 fn _log_entry(logger: dict, level: string, msg: string, fields: dict) -> string
     let merged = dict_merge(logger["fields"], fields)
-    let ks = keys(merged)
-    let tail_parts = []
-    for k in ks
-        push(tail_parts, "," + chr(34) + _log_json_escape(k) + chr(34) + ":" + _log_field_value_json(merged[k]))
-    let tail = join(tail_parts, "")
-    let head = chr(123) + chr(34) + "ts" + chr(34) + ":" + str(time_ms())
-    head += "," + chr(34) + "level" + chr(34) + ":" + chr(34) + level + chr(34)
-    head += "," + chr(34) + "logger" + chr(34) + ":" + chr(34) + _log_json_escape(logger["name"]) + chr(34)
-    head += "," + chr(34) + "msg" + chr(34) + ":" + chr(34) + _log_json_escape(msg) + chr(34)
-    head + tail + chr(125)
+    let head = [["ts", str(time_ms())], ["level", _log_json_str(level)], ["logger", _log_json_str(logger["name"])], ["msg", _log_json_str(msg)]]
+    let tail = [[k, _log_field_value_json(merged[k])] for k in keys(merged)]
+    _log_json_obj([...head, ...tail])
+
+// THE emit rule: check the filter, then format. Returns a Result, KEEPING the reason nothing was
+// emitted:
+//   ok("{\"ts\":...}")                                     the formatted line
+//   err("suppressed: level 'debug' is below ... 'info'")    the call was dropped by the filter
+// The four level-specific functions below were four copies of this; "" was a sentinel that could not
+// distinguish "the filter dropped it" from "it formatted to nothing", so a caller wiring a log line
+// into an audit trail had no way to tell a suppressed call from a broken one.
+// Unlike the four adapters, `level` here is caller-supplied, so it is escaped like any other value.
+fn log_at(logger: dict, level: string, msg: string, fields: dict) -> Result
+    if log_should_log(logger, level) == 0
+        let floor = logger["level"]
+        return err("suppressed: level '{level}' is below the logger minimum '{floor}'")
+    ok(_log_entry(logger, level, msg, fields))
 
 // Log at "debug". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
 fn log_debug(logger: dict, msg: string, fields: dict) -> string
-    if log_should_log(logger, "debug") == 0
-        return ""
-    _log_entry(logger, "debug", msg, fields)
+    unwrap_or(log_at(logger, "debug", msg, fields), "")
 
 // Log at "info". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
 fn log_info(logger: dict, msg: string, fields: dict) -> string
-    if log_should_log(logger, "info") == 0
-        return ""
-    _log_entry(logger, "info", msg, fields)
+    unwrap_or(log_at(logger, "info", msg, fields), "")
 
 // Log at "warn". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
 fn log_warn(logger: dict, msg: string, fields: dict) -> string
-    if log_should_log(logger, "warn") == 0
-        return ""
-    _log_entry(logger, "warn", msg, fields)
+    unwrap_or(log_at(logger, "warn", msg, fields), "")
 
 // Log at "error". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
 fn log_error(logger: dict, msg: string, fields: dict) -> string
-    if log_should_log(logger, "error") == 0
-        return ""
-    _log_entry(logger, "error", msg, fields)
+    unwrap_or(log_at(logger, "error", msg, fields), "")

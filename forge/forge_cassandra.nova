@@ -46,7 +46,45 @@
 // scanning for a sentinel byte. This is a structural property of the wire format, not
 // an ad hoc filter.
 //
-// PUBLIC API:
+// ─────────────────────────────────────────────────────────────────────────────
+// RAISED 2026-08-05. The wire format itself is UNTOUCHED — byte layouts, field
+// widths, masking rules, bounds checks and the exact failure *decisions* are all
+// preserved, and the behaviour diff over the full public API is byte-identical.
+// What changed is that the codec no longer THROWS AWAY WHY A FRAME FAILED, and the
+// rules it enforces are each written exactly once:
+//
+//   1. FAILURE WAS TWO DIFFERENT IN-BAND SENTINELS, BOTH LOSSY. Encoders returned
+//      `bytes_create(0)`; decoders returned a zero value with `next_pos == pos`
+//      unchanged. Both say "something was wrong" and nothing else — for a network
+//      codec, where the whole point of a failure is to tell an operator whether the
+//      peer sent garbage, the frame was truncated, or OUR OWN encode overflowed a
+//      length field, that is the least useful possible answer. Every rule now lives
+//      in a Result-returning `*_write` / `*_read` function carrying a reason built
+//      from a CqlFail ADT, and every historical `*_encode` / `*_decode` entry point
+//      is a ONE-LINE adapter with byte-identical behaviour.
+//
+//   2. THE "PROPAGATE THE FAILURE SENTINEL" RULE WAS WRITTEN SIX TIMES as
+//      `if bytes_len(x) == 0 { return bytes_create(0) }`, and twice more as a hand-
+//      rolled `let ok = 1` flag threaded through a while-loop to fake an early exit
+//      (cql_string_map_encode, cql_string_map_decode). Six hand-written copies of a
+//      propagation rule is six chances to forget one — and forgetting one in an
+//      encoder is precisely the frame-desync class this module is hardened against.
+//      It is now `?`, once per call site, and both flag-loops are gone.
+//
+//   3. [string] AND [long string] WERE THE SAME CODE TWICE, differing only in the
+//      width of the length prefix (2 vs 4 bytes). Four functions carried two copies
+//      of one rule; they had already drifted in their comments, and a bounds fix
+//      applied to one would not have been applied to the other. There is now ONE
+//      writer and ONE reader parameterised by width, with the four public names as
+//      adapters — the two widths are now INCAPABLE of disagreeing.
+//
+//   4. THE OPCODE AND CONSISTENCY REGISTRIES WERE WRITTEN TWICE EACH — 54 `if`
+//      branches across four functions, with name→number and number→name as
+//      independent copies of the same fact. They agreed today; nothing made them
+//      agree tomorrow. Each registry is now ONE dict literal, and the reverse
+//      direction is DERIVED by inverting it.
+//
+// PUBLIC API — sentinel entry points (behaviour preserved exactly):
 //   cql_frame_header_encode(version, flags, stream, opcode, length) -> bytes   (9 bytes)
 //   cql_frame_header_decode(b, pos) -> list   [{"version","flags","stream","opcode","length"}, next_pos]
 //     Bounds-safe: returns [{}, pos] if pos<0 or fewer than 9 bytes remain.
@@ -70,8 +108,17 @@
 //   cql_opcode_name(op: int) -> string / cql_opcode_num(name: string) -> int
 //   cql_consistency_name(c: int) -> string / cql_consistency_num(name: string) -> int
 //
-// ENCODE FAILURE CONTRACT: every *_encode function whose input has a declared
-// wire width (cql_string_encode/cql_long_string_encode/cql_string_map_encode/
+// PUBLIC API — Result twins (NEW: same rules, but they tell you WHY):
+//   cql_frame_header_write/read, cql_string_write/read, cql_long_string_write/read,
+//   cql_string_map_write/read, cql_bytes_write/read, cql_frame_write,
+//   cql_startup_write, cql_query_body_write, cql_query_write, cql_options_write
+//     Writers -> ok(bytes) | err(reason). Readers -> ok([value, next_pos, ...]) | err(reason).
+//     These are THE implementations; the sentinel names above are adapters over them.
+//     Prefer these for anything user-facing — "truncated frame: 7-byte [string] body
+//     at 12" is actionable, `["", 12]` is not.
+//
+// ENCODE FAILURE CONTRACT (unchanged): every *_encode function whose input has a
+// declared wire width (cql_string_encode/cql_long_string_encode/cql_string_map_encode/
 // cql_bytes_encode/cql_frame_header_encode and everything built on top of them —
 // cql_startup_body/cql_startup_frame/cql_query_body/cql_query_frame) validates its
 // input against that width and returns bytes_create(0) (0 bytes) on failure,
@@ -92,318 +139,343 @@
 
 import std/encoding/pack as pk
 
+// ── failure causes ───────────────────────────────────────────────────────────
+
+// Why a read or write failed. An ADT rather than a bare string so the CAUSE is a value a
+// caller can match on, and so the four causes stay DISTINCT: `Truncated` means the PEER
+// sent (or we were handed) fewer bytes than a declared length demands — a network/framing
+// problem; `Oversized` means OUR OWN payload cannot be described by the wire's fixed-width
+// length field — a local bug or an unvalidated user input, and the one case where retrying
+// the same frame can never help; `TooManyEntries` is the same class at the [string map]
+// count field; `NegativeLength` is a malformed [bytes] length that is not the legal -1 null
+// sentinel. The old code flattened all four into a 0-byte result or an unchanged position.
+enum CqlFail
+    Truncated(string)
+    Oversized(string)
+    TooManyEntries(string)
+    NegativeLength(string)
+
+fn _cql_fail_text(f) -> string
+    match f
+        Truncated(t) => "truncated frame: {t}"
+        Oversized(t) => "{t} does not fit its wire length field"
+        TooManyEntries(t) => "[string map] has {t} entries, exceeding the 16-bit count field"
+        NegativeLength(t) => "[bytes] declared length {t}, which is negative and is not the -1 null sentinel"
+
+// ── shared primitives ────────────────────────────────────────────────────────
+
+// Concatenate an ordered list of already-encoded fields. Every frame and every composite
+// primitive in this module is "these fields, in this order", and writing that as a LIST
+// rather than a chain of `out = bytes_concat(out, ...)` reassignments makes the wire order
+// a single readable expression instead of five statements that must be read in sequence to
+// confirm nothing was appended out of order. The byte order is identical.
+fn _cql_join(parts: list) -> bytes
+    reduce(parts, (a, b) => bytes_concat(a, b), bytes_create(0))
+
+// The three width-dependent pieces of a length-prefixed field, each an explicit two-branch
+// dispatch rather than computed arithmetic (`(1 << (width * 8)) - 1` and friends): these are
+// wire constants, and a reader auditing this codec against the spec must be able to see
+// 0xFFFF and 0xFFFFFFFF written down.
+fn _cql_len_pack(n: int, width: int) -> bytes
+    if width == 2
+        return pk.pack_u16_be(n)
+    pk.pack_u32_be(n)
+
+fn _cql_len_unpack(b: bytes, pos: int, width: int) -> int
+    if width == 2
+        return pk.unpack_u16_be(b, pos)
+    pk.unpack_u32_be(b, pos)
+
+fn _cql_len_max(width: int) -> int
+    if width == 2
+        return 0xFFFF
+    0xFFFFFFFF
+
+// THE decode adapter, shared by all five historical *_decode entry points: on success hand
+// back the reader's [value, next_pos] (or [payload, next_pos, is_null]) list unchanged; on
+// failure hand back `on_fail`, which each caller supplies as its own documented zero value
+// plus the UNCHANGED pos. One function instead of five copies of the same shape.
+fn _cql_pair_or(r: Result, on_fail: list) -> list
+    if is_err(r)
+        return on_fail
+    unwrap(r)
+
 // ── frame header (9 bytes) ──────────────────────────────────────────────────
 
-// cql_frame_header_encode: build the 9-byte CQL native-protocol frame header.
+// cql_frame_header_write: build the 9-byte CQL native-protocol frame header.
 // version/flags/opcode masked to 8 bits; stream masked to 16 bits (two's-complement,
 // so a negative stream id round-trips correctly — that field is a client-chosen ID,
 // not a buffer length, so wraparound there is harmless by design).
 // `length` is DIFFERENT: it is the body byte-count and governs how many following
 // bytes a peer will read, so it must NEVER be silently masked/wrapped — a length
 // that does not fit the wire's 32-bit unsigned field is a genuine encode error, not
-// a value to truncate. Returns bytes_create(0) (0 bytes — never a valid header size,
-// which is always exactly 9) if length is negative or exceeds 0xFFFFFFFF.
-fn cql_frame_header_encode(version: int, flags: int, stream: int, opcode: int, length: int) -> bytes
+// a value to truncate.
+fn cql_frame_header_write(version: int, flags: int, stream: int, opcode: int, length: int) -> Result
     if length < 0 or length > 0xFFFFFFFF
-        return bytes_create(0)
-    let out = pk.pack_u8(version & 0xFF)
-    out = bytes_concat(out, pk.pack_u8(flags & 0xFF))
-    out = bytes_concat(out, pk.pack_u16_be(stream & 0xFFFF))
-    out = bytes_concat(out, pk.pack_u8(opcode & 0xFF))
-    out = bytes_concat(out, pk.pack_u32_be(length))
-    out
+        return err(_cql_fail_text(Oversized("a body length of {length}")))
+    ok(_cql_join([pk.pack_u8(version & 0xFF), pk.pack_u8(flags & 0xFF), pk.pack_u16_be(stream & 0xFFFF), pk.pack_u8(opcode & 0xFF), pk.pack_u32_be(length)]))
 
-// cql_frame_header_decode: decode a 9-byte frame header from b at pos.
-// Returns [{"version","flags","stream","opcode","length"}, pos+9] on success, or
-// [{}, pos] if pos is negative or fewer than 9 bytes remain (bounds-safe — b is
-// attacker-controlled network input).
-fn cql_frame_header_decode(b: bytes, pos: int) -> list
+// Returns bytes_create(0) (0 bytes — never a valid header size, which is always exactly 9)
+// if length is negative or exceeds 0xFFFFFFFF.
+fn cql_frame_header_encode(version: int, flags: int, stream: int, opcode: int, length: int) -> bytes
+    unwrap_or(cql_frame_header_write(version, flags, stream, opcode, length), bytes_create(0))
+
+// cql_frame_header_read: decode a 9-byte frame header from b at pos.
+// Bounds-safe — b is attacker-controlled network input.
+fn cql_frame_header_read(b: bytes, pos: int) -> Result
     if pos < 0 or pos + 9 > bytes_len(b)
-        return [{}, pos]
-    let version = pk.unpack_u8(b, pos)
-    let flags = pk.unpack_u8(b, pos + 1)
-    let stream = pk.unpack_i16_be(b, pos + 2)
-    let opcode = pk.unpack_u8(b, pos + 4)
-    let length = pk.unpack_u32_be(b, pos + 5)
-    let hdr = {"version": version, "flags": flags, "stream": stream, "opcode": opcode, "length": length}
-    [hdr, pos + 9]
+        return err(_cql_fail_text(Truncated("9-byte frame header at {pos}")))
+    let hdr = {"version": pk.unpack_u8(b, pos), "flags": pk.unpack_u8(b, pos + 1), "stream": pk.unpack_i16_be(b, pos + 2), "opcode": pk.unpack_u8(b, pos + 4), "length": pk.unpack_u32_be(b, pos + 5)}
+    ok([hdr, pos + 9])
 
-// ── [string] : [short] byte-length + UTF-8 bytes ────────────────────────────
+// Returns [{"version","flags","stream","opcode","length"}, pos+9] on success, or
+// [{}, pos] if pos is negative or fewer than 9 bytes remain.
+fn cql_frame_header_decode(b: bytes, pos: int) -> list
+    _cql_pair_or(cql_frame_header_read(b, pos), [{}, pos])
 
-// cql_string_encode: [short] byte-length + UTF-8 bytes. The length field is a
-// 16-bit wire quantity, so a string whose BYTE length exceeds 0xFFFF (65535) does
-// not fit it. The old code masked with `n & 0xFFFF`, which for n==65536 silently
-// wrote a 0x0000 ("empty string") length prefix followed by the full 65536-byte
-// payload — a decoder would read an empty string and then misinterpret those
-// smuggled bytes as subsequent frame fields (a self-inflicted frame-desync, the
-// production-side mirror of the over-read/malformed-acceptance decode bugs this
-// module is otherwise hardened against). FIX: validate and reject instead of
-// wrapping. Returns bytes_create(0) (0 bytes — never a valid encoding, which is
-// always >= 2 bytes even for the empty string) on oversized input; this is an
-// unambiguous in-band failure signal a caller can check via bytes_len(result)==0.
+// ── [string] / [long string] : ONE length-prefixed UTF-8 text codec ─────────
+
+// THE text writer, for BOTH CQL text primitives: [string] has a 16-bit byte-length prefix
+// and [long string] a 32-bit one, and that width is the ONLY difference between them — so it
+// is a parameter, not a second copy of the function.
+// The length field is a fixed-width wire quantity, so a string whose BYTE length exceeds it
+// does not fit. The old code masked with `n & 0xFFFF`, which for n==65536 silently wrote a
+// 0x0000 ("empty string") length prefix followed by the full 65536-byte payload — a decoder
+// would read an empty string and then misinterpret those smuggled bytes as subsequent frame
+// fields (a self-inflicted frame-desync, the production-side mirror of the over-read/
+// malformed-acceptance decode bugs this module is otherwise hardened against). Validate and
+// reject instead of wrapping.
+// The PIPE states the wire order the way the spec states it: the length prefix, then the payload.
+fn _cql_text_write(s: string, width: int) -> Result
+    let sb = str_to_bytes(s)
+    let n = bytes_len(sb)
+    if n > _cql_len_max(width)
+        return err(_cql_fail_text(Oversized("a {n}-byte text field")))
+    ok(_cql_len_pack(n, width) |> bytes_concat(sb))
+
+// THE text reader, for both widths. Two bounds checks, in the only order that is safe: the
+// prefix must be fully present before it can be trusted, and the body it declares must be
+// fully present before it is sliced.
+fn _cql_text_read(b: bytes, pos: int, width: int) -> Result
+    if pos < 0 or pos + width > bytes_len(b)
+        return err(_cql_fail_text(Truncated("{width}-byte text length prefix at {pos}")))
+    let n = _cql_len_unpack(b, pos, width)
+    let start = pos + width
+    if start + n > bytes_len(b)
+        return err(_cql_fail_text(Truncated("{n}-byte text body at {start}")))
+    ok([bytes_to_str(bytes_slice(b, start, start + n)), start + n])
+
+// [string] : [short] byte-length + UTF-8 bytes.
+fn cql_string_write(s: string) -> Result
+    _cql_text_write(s, 2)
+
+// Returns bytes_create(0) (never a valid encoding, which is always >= 2 bytes even for the
+// empty string) on oversized input; check via bytes_len(result) == 0.
 fn cql_string_encode(s: string) -> bytes
-    let sb = str_to_bytes(s)
-    let n = bytes_len(sb)
-    if n > 0xFFFF
-        return bytes_create(0)
-    bytes_concat(pk.pack_u16_be(n), sb)
+    unwrap_or(cql_string_write(s), bytes_create(0))
 
-// cql_string_decode: bounds-safe. Returns ["", pos] unchanged on truncation
-// (declared length prefix present but fewer than n bytes remain, or fewer than
-// 2 header bytes remain).
+fn cql_string_read(b: bytes, pos: int) -> Result
+    _cql_text_read(b, pos, 2)
+
+// Bounds-safe. Returns ["", pos] unchanged on truncation (declared length prefix present
+// but fewer than n bytes remain, or fewer than 2 header bytes remain).
 fn cql_string_decode(b: bytes, pos: int) -> list
-    if pos < 0 or pos + 2 > bytes_len(b)
-        return ["", pos]
-    let n = pk.unpack_u16_be(b, pos)
-    if pos + 2 + n > bytes_len(b)
-        return ["", pos]
-    let sb = bytes_slice(b, pos + 2, pos + 2 + n)
-    [bytes_to_str(sb), pos + 2 + n]
+    _cql_pair_or(cql_string_read(b, pos), ["", pos])
 
-// ── [long string] : [int] byte-length + UTF-8 bytes ─────────────────────────
+// [long string] : [int] byte-length + UTF-8 bytes.
+fn cql_long_string_write(s: string) -> Result
+    _cql_text_write(s, 4)
 
-// cql_long_string_encode: [int] byte-length + UTF-8 bytes. Same class of bug as
-// cql_string_encode but at the 32-bit width — guarded the same way (see comment
-// there). Returns bytes_create(0) (never a valid encoding, always >= 4 bytes) if
-// the byte length exceeds 0xFFFFFFFF.
+// Returns bytes_create(0) (never a valid encoding, always >= 4 bytes) if the byte length
+// exceeds 0xFFFFFFFF.
 fn cql_long_string_encode(s: string) -> bytes
-    let sb = str_to_bytes(s)
-    let n = bytes_len(sb)
-    if n > 0xFFFFFFFF
-        return bytes_create(0)
-    bytes_concat(pk.pack_u32_be(n), sb)
+    unwrap_or(cql_long_string_write(s), bytes_create(0))
+
+fn cql_long_string_read(b: bytes, pos: int) -> Result
+    _cql_text_read(b, pos, 4)
 
 fn cql_long_string_decode(b: bytes, pos: int) -> list
-    if pos < 0 or pos + 4 > bytes_len(b)
-        return ["", pos]
-    let n = pk.unpack_u32_be(b, pos)
-    if pos + 4 + n > bytes_len(b)
-        return ["", pos]
-    let sb = bytes_slice(b, pos + 4, pos + 4 + n)
-    [bytes_to_str(sb), pos + 4 + n]
+    _cql_pair_or(cql_long_string_read(b, pos), ["", pos])
 
 // ── [string map] : [short] count + count * ([string] key, [string] value) ───
 
-// cql_string_map_encode: iteration order follows keys(m) — the caller controls
+// cql_string_map_write: iteration order follows keys(m) — the caller controls
 // determinism by controlling insertion order (matches this codebase's existing
 // [string map]-shaped encoders, e.g. std/net/httpheaders).
-// Bounds/propagation, mirroring cql_string_encode's fix: the entry `count` is
-// itself a 16-bit field (masking it on overflow would desync count vs. actual
-// entries written — same bug class), and if ANY key/value fails to encode (e.g.
-// a value longer than 0xFFFF bytes) that failure must abort the WHOLE map, not
-// just silently contribute zero bytes for that one entry while `count` still
-// claims it is present (which would desync every entry after it). Returns
-// bytes_create(0) (never valid — a real encoding is always >= 2 bytes) on failure.
-fn cql_string_map_encode(m: dict) -> bytes
+// The entry `count` is itself a 16-bit field (masking it on overflow would desync count vs.
+// actual entries written — same bug class as the text writer), and if ANY key/value fails to
+// encode (e.g. a value longer than 0xFFFF bytes) that failure must abort the WHOLE map, not
+// just silently contribute zero bytes for that one entry while `count` still claims it is
+// present (which would desync every entry after it). That whole-map abort used to be a
+// hand-rolled `let ok = 1` flag threaded through a while-loop; it is now `?`, which cannot
+// be forgotten on a later edit the way a flag check can.
+// The LOOP STAYS: each entry contributes two length-prefixed fields, so the work is per-entry
+// and there is nothing for a comprehension to express more clearly.
+fn cql_string_map_write(m: dict) -> Result
     let ks = keys(m)
-    let n = len(ks)
-    if n > 0xFFFF
-        return bytes_create(0)
-    let out = pk.pack_u16_be(n)
-    let i = 0
-    let ok = 1
-    while i < n and ok == 1
-        let k = ks[i]
-        let ke = cql_string_encode(k)
-        if bytes_len(ke) == 0
-            ok = 0
-        else
-            let ve = cql_string_encode(m[k])
-            if bytes_len(ve) == 0
-                ok = 0
-            else
-                out = bytes_concat(out, ke)
-                out = bytes_concat(out, ve)
-        i += 1
-    if ok == 0
-        return bytes_create(0)
-    out
+    if len(ks) > 0xFFFF
+        return err(_cql_fail_text(TooManyEntries(str(len(ks)))))
+    let parts = [pk.pack_u16_be(len(ks))]
+    for k in ks
+        push(parts, _cql_text_write(k, 2)?)
+        push(parts, _cql_text_write(m[k], 2)?)
+    ok(_cql_join(parts))
 
-// cql_string_map_decode: bounds-safe. Stops and returns [{}, pos] unchanged as
-// soon as either a key or a value fails to decode (truncated input) — never
-// returns a partially-populated map, so callers get an unambiguous success/fail
-// signal from comparing the returned pos to the pos they passed in.
-fn cql_string_map_decode(b: bytes, pos: int) -> list
+// Returns bytes_create(0) (never valid — a real encoding is always >= 2 bytes) on failure.
+fn cql_string_map_encode(m: dict) -> bytes
+    unwrap_or(cql_string_map_write(m), bytes_create(0))
+
+// cql_string_map_read: never returns a partially-populated map — the first malformed entry
+// aborts the whole read, so a caller gets an unambiguous success/fail signal.
+// The LOOP STAYS: `cur` advances by a data-dependent amount (each entry's own declared
+// lengths), which no for-range expresses, and `?` gives the early exit on the first bad
+// entry that the old `while i < count and ok == 1` was emulating by hand.
+fn cql_string_map_read(b: bytes, pos: int) -> Result
     if pos < 0 or pos + 2 > bytes_len(b)
-        return [{}, pos]
+        return err(_cql_fail_text(Truncated("[string map] 2-byte count at {pos}")))
     let count = pk.unpack_u16_be(b, pos)
     let cur = pos + 2
     let out = {}
-    let i = 0
-    let ok = 1
-    while i < count and ok == 1
-        let kr = cql_string_decode(b, cur)
-        let kpos = kr[1]
-        if kpos == cur
-            ok = 0
-        else
-            let k = kr[0]
-            cur = kpos
-            let vr = cql_string_decode(b, cur)
-            let vpos = vr[1]
-            if vpos == cur
-                ok = 0
-            else
-                out[k] = vr[0]
-                cur = vpos
-        i += 1
-    if ok == 0
-        return [{}, pos]
-    [out, cur]
+    for i in 0..count
+        let kr = _cql_text_read(b, cur, 2)?
+        let vr = _cql_text_read(b, kr[1], 2)?
+        out[kr[0]] = vr[0]
+        cur = vr[1]
+    ok([out, cur])
+
+// Bounds-safe. Returns [{}, pos] unchanged as soon as either a key or a value fails to
+// decode (truncated input).
+fn cql_string_map_decode(b: bytes, pos: int) -> list
+    _cql_pair_or(cql_string_map_read(b, pos), [{}, pos])
 
 // ── [bytes] : [int] n + n bytes (n == -1 means null) ────────────────────────
 
-// cql_bytes_encode: [int] n + n bytes. `n` is a SIGNED 32-bit field on the wire
-// (cql_bytes_decode reads it with unpack_i32_be so that -1 can mean null). A
-// payload of 2^31 bytes or more has no correct signed-32-bit representation: the
-// bit pattern would round-trip through unpack_i32_be as a NEGATIVE number (and if
-// it happened to land on -1, it would even collide with the null sentinel). Reject
-// rather than emit a length prefix that cannot decode back to the true size.
-// Returns bytes_create(0) (never valid — a real encoding is always >= 4 bytes) if
-// the payload does not fit in a signed 32-bit length.
-fn cql_bytes_encode(payload: bytes) -> bytes
+// cql_bytes_write: [int] n + n bytes. `n` is a SIGNED 32-bit field on the wire
+// (the reader takes it with unpack_i32_be so that -1 can mean null). A payload of 2^31
+// bytes or more has no correct signed-32-bit representation: the bit pattern would round-trip
+// as a NEGATIVE number (and if it happened to land on -1, it would even collide with the null
+// sentinel). Reject rather than emit a length prefix that cannot decode back to the true size.
+fn cql_bytes_write(payload: bytes) -> Result
     let n = bytes_len(payload)
     if n < 0 or n > 0x7FFFFFFF
-        return bytes_create(0)
-    bytes_concat(pk.pack_i32_be(n), payload)
+        return err(_cql_fail_text(Oversized("a {n}-byte [bytes] payload")))
+    ok(pk.pack_i32_be(n) |> bytes_concat(payload))
+
+// Returns bytes_create(0) (never valid — a real encoding is always >= 4 bytes) if the
+// payload does not fit in a signed 32-bit length.
+fn cql_bytes_encode(payload: bytes) -> bytes
+    unwrap_or(cql_bytes_write(payload), bytes_create(0))
 
 fn cql_bytes_encode_null() -> bytes
     pk.pack_i32_be(-1)
 
-// cql_bytes_decode: returns [payload_bytes, next_pos, is_null]. is_null==1 iff the
-// length prefix was exactly -1 (CQL's null-bytes sentinel) — payload_bytes is an
-// empty `bytes` in that case, never a null/undefined value. Any other negative
-// length, or a positive length that overruns the buffer, is treated as malformed
-// and reported the same way string/map decoders report failure: next_pos == pos
-// unchanged, is_null == 0.
-fn cql_bytes_decode(b: bytes, pos: int) -> list
+// cql_bytes_read: ok([payload_bytes, next_pos, is_null]). is_null==1 iff the length prefix
+// was exactly -1 (CQL's null-bytes sentinel) — payload_bytes is an empty `bytes` in that
+// case, never a null/undefined value. Any OTHER negative length is malformed and is now
+// reported as such by name (NegativeLength) rather than being merged into "truncated".
+fn cql_bytes_read(b: bytes, pos: int) -> Result
     if pos < 0 or pos + 4 > bytes_len(b)
-        return [bytes_create(0), pos, 0]
+        return err(_cql_fail_text(Truncated("[bytes] 4-byte length prefix at {pos}")))
     let n = pk.unpack_i32_be(b, pos)
     if n == -1
-        return [bytes_create(0), pos + 4, 1]
-    if n < 0 or pos + 4 + n > bytes_len(b)
-        return [bytes_create(0), pos, 0]
-    let payload = bytes_slice(b, pos + 4, pos + 4 + n)
-    [payload, pos + 4 + n, 0]
+        return ok([bytes_create(0), pos + 4, 1])
+    if n < 0
+        return err(_cql_fail_text(NegativeLength(str(n))))
+    if pos + 4 + n > bytes_len(b)
+        return err(_cql_fail_text(Truncated("{n}-byte [bytes] payload at {pos}")))
+    ok([bytes_slice(b, pos + 4, pos + 4 + n), pos + 4 + n, 0])
 
-// ── STARTUP (opcode 0x01) ────────────────────────────────────────────────────
+// Malformed input is reported the same way the string/map decoders report failure:
+// next_pos == pos unchanged, is_null == 0.
+fn cql_bytes_decode(b: bytes, pos: int) -> list
+    _cql_pair_or(cql_bytes_read(b, pos), [bytes_create(0), pos, 0])
+
+// ── request frames ───────────────────────────────────────────────────────────
+
+// THE frame builder: header (version 0x04, flags 0x00, caller's stream, caller's opcode,
+// the body's own length) followed by the body. This was written out twice — once in
+// cql_startup_frame and once in cql_query_frame, each with its own copy of the
+// "if the header failed, do not emit a header that claims a body" check — and a third time
+// in degenerate form in cql_options_frame. One function now, so a fix to frame assembly
+// lands in every request type at once.
+fn cql_frame_write(stream: int, opcode: int, body: bytes) -> Result
+    let hdr = cql_frame_header_write(0x04, 0x00, stream, opcode, bytes_len(body))?
+    ok(bytes_concat(hdr, body))
+
+// STARTUP (opcode 0x01). `options` is typically {"CQL_VERSION": "3.0.0"} and optionally
+// "COMPRESSION". A failed body must abort the frame rather than produce a header that
+// claims a body which was never written.
+fn cql_startup_write(stream: int, options: dict) -> Result
+    let body = cql_string_map_write(options)?
+    cql_frame_write(stream, 0x01, body)
 
 fn cql_startup_body(options: dict) -> bytes
     cql_string_map_encode(options)
 
-// cql_startup_frame: full request frame (version=0x04, flags=0x00, given stream,
-// opcode STARTUP). `options` typically {"CQL_VERSION": "3.0.0"} and optionally
-// "COMPRESSION". Propagates cql_startup_body's failure sentinel: a real
-// [string map] encoding is never 0 bytes (even {} encodes as a 2-byte count=0),
-// so a 0-byte body unambiguously means an option name/value failed to encode —
-// in that case return bytes_create(0) rather than emitting a header that claims
-// a body which was never actually written.
 fn cql_startup_frame(stream: int, options: dict) -> bytes
-    let body = cql_startup_body(options)
-    if bytes_len(body) == 0
-        return bytes_create(0)
-    let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x01, bytes_len(body))
-    if bytes_len(hdr) == 0
-        return bytes_create(0)
-    bytes_concat(hdr, body)
+    unwrap_or(cql_startup_write(stream, options), bytes_create(0))
 
-// ── QUERY (opcode 0x07) ──────────────────────────────────────────────────────
+// QUERY body: [long string query][short consistency][byte flags]. flags is always 0x00 here
+// (no bound values, no paging, no serial consistency, no default-timestamp, no
+// names-for-values) — the simplest legal v4 QUERY body. If the query text is too large for
+// its 32-bit length prefix, abort the whole body: appending the consistency/flags bytes onto
+// a failed (empty) query field would silently produce a body missing its length-prefixed
+// query entirely, desyncing every byte after it.
+fn cql_query_body_write(query: string, consistency: int) -> Result
+    let qb = cql_long_string_write(query)?
+    ok(_cql_join([qb, pk.pack_u16_be(consistency & 0xFFFF), pk.pack_u8(0)]))
 
-// cql_query_body: [long string query][short consistency][byte flags]. flags is
-// always 0x00 here (no bound values, no paging, no serial consistency, no
-// default-timestamp, no names-for-values) — the simplest legal v4 QUERY body.
-// Propagates cql_long_string_encode's failure sentinel: if the query text is too
-// large to fit its 32-bit length prefix, abort the whole body — appending the
-// consistency/flags bytes onto a failed (empty) qb would silently produce a body
-// that is missing its length-prefixed query field entirely, desyncing every byte
-// after it. Returns bytes_create(0) (never valid — always >= 7 bytes) on failure.
+// Returns bytes_create(0) (never valid — always >= 7 bytes) on failure.
 fn cql_query_body(query: string, consistency: int) -> bytes
-    let qb = cql_long_string_encode(query)
-    if bytes_len(qb) == 0
-        return bytes_create(0)
-    let cb = pk.pack_u16_be(consistency & 0xFFFF)
-    let fb = pk.pack_u8(0)
-    bytes_concat(bytes_concat(qb, cb), fb)
+    unwrap_or(cql_query_body_write(query, consistency), bytes_create(0))
+
+// QUERY (opcode 0x07).
+fn cql_query_write(stream: int, query: string, consistency: int) -> Result
+    let body = cql_query_body_write(query, consistency)?
+    cql_frame_write(stream, 0x07, body)
 
 fn cql_query_frame(stream: int, query: string, consistency: int) -> bytes
-    let body = cql_query_body(query, consistency)
-    if bytes_len(body) == 0
-        return bytes_create(0)
-    let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x07, bytes_len(body))
-    if bytes_len(hdr) == 0
-        return bytes_create(0)
-    bytes_concat(hdr, body)
+    unwrap_or(cql_query_write(stream, query, consistency), bytes_create(0))
 
-// ── OPTIONS (opcode 0x05) — empty body ───────────────────────────────────────
+// OPTIONS (opcode 0x05) — empty body, so this is the frame builder with nothing after the
+// header. It is the same 9 bytes as before; it just no longer says so in its own words.
+fn cql_options_write(stream: int) -> Result
+    cql_frame_write(stream, 0x05, bytes_create(0))
 
 fn cql_options_frame(stream: int) -> bytes
-    cql_frame_header_encode(0x04, 0x00, stream, 0x05, 0)
+    unwrap_or(cql_options_write(stream), bytes_create(0))
 
-// ── opcode / consistency name<->number tables ────────────────────────────────
+// ── opcode / consistency registries ──────────────────────────────────────────
 
+// THE opcode registry — the only place in this module where an opcode number is written down.
+// Was 32 `if` branches across two functions holding two independent copies of this table.
+fn _cql_opcodes() -> dict
+    {"ERROR": 0x00, "STARTUP": 0x01, "READY": 0x02, "AUTHENTICATE": 0x03, "OPTIONS": 0x05, "SUPPORTED": 0x06, "QUERY": 0x07, "RESULT": 0x08, "PREPARE": 0x09, "EXECUTE": 0x0A, "REGISTER": 0x0B, "EVENT": 0x0C, "BATCH": 0x0D, "AUTH_CHALLENGE": 0x0E, "AUTH_RESPONSE": 0x0F, "AUTH_SUCCESS": 0x10}
+
+// THE consistency registry — likewise, was 22 `if` branches across two functions.
+fn _cql_consistencies() -> dict
+    {"ANY": 0x0000, "ONE": 0x0001, "TWO": 0x0002, "THREE": 0x0003, "QUORUM": 0x0004, "ALL": 0x0005, "LOCAL_QUORUM": 0x0006, "EACH_QUORUM": 0x0007, "SERIAL": 0x0008, "LOCAL_SERIAL": 0x0009, "LOCAL_ONE": 0x000A}
+
+// number -> name, DERIVED by inverting a name -> number registry rather than restated. Both
+// registries have distinct values, so the inverse is total and unambiguous; keys are
+// stringified because the lookup key arrives as an int and a dict keyed by str(n) is the one
+// shape both directions can share. An opcode absent from the registry (e.g. 0x04, CREDENTIALS,
+// removed after protocol v1) simply has no entry, which is exactly the old "" answer.
+fn _cql_by_value(m: dict) -> dict
+    {str(m[k]): k for k in keys(m)}
+
+// Name of an opcode, or "" if it is not a known opcode.
 fn cql_opcode_name(op: int) -> string
-    if op == 0x00 then return "ERROR"
-    if op == 0x01 then return "STARTUP"
-    if op == 0x02 then return "READY"
-    if op == 0x03 then return "AUTHENTICATE"
-    if op == 0x05 then return "OPTIONS"
-    if op == 0x06 then return "SUPPORTED"
-    if op == 0x07 then return "QUERY"
-    if op == 0x08 then return "RESULT"
-    if op == 0x09 then return "PREPARE"
-    if op == 0x0A then return "EXECUTE"
-    if op == 0x0B then return "REGISTER"
-    if op == 0x0C then return "EVENT"
-    if op == 0x0D then return "BATCH"
-    if op == 0x0E then return "AUTH_CHALLENGE"
-    if op == 0x0F then return "AUTH_RESPONSE"
-    if op == 0x10 then return "AUTH_SUCCESS"
-    return ""
+    get(_cql_by_value(_cql_opcodes()), str(op), "")
 
+// Number of a named opcode, or -1 if the name is not known.
 fn cql_opcode_num(name: string) -> int
-    if name == "ERROR" then return 0x00
-    if name == "STARTUP" then return 0x01
-    if name == "READY" then return 0x02
-    if name == "AUTHENTICATE" then return 0x03
-    if name == "OPTIONS" then return 0x05
-    if name == "SUPPORTED" then return 0x06
-    if name == "QUERY" then return 0x07
-    if name == "RESULT" then return 0x08
-    if name == "PREPARE" then return 0x09
-    if name == "EXECUTE" then return 0x0A
-    if name == "REGISTER" then return 0x0B
-    if name == "EVENT" then return 0x0C
-    if name == "BATCH" then return 0x0D
-    if name == "AUTH_CHALLENGE" then return 0x0E
-    if name == "AUTH_RESPONSE" then return 0x0F
-    if name == "AUTH_SUCCESS" then return 0x10
-    return -1
+    get(_cql_opcodes(), name, 0 - 1)
 
+// Name of a consistency level, or "" if it is not a known level.
 fn cql_consistency_name(c: int) -> string
-    if c == 0x0000 then return "ANY"
-    if c == 0x0001 then return "ONE"
-    if c == 0x0002 then return "TWO"
-    if c == 0x0003 then return "THREE"
-    if c == 0x0004 then return "QUORUM"
-    if c == 0x0005 then return "ALL"
-    if c == 0x0006 then return "LOCAL_QUORUM"
-    if c == 0x0007 then return "EACH_QUORUM"
-    if c == 0x0008 then return "SERIAL"
-    if c == 0x0009 then return "LOCAL_SERIAL"
-    if c == 0x000A then return "LOCAL_ONE"
-    return ""
+    get(_cql_by_value(_cql_consistencies()), str(c), "")
 
+// Number of a named consistency level, or -1 if the name is not known.
 fn cql_consistency_num(name: string) -> int
-    if name == "ANY" then return 0x0000
-    if name == "ONE" then return 0x0001
-    if name == "TWO" then return 0x0002
-    if name == "THREE" then return 0x0003
-    if name == "QUORUM" then return 0x0004
-    if name == "ALL" then return 0x0005
-    if name == "LOCAL_QUORUM" then return 0x0006
-    if name == "EACH_QUORUM" then return 0x0007
-    if name == "SERIAL" then return 0x0008
-    if name == "LOCAL_SERIAL" then return 0x0009
-    if name == "LOCAL_ONE" then return 0x000A
-    return -1
+    get(_cql_consistencies(), name, 0 - 1)

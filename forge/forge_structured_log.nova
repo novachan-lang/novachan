@@ -1,53 +1,233 @@
-// forge_structured_log — Structured logging with levels and fields.
+// forge_structured_log -- structured logging: an in-memory log of entries, each carrying a severity
+// LEVEL, a message, and one key/value field, with a minimum-level filter that drops entries below it.
+// The log is a plain dict so it can be passed across process boundaries by value. LEAF -- imports
+// NOTHING.
+//
+// DEEP RAISE 2026-08-05. What was wrong, concretely:
+//   * The FLAT-KEY LAYOUT (`entries["3_msg"]`) was known in THREE places -- the writer built the keys,
+//     and `slog_entry_msg` and `slog_entry_level` each rebuilt them independently. Three copies of one
+//     storage rule is three places for it to drift.
+//   * The BOUNDS RULE was written TWICE, once per reader, each with its own sentinel ("" vs -1). Both
+//     threw away WHY the read failed -- a negative index (a caller bug) and an index past the end (a
+//     race with a filtered write) are different problems, and "" could not be told from an entry whose
+//     message genuinely IS "".
+//   * `field_key` / `field_val` were WRITE-ONLY. Every entry stored them and NO function could read
+//     them back, so the "structured" half of a structured logger was unreachable.
+//   * There was NO WAY TO EMIT the log, and no way to render a level: 0..3 appeared as bare magic
+//     numbers in five places and nothing mapped them to "DEBUG".."ERROR".
+//
+// Now: the level set is an ADT (LogLevel) that is the single source of the 0..3 numbering, the read
+// failure cause is an ADT (SlogFail), there is ONE bounds check and ONE generic field reader that the
+// typed accessors adapt, and the flat-key scheme lives only in `_slog_key`.
+//
+// The STORED LAYOUT IS DELIBERATELY UNCHANGED -- still `entries[str(i) + "_msg"]` and a separate
+// `count` -- because `s` is a plain dict that any caller may inspect, and a raise is a refactor. The
+// duplication that mattered (three copies of the key scheme, two copies of the bounds rule) is gone
+// without touching what is stored. Verified: the behaviour diff prints `str(s)` itself.
 
+// ---------------------------------------------------------------------------------------------------
+// Levels
+// ---------------------------------------------------------------------------------------------------
+
+// The severity levels. A genuinely closed set, so an enum -- and it is now the ONLY place the 0..3
+// numbering is written down. `Unknown(n)` keeps the mapping total: the public API takes a bare `int`,
+// so a caller can pass 7, and a total function is better than a silent fallthrough.
+enum LogLevel
+    Debug()
+    Info()
+    Warn()
+    Error()
+    Unknown(int)
+
+// PRIVATE: the wire number for a level. THE definition of the numbering -- the four convenience
+// wrappers below get their constants from here instead of each hard-coding one.
+fn _slog_num(lv) -> int
+    match lv
+        Debug() => return 0
+        Info() => return 1
+        Warn() => return 2
+        Error() => return 3
+        Unknown(n) => return n
+
+// PRIVATE: classify a level number. Return type deliberately UNANNOTATED: an enum variant constructor
+// has the VARIANT's type, not the enum's, so `-> LogLevel` is rejected by the checker.
+fn _slog_level(n: int)
+    if n == 0
+        return Debug()
+    if n == 1
+        return Info()
+    if n == 2
+        return Warn()
+    if n == 3
+        return Error()
+    Unknown(n)
+
+// The printable name of a level. Previously MISSING entirely -- a structured logger that cannot render
+// a severity cannot emit a log line.
+fn slog_level_name(level: int) -> string
+    match _slog_level(level)
+        Debug() => return "DEBUG"
+        Info() => return "INFO"
+        Warn() => return "WARN"
+        Error() => return "ERROR"
+        Unknown(n) => return "LEVEL{n}"
+
+// ---------------------------------------------------------------------------------------------------
+// Read failure causes
+// ---------------------------------------------------------------------------------------------------
+
+// Why an entry read failed. An ADT rather than a bare sentinel so the CAUSE is a value a caller can
+// match on: a NEGATIVE index is a caller arithmetic bug, while an index PAST THE END is the ordinary
+// consequence of a level filter having dropped a write. The old "" / -1 sentinels made them
+// indistinguishable from each other AND from a real entry whose message is "" or whose level is -1.
+enum SlogFail
+    Negative(int)
+    PastEnd(int)
+
+fn _slog_fail_text(f, total: int) -> string
+    match f
+        Negative(i) => "index {i} is negative"
+        PastEnd(i) => "index {i} out of range ({total} entries)"
+
+// ---------------------------------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------------------------------
+
+// A new, empty log. The default minimum level is Debug, i.e. keep everything -- taken from the ADT
+// rather than written as a bare 0.
 fn slog_new() -> dict
     let s = {}
     s["entries"] = {}
     s["count"] = 0
-    s["min_level"] = 0
+    s["min_level"] = _slog_num(Debug())
     s
 
+// Set the minimum level; entries below it are dropped by `slog_log`. Mutates and returns `s` (dicts are
+// reference values) so it chains.
 fn slog_set_level(s: dict, level: int) -> dict
     s["min_level"] = level
     s
 
+// PRIVATE: the storage key for one field of one entry. THE definition of the flat layout -- the writer
+// and every reader go through here, so the scheme is stated once. Suffixes: "level", "msg", "fk", "fv".
+fn _slog_key(index: int, suffix: string) -> string
+    str(index) + "_" + suffix
+
+// Append an entry, unless `level` is below the log's minimum.
 fn slog_log(s: dict, level: int, message: string, field_key: string, field_val: string) -> dict
     if level < s["min_level"]
         return s
     let idx = s["count"]
-    let k = str(idx)
-    s["entries"][k + "_level"] = level
-    s["entries"][k + "_msg"] = message
-    s["entries"][k + "_fk"] = field_key
-    s["entries"][k + "_fv"] = field_val
+    s["entries"][_slog_key(idx, "level")] = level
+    s["entries"][_slog_key(idx, "msg")] = message
+    s["entries"][_slog_key(idx, "fk")] = field_key
+    s["entries"][_slog_key(idx, "fv")] = field_val
     s["count"] = idx + 1
     s
 
+// The four severities. Thin adapters -- each takes its constant from the ADT, so the numbering cannot
+// drift away from `slog_level_name`.
 fn slog_debug(s: dict, msg: string, fk: string, fv: string) -> dict
-    slog_log(s, 0, msg, fk, fv)
+    slog_log(s, _slog_num(Debug()), msg, fk, fv)
 
 fn slog_info(s: dict, msg: string, fk: string, fv: string) -> dict
-    slog_log(s, 1, msg, fk, fv)
+    slog_log(s, _slog_num(Info()), msg, fk, fv)
 
 fn slog_warn(s: dict, msg: string, fk: string, fv: string) -> dict
-    slog_log(s, 2, msg, fk, fv)
+    slog_log(s, _slog_num(Warn()), msg, fk, fv)
 
 fn slog_error(s: dict, msg: string, fk: string, fv: string) -> dict
-    slog_log(s, 3, msg, fk, fv)
+    slog_log(s, _slog_num(Error()), msg, fk, fv)
+
+// ---------------------------------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------------------------------
 
 fn slog_entry_count(s: dict) -> int
     s["count"]
 
-fn slog_entry_msg(s: dict, index: int) -> string
+// PRIVATE: THE bounds rule -- the single place that decides whether an index names an entry, and the
+// only place that knows why it does not. Both readers below and `slog_entry` adapt this one function.
+fn _slog_bounds(s: dict, index: int) -> Result
+    let total = slog_entry_count(s)
     if index < 0
-        return ""
-    if index >= s["count"]
-        return ""
-    s["entries"][str(index) + "_msg"]
+        return err(_slog_fail_text(Negative(index), total))
+    if index >= total
+        return err(_slog_fail_text(PastEnd(index), total))
+    ok(index)
 
+// PRIVATE: read ONE field with a typed fallback. GENERIC because the message reader and the level
+// reader were the SAME logic at two concrete types -- bounds-check, build the key, read it, else a
+// type-appropriate default -- written out twice with different sentinels. One implementation, two
+// adapters, and the sentinel is now the CALLER's choice rather than baked in.
+fn <T> _slog_field(s: dict, index: int, suffix: string, fallback: T) -> T
+    if is_err(_slog_bounds(s, index))
+        return fallback
+    s["entries"][_slog_key(index, suffix)]
+
+// The message at `index`, or "" if the index does not name an entry.
+// NOTE: "" is ALSO a legitimate message, so this signature cannot distinguish "no such entry" from "an
+// entry with an empty message". That ambiguity is inherent to the existing contract and is PRESERVED
+// for current callers -- reach for `slog_entry` when the difference matters.
+fn slog_entry_msg(s: dict, index: int) -> string
+    _slog_field(s, index, "msg", "")
+
+// The level at `index`, or -1 if the index does not name an entry.
 fn slog_entry_level(s: dict, index: int) -> int
-    if index < 0
-        return -1
-    if index >= s["count"]
-        return -1
-    s["entries"][str(index) + "_level"]
+    _slog_field(s, index, "level", -1)
+
+// The field key / value at `index`. These are NEW: both were written by every `slog_log` call and no
+// function could read either back, so the structured half of the log was unreachable.
+fn slog_entry_field_key(s: dict, index: int) -> string
+    _slog_field(s, index, "fk", "")
+
+fn slog_entry_field_val(s: dict, index: int) -> string
+    _slog_field(s, index, "fv", "")
+
+// PRIVATE: assemble one entry as a self-contained dict. Callers get all four fields in one read
+// instead of four bounds-checked lookups.
+fn _slog_entry_at(s: dict, index: int) -> dict
+    let e = {}
+    e["level"] = slog_entry_level(s, index)
+    e["msg"] = slog_entry_msg(s, index)
+    e["fk"] = slog_entry_field_key(s, index)
+    e["fv"] = slog_entry_field_val(s, index)
+    e
+
+// The entry at `index`, KEEPING the reason on failure:
+//   ok({"level":.., "msg":.., "fk":.., "fv":..})
+//   err("index 9 out of range (4 entries)")
+fn slog_entry(s: dict, index: int) -> Result
+    let i = _slog_bounds(s, index)?
+    ok(_slog_entry_at(s, i))
+
+// Every entry, in order, as a list of dicts. A comprehension over the index range -- the bound is
+// evaluated once, which is correct here because reading never appends.
+fn slog_entries(s: dict) -> list
+    [_slog_entry_at(s, i) for i in 0..slog_entry_count(s)]
+
+// The entries a caller-supplied predicate keeps. The predicate is a CLOSURE over an entry dict, so
+// "errors only", "everything mentioning this request id", or any other selection is the caller's to
+// express rather than this module's to enumerate:
+//   slog_where(s, (e) => e["level"] >= 2)
+fn slog_where(s: dict, keep) -> list
+    slog_entries(s).filter(keep)
+
+// PRIVATE: render one entry. The field is omitted when there is no key, so a plain message does not
+// trail a bare "=".
+fn _slog_render(e: dict) -> string
+    let lv = slog_level_name(e["level"])
+    let msg = str(e["msg"])
+    let fk = str(e["fk"])
+    let fv = str(e["fv"])
+    if len(fk) == 0
+        return "{lv} {msg}"
+    "{lv} {msg} {fk}={fv}"
+
+// The log as rendered lines / as one block of text. Previously there was NO way to get the log OUT of
+// the log object at all.
+fn slog_lines(s: dict) -> list
+    [_slog_render(e) for e in slog_entries(s)]
+
+fn slog_format(s: dict) -> string
+    join(slog_lines(s), chr(10))

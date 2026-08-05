@@ -1,74 +1,126 @@
-// forge_output_encoder — Encode output for safe display (HTML/URL/JSON).
+// forge_output_encoder -- Encode output for safe display: HTML text, URL components, JSON string bodies,
+// CSV fields. Each function takes untrusted text and returns it neutralised for ONE output context.
+// LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Every function here was the SAME loop written again: walk the characters of a string,
+// replace some of them, accumulate with `+=`. Four copies of that walk, three if-ladders over character
+// constants, and one int-used-as-a-boolean. Four copies of one rule is four places for it to drift, and
+// `+=` in a per-character loop is quadratic in the length of the output.
+//
+// Now there is ONE walk -- `_oe_escape` -- and each encoder is just its TABLE. Adding a character to an
+// escape set is a one-entry edit to data instead of a new branch inside a nested if, and the output is
+// joined once instead of grown.
+//
+// COVERAGE IS PARTIAL, AND THAT IS LOAD-BEARING. Each table is preserved EXACTLY as it was (a raise is a
+// refactor, never a redesign) and each one now carries a note saying precisely what it does NOT cover.
+// `oe_url_encode_checked` is the entry point that refuses rather than handing back a string that merely
+// LOOKS encoded.
+
+// ── the shared walk ──────────────────────────────────────────────────────────────────────────────────
+// The characters of `s` as a list. Every encoder needs this, and a comprehension cannot iterate a string
+// directly: `[c for c in s]` compiles inside a module and then SEGFAULTS at runtime, so the source must
+// be a list of indices.
+fn _oe_chars(s: string) -> list
+    [char_at(s, i) for i in 0..len(s)]
+
+// THE escape walk. Every character present in `table` is replaced by its value; every other character
+// passes through. This one function is what the four hand-written character loops collapsed into.
+fn _oe_escape(s: string, table: dict) -> string
+    join(_oe_chars(s).map((c) => get(table, c, c)), "")
+
+// ── HTML ─────────────────────────────────────────────────────────────────────────────────────────────
+// KNOWN GAP, PRESERVED: `'` is NOT escaped. That is safe in element text and inside a DOUBLE-quoted
+// attribute, and UNSAFE inside a SINGLE-quoted attribute value -- `<a title='...'>` can be broken out of.
+// The set is left exactly as it was; the gap is tracked rather than silently widened here.
+fn _oe_html_table() -> dict
+    {"<": "&lt;", ">": "&gt;", "&": "&amp;", "\"": "&quot;"}
 
 fn oe_html_encode(input: string) -> string
-    let result = ""
-    for i in 0..len(input)
-        let c = input[i]
-        if c == "<"
-            result += "&lt;"
-        else
-            if c == ">"
-                result += "&gt;"
-            else
-                if c == "&"
-                    result += "&amp;"
-                else
-                    if c == "\""
-                        result += "&quot;"
-                    else
-                        result += c
-    result
+    input |> _oe_escape(_oe_html_table())
 
+// ── URL ──────────────────────────────────────────────────────────────────────────────────────────────
+// KNOWN GAP, PRESERVED: this covers SIX characters. "/", ":", "%" and every byte above 0x7F pass through
+// untouched, so the result is NOT a safe URL component in general -- see oe_url_encode_checked.
+fn _oe_url_table() -> dict
+    {" ": "%20", "&": "%26", "=": "%3D", "?": "%3F", "#": "%23", "+": "%2B"}
+
+// The percent-encoding of one character, or the character itself when this encoder does not cover it.
+// Public API, kept as a thin adapter over the ONE table so it can never disagree with oe_url_encode --
+// before, the ladder here was the only definition and oe_url_encode called it per character.
 fn oe_url_encode_char(c: string) -> string
-    if c == " "
-        return "%20"
-    if c == "&"
-        return "%26"
-    if c == "="
-        return "%3D"
-    if c == "?"
-        return "%3F"
-    if c == "#"
-        return "%23"
-    if c == "+"
-        return "%2B"
-    c
+    get(_oe_url_table(), c, c)
 
 fn oe_url_encode(input: string) -> string
-    let result = ""
+    input |> _oe_escape(_oe_url_table())
+
+// Why a checked encode refused. An ADT and not a bare string because the two causes need DIFFERENT
+// responses from the caller: an uncovered character means this encoder is the wrong tool for the context
+// (fix the call site), while a pre-existing "%" means the input has already been encoded once (fix the
+// data flow -- encoding again turns "%20" into "%2520").
+enum OeUnsafe
+    Uncovered(string)
+    DoubleEncode(string)
+
+fn _oe_unsafe_text(f) -> string
+    match f
+        Uncovered(c) => "character '{c}' is not encodable by this encoder"
+        DoubleEncode(c) => "input already contains '{c}' -- encoding again would double-encode it"
+
+// RFC 3986 unreserved set: the only characters that may legitimately appear LITERALLY in a URL component.
+// A module-level string, which is safe -- scalars and strings survive module level, CONTAINERS DO NOT
+// (a module-level dict or list reads back empty from inside a module, and a write to it is discarded).
+let _OE_URL_UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+
+// Percent-encode with a GUARANTEE instead of a string that merely looks encoded:
+//   ok("hello%20world")                                        every character unreserved or in the table
+//   err("character '/' is not encodable by this encoder")       it was not -- naming the offender
+//   err("input already contains '%' ...")                       the input is already encoded
+// This is the sentinel-to-Result conversion that matters in this module. `oe_url_encode` returns a plain
+// string whether or not it could actually encode the input, so "came back unchanged" and "was safe all
+// along" are indistinguishable -- exactly the silent-success failure mode.
+//
+// A LOOP and not all_match, because it must SHORT-CIRCUIT on the first offender AND report WHICH
+// character it was; all_match can only report that one existed.
+fn oe_url_encode_checked(input: string) -> Result
+    let table = _oe_url_table()
     for i in 0..len(input)
-        result += oe_url_encode_char(input[i])
-    result
+        let c = char_at(input, i)
+        if c == "%"
+            return err(_oe_unsafe_text(DoubleEncode(c)))
+        if find(_OE_URL_UNRESERVED, c) < 0 and c not in table
+            return err(_oe_unsafe_text(Uncovered(c)))
+    ok(_oe_escape(input, table))
+
+// ── JSON ─────────────────────────────────────────────────────────────────────────────────────────────
+// KNOWN GAP, PRESERVED: JSON requires the control characters U+0000..U+001F to be escaped too, and this
+// table does not. A literal newline or tab in the input therefore produces INVALID JSON. The literals are
+// byte-identical to the ones this module has always used, so the behaviour is unchanged; the gap is
+// tracked rather than fixed inside a raise.
+fn _oe_json_table() -> dict
+    {"\\": "\\\\", "\"": "\\\""}
 
 fn oe_json_escape(input: string) -> string
-    let result = ""
-    for i in 0..len(input)
-        let c = input[i]
-        if c == "\\"
-            result += "\\\\"
-        else
-            if c == "\""
-                result += "\\\""
-            else
-                result += c
-    result
+    input |> _oe_escape(_oe_json_table())
 
+// ── CSV ──────────────────────────────────────────────────────────────────────────────────────────────
+// The characters whose presence forces the field to be quoted -- the rule as DATA, so `in` states it once
+// instead of a pair of hand-written comparisons setting an int flag.
+//
+// KNOWN GAP, PRESERVED: RFC 4180 also requires quoting a field that contains CR or LF. They are not in
+// this set, so a field with an embedded newline comes back unquoted and BREAKS the row structure of the
+// file it is written into. Preserved exactly; tracked as a real defect.
+fn _oe_csv_triggers() -> dict
+    {",": true, "\"": true}
+
+// Inside a quoted CSV field a literal quote is doubled. That is the whole escape table.
+fn _oe_csv_table() -> dict
+    {"\"": "\"\""}
+
+// Quote a CSV field only when it needs it; double any embedded quote. `needs_quote` was an int used as a
+// boolean, set by a scan loop; it is now the boolean question it always was -- any_match plus a closure
+// over the trigger set -- and the second loop that built the body is now the shared walk.
 fn oe_csv_escape(input: string) -> string
-    let needs_quote = 0
-    for i in 0..len(input)
-        let c = input[i]
-        if c == ","
-            needs_quote = 1
-        if c == "\""
-            needs_quote = 1
-    if needs_quote == 0
+    let triggers = _oe_csv_triggers()
+    if not any_match(_oe_chars(input), (c) => c in triggers)
         return input
-    let result = "\""
-    for j in 0..len(input)
-        let c = input[j]
-        if c == "\""
-            result += "\"\""
-        else
-            result += c
-    result += "\""
-    result
+    "\"" + _oe_escape(input, _oe_csv_table()) + "\""

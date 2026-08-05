@@ -11,9 +11,27 @@
 //   4. THE MODULE HAD NO DIFF, despite "with diff detection" in its own title. ss_diff / ss_changed_keys
 //      are added -- and they are short precisely because the lookup rules are now in one place.
 //
-// Storage note, unchanged: a snapshot is flattened into the same dict under "<idx>_<key>" rather than
-// nested, so a KEY CONTAINING "_" is ambiguous with the index prefix. That hazard predates this raise and
-// is preserved rather than silently redesigned; it is called out at ss_snapshot_keys.
+// RAISE PASS 2 (same day) -- the first pass left three sentinels and two duplicated rules behind:
+//   5. ss_snapshot_keys / ss_changed_keys / ss_diff returned an EMPTY CONTAINER for "no such snapshot",
+//      which is exactly what a snapshot with no keys returns. Proven indistinguishable at runtime:
+//      ss_snapshot_keys(e, 0) on a zero-key snapshot and ss_snapshot_keys(e, 77) on a nonexistent one
+//      BOTH gave []. Each now has a `_checked` Result form that names the cause; the container-returning
+//      forms are thin adapters over it.
+//   6. THE METADATA KEY NAMES ("label", "key_count") WERE WRITTEN IN TWO PLACES -- once by
+//      ss_take_snapshot, which stores them, and once by ss_snapshot_keys, which must hide them again.
+//      Two copies of one fact: add a third metadata field and the reader silently starts reporting it as
+//      a user key. Now _ss_reserved() states the set ONCE and both sides read it.
+//   7. ss_snapshot_label_checked and ss_snapshot_value_checked each re-implemented "bounds-check, build
+//      the flat key, look it up". One _ss_snap_raw does it; both are adapters. (This also closes a latent
+//      unchecked dict read: the old label path indexed s["snapshots"] without proving the key was there.)
+//
+// Storage note, unchanged: a snapshot is flattened into the same dict under "<idx>_<key>". The REAL
+// collision is not "_" in a key (the prefix is anchored, so "x_y" round-trips fine -- verified) but a live
+// key named EXACTLY "label" or "key_count": ss_take_snapshot writes its metadata after the values, so the
+// user's value is overwritten and then hidden by the reserved-name filter. Verified at runtime:
+// set("key_count","USER-VALUE") -> snapshot_value(...,"key_count") == "" and the key is absent from
+// ss_snapshot_keys. That hazard predates this raise; fixing it means changing the storage layout, which is
+// a redesign, not a raise -- so it is documented precisely here and at _ss_reserved rather than papered over.
 
 // Why a lookup failed. An ADT so the CAUSE is a value: a missing key is a client error, a bad index is a
 // programmer error, and both used to arrive as "".
@@ -25,6 +43,12 @@ fn _sf_text(f) -> string
     match f
         NoKey(k) => "no key '{k}'"
         NoSnapshot(i) => "no snapshot at index {i}"
+
+// The per-snapshot METADATA key names, stated ONCE. ss_take_snapshot writes exactly these suffixes and
+// ss_snapshot_keys must hide exactly these suffixes; keeping the list in one place is what stops those two
+// from drifting apart. A live key with one of these names is shadowed -- see the header note.
+fn _ss_reserved() -> list
+    ["label", "key_count"]
 
 fn ss_new() -> dict
     {"current": {}, "snapshots": {}, "snap_count": 0}
@@ -49,68 +73,111 @@ fn ss_get_checked(s: dict, key: string) -> Result
 fn ss_get(s: dict, key: string) -> string
     unwrap_or(ss_get_checked(s, key), "")
 
+// The flat storage key for one field of one snapshot. The "<idx>_<name>" layout is expressed HERE and
+// nowhere else, so the writer below and every reader agree by construction.
+fn _ss_key(index: int, name: string) -> string
+    "{index}_{name}"
+
 fn ss_take_snapshot(s: dict, label: string) -> dict
     let idx = s["snap_count"]
     let ks = keys(s["current"])
     for k in ks
-        s["snapshots"]["{idx}_{k}"] = s["current"][k]
-    s["snapshots"]["{idx}_label"] = label
-    s["snapshots"]["{idx}_key_count"] = len(ks)
+        s["snapshots"][_ss_key(idx, k)] = s["current"][k]
+    // Metadata last, and under the names _ss_reserved() publishes.
+    s["snapshots"][_ss_key(idx, "label")] = label
+    s["snapshots"][_ss_key(idx, "key_count")] = len(ks)
     s["snap_count"] = idx + 1
     s
 
 fn ss_snapshot_count(s: dict) -> int
     s["snap_count"]
 
-fn ss_snapshot_label_checked(s: dict, index: int) -> Result
+// THE snapshot read -- bounds-check, build the flat key, look it up. Every checked accessor below is an
+// adapter over this one function, so there is exactly one place that knows how a read can fail.
+fn _ss_snap_raw(s: dict, index: int, name: string) -> Result
     if not ss_has_snapshot(s, index)
         return err(_sf_text(NoSnapshot(index)))
-    ok(s["snapshots"]["{index}_label"])
+    let sk = _ss_key(index, name)
+    if sk not in s["snapshots"]
+        return err(_sf_text(NoKey(name)))
+    ok(s["snapshots"][sk])
+
+fn ss_snapshot_label_checked(s: dict, index: int) -> Result
+    _ss_snap_raw(s, index, "label")
 
 fn ss_snapshot_label(s: dict, index: int) -> string
     unwrap_or(ss_snapshot_label_checked(s, index), "")
 
 fn ss_snapshot_value_checked(s: dict, index: int, key: string) -> Result
-    if not ss_has_snapshot(s, index)
-        return err(_sf_text(NoSnapshot(index)))
-    let sk = "{index}_{key}"
-    if sk not in s["snapshots"]
-        return err(_sf_text(NoKey(key)))
-    ok(s["snapshots"][sk])
+    _ss_snap_raw(s, index, key)
 
 fn ss_snapshot_value(s: dict, index: int, key: string) -> string
     unwrap_or(ss_snapshot_value_checked(s, index, key), "")
 
+// How many keys the snapshot captured. ss_take_snapshot has always STORED this and nothing could read it
+// back -- dead storage. It is also the cheap cross-check on ss_snapshot_keys.
+fn ss_snapshot_key_count_checked(s: dict, index: int) -> Result
+    _ss_snap_raw(s, index, "key_count")
+
+fn ss_snapshot_key_count(s: dict, index: int) -> int
+    unwrap_or(ss_snapshot_key_count_checked(s, index), 0)
+
 fn ss_current_size(s: dict) -> int
     len(keys(s["current"]))
 
-// The keys captured in snapshot `index`.
-// CAVEAT, pre-existing and preserved: snapshots are flattened under "<idx>_<key>", so a key that itself
-// contains "_" is indistinguishable from the index prefix of another snapshot. This reconstructs by
-// prefix match, which inherits that ambiguity -- it is not introduced here.
-fn ss_snapshot_keys(s: dict, index: int) -> list
+// The keys captured in snapshot `index`, KEEPING the reason when the snapshot does not exist.
+// Strips the "<idx>_" prefix ONCE per key (the previous pass recomputed the same slice three times per
+// element -- twice to test it against the reserved names, once to emit it) and then drops the metadata
+// names that _ss_reserved() publishes.
+fn ss_snapshot_keys_checked(s: dict, index: int) -> Result
     if not ss_has_snapshot(s, index)
-        return []
-    let pre = "{index}_"
+        return err(_sf_text(NoSnapshot(index)))
+    let pre = _ss_key(index, "")
     let n = len(pre)
-    let raw = [k for k in keys(s["snapshots"]) if len(k) > n and slice(k, 0, n) == pre]
-    [slice(k, n, len(k)) for k in raw if slice(k, n, len(k)) != "label" and slice(k, n, len(k)) != "key_count"]
+    let reserved = _ss_reserved()
+    let stripped = [slice(k, n, len(k)) for k in keys(s["snapshots"]) if len(k) > n and slice(k, 0, n) == pre]
+    ok([k for k in stripped if k not in reserved])
+
+// Adapter: [] when the snapshot does not exist. NOTE [] is ALSO what a snapshot with no keys returns, so
+// reach for ss_snapshot_keys_checked when the difference matters.
+fn ss_snapshot_keys(s: dict, index: int) -> list
+    unwrap_or(ss_snapshot_keys_checked(s, index), [])
 
 // Keys whose value differs between snapshot `index` and the LIVE state. This is the "diff detection"
 // the module was named for and did not have.
-fn ss_changed_keys(s: dict, index: int) -> list
-    if not ss_has_snapshot(s, index)
-        return []
-    let snap_keys = ss_snapshot_keys(s, index)
+// `return kr` rather than `ss_snapshot_keys_checked(...)?` is DELIBERATE, and was measured: `?` rewrites the
+// message to "in <fn> at line N: <msg>", and because ss_diff_checked calls this which calls
+// ss_snapshot_keys_checked, `?` at both levels produced
+//   "in ss_diff_checked at line 164: in ss_changed_keys_checked at line 149: no snapshot at index 0"
+// -- the prefix MULTIPLIES with nesting, and it bakes LINE NUMBERS into a public error string, so any later
+// edit to this file silently changes the message a caller sees. These messages are the answer, not a trace.
+// `err(unwrap_err(..))` rather than a bare `return kr` for a second reason the type checker found: returning
+// the inner Result VALUE unifies its payload type with this function's own ok() payload, so ss_diff_checked
+// (ok payload = dict) could not forward a Result whose ok payload is a list -- E1001. Re-raising just the
+// message keeps the text byte-identical AND keeps the two payload types independent.
+fn ss_changed_keys_checked(s: dict, index: int) -> Result
+    let kr = ss_snapshot_keys_checked(s, index)
+    if is_err(kr)
+        return err(unwrap_err(kr))
+    let snap_keys = unwrap(kr)
     let live_keys = keys(s["current"])
     // A key counts as changed if it was added, removed, or has a different value. Membership reads as
     // membership now, and the three cases are one comprehension each rather than a nested scan.
     let removed = [k for k in snap_keys if k not in s["current"]]
     let added = [k for k in live_keys if k not in snap_keys]
     let altered = [k for k in snap_keys if k in s["current"] and ss_snapshot_value(s, index, k) != s["current"][k]]
-    [...removed, ...added, ...altered]
+    ok([...removed, ...added, ...altered])
+
+fn ss_changed_keys(s: dict, index: int) -> list
+    unwrap_or(ss_changed_keys_checked(s, index), [])
 
 // The diff as data: {key: [snapshot_value, live_value]}. A dict comprehension over the changed keys,
 // so the shape of the answer is written once.
+fn ss_diff_checked(s: dict, index: int) -> Result
+    let cr = ss_changed_keys_checked(s, index)
+    if is_err(cr)
+        return err(unwrap_err(cr))
+    ok({k: [ss_snapshot_value(s, index, k), ss_get(s, k)] for k in unwrap(cr)})
+
 fn ss_diff(s: dict, index: int) -> dict
-    {k: [ss_snapshot_value(s, index, k), ss_get(s, k)] for k in ss_changed_keys(s, index)}
+    unwrap_or(ss_diff_checked(s, index), {})

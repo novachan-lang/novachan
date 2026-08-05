@@ -12,116 +12,245 @@
 //   state["fn_" + name + "_line"]       -- 1-based line number (string)
 //   state["fn_" + name + "_doc"]        -- doc comment text (may be "")
 //   state["fn_" + name + "_sig"]        -- full "fn name(...)" signature text
+//
+// RAISED 2026-08-05. Five shape problems:
+//   * dg_extract_params returned "" for FOUR different situations -- no "(", no ")", ")" before "(",
+//     and a genuine zero-parameter signature. "fn f()" and "not code at all" were indistinguishable.
+//     Now dg_params_of returns a Result: ok("") means "really has no parameters", err names the cause.
+//   * dg_extract_name assumed its argument starts with "fn " and blind-sliced 3 bytes off the front, so
+//     on any other line it returned a SILENTLY WRONG name rather than nothing (see dg_name_of).
+//   * The doc-comment MARKERS were listed twice, in dg_is_comment_line and again in
+//     dg_strip_comment_marker -- a line could be classified as a comment by one and left unstripped by
+//     the other. ONE _dgn_comment_markers table now feeds both.
+//   * dg_parse_file's body was a four-branch if-ladder in which every branch mutated the same
+//     pending_doc accumulator differently, so the state machine could only be read all at once. The
+//     four cases are a DocLine ADT and the loop is a match.
+//   * "fn_" + name + "_" + field was spelled out FIFTEEN times, and the "unknown function" check plus
+//     its message THREE times (two of those also re-reading the same five keys). One _dgn_key, one
+//     _dgn_record.
+// PRIVATE helpers are prefixed _dgn_ rather than _dg_: forge_dependency_graph and std/graph/directed
+// both also use a dg_ prefix and NOVA gives top-level fns no per-module mangling.
+
+// Why a signature line yielded no name or no parameter list. An ADT, not a bare string, so the CAUSE
+// is a value: "this is not a declaration" is a caller mistake, while "no ')'" is a truncated source
+// line, and collapsing both into "" (as before) makes them the same thing.
+enum SigFail
+    NotAFnLine(string)
+    NoOpenParen(string)
+    NoCloseParen(string)
+    ParensReversed(string)
+    EmptyName(string)
+
+// The param is deliberately UNANNOTATED: annotating it `f: SigFail` makes the inferrer type a
+// constructor argument as the VARIANT type and reject the call with E1001.
+fn _dgn_sig_fail_text(f) -> string
+    match f
+        NotAFnLine(s) => "not a function declaration: '{s}'"
+        NoOpenParen(s) => "no '(' in '{s}'"
+        NoCloseParen(s) => "no ')' in '{s}'"
+        ParensReversed(s) => "')' precedes '(' in '{s}'"
+        EmptyName(s) => "no function name before '(' in '{s}'"
+
+// PRIVATE: guarded ok -- `val` when the guard holds, else err(why). GENERIC in the payload because the
+// guard says nothing about what is being returned: it is used below with a string payload
+// (dg_param_list) and a dict payload (_dgn_record). `val` is evaluated EAGERLY, so every call site must
+// pass an expression that is safe to evaluate even when the guard fails -- which is exactly why
+// dg_fn_at, whose value is an out-of-range list index, keeps its own explicit check instead of this.
+fn <T> _dgn_ok_if(guard: bool, val: T, why: string) -> Result
+    if guard
+        return ok(val)
+    err(why)
+
+// PRIVATE: THE state key for one function's one field. This string was written out fifteen times; a
+// typo in any one of them silently reads or writes a key nobody else uses, and a flat-dict state has
+// no schema to catch that.
+fn _dgn_key(name: string, field: string) -> string
+    "fn_" + name + "_" + field
+
+// PRIVATE: one registered field, or "" when absent. Membership test rather than a get-with-default so
+// this stays independent of any builtin whose name a future import could shadow.
+fn _dgn_get(state: dict, name: string, field: string) -> string
+    let k = _dgn_key(name, field)
+    state[k] if k in state else ""
+
+// PRIVATE: has this function been registered? The bool the module actually reasons with; dg_has_fn is
+// the published int adapter over it.
+fn _dgn_known(state: dict, name: string) -> bool
+    _dgn_key(name, "sig") in state
 
 fn dg_new() -> dict
-    let st = {}
-    st["file_count"] = "0"
-    st["fn_count"] = "0"
-    st["fn_names"] = ""
-    st
+    {"file_count": "0", "fn_count": "0", "fn_names": ""}
 
-// Extract the comma-separated parameter NAMES (not types) from a signature
-// line such as "fn add(a: int, b: int) -> int".
-fn dg_extract_params(sig_line: string) -> string
+// PRIVATE: the (open, close) index pair spanning a signature's parameter list, or WHY there is none.
+// The three rejections are tested in the original order, so the error precedence is unchanged.
+fn _dgn_paren_span(sig_line: string) -> Result
     let open_i = find(sig_line, "(")
     let close_i = find(sig_line, ")")
     if open_i < 0
-        return ""
+        return err(_dgn_sig_fail_text(NoOpenParen(sig_line)))
     if close_i < 0
-        return ""
+        return err(_dgn_sig_fail_text(NoCloseParen(sig_line)))
     if close_i <= open_i
-        return ""
-    let inner = slice(sig_line, open_i + 1, close_i)
-    let inner_t = trim(inner)
-    if len(inner_t) == 0
-        return ""
-    let parts = split(inner_t, ",")
-    let out = ""
-    for i in 0..len(parts)
-        let p = trim(parts[i])
-        let colon_i = find(p, ":")
-        let pname = p
-        if colon_i >= 0
-            pname = trim(slice(p, 0, colon_i))
-        if len(pname) > 0
-            if len(out) > 0
-                out += ", "
-            out += pname
-    out
+        return err(_dgn_sig_fail_text(ParensReversed(sig_line)))
+    ok([open_i, close_i])
 
-// Extract the function name from a line starting with "fn ".
-fn dg_extract_name(sig_line: string) -> string
+// PRIVATE: one parameter's NAME from "name: type", or the whole token when it is untyped.
+fn _dgn_param_name(p: string) -> string
+    let t = trim(p)
+    let colon_i = find(t, ":")
+    trim(slice(t, 0, colon_i)) if colon_i >= 0 else t
+
+// The comma-separated parameter NAMES (not types) of a signature line such as
+// "fn add(a: int, b: int) -> int", KEEPING the reason there are none:
+//   ok("a, b")                   the parameter names
+//   ok("")                       a GENUINE zero-parameter signature -- "fn f()"
+//   err("no '(' in 'garbage'")   the line is not a signature at all
+// That ok("")-vs-err split is the whole point: dg_extract_params returns "" for both and so cannot tell
+// a nullary function from a line it failed to parse.
+// A UFCS chain, not an accumulate-in-a-loop: split the parameter list, take each name, drop the empties.
+// `?` is used here (unlike in dg_get_fn) because this function is NEW: nothing depends on its exact
+// error text, so the "in dg_params_of at line N: " prefix `?` prepends is acceptable noise rather than a
+// silent rewrite of a published message.
+fn dg_params_of(sig_line: string) -> Result
+    let span = _dgn_paren_span(sig_line)?
+    let inner = trim(slice(sig_line, span[0] + 1, span[1]))
+    if len(inner) == 0
+        return ok("")
+    let names = split(inner, ",").map((p) => _dgn_param_name(p)).filter((nm) => len(nm) > 0)
+    ok(join(names, ", "))
+
+// Extract the comma-separated parameter NAMES from a signature line, or "" if there are none for any
+// reason. A thin adapter over dg_params_of, preserving the original "" contract; reach for dg_params_of
+// when "no parameters" and "not parseable" need to be different answers.
+fn dg_extract_params(sig_line: string) -> string
+    unwrap_or(dg_params_of(sig_line), "")
+
+// The function name declared by a line, KEEPING the reason on failure:
+//   ok("add")                                      the name
+//   err("not a function declaration: 'x = 1'")     the line does not start with "fn "
+//   err("no '(' in 'fn add'")                      there is no parameter list to stop at
+//   err("no function name before '(' in 'fn ()'")  the parameter list starts immediately
+// The starts_with guard is NEW and is a FIX: the original sliced 3 bytes off the front unconditionally,
+// so dg_extract_name("hello(x)") returned "lo" -- a confidently wrong name for a line that declares
+// nothing. It was only ever safe because its one caller had already tested starts_with(line, "fn ").
+fn dg_name_of(sig_line: string) -> Result
+    if not starts_with(sig_line, "fn ")
+        return err(_dgn_sig_fail_text(NotAFnLine(sig_line)))
     let after = trim(slice(sig_line, 3, len(sig_line)))
     let open_i = find(after, "(")
     if open_i < 0
-        return ""
-    trim(slice(after, 0, open_i))
+        return err(_dgn_sig_fail_text(NoOpenParen(sig_line)))
+    let name = trim(slice(after, 0, open_i))
+    if len(name) == 0
+        return err(_dgn_sig_fail_text(EmptyName(sig_line)))
+    ok(name)
 
-// 1 if the trimmed line looks like a doc-comment line ("#..." or "//...").
+// Extract the function name from a line starting with "fn ", or "" when there is none. A thin adapter
+// over dg_name_of, preserving the "" contract for the cases the original also answered "" for.
+fn dg_extract_name(sig_line: string) -> string
+    unwrap_or(dg_name_of(sig_line), "")
+
+// PRIVATE: THE doc-comment markers. ONE table -- dg_is_comment_line and dg_strip_comment_marker each
+// carried their own copy, so adding a marker to one and not the other would make a line count as a
+// comment and then not be stripped (or the reverse): a silent drift pair over two functions that must
+// agree by definition. Longest first, so a marker that prefixes another still strips the longer one.
+fn _dgn_comment_markers() -> list
+    ["//", "#"]
+
+// PRIVATE: does the trimmed line open a doc comment? any_match states the rule ONCE over the marker
+// table instead of one if-return per marker.
+fn _dgn_is_comment(trimmed: string) -> bool
+    len(trimmed) > 0 and any_match(_dgn_comment_markers(), (m) => starts_with(trimmed, m))
+
+// 1 if the trimmed line looks like a doc-comment line ("#..." or "//..."). Returns int, not bool,
+// because that is the published contract callers compare against `== 1`.
 fn dg_is_comment_line(trimmed: string) -> int
-    if len(trimmed) == 0
-        return 0
-    if starts_with(trimmed, "#")
-        return 1
-    if starts_with(trimmed, "//")
-        return 1
-    0
+    1 if _dgn_is_comment(trimmed) else 0
 
-// Strip a leading "#" or "//" (and one following space) from a comment line.
+// Strip a leading "#" or "//" (and following whitespace) from a comment line.
+// The `for` STAYS a loop: it short-circuits on the first matching marker, so at most one marker is
+// stripped -- exactly the original's if/else-if behaviour, and NOT what all_match/any_match express.
 fn dg_strip_comment_marker(trimmed: string) -> string
-    let body = trimmed
-    if starts_with(body, "//")
-        body = slice(body, 2, len(body))
-    else if starts_with(body, "#")
-        body = slice(body, 1, len(body))
-    trim(body)
+    for m in _dgn_comment_markers()
+        if starts_with(trimmed, m)
+            return trim(slice(trimmed, len(m), len(trimmed)))
+    trim(trimmed)
 
-// Parse one NOVA source file's content and register every top-level
-// function it declares into `state`. Returns the updated state.
+// How one source line participates in doc extraction — a CLOSED set of four cases. It was an
+// if/else-if ladder whose four branches each mutated the same `pending_doc` accumulator in a different
+// way, so the state machine had to be reconstructed by reading all four branches at once. As an ADT the
+// classification is one value and the accumulator rule is one match.
+enum DocLine
+    Comment(string)
+    FnDecl(string)
+    Blank(string)
+    Other(string)
+
+// PRIVATE: classify one ALREADY-TRIMMED line. Order matters and is the original's: a comment first
+// (an empty line is not a comment, since _dgn_is_comment requires a marker), then a declaration, then
+// blank, then anything else.
+// The return type is deliberately UNANNOTATED, for the same reason _dgn_sig_fail_text's parameter is:
+// the inferrer types a constructor application as the VARIANT type, so declaring `-> DocLine` rejects
+// every `return Comment(...)` with E1001.
+fn _dgn_classify(trimmed: string)
+    if _dgn_is_comment(trimmed)
+        return Comment(dg_strip_comment_marker(trimmed))
+    if starts_with(trimmed, "fn ")
+        return FnDecl(trimmed)
+    if len(trimmed) == 0
+        return Blank("")
+    Other("")
+
+// PRIVATE: append one comment fragment to the pending doc, space-separated.
+fn _dgn_append_doc(acc: string, piece: string) -> string
+    piece if len(acc) == 0 else acc + " " + piece
+
+// PRIVATE: register (or RE-register) one declaration and return the state.
+// `known` is sampled BEFORE any write, because a re-declaration must overwrite the five field keys yet
+// must NOT append the name a second time nor double-count it -- the original's ordering, preserved.
+// A line that declares nothing parseable is skipped (the caller still resets the doc accumulator).
+fn _dgn_register(state: dict, sig: string, filename: string, line_no: int, doc: string) -> dict
+    let nr = dg_name_of(sig)
+    if is_err(nr)
+        return state
+    let name = unwrap(nr)
+    if not _dgn_known(state, name)
+        state["fn_names"] = name if len(state["fn_names"]) == 0 else state["fn_names"] + "," + name
+        state["fn_count"] = str(int(state["fn_count"]) + 1)
+    state[_dgn_key(name, "params")] = dg_extract_params(sig)
+    state[_dgn_key(name, "file")] = filename
+    state[_dgn_key(name, "line")] = str(line_no)
+    state[_dgn_key(name, "doc")] = doc
+    state[_dgn_key(name, "sig")] = sig
+    state
+
+// Parse one NOVA source file's content and register every top-level function it declares into `state`.
+// Returns the updated state.
+// The `for` STAYS a loop: it carries the pending_doc accumulator from line to line, which is a fold no
+// comprehension expresses. What changed is that the per-line DECISION is now a match over a classified
+// value, so each of the four cases states its effect on the accumulator in one place.
 fn dg_parse_file(state: dict, filename: string, content: string) -> dict
-    let lines = split(content, "\n")
     let pending_doc = ""
     let line_no = 0
-    for i in 0..len(lines)
+    for raw in split(content, "\n")
         line_no += 1
-        let raw = lines[i]
-        let trimmed = trim(raw)
-        if dg_is_comment_line(trimmed) == 1
-            let piece = dg_strip_comment_marker(trimmed)
-            if len(pending_doc) == 0
-                pending_doc = piece
-            else
-                pending_doc += " " + piece
-        else if starts_with(trimmed, "fn ")
-            let name = dg_extract_name(trimmed)
-            if len(name) > 0
-                let params = dg_extract_params(trimmed)
-                let already = dg_has_fn(state, name)
-                if already == 0
-                    if len(state["fn_names"]) > 0
-                        state["fn_names"] = state["fn_names"] + "," + name
-                    else
-                        state["fn_names"] = name
-                    state["fn_count"] = str(int(state["fn_count"]) + 1)
-                state["fn_" + name + "_params"] = params
-                state["fn_" + name + "_file"] = filename
-                state["fn_" + name + "_line"] = str(line_no)
-                state["fn_" + name + "_doc"] = pending_doc
-                state["fn_" + name + "_sig"] = trimmed
-            pending_doc = ""
-        else if len(trimmed) == 0
-            pending_doc = pending_doc
-        else
-            pending_doc = ""
+        match _dgn_classify(trim(raw))
+            Comment(piece) => pending_doc = _dgn_append_doc(pending_doc, piece)
+            FnDecl(sig) =>
+                state = _dgn_register(state, sig, filename, line_no, pending_doc)
+                pending_doc = ""
+            // A BLANK line PRESERVES the accumulator: a doc comment may be separated from its
+            // function by empty lines. This no-op arm is the rule, stated rather than implied.
+            Blank(b) => pending_doc = pending_doc
+            // Any other code line DISCARDS it -- a comment not immediately above a declaration is not
+            // that declaration's doc.
+            Other(o) => pending_doc = ""
     state["file_count"] = str(int(state["file_count"]) + 1)
     state
 
 // 1 if `fn_name` has been documented, else 0.
 fn dg_has_fn(state: dict, fn_name: string) -> int
-    let has = contains(state, "fn_" + fn_name + "_sig")
-    if has == true
-        return 1
-    0
+    1 if _dgn_known(state, fn_name) else 0
 
 // Number of documented functions.
 fn dg_fn_count(state: dict) -> int
@@ -132,6 +261,8 @@ fn dg_fn_list(state: dict) -> string
     state["fn_names"]
 
 // Nth documented function name (0-based index) as a Result.
+// Keeps its own bounds checks rather than using _dgn_ok_if: the value is `names[index]`, which must not
+// be evaluated before the range test.
 fn dg_fn_at(state: dict, index: int) -> Result
     if index < 0
         return err("dg_fn_at: negative index")
@@ -140,55 +271,64 @@ fn dg_fn_at(state: dict, index: int) -> Result
         return err("dg_fn_at: index out of range")
     ok(names[index])
 
+// PRIVATE: THE registered record for one function, or the one "unknown function" error. The three
+// readers below each re-implemented this existence check and its message, and two of them then re-read
+// the same five state keys by hand. `who` carries each reader's own message prefix, byte-for-byte.
+fn _dgn_record(state: dict, name: string, who: string) -> Result
+    let rec = {"name": name, "sig": _dgn_get(state, name, "sig"), "doc": _dgn_get(state, name, "doc"), "params": _dgn_get(state, name, "params"), "file": _dgn_get(state, name, "file"), "line": _dgn_get(state, name, "line")}
+    _dgn_ok_if(_dgn_known(state, name), rec, "{who}: unknown function '{name}'")
+
 // Comma-separated parameter list for a function, as a Result.
 fn dg_param_list(state: dict, fn_name: string) -> Result
-    if dg_has_fn(state, fn_name) == 0
-        return err("dg_param_list: unknown function '" + fn_name + "'")
-    ok(state["fn_" + fn_name + "_params"])
+    _dgn_ok_if(_dgn_known(state, fn_name), _dgn_get(state, fn_name, "params"), "dg_param_list: unknown function '{fn_name}'")
 
 // Get the full doc record for a function, rendered as a Result<string>.
 // Format: "name(params) -- doc [file:line]"
+// NOT `_dgn_record(...)?`: NOVA's `?` is not a transparent propagate -- it PREFIXES the error with
+// "in dg_get_fn at line N: ", which both rewrites this function's published error text and states the
+// function name twice ("in dg_get_fn at line 285: dg_get_fn: unknown function 'x'"). Verified by
+// behaviour diff. Explicit is_err forwarding keeps the message byte-for-byte.
 fn dg_get_fn(state: dict, name: string) -> Result
-    if dg_has_fn(state, name) == 0
-        return err("dg_get_fn: unknown function '" + name + "'")
-    let sig = state["fn_" + name + "_sig"]
-    let doc = state["fn_" + name + "_doc"]
-    let file = state["fn_" + name + "_file"]
-    let line = state["fn_" + name + "_line"]
-    let out = sig
-    if len(doc) > 0
-        out += " -- " + doc
-    out += " [" + file + ":" + line + "]"
-    ok(out)
+    let rr = _dgn_record(state, name, "dg_get_fn")
+    if is_err(rr)
+        return err(unwrap_err(rr))
+    let r = unwrap(rr)
+    let sig = r["sig"]
+    let doc = r["doc"]
+    let file = r["file"]
+    let line = r["line"]
+    let body = "{sig} -- {doc}" if len(doc) > 0 else sig
+    ok("{body} [{file}:{line}]")
 
 // Render full documentation text for one function, as a Result<string>.
+// join over the pieces, not `out +=` five times: the optional doc paragraph and the two-way parameter
+// line are the only variability, and they read as such.
+// Explicit is_err forwarding rather than `?`, for the reason spelled out on dg_get_fn.
 fn dg_render_fn(state: dict, fn_name: string) -> Result
-    if dg_has_fn(state, fn_name) == 0
-        return err("dg_render_fn: unknown function '" + fn_name + "'")
-    let sig = state["fn_" + fn_name + "_sig"]
-    let doc = state["fn_" + fn_name + "_doc"]
-    let params = state["fn_" + fn_name + "_params"]
-    let file = state["fn_" + fn_name + "_file"]
-    let line = state["fn_" + fn_name + "_line"]
-    let out = "## " + fn_name + "\n\n"
-    out += "```\n" + sig + "\n```\n\n"
-    if len(doc) > 0
-        out += doc + "\n\n"
+    let rr = _dgn_record(state, fn_name, "dg_render_fn")
+    if is_err(rr)
+        return err(unwrap_err(rr))
+    let r = unwrap(rr)
+    let sig = r["sig"]
+    let doc = r["doc"]
+    let params = r["params"]
+    let file = r["file"]
+    let line = r["line"]
+    let params_line = "Parameters: (none)\n"
     if len(params) > 0
-        out += "Parameters: " + params + "\n"
-    else
-        out += "Parameters: (none)\n"
-    out += "Defined in " + file + " at line " + line + "\n"
-    ok(out)
+        params_line = "Parameters: {params}\n"
+    let parts = ["## {fn_name}\n\n", "```\n" + sig + "\n```\n\n"]
+    if len(doc) > 0
+        push(parts, "{doc}\n\n")
+    push(parts, params_line)
+    push(parts, "Defined in {file} at line {line}\n")
+    ok(join(parts, ""))
 
 // Render documentation for every function, in registration order.
+// join, not `out +=` inside a loop: string += per function is O(n^2) in the number of functions. The
+// is-renderable test moved into the filter, so the map's unwrap cannot fail.
 fn dg_render_all(state: dict) -> string
-    let names = split(state["fn_names"], ",")
-    let out = "# Documentation\n\n"
-    for i in 0..len(names)
-        let n = names[i]
-        if len(n) > 0
-            let r = dg_render_fn(state, n)
-            if is_ok(r)
-                out += unwrap(r) + "\n"
-    out
+    let st = state
+    let names = split(st["fn_names"], ",").filter((n) => len(n) > 0 and _dgn_known(st, n))
+    let bodies = names.map((n) => unwrap(dg_render_fn(st, n)) + "\n")
+    "# Documentation\n\n" + join(bodies, "")

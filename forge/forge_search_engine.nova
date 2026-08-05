@@ -1,155 +1,208 @@
-// forge_search_engine — Full-text search index (inverted index).
-// Tokenize, index, query with TF scoring.
+// forge_search_engine -- Full-text search over an in-memory INVERTED INDEX. `se_new` makes an engine,
+// `se_add_doc` tokenizes a document and folds its term frequencies into the index, `se_search` scores every
+// document containing any query token by plain TF (sum of term frequencies -- no IDF, no length
+// normalisation) and returns them highest-score-first. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Four separate things were being done by hand that the language already does:
+//
+//   1. ASCII lower-casing was a 26-branch if-ladder (`se_char_lower`) called once per character by
+//      `se_lower`. The runtime's `lower` builtin is EXACTLY that rule -- `(c >= 'A' && c <= 'Z') ? c + 32
+//      : c`, verified in nova_runtime.c -- so 54 lines of this module were a slower copy of a builtin,
+//      and a copy is a place to drift. Both are now one-line adapters over `lower`.
+//   2. Ranking was a hand-rolled O(n^2) swap-selection sort. It is now `sort_by` with a key closure:
+//      O(n log n), and STABLE, so equal scores keep the order they were discovered in instead of being
+//      permuted by the sort's swap history. See the note on se_sort_results -- this is the one place the
+//      raise changes an observable result.
+//   3. Every "is this key present? then read it, else use a default" was a `contains` call followed by an
+//      if/else. That is `get(d, k, default)`, one expression, and it appeared FOUR times.
+//   4. Nothing validated that the dict handed in was actually an engine, and nothing could report why a
+//      document could not be indexed. Both now have a Result surface with an ADT naming the cause.
+//
+// The pre-existing functions keep their exact signatures and behaviour; the `_checked` entry points and
+// `se_get_doc` are additions.
 
+// ── failure causes ───────────────────────────────────────────────────────────────────────────────────
+// An ADT and not bare strings because the three causes need different responses: NotAnEngine is a
+// programming error at the call site, DuplicateDoc is a data-flow error (re-indexing a document silently
+// DOUBLES its term frequencies and its contribution to doc_count), and UnknownDoc is an ordinary lookup
+// miss. Flattening all three into a 0 or a false -- which is all the old module could do -- makes them
+// indistinguishable from each other and from success.
+// NOTE: every variant carries a payload on purpose; a NULLARY enum variant currently mis-compiles.
+enum SeFail
+    NotAnEngine(string)
+    DuplicateDoc(string)
+    UnknownDoc(string)
+
+fn _se_fail_text(f) -> string
+    match f
+        NotAnEngine(field) => "not a search engine: no '{field}' field (was it made by se_new?)"
+        DuplicateDoc(id) => "document '{id}' is already indexed -- re-adding would double its term counts"
+        UnknownDoc(id) => "no document '{id}' in this index"
+
+// The ONE place that knows an engine's shape. Every checked entry point goes through it, so "what makes a
+// dict an engine" is stated once and cannot drift from se_new.
+// A LOOP, not all_match, because it must report WHICH field is missing, not merely that one is.
+fn _se_check(engine: dict) -> Result
+    for field in ["index", "docs", "doc_count"]
+        if field not in engine
+            return err(_se_fail_text(NotAnEngine(field)))
+    ok(engine)
+
+// Callers below all propagate a failed `_se_check` as `err(unwrap_err(checked))` rather than returning
+// `checked` itself. That is not ceremony: `_se_check` succeeds with the ENGINE, so its Result's ok-type is
+// a dict, and returning it from a function that succeeds with a list (se_search_checked) or a string
+// (se_get_doc) is a genuine type error -- the checker rejects it, correctly. Re-wrapping carries the reason
+// across without dragging the ok-type along.
+
+// ── case folding ─────────────────────────────────────────────────────────────────────────────────────
+// Both of these are now adapters over the `lower` builtin, which implements the identical ASCII rule and
+// leaves every byte outside A-Z alone (so UTF-8 continuation bytes are untouched, exactly as the old
+// ladder left them).
 fn se_char_lower(ch: string) -> string
-    if ch == "A"
-        return "a"
-    if ch == "B"
-        return "b"
-    if ch == "C"
-        return "c"
-    if ch == "D"
-        return "d"
-    if ch == "E"
-        return "e"
-    if ch == "F"
-        return "f"
-    if ch == "G"
-        return "g"
-    if ch == "H"
-        return "h"
-    if ch == "I"
-        return "i"
-    if ch == "J"
-        return "j"
-    if ch == "K"
-        return "k"
-    if ch == "L"
-        return "l"
-    if ch == "M"
-        return "m"
-    if ch == "N"
-        return "n"
-    if ch == "O"
-        return "o"
-    if ch == "P"
-        return "p"
-    if ch == "Q"
-        return "q"
-    if ch == "R"
-        return "r"
-    if ch == "S"
-        return "s"
-    if ch == "T"
-        return "t"
-    if ch == "U"
-        return "u"
-    if ch == "V"
-        return "v"
-    if ch == "W"
-        return "w"
-    if ch == "X"
-        return "x"
-    if ch == "Y"
-        return "y"
-    if ch == "Z"
-        return "z"
-    ch
+    lower(ch)
 
 fn se_lower(s: string) -> string
-    let out_parts = []
-    for i in 0..len(s)
-        push(out_parts, se_char_lower(s[i]))
-    let out = join(out_parts, "")
-    out
+    lower(s)
 
+// ── the engine ───────────────────────────────────────────────────────────────────────────────────────
+// index:     token -> {doc_id -> term frequency}
+// docs:      doc_id -> the original content
+// doc_count: how many documents have been added
 fn se_new() -> dict
-    let s = {}
-    s["index"] = {}
-    s["docs"] = {}
-    s["doc_count"] = 0
-    s
+    {"index": {}, "docs": {}, "doc_count": 0}
 
+// ── tokenizing ───────────────────────────────────────────────────────────────────────────────────────
+// The characters that end a token. A module-level STRING, which is safe: scalars and strings survive at
+// module level, CONTAINERS DO NOT -- a module-level dict or list reads back empty from inside a module and
+// a write to it is silently discarded.
+let _SE_DELIMS = " \n\t,.!?"
+
+// Split `text` into lower-cased tokens on any delimiter.
+//
+// A LOOP and not a comprehension: a token is accumulated ACROSS iterations, so the step is data-dependent
+// and no comprehension expresses it. (A comprehension could not iterate the string anyway -- `[c for c in
+// s]` compiles inside a module and then segfaults.)
+//
+// Two deliberate changes inside the loop. A sentinel delimiter is appended to the input so the flush
+// happens in ONE place: the old version repeated `if len(word) > 0 { push(tokens, se_lower(word)) }` after
+// the loop, and two copies of the flush are two places to forget the lower-casing. And the token is
+// accumulated into a LIST joined once, not grown with `+=`, which was quadratic -- a 100KB run of
+// non-delimiter bytes (a base64 blob in a document) made the old loop copy ~10^10 bytes.
 fn se_tokenize(text: string) -> list
     let tokens = []
-    let word = ""
-    for i in 0..len(text)
-        let ch = text[i]
-        if ch == " " or ch == "\n" or ch == "\t" or ch == "," or ch == "." or ch == "!" or ch == "?"
-            if len(word) > 0
-                push(tokens, se_lower(word))
-                word = ""
+    let word_chars = []
+    let padded = text + " "
+    for i in 0..len(padded)
+        let ch = char_at(padded, i)
+        if find(_SE_DELIMS, ch) >= 0
+            if len(word_chars) > 0
+                push(tokens, lower(join(word_chars, "")))
+                word_chars = []
         else
-            word += ch
-    if len(word) > 0
-        push(tokens, se_lower(word))
+            push(word_chars, ch)
     tokens
 
-fn se_add_doc(engine: dict, doc_id: string, content: string) -> dict
-    let tokens = se_tokenize(content)
+// ── indexing ─────────────────────────────────────────────────────────────────────────────────────────
+// Add `by` to a counter in a dict of counts. "The count so far, or zero" was written as a contains/else
+// pair twice -- once for term frequencies, once for query scores -- and is now one function used by both.
+fn _se_bump(counts: dict, key: string, by: int)
+    counts[key] = get(counts, key, 0) + by
+
+// Fold one document into the index. THE indexing rule -- both se_add_doc and se_add_doc_checked call this
+// and nothing else, so they cannot disagree about what indexing does.
+// `engine["index"]` is not written back at the end: `idx` IS that dict by reference, which the old body
+// already depended on (it mutated `posting` in place without writing that back either).
+fn _se_index(engine: dict, doc_id: string, content: string) -> dict
     engine["docs"][doc_id] = content
-    engine["doc_count"] = engine["doc_count"] + 1
+    engine["doc_count"] += 1
     let idx = engine["index"]
-    for i in 0..len(tokens)
-        let tok = tokens[i]
-        let has_tok = contains(idx, tok)
-        if has_tok != true
+    for tok in se_tokenize(content)
+        if tok not in idx
             idx[tok] = {}
-        let posting = idx[tok]
-        let has_doc = contains(posting, doc_id)
-        if has_doc == true
-            posting[doc_id] = posting[doc_id] + 1
-        else
-            posting[doc_id] = 1
-    engine["index"] = idx
+        _se_bump(idx[tok], doc_id, 1)
     engine
 
-fn se_search(engine: dict, query: string) -> list
-    let qtokens = se_tokenize(query)
-    let scores = {}
-    let i = 0
-    while i < len(qtokens)
-        let tok = qtokens[i]
-        let has_tok = contains(engine["index"], tok)
-        if has_tok == true
-            let posting = engine["index"][tok]
-            let doc_ids = keys(posting)
-            for j in 0..len(doc_ids)
-                let did = doc_ids[j]
-                let freq = posting[did]
-                let has_did = contains(scores, did)
-                if has_did == true
-                    scores[did] = scores[did] + freq
-                else
-                    scores[did] = freq
-        i += 1
-    let result = []
-    let scored_ids = keys(scores)
-    i = 0
-    while i < len(scored_ids)
-        let entry = {}
-        entry["doc_id"] = scored_ids[i]
-        entry["score"] = scores[scored_ids[i]]
-        push(result, entry)
-        i += 1
-    se_sort_results(result)
+// Add a document to the index and return the engine. Unchecked, exactly as before: a doc_id that is
+// already present is indexed AGAIN, which double-counts doc_count and doubles that document's term
+// frequencies. That is the long-standing behaviour and is PRESERVED -- reach for se_add_doc_checked when
+// re-indexing must not corrupt the scores.
+fn se_add_doc(engine: dict, doc_id: string, content: string) -> dict
+    _se_index(engine, doc_id, content)
 
+// Add a document, REFUSING what the unchecked version corrupts silently:
+//   ok(engine)                                          indexed
+//   err("not a search engine: no 'index' field ...")     the dict was not made by se_new
+//   err("document 'd1' is already indexed ...")          re-adding would double its term counts
+fn se_add_doc_checked(engine: dict, doc_id: string, content: string) -> Result
+    let checked = _se_check(engine)
+    if is_err(checked)
+        return err(unwrap_err(checked))
+    if doc_id in engine["docs"]
+        return err(_se_fail_text(DuplicateDoc(doc_id)))
+    ok(_se_index(engine, doc_id, content))
+
+// ── searching ────────────────────────────────────────────────────────────────────────────────────────
+// Score every document containing any query token and return [{"doc_id": .., "score": ..}] ordered by
+// score, highest first. Score is plain TF: the sum of the term frequencies of the matching tokens.
+//
+// The two `while` loops are now `for` loops, the two contains/else pairs are `get(..., 0)` via _se_bump,
+// and the loop that turned the score dict into a list of entry dicts is a comprehension.
+fn se_search(engine: dict, query: string) -> list
+    let idx = get(engine, "index", {})
+    let scores = {}
+    for tok in se_tokenize(query)
+        if tok in idx
+            let posting = idx[tok]
+            for did in keys(posting)
+                _se_bump(scores, did, posting[did])
+    se_sort_results([{"doc_id": did, "score": scores[did]} for did in keys(scores)])
+
+// Search, REFUSING a dict that is not an engine instead of quietly scoring nothing:
+//   ok([{"doc_id": "d1", "score": 3}, ...])
+//   err("not a search engine: no 'index' field ...")
+fn se_search_checked(engine: dict, query: string) -> Result
+    let checked = _se_check(engine)
+    if is_err(checked)
+        return err(unwrap_err(checked))
+    ok(se_search(engine, query))
+
+// Order results by score, highest first.
+//
+// This replaces a hand-rolled swap-selection sort -- `for i, for j > i, if results[j].score >
+// results[i].score then swap` -- with `sort_by` and a key closure. `sort_by` computes the key once per
+// element and stable-merge-sorts, so it is O(n log n) instead of O(n^2) AND equal scores keep the order
+// they were discovered in. The old sort was UNSTABLE: on scores [a:1, b:1, c:2] its swap history yielded
+// [c, b, a], permuting the two equal elements for no reason. That is the ONE observable change this raise
+// makes to this module, and it makes tie order meaningful (index insertion order) instead of arbitrary.
+//
+// The sorted order is written BACK into `results` because this function has always sorted IN PLACE and
+// returned the same list; a caller holding the original reference must still see it ordered.
 fn se_sort_results(results: list) -> list
-    for i in 0..len(results)
-        let j = i + 1
-        while j < len(results)
-            if results[j]["score"] > results[i]["score"]
-                let tmp = results[i]
-                results[i] = results[j]
-                results[j] = tmp
-            j += 1
+    let ordered = sort_by(results, (r) => 0 - r["score"])
+    for i, r in ordered
+        results[i] = r
     results
 
+// ── queries about the index ──────────────────────────────────────────────────────────────────────────
+// How many documents have been added. `get` with a default rather than a bare index, so a dict that is not
+// an engine yields 0 instead of whatever indexing a missing key produces. Identical for every real engine.
 fn se_doc_count(engine: dict) -> int
-    engine["doc_count"]
+    get(engine, "doc_count", 0)
 
+// Whether `doc_id` has been indexed. The old body was `contains(...) == true` -> `return true` -> `false`,
+// which is the expression itself.
 fn se_has_doc(engine: dict, doc_id: string) -> bool
-    let has_it = contains(engine["docs"], doc_id)
-    if has_it == true
-        return true
-    false
+    doc_id in get(engine, "docs", {})
+
+// The stored content of an indexed document:
+//   ok("The quick brown fox ...")
+//   err("no document 'd9' in this index")
+// The engine has always stored the content under "docs" with no way to read it back out; this is that
+// accessor, and it reports a miss instead of returning "" -- which is also a legitimate document body.
+fn se_get_doc(engine: dict, doc_id: string) -> Result
+    let checked = _se_check(engine)
+    if is_err(checked)
+        return err(unwrap_err(checked))
+    if doc_id not in engine["docs"]
+        return err(_se_fail_text(UnknownDoc(doc_id)))
+    ok(engine["docs"][doc_id])
