@@ -1,53 +1,116 @@
-// forge_state_snapshot — Periodic state snapshots with diff detection.
+// forge_state_snapshot -- Periodic state snapshots with diff detection.
+//
+// RAISED 2026-08-05. Four things were wrong structurally:
+//
+//   1. FOUR FUNCTIONS RETURNED "" FOR "ABSENT", which collides with a stored empty string. A caller could
+//      not tell "that key holds the empty string" from "no such key" or "no such snapshot index" -- and
+//      for a diff tool that distinction is the whole job. The Result-returning forms carry the reason;
+//      the original "" contracts are preserved as one-line adapters.
+//   2. `if has != true` (three times) where `not in` says it directly.
+//   3. THE BOUNDS CHECK WAS WRITTEN OUT THREE TIMES as two separate ifs. It is now one predicate.
+//   4. THE MODULE HAD NO DIFF, despite "with diff detection" in its own title. ss_diff / ss_changed_keys
+//      are added -- and they are short precisely because the lookup rules are now in one place.
+//
+// Storage note, unchanged: a snapshot is flattened into the same dict under "<idx>_<key>" rather than
+// nested, so a KEY CONTAINING "_" is ambiguous with the index prefix. That hazard predates this raise and
+// is preserved rather than silently redesigned; it is called out at ss_snapshot_keys.
+
+// Why a lookup failed. An ADT so the CAUSE is a value: a missing key is a client error, a bad index is a
+// programmer error, and both used to arrive as "".
+enum SnapFail
+    NoKey(string)
+    NoSnapshot(int)
+
+fn _sf_text(f) -> string
+    match f
+        NoKey(k) => "no key '{k}'"
+        NoSnapshot(i) => "no snapshot at index {i}"
 
 fn ss_new() -> dict
-    let s = {}
-    s["current"] = {}
-    s["snapshots"] = {}
-    s["snap_count"] = 0
-    s
+    {"current": {}, "snapshots": {}, "snap_count": 0}
 
 fn ss_set(s: dict, key: string, value: string) -> dict
     s["current"][key] = value
     s
 
+// Is `index` a snapshot that exists? The bounds rule, stated ONCE -- it was two separate ifs repeated
+// in three functions.
+fn ss_has_snapshot(s: dict, index: int) -> bool
+    index >= 0 and index < s["snap_count"]
+
+// Live value KEEPING the reason.
+fn ss_get_checked(s: dict, key: string) -> Result
+    if key not in s["current"]
+        return err(_sf_text(NoKey(key)))
+    ok(s["current"][key])
+
+// Live value, or "" if absent. Contract UNCHANGED -- note "" is also a storable value, so use
+// ss_get_checked when the difference matters.
 fn ss_get(s: dict, key: string) -> string
-    let has = contains(s["current"], key)
-    if has != true
-        return ""
-    s["current"][key]
+    unwrap_or(ss_get_checked(s, key), "")
 
 fn ss_take_snapshot(s: dict, label: string) -> dict
     let idx = s["snap_count"]
-    let k = str(idx)
     let ks = keys(s["current"])
-    for i in 0..len(ks)
-        s["snapshots"][k + "_" + ks[i]] = s["current"][ks[i]]
-    s["snapshots"][k + "_label"] = label
-    s["snapshots"][k + "_key_count"] = len(ks)
+    for k in ks
+        s["snapshots"]["{idx}_{k}"] = s["current"][k]
+    s["snapshots"]["{idx}_label"] = label
+    s["snapshots"]["{idx}_key_count"] = len(ks)
     s["snap_count"] = idx + 1
     s
 
 fn ss_snapshot_count(s: dict) -> int
     s["snap_count"]
 
+fn ss_snapshot_label_checked(s: dict, index: int) -> Result
+    if not ss_has_snapshot(s, index)
+        return err(_sf_text(NoSnapshot(index)))
+    ok(s["snapshots"]["{index}_label"])
+
 fn ss_snapshot_label(s: dict, index: int) -> string
-    if index < 0
-        return ""
-    if index >= s["snap_count"]
-        return ""
-    s["snapshots"][str(index) + "_label"]
+    unwrap_or(ss_snapshot_label_checked(s, index), "")
+
+fn ss_snapshot_value_checked(s: dict, index: int, key: string) -> Result
+    if not ss_has_snapshot(s, index)
+        return err(_sf_text(NoSnapshot(index)))
+    let sk = "{index}_{key}"
+    if sk not in s["snapshots"]
+        return err(_sf_text(NoKey(key)))
+    ok(s["snapshots"][sk])
 
 fn ss_snapshot_value(s: dict, index: int, key: string) -> string
-    if index < 0
-        return ""
-    if index >= s["snap_count"]
-        return ""
-    let sk = str(index) + "_" + key
-    let has = contains(s["snapshots"], sk)
-    if has != true
-        return ""
-    s["snapshots"][sk]
+    unwrap_or(ss_snapshot_value_checked(s, index, key), "")
 
 fn ss_current_size(s: dict) -> int
     len(keys(s["current"]))
+
+// The keys captured in snapshot `index`.
+// CAVEAT, pre-existing and preserved: snapshots are flattened under "<idx>_<key>", so a key that itself
+// contains "_" is indistinguishable from the index prefix of another snapshot. This reconstructs by
+// prefix match, which inherits that ambiguity -- it is not introduced here.
+fn ss_snapshot_keys(s: dict, index: int) -> list
+    if not ss_has_snapshot(s, index)
+        return []
+    let pre = "{index}_"
+    let n = len(pre)
+    let raw = [k for k in keys(s["snapshots"]) if len(k) > n and slice(k, 0, n) == pre]
+    [slice(k, n, len(k)) for k in raw if slice(k, n, len(k)) != "label" and slice(k, n, len(k)) != "key_count"]
+
+// Keys whose value differs between snapshot `index` and the LIVE state. This is the "diff detection"
+// the module was named for and did not have.
+fn ss_changed_keys(s: dict, index: int) -> list
+    if not ss_has_snapshot(s, index)
+        return []
+    let snap_keys = ss_snapshot_keys(s, index)
+    let live_keys = keys(s["current"])
+    // A key counts as changed if it was added, removed, or has a different value. Membership reads as
+    // membership now, and the three cases are one comprehension each rather than a nested scan.
+    let removed = [k for k in snap_keys if k not in s["current"]]
+    let added = [k for k in live_keys if k not in snap_keys]
+    let altered = [k for k in snap_keys if k in s["current"] and ss_snapshot_value(s, index, k) != s["current"][k]]
+    [...removed, ...added, ...altered]
+
+// The diff as data: {key: [snapshot_value, live_value]}. A dict comprehension over the changed keys,
+// so the shape of the answer is written once.
+fn ss_diff(s: dict, index: int) -> dict
+    {k: [ss_snapshot_value(s, index, k), ss_get(s, k)] for k in ss_changed_keys(s, index)}
