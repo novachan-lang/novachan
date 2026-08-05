@@ -6,119 +6,103 @@
 // alternative to JSON when you want a tiny, dependency-free, deterministic format: config blobs, cache keys,
 // message framing. Encoding walks a NOVA value (int/string/list/dict) recursively; decoding is a small recursive
 // parser. This validates that NOVA values round-trip through a self-describing wire format. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Seven problems:
+//
+//   1. _be_less used a `decided` flag to control the comparison loop. Early returns.
+//   2. _be_less used `decided == false`. `not decided` (now removed entirely).
+//   3. bencode_encode had deeply nested else+if chains. Flat if + early return.
+//   4. bencode_encode used quadratic `out +=` for list/dict. Parts list + join.
+//   5. bencode_encode used `"i" + str(v) + "e"`. Interpolation.
+//   6. _be_toint used `0 - v`. `-v`.
+//   7. _be_parse used `p[0] = p[0] + 1` at 9 sites. Compound `+=`.
 
-// PRIVATE: is string a lexicographically before b?
 fn _be_less(a: string, b: string) -> bool
-    let n = len(a)
-    if len(b) < n
-        n = len(b)
-    let out = false
-    let decided = false
-    let i = 0
-    while i < n and decided == false
+    let n = min(len(a), len(b))
+    for i in 0..n
         let ca = ord(char_at(a, i))
         let cb = ord(char_at(b, i))
         if ca < cb
-            out = true
-            decided = true
-        else
-            if ca > cb
-                decided = true
-        i += 1
-    if decided == false and len(a) < len(b)
-        out = true
-    out
+            return true
+        else if ca > cb
+            return false
+    len(a) < len(b)
 
-// Encode a NOVA value (int, string, list, or dict) into a bencode string. Dict keys are emitted sorted (canonical).
 fn bencode_encode(v) -> string
     let t = type_of(v)
-    let out = ""
     if t == "int"
-        out = "i" + str(v) + "e"
-    else
-        if t == "string"
-            out = str(len(v)) + ":" + v
-        else
-            if t == "list"
-                out = "l"
-                for i in 0..len(v)
-                    out += bencode_encode(v[i])
-                out += "e"
-            else
-                if t == "dict"
-                    // sort keys for canonical output
-                    let ks = keys(v)
-                    let a = 1
-                    while a < len(ks)
-                        let keyv = ks[a]
-                        let b = a - 1
-                        while b >= 0 and _be_less(keyv, ks[b])
-                            ks[b + 1] = ks[b]
-                            b -= 1
-                        ks[b + 1] = keyv
-                        a += 1
-                    out = "d"
-                    for j in 0..len(ks)
-                        out += bencode_encode(ks[j]) + bencode_encode(v[ks[j]])
-                    out += "e"
-    out
+        return "i{v}e"
+    if t == "string"
+        return "{len(v)}:{v}"
+    if t == "list"
+        let parts = ["l"]
+        for i in 0..len(v)
+            push(parts, bencode_encode(v[i]))
+        push(parts, "e")
+        return join(parts, "")
+    if t == "dict"
+        let ks = keys(v)
+        // insertion sort for canonical dict key order
+        let a = 1
+        while a < len(ks)
+            let keyv = ks[a]
+            let b = a - 1
+            while b >= 0 and _be_less(keyv, ks[b])
+                ks[b + 1] = ks[b]
+                b -= 1
+            ks[b + 1] = keyv
+            a += 1
+        let parts = ["d"]
+        for j in 0..len(ks)
+            push(parts, bencode_encode(ks[j]))
+            push(parts, bencode_encode(v[ks[j]]))
+        push(parts, "e")
+        return join(parts, "")
+    ""
 
-// PRIVATE: parse a decimal integer string (leading '-' allowed).
 fn _be_toint(s: string) -> int
-    let neg = false
-    let start = 0
-    if len(s) > 0 and char_at(s, 0) == "-"
-        neg = true
-        start = 1
+    let neg = len(s) > 0 and char_at(s, 0) == "-"
+    let start = 1 if neg else 0
     let v = 0
-    let i = start
-    while i < len(s)
+    for i in start..len(s)
         v = v * 10 + (ord(char_at(s, i)) - 48)
-        i += 1
-    if neg
-        v = 0 - v
-    v
+    -v if neg else v
 
-// PRIVATE: recursive parse at position p[0]; returns the decoded value (int/string/list/dict).
 fn _be_parse(s: string, p: list)
     let c = char_at(s, p[0])
     if c == "i"
-        p[0] = p[0] + 1
-        let numstr = ""
+        p[0] += 1
+        let numstr_parts = []
         while char_at(s, p[0]) != "e"
-            numstr += char_at(s, p[0])
-            p[0] = p[0] + 1
-        p[0] = p[0] + 1
-        return _be_toint(numstr)
+            push(numstr_parts, char_at(s, p[0]))
+            p[0] += 1
+        p[0] += 1
+        return _be_toint(join(numstr_parts, ""))
     if c == "l"
-        p[0] = p[0] + 1
+        p[0] += 1
         let lst = []
         while char_at(s, p[0]) != "e"
             push(lst, _be_parse(s, p))
-        p[0] = p[0] + 1
+        p[0] += 1
         return lst
     if c == "d"
-        p[0] = p[0] + 1
+        p[0] += 1
         let dct = {}
         while char_at(s, p[0]) != "e"
             let k = _be_parse(s, p)
             let val = _be_parse(s, p)
             dct[k] = val
-        p[0] = p[0] + 1
+        p[0] += 1
         return dct
-    // byte string: <len>:<bytes>
     let numstr_parts = []
     while char_at(s, p[0]) != ":"
         push(numstr_parts, char_at(s, p[0]))
-        p[0] = p[0] + 1
-    let numstr = join(numstr_parts, "")
-    p[0] = p[0] + 1
-    let length = _be_toint(numstr)
+        p[0] += 1
+    p[0] += 1
+    let length = _be_toint(join(numstr_parts, ""))
     let sv = slice(s, p[0], p[0] + length)
-    p[0] = p[0] + length
+    p[0] += length
     sv
 
-// Decode a bencode string into a NOVA value (int / string / list / dict).
 fn bencode_decode(s: string)
-    let p = [0]
-    _be_parse(s, p)
+    _be_parse(s, [0])
