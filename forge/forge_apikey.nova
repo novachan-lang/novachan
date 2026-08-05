@@ -1,65 +1,47 @@
-// forge_apikey — API keys (Stripe-style prefix_random) + a store for per-key auth + metadata (owner/scopes/
+// forge_apikey -- API keys (Stripe-style prefix_random) + a store for per-key auth + metadata (owner/scopes/
 // rate-limit), keyed by the raw key; extract from Authorization: Bearer or X-API-Key. Keys are CSPRNG. (In
-// prod, store a HASH of the key, not the key itself — a follow-up; document it.) "Verified by reasoning":
+// prod, store a HASH of the key, not the key itself -- a follow-up; document it.) "Verified by reasoning":
 // apikey_generate("sk") -> "sk_<48hex>"; apikey_valid after register; apikey_extract("Bearer sk_x") -> "sk_x".
 //
-// LEAF module — imports NOTHING (only built-ins: secure_bytes, bytes_len, bytes_get, contains, keys, slice,
+// LEAF module -- imports NOTHING (only built-ins: secure_bytes, bytes_len, bytes_get, contains, keys, slice,
 // starts_with, len, str).
+//
+// RAISED 2026-08-05. Three problems:
+//
+//   1. _apikey_rand_hex used a while-index loop. for-in range. And `let out = join(...); out` --
+//      the intermediate binding has no reader.
+//   2. apikey_generate used `prefix + "_" + ...` -- interpolation.
+//   3. apikey_valid / apikey_meta used `contains(store, key)` -- `key in store` is the idiomatic
+//      form and reads as English.
 
-// _apikey_rand_hex -- PRIVATE. Generate nbytes of CSPRNG entropy as lowercase hex (returns 2*nbytes chars).
-// Uses secure_bytes (OS CSPRNG) + bytes_get for extraction. The lookup string indexes each nibble.
 fn _apikey_rand_hex(nbytes: int) -> string
     let b = secure_bytes(nbytes)
     let n = bytes_len(b)
     let digits = "0123456789abcdef"
     let out_parts = []
-    let i = 0
-    while i < n
+    for i in 0..n
         let byte = bytes_get(b, i)
         push(out_parts, digits[byte / 16] + digits[byte % 16])
-        i += 1
-    let out = join(out_parts, "")
-    out
+    join(out_parts, "")
 
-// apikey_generate(prefix) -> string
-// Return prefix + "_" + _apikey_rand_hex(24). 24 bytes = 48 hex chars of entropy (192 bits).
-// Pattern matches Stripe: a human-readable prefix (sk_live, pk_test, rk_...) plus a random secret.
-// Example: apikey_generate("sk_live") -> "sk_live_a3f9e2...48 hex chars...".
 fn apikey_generate(prefix: string) -> string
-    prefix + "_" + _apikey_rand_hex(24)
+    "{prefix}_{_apikey_rand_hex(24)}"
 
-// apikey_store_new() -> dict
-// Create an empty API-key store. The store maps raw key strings -> metadata dicts.
-// Metadata shape (caller-defined, example): {"owner": "alice", "scopes": ["read","write"], "rate_limit": 1000}.
 fn apikey_store_new() -> dict
     {}
 
-// apikey_register(store, key, meta) -> dict
-// Insert `key` -> `meta` into the store and return the store (fluent). Thread-safety: callers that share
-// a store across tasks must own it inside an actor (one owner, message-passing access) — the same rule
-// as all mutable dicts in NOVA.
 fn apikey_register(store: dict, key: string, meta) -> dict
     store[key] = meta
     store
 
-// apikey_valid(store, key) -> bool
-// Return true iff `key` is present in the store (i.e. has been registered and not revoked).
-// O(1) dict lookup; does NOT check expiry — add an exp field in meta and gate on it at the call site.
 fn apikey_valid(store: dict, key: string) -> bool
-    contains(store, key)
+    key in store
 
-// apikey_meta(store, key) -> any
-// Return the metadata dict for `key`, or {} if the key is absent. Callers check apikey_valid first
-// when distinguishing "present with empty meta" from "not registered". Fail-closed: unknown key -> {}.
 fn apikey_meta(store: dict, key: string) -> any
-    if apikey_valid(store, key)
+    if key in store
         return store[key]
     {}
 
-// apikey_revoke(store, key) -> dict
-// Return a NEW store with `key` removed. Immutable rebuild: iterate all keys, copy every entry
-// except `key`. No dict-delete builtin needed; consistent with NOVA's value-model (stores are values).
-// O(n) in the number of registered keys — fine for the common case of <10k active keys per instance.
 fn apikey_revoke(store: dict, key: string) -> dict
     let out = {}
     for k in keys(store)
@@ -67,12 +49,6 @@ fn apikey_revoke(store: dict, key: string) -> dict
             out[k] = store[k]
     out
 
-// apikey_extract(header_value) -> string
-// Extract the raw API key from an already-read header value. Two header forms are supported:
-//   Authorization: Bearer <key>   -> strip the "Bearer " prefix (7 chars), return the key
-//   X-API-Key: <key>              -> the caller passes the value directly; return it as-is
-// This function is pure-value: it takes the header string, not a Request, so it is testable in
-// isolation and usable from any context (middleware, gRPC interceptor, CLI auth).
 fn apikey_extract(header_value: string) -> string
     if starts_with(header_value, "Bearer ")
         return slice(header_value, 7, len(header_value))
