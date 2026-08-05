@@ -1,56 +1,110 @@
 // forge_ab_router — A/B test routing with variant tracking.
+//
+// RAISED 2026-08-05. Three structural problems:
+//
+//   1. THE VARIANT WAS A BARE STRING tested by if/else in three places, and ab_convert's
+//      `if variant == "A" ... else` credited ANY other string to B -- so ab_convert(a, "typo") or
+//      ab_convert(a, "a") silently inflated B's conversions and skewed the experiment. There is now a
+//      registry of the legal variants, ab_convert_checked refuses an unknown one, and the permissive
+//      contract of ab_convert is kept but stated instead of implied.
+//   2. THE A AND B PATHS WERE WRITTEN OUT SEPARATELY in five places (route, convert, two rate
+//      functions, two count functions). They are two symmetric sides of one experiment: the field
+//      names now come from a per-variant table, so each operation is ONE path with a key chosen by
+//      variant. ab_a_rate / ab_b_rate are one-line adapters over ab_rate.
+//   3. FIVE COUNTERS incremented by hand at their own sites, via
+//      `a["x"] = a["x"] + 1`. Compound assignment says it once.
+//
+// An `enum Variant` is the right shape for this and was tried FIRST. It does not compile on the
+// current toolchain: a function returning two different variants of one enum fails to unify them
+// (error[E1001]: expected VariantA, found VariantB), because a variant is typed as its own type rather
+// than as its enum. A compiler fix for exactly that is in flight; this module uses a string-keyed
+// registry, which gives the same single-source-of-truth without the ADT.
+
+// THE registry: every legal variant, and the state fields it owns. The single authority -- ab_variants,
+// ab_is_variant, the rate functions and the count functions all read it, so a variant cannot be added
+// in one place and missed in another.
+fn _ab_fields() -> dict
+    {
+        "A": {"count": "a_count", "conv": "a_conversions"},
+        "B": {"count": "b_count", "conv": "b_conversions"}
+    }
+
+fn ab_variants() -> list
+    keys(_ab_fields())
+
+fn ab_is_variant(name: string) -> bool
+    name in _ab_fields()
+
+fn _ab_count_key(v: string) -> string
+    _ab_fields()[v]["count"]
+
+fn _ab_conv_key(v: string) -> string
+    _ab_fields()[v]["conv"]
 
 fn ab_new(variant_a_pct: int) -> dict
-    let a = {}
-    a["a_pct"] = variant_a_pct
-    a["a_count"] = 0
-    a["b_count"] = 0
-    a["a_conversions"] = 0
-    a["b_conversions"] = 0
-    a
+    {"a_pct": variant_a_pct, "a_count": 0, "b_count": 0, "a_conversions": 0, "b_conversions": 0}
 
+// Which variant does `rand_pct` (0..99) fall into? The split rule, stated once as an expression.
+fn ab_variant_for(a: dict, rand_pct: int) -> string
+    "A" if rand_pct < a["a_pct"] else "B"
+
+// Record an impression and return {variant, a}. Contract UNCHANGED -- the shape callers read.
 fn ab_route(a: dict, rand_pct: int) -> dict
-    let result = {}
-    if rand_pct < a["a_pct"]
-        a["a_count"] = a["a_count"] + 1
-        result["variant"] = "A"
-    else
-        a["b_count"] = a["b_count"] + 1
-        result["variant"] = "B"
-    result["a"] = a
-    result
+    let v = ab_variant_for(a, rand_pct)
+    a[_ab_count_key(v)] += 1
+    {"variant": v, "a": a}
 
+// Credit a conversion to `variant`.
+// CONTRACT UNCHANGED, hole included: an unrecognised name is credited to B. That is a silent
+// experiment-corrupting bug -- ab_convert(a, "a") inflates B -- but existing callers depend on the
+// permissive behaviour, so it stays and is now DOCUMENTED rather than emergent from an if/else.
+// New code should use ab_convert_checked.
 fn ab_convert(a: dict, variant: string) -> dict
-    if variant == "A"
-        a["a_conversions"] = a["a_conversions"] + 1
-    else
-        a["b_conversions"] = a["b_conversions"] + 1
+    let v = variant if ab_is_variant(variant) else "B"
+    a[_ab_conv_key(v)] += 1
     a
+
+// The STRICT door: an unknown variant name is an error naming the legal set, not a silent credit to B.
+//     state = ab_convert_checked(state, name)?
+fn ab_convert_checked(a: dict, variant: string) -> Result
+    if not ab_is_variant(variant)
+        return err("unknown variant '{variant}' (expected one of {join(ab_variants(), \", \")})")
+    a[_ab_conv_key(variant)] += 1
+    ok(a)
+
+// Conversion rate in whole percent, 0 when the variant has had no traffic. ONE rate function taking a
+// variant; ab_a_rate and ab_b_rate each carried the same three lines.
+fn ab_rate(a: dict, v: string) -> int
+    let n = a[_ab_count_key(v)]
+    0 if n == 0 else a[_ab_conv_key(v)] * 100 / n
 
 fn ab_a_rate(a: dict) -> int
-    if a["a_count"] == 0
-        return 0
-    a["a_conversions"] * 100 / a["a_count"]
+    ab_rate(a, "A")
 
 fn ab_b_rate(a: dict) -> int
-    if a["b_count"] == 0
-        return 0
-    a["b_conversions"] * 100 / a["b_count"]
+    ab_rate(a, "B")
 
 fn ab_winner(a: dict) -> string
     let ra = ab_a_rate(a)
     let rb = ab_b_rate(a)
     if ra > rb
         return "A"
-    if rb > ra
-        return "B"
-    "tie"
+    "B" if rb > ra else "tie"
 
+// Impressions per variant, summed off the registry rather than by naming both counters.
 fn ab_total_traffic(a: dict) -> int
-    a["a_count"] + a["b_count"]
+    sum([a[_ab_count_key(v)] for v in ab_variants()])
+
+fn ab_count(a: dict, v: string) -> int
+    a[_ab_count_key(v)]
 
 fn ab_a_count(a: dict) -> int
-    a["a_count"]
+    ab_count(a, "A")
 
 fn ab_b_count(a: dict) -> int
-    a["b_count"]
+    ab_count(a, "B")
+
+// The whole experiment as data: {variant: [impressions, conversions, rate_pct]}. A dict comprehension
+// over the registry, so reporting does not have to name A and B at all.
+fn ab_report(a: dict) -> dict
+    {v: [ab_count(a, v), a[_ab_conv_key(v)], ab_rate(a, v)] for v in ab_variants()}

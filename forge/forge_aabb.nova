@@ -2,67 +2,76 @@
 // 2D game (Reactor physics), UI hit-testing, and spatial index uses before any expensive precise test. A box
 // is [x, y, w, h] (top-left origin, width/height). This gives overlap, point-containment, box-containment, and
 // the intersection rectangle. Where forge_polygon does arbitrary shapes, AABB is the O(1) rectangle case. LEAF.
+//
+// RAISED 2026-08-05. Every predicate was a chain of four `if <cond> return false` statements ending in
+// `true` -- the negation of one boolean expression, spelled out one clause at a time. Written directly,
+// each becomes the geometric rule it IS, and the four edge cases can be read together instead of in
+// sequence. The private _ab_max / _ab_min re-implemented the max/min builtins.
+//
+// Boxes are lists rather than a struct DELIBERATELY: [x,y,w,h] is the interchange format these functions
+// exist to accept (from forge_polygon, the sprite layer, spatial indexes), and every accessor below is a
+// one-liner over it. A struct would force a conversion at every boundary for no gain -- the opposite of
+// deflatex's bit-writer, whose 3-list WAS the hazard because its layout was implicit and mutated in place.
+
+// PRIVATE: the four edges of a box, named. The expressions a[0]+a[2] and a[1]+a[3] appeared eleven times
+// across this module with the meaning left to the reader.
+fn aabb_left(b: list) -> int
+    b[0]
+fn aabb_top(b: list) -> int
+    b[1]
+fn aabb_right(b: list) -> int
+    b[0] + b[2]
+fn aabb_bottom(b: list) -> int
+    b[1] + b[3]
 
 // Do boxes a and b overlap? Uses strict inequalities, so boxes that merely share an edge do NOT count as
-// overlapping (touching is not colliding).
+// overlapping (touching is not colliding). Two boxes overlap exactly when they overlap on BOTH axes, which
+// is what this now says.
 fn aabb_intersects(a: list, b: list) -> bool
-    if a[0] + a[2] <= b[0]
-        return false
-    if b[0] + b[2] <= a[0]
-        return false
-    if a[1] + a[3] <= b[1]
-        return false
-    if b[1] + b[3] <= a[1]
-        return false
-    true
+    aabb_right(a) > aabb_left(b) and aabb_right(b) > aabb_left(a) and aabb_bottom(a) > aabb_top(b) and aabb_bottom(b) > aabb_top(a)
 
 // Is point (px, py) inside box (edges inclusive on the top-left, exclusive on the bottom-right)?
 // NOTE: box values are coerced to float (*1.0) before comparing to the float px/py -- comparing a float
 // variable directly to an int value is UNSOUND in NOVA (the int side is bit-reinterpreted; see memory), so
-// both operands must be the same type.
+// both operands must be the same type. That coercion is why this cannot just use the edge helpers above.
 fn aabb_contains_point(box: list, px: float, py: float) -> bool
-    let bx = box[0] * 1.0
-    let by = box[1] * 1.0
-    let bx2 = (box[0] + box[2]) * 1.0
-    let by2 = (box[1] + box[3]) * 1.0
-    if px < bx
-        return false
-    if py < by
-        return false
-    if px >= bx2
-        return false
-    if py >= by2
-        return false
-    true
+    px >= aabb_left(box) * 1.0 and py >= aabb_top(box) * 1.0 and px < aabb_right(box) * 1.0 and py < aabb_bottom(box) * 1.0
 
-// Does box a fully contain box b?
+// Does box a fully contain box b? b is inside a exactly when b's edges do not cross a's.
 fn aabb_contains(a: list, b: list) -> bool
-    if b[0] < a[0]
-        return false
-    if b[1] < a[1]
-        return false
-    if b[0] + b[2] > a[0] + a[2]
-        return false
-    if b[1] + b[3] > a[1] + a[3]
-        return false
-    true
-
-// PRIVATE: max/min helpers over two numbers.
-fn _ab_max(x, y)
-    if x > y
-        return x
-    y
-fn _ab_min(x, y)
-    if x < y
-        return x
-    y
+    aabb_left(b) >= aabb_left(a) and aabb_top(b) >= aabb_top(a) and aabb_right(b) <= aabb_right(a) and aabb_bottom(b) <= aabb_bottom(a)
 
 // The intersection rectangle [x, y, w, h] of a and b, or [0,0,0,0] if they do not overlap.
+// _ab_max / _ab_min are gone -- they were the `max` and `min` builtins written out again.
 fn aabb_intersection(a: list, b: list) -> list
-    if aabb_intersects(a, b) == false
+    if not aabb_intersects(a, b)
         return [0, 0, 0, 0]
-    let x = _ab_max(a[0], b[0])
-    let y = _ab_max(a[1], b[1])
-    let x2 = _ab_min(a[0] + a[2], b[0] + b[2])
-    let y2 = _ab_min(a[1] + a[3], b[1] + b[3])
+    let x = max(aabb_left(a), aabb_left(b))
+    let y = max(aabb_top(a), aabb_top(b))
+    let x2 = min(aabb_right(a), aabb_right(b))
+    let y2 = min(aabb_bottom(a), aabb_bottom(b))
     [x, y, x2 - x, y2 - y]
+
+// The smallest box containing BOTH a and b. The mirror of aabb_intersection, and the operation a spatial
+// index needs when growing a node -- the module offered the intersection but not the union.
+fn aabb_union(a: list, b: list) -> list
+    let x = min(aabb_left(a), aabb_left(b))
+    let y = min(aabb_top(a), aabb_top(b))
+    let x2 = max(aabb_right(a), aabb_right(b))
+    let y2 = max(aabb_bottom(a), aabb_bottom(b))
+    [x, y, x2 - x, y2 - y]
+
+fn aabb_area(b: list) -> int
+    b[2] * b[3]
+
+// Does `box` overlap ANY box in `boxes`? / ALL of them? The broad-phase question callers actually ask,
+// stated with any_match / all_match over a closure instead of a scan loop at each call site.
+fn aabb_intersects_any(box: list, boxes: list) -> bool
+    any_match(boxes, (o) => aabb_intersects(box, o))
+
+fn aabb_intersects_all(box: list, boxes: list) -> bool
+    all_match(boxes, (o) => aabb_intersects(box, o))
+
+// Every box in `boxes` that overlaps `box` -- the broad-phase result itself, as a filtered comprehension.
+fn aabb_overlapping(box: list, boxes: list) -> list
+    [o for o in boxes if aabb_intersects(box, o)]
