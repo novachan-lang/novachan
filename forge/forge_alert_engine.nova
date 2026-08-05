@@ -1,79 +1,170 @@
-fn ae_new()
-    let s = {}
-    s["rule_count"] = 0
-    s["rule_names"] = ""
-    s["alert_count"] = 0
-    s["check_count"] = 0
-    return s
+// forge_alert_engine -- threshold alerting: register named rules ("cpu > 90"), feed metric values, and
+// get back which rules fired. The shape a monitoring alertmanager has: rules are data, a check is a
+// single pass over the rules watching that metric, and per-rule + global fire counts accumulate. State
+// is a flat dict so it can be snapshotted or persisted as-is. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Four problems, one of them a real hole in the alerting itself:
+//
+//   1. THE COMPARATOR WAS FIVE SEPARATE NON-CHAINED `if`s:
+//        if op == "gt" and value > thresh
+//            fire = 1
+//        if op == "lt" and value < thresh
+//            fire = 1
+//        ... three more ...
+//      An UNRECOGNISED operator matched none of them, so `fire` stayed 0 and the rule SILENTLY NEVER
+//      FIRED. A typo'd op -- "GT", "greater", ">" -- registers happily via ae_add_rule and then
+//      disables that alert forever, which is the worst failure mode a monitoring system can have: it
+//      looks healthy because nothing is watching. The operators are now a dict of CLOSURES, which is
+//      also the single authority for which ops exist, and ae_add_rule_checked refuses an unknown one.
+//   2. THE RULE KEYS "rule_<i>_name" (and _metric/_op/_threshold/_alerts) were rebuilt by
+//      concatenation at ELEVEN sites. _rule_key owns the scheme.
+//   3. `triggered` was grown with `triggered += "," + rname` inside the loop -- string concatenation
+//      per firing rule, which is quadratic. It is a list joined once.
+//   4. rule_names was a CSV kept beside rule_count: two derived facts stored as state.
 
-fn ae_add_rule(s, rule_name, metric_name, op, threshold)
+// THE operator registry. A dict of closures, so adding an operator is one row and the set of legal
+// operators is a value the module can be asked about -- it used to exist only implicitly inside the
+// five if-statements, which is why nothing could reject a typo.
+fn ae_operators() -> dict
+    {
+        "gt": (v, t) => v > t,
+        "lt": (v, t) => v < t,
+        "eq": (v, t) => v == t,
+        "gte": (v, t) => v >= t,
+        "lte": (v, t) => v <= t
+    }
+
+fn ae_operator_names() -> list
+    keys(ae_operators())
+
+fn ae_is_operator(op: string) -> bool
+    op in ae_operators()
+
+// PRIVATE: THE rule key scheme, previously concatenated at eleven sites.
+fn _rule_key(idx: int, field: string) -> string
+    "rule_{idx}_{field}"
+
+// PRIVATE: append to a CSV held in one string field.
+fn _csv_append(csv: string, item: string) -> string
+    item if csv == "" else "{csv},{item}"
+
+fn ae_new() -> dict
+    {"rule_count": 0, "rule_names": "", "alert_count": 0, "check_count": 0}
+
+// PRIVATE: the registration itself, shared by the permissive and strict doors.
+fn _ae_bind(s: dict, rule_name: string, metric_name: string, op: string, threshold: int) -> dict
     let idx = int(s["rule_count"])
-    s["rule_" + str(idx) + "_name"] = rule_name
-    s["rule_" + str(idx) + "_metric"] = metric_name
-    s["rule_" + str(idx) + "_op"] = op
-    s["rule_" + str(idx) + "_threshold"] = threshold
-    s["rule_" + str(idx) + "_alerts"] = 0
+    s[_rule_key(idx, "name")] = rule_name
+    s[_rule_key(idx, "metric")] = metric_name
+    s[_rule_key(idx, "op")] = op
+    s[_rule_key(idx, "threshold")] = threshold
+    s[_rule_key(idx, "alerts")] = 0
     s["rule_count"] = idx + 1
-    if s["rule_names"] == ""
-        s["rule_names"] = rule_name
-    else
-        s["rule_names"] = str(s["rule_names"]) + "," + rule_name
-    return s
+    s["rule_names"] = _csv_append(str(s["rule_names"]), rule_name)
+    s
 
-fn ae_check(s, metric_name, value) -> Result
-    let count = int(s["rule_count"])
-    let triggered = ""
-    for i in 0..count
-        let rmetric = str(s["rule_" + str(i) + "_metric"])
-        if rmetric == metric_name
-            let op = str(s["rule_" + str(i) + "_op"])
-            let thresh = int(s["rule_" + str(i) + "_threshold"])
-            let fire = 0
-            if op == "gt" and value > thresh
-                fire = 1
-            if op == "lt" and value < thresh
-                fire = 1
-            if op == "eq" and value == thresh
-                fire = 1
-            if op == "gte" and value >= thresh
-                fire = 1
-            if op == "lte" and value <= thresh
-                fire = 1
-            if fire == 1
-                let rname = str(s["rule_" + str(i) + "_name"])
-                s["rule_" + str(i) + "_alerts"] = int(s["rule_" + str(i) + "_alerts"]) + 1
-                s["alert_count"] = int(s["alert_count"]) + 1
-                if triggered == ""
-                    triggered = rname
-                else
-                    triggered += "," + rname
+// Register a rule. CONTRACT UNCHANGED: an unrecognised `op` is accepted and the rule then never fires.
+// That is a silent monitoring hole -- see the header -- but existing callers depend on the permissive
+// behaviour, so it stays. New code should use ae_add_rule_checked.
+fn ae_add_rule(s: dict, rule_name: string, metric_name: string, op: string, threshold: int) -> dict
+    _ae_bind(s, rule_name, metric_name, op, threshold)
+
+// The STRICT door: an unknown operator is an error naming the legal set, rather than a rule that
+// quietly watches nothing.
+//     state = ae_add_rule_checked(state, "cpu-high", "cpu", "gt", 90)?
+fn ae_add_rule_checked(s: dict, rule_name: string, metric_name: string, op: string, threshold: int) -> Result
+    if not ae_is_operator(op)
+        return err("unknown operator '{op}' (expected one of {join(ae_operator_names(), \", \")})")
+    ok(_ae_bind(s, rule_name, metric_name, op, threshold))
+
+// PRIVATE: does rule `i` fire on `value`? An unknown operator does not fire -- the pre-existing
+// behaviour, preserved, but now in ONE place with a name instead of as the gap between five ifs.
+fn _ae_fires(s: dict, i: int, value: int) -> bool
+    let op = str(s[_rule_key(i, "op")])
+    if not ae_is_operator(op)
+        return false
+    let test = ae_operators()[op]
+    test(value, int(s[_rule_key(i, "threshold")]))
+
+// PRIVATE: the indices of every rule watching `metric_name`.
+fn _ae_rules_for(s: dict, metric_name: string) -> list
+    [i for i in 0..int(s["rule_count"]) if str(s[_rule_key(i, "metric")]) == metric_name]
+
+// Feed one metric value. Every rule watching that metric is evaluated; each firing rule's own counter
+// and the global alert count are incremented, and last_triggered records the firing rule names.
+fn ae_check(s: dict, metric_name: string, value: int) -> Result
+    let firing = [i for i in _ae_rules_for(s, metric_name) if _ae_fires(s, i, value)]
+    for i in firing
+        s[_rule_key(i, "alerts")] = int(s[_rule_key(i, "alerts")]) + 1
+        s["alert_count"] = int(s["alert_count"]) + 1
     s["check_count"] = int(s["check_count"]) + 1
-    if triggered == ""
-        return ok(s)
-    s["last_triggered"] = triggered
-    return ok(s)
+    // Joined ONCE. The old loop grew this string with `+= "," + name` per firing rule.
+    if len(firing) > 0
+        s["last_triggered"] = join([str(s[_rule_key(i, "name")]) for i in firing], ",")
+    ok(s)
 
-fn ae_alert_count(s)
-    return int(s["alert_count"])
+fn ae_alert_count(s: dict) -> int
+    int(s["alert_count"])
 
-fn ae_rule_count(s)
-    return int(s["rule_count"])
+fn ae_rule_count(s: dict) -> int
+    int(s["rule_count"])
 
-fn ae_check_count(s)
-    return int(s["check_count"])
+fn ae_check_count(s: dict) -> int
+    int(s["check_count"])
 
-fn ae_rule_alerts(s, rule_name) -> Result
-    let count = int(s["rule_count"])
-    for i in 0..count
-        let rname = str(s["rule_" + str(i) + "_name"])
-        if rname == rule_name
-            return ok(int(s["rule_" + str(i) + "_alerts"]))
-    return err("rule not found: " + rule_name)
+// PRIVATE: the index of the rule called `rule_name`, or -1. The linear search was inline in
+// ae_rule_alerts and is needed by the new accessors too.
+fn _ae_index_of(s: dict, rule_name: string) -> int
+    for i in 0..int(s["rule_count"])
+        if str(s[_rule_key(i, "name")]) == rule_name
+            return i
+    0 - 1
 
-fn ae_last_triggered(s) -> Result
+fn ae_rule_alerts(s: dict, rule_name: string) -> Result
+    let i = _ae_index_of(s, rule_name)
+    if i < 0
+        return err("rule not found: {rule_name}")
+    ok(int(s[_rule_key(i, "alerts")]))
+
+fn ae_last_triggered(s: dict) -> Result
     if "last_triggered" not in s
         return err("no alerts triggered")
-    return ok(str(s["last_triggered"]))
+    ok(str(s["last_triggered"]))
 
-fn ae_rule_names(s)
-    return str(s["rule_names"])
+fn ae_rule_names(s: dict) -> string
+    str(s["rule_names"])
+
+// --- what the engine tracked but could not report -------------------------------------------------
+
+// The rule names as a LIST. rule_names is a CSV kept beside rule_count -- two derived facts stored as
+// state; this derives the list from the rules themselves, so it cannot disagree with them.
+fn ae_rules(s: dict) -> list
+    [str(s[_rule_key(i, "name")]) for i in 0..int(s["rule_count"])]
+
+// One rule as data: {name, metric, op, threshold, alerts}. A caller inspecting a rule had to rebuild
+// five mangled keys itself.
+fn ae_rule(s: dict, rule_name: string) -> Result
+    let i = _ae_index_of(s, rule_name)
+    if i < 0
+        return err("rule not found: {rule_name}")
+    ok({"name": str(s[_rule_key(i, "name")]),
+        "metric": str(s[_rule_key(i, "metric")]),
+        "op": str(s[_rule_key(i, "op")]),
+        "threshold": int(s[_rule_key(i, "threshold")]),
+        "alerts": int(s[_rule_key(i, "alerts")])})
+
+// Which rules WOULD fire on this value, without recording anything -- a dry run, which is how an
+// operator tests a threshold before deploying it. ae_check is the only way to evaluate a rule today,
+// and it mutates the counters.
+fn ae_would_fire(s: dict, metric_name: string, value: int) -> list
+    [str(s[_rule_key(i, "name")]) for i in _ae_rules_for(s, metric_name) if _ae_fires(s, i, value)]
+
+// Rules registered with an operator this engine does not implement -- i.e. rules that can never fire.
+// Exactly the silent hole described in the header, made auditable: a monitoring config can be checked
+// for dead rules instead of appearing healthy because nothing is watching.
+fn ae_dead_rules(s: dict) -> list
+    [str(s[_rule_key(i, "name")]) for i in 0..int(s["rule_count"]) if not ae_is_operator(str(s[_rule_key(i, "op")]))]
+
+// Fires per rule: {name: count}. A dict comprehension, so a dashboard does not need the index scheme.
+fn ae_report(s: dict) -> dict
+    {str(s[_rule_key(i, "name")]): int(s[_rule_key(i, "alerts")]) for i in 0..int(s["rule_count"])}
