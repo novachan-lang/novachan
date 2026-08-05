@@ -10,9 +10,10 @@ export function activate(context: vscode.ExtensionContext) {
     const isWin = process.platform === 'win32';
     const ext = isWin ? '.exe' : '';
 
-    // The compiler binary is the LSP server when run with the 'lsp' subcommand.
-    // (Prior versions shipped a separate nova-lsp.exe; that's now a copy of
-    // nova-compiler.exe and either path works.)
+    // The compiler binary IS the LSP server when run with the 'lsp' subcommand
+    // (nova_compiler.nova's lsp_server_main, self-hosted alongside the compiler
+    // proper). nova-lsp.exe is kept as an identical copy for back-compat with
+    // nova.lsp.path pointing at it directly, but nova-compiler.exe is canonical.
     let serverPath = config.get<string>('lsp.path', '');
     if (!serverPath) {
         serverPath = path.join(context.extensionPath, 'bin', `nova-compiler${ext}`);

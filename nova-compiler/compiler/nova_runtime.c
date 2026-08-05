@@ -1590,6 +1590,12 @@ static const char* nova_str_safe(int64_t handle) {
     return "";
 }
 
+static inline int64_t nova_str_len_fast(const char* s) {
+    NovaMemTag tag = nova_mem_find_tag((void*)s);
+    if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN(s);
+    return (int64_t)strlen(s);
+}
+
 /* nova_rt_init is defined later (after all lock declarations) */
 
 /* int_to_str cache declared above (before nova_mem_find_tag) */
@@ -5701,8 +5707,7 @@ int64_t nova_rt_read_file(int64_t path) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "cannot open file '%s': %s", p, strerror(errno));
         nova_set_error(errbuf);
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        return nova_str_take(NULL);
     }
 #ifdef _WIN32
     _fseeki64(f, 0, SEEK_END);
@@ -5717,10 +5722,18 @@ int64_t nova_rt_read_file(int64_t path) {
         fclose(f);
         nova_set_error(sz < 0 ? "read_file: cannot determine size"
                                : "read_file: file exceeds 512MB limit");
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        return nova_str_take(NULL);
     }
-    char* buf = (char*)nova_heap_alloc((size_t)sz + 1, NOVA_MEM_RAW);
+    /* PERF: return a proper FAT string (cached length via nova_str_take, which itself
+       wraps nova_fat_str_create) instead of a bare NOVA_MEM_RAW allocation. RAW strings
+       have no cached length at all -- every downstream len()/indexing/slice call on
+       them falls back to strlen(), and a tokenizer indexing this content character by
+       character turned that into an O(n^2) full-file rescan on EVERY character. A
+       235KB file took 5.9s to index for exactly this reason even after fixing
+       nova_rt_str_char_at itself, because read_file's own output was never fat-tagged
+       in the first place. malloc (not nova_heap_alloc) here since nova_str_take frees
+       its input with plain free(). */
+    char* buf = (char*)malloc((size_t)sz + 1);
     if (!buf) {
         fclose(f);
         nova_set_error("read_file: out of memory");
@@ -5729,7 +5742,7 @@ int64_t nova_rt_read_file(int64_t path) {
     size_t nr = fread(buf, 1, (size_t)sz, f);
     buf[nr] = '\0';
     fclose(f);
-    return (int64_t)(uintptr_t)buf;
+    return nova_str_take(buf);
 }
 
 #ifdef _WIN32
@@ -5851,11 +5864,14 @@ static int json_at_end(JsonParser* p) { return p->pos >= p->len; }
 static int64_t json_parse_value(JsonParser* p);
 
 static int64_t json_make_str(const char* s, int64_t len) {
-    char* buf = (char*)nova_heap_alloc((size_t)len + 1, NOVA_MEM_RAW);
-    if (!buf) return 0;
-    memcpy(buf, s, (size_t)len);
-    buf[len] = '\0';
-    return (int64_t)(uintptr_t)buf;
+    /* PERF: a FAT string (cached length), not a bare RAW allocation -- this is the
+       no-escape fast path for every JSON string VALUE, including an LSP didOpen/
+       didChange message's entire "text" field (the whole open file, as one JSON
+       string). A RAW string has no cached length, so every len()/index/slice on it
+       falls back to strlen(); a tokenizer indexing that content character by
+       character turned into an O(n^2) full-string rescan per character. See
+       nova_rt_read_file for the same fix and fuller rationale. */
+    return (int64_t)(uintptr_t)nova_fat_str_create(s, (size_t)len);
 }
 
 static int64_t json_parse_string(JsonParser* p) {
@@ -5876,7 +5892,11 @@ static int64_t json_parse_string(JsonParser* p) {
     if (!has_escape) {
         return json_make_str(p->src + start, raw_len);
     }
-    char* buf = (char*)nova_heap_alloc((size_t)raw_len + 1, NOVA_MEM_RAW);
+    /* PERF: malloc (not nova_heap_alloc) -- this buffer is handed to nova_str_take
+       below, which frees it with plain free() and returns a proper FAT string (see
+       json_make_str for the fuller rationale: this is the escaped-string path, hit
+       by every LSP didOpen/didChange "text" field since JSON escapes newlines). */
+    char* buf = (char*)malloc((size_t)raw_len + 1);
     if (!buf) return 0;
     int64_t out = 0;
     for (int64_t i = start; i < start + raw_len; ) {
@@ -5950,7 +5970,7 @@ static int64_t json_parse_string(JsonParser* p) {
         }
     }
     buf[out] = '\0';
-    return (int64_t)(uintptr_t)buf;
+    return nova_str_take(buf);
 }
 
 static int64_t json_parse_number(JsonParser* p) {
@@ -17560,7 +17580,7 @@ int64_t nova_rt_file_read_bytes(int64_t h, int64_t n) {
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = nova_str_safe(str_val);
     if (!s) return (int64_t)(uintptr_t)"";
-    int64_t len = (int64_t)strlen(s);
+    int64_t len = nova_str_len_fast(s);
     int64_t idx = index;
     if (idx < 0) idx += len;
     if (idx < 0 || idx >= len) return (int64_t)(uintptr_t)"";

@@ -29220,6 +29220,126 @@ fn lsp_get_completions(docs: dict, uri: string) -> string
         i = i + 1
     join(items, ",")
 
+// ── Document symbols (outline) — Ctrl+O "Quick Outline" ─────────────────────
+// Text-scan based (same style as lsp_find_definition), since Stmt tracks only
+// a start line (sline), not a column — re-deriving the column from the raw
+// line text is simpler and matches the rest of this file's approach.
+fn lsp_get_document_symbols(docs: dict, uri: string) -> string
+    if not contains(docs, uri)
+        return "[]"
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let items = []
+    let i = 0
+    while i < len(lines)
+        let raw = lines[i]
+        let line = trim(raw)
+        let sym_name = ""
+        let sym_kind = 0
+        if starts_with(line, "fn ")
+            let after = slice(line, 3, len(line))
+            let stop = len(after)
+            let paren = find(after, "(")
+            let langle = find(after, "<")
+            if paren >= 0 and paren < stop
+                stop = paren
+            if langle >= 0 and langle < stop
+                stop = langle
+            let cand = trim(slice(after, 0, stop))
+            if len(cand) > 0 and find(cand, " ") < 0
+                sym_name = cand
+                if find(cand, ".") >= 0
+                    sym_kind = 6
+                else
+                    sym_kind = 12
+        else if starts_with(line, "type ")
+            let after = trim(slice(line, 5, len(line)))
+            let stop = len(after)
+            let sp = find(after, " ")
+            let langle = find(after, "<")
+            if sp >= 0 and sp < stop
+                stop = sp
+            if langle >= 0 and langle < stop
+                stop = langle
+            let cand = slice(after, 0, stop)
+            if len(cand) > 0
+                sym_name = cand
+                sym_kind = 23
+        else if starts_with(line, "enum ")
+            let after = trim(slice(line, 5, len(line)))
+            let stop = len(after)
+            let sp = find(after, " ")
+            let langle = find(after, "<")
+            if sp >= 0 and sp < stop
+                stop = sp
+            if langle >= 0 and langle < stop
+                stop = langle
+            let cand = slice(after, 0, stop)
+            if len(cand) > 0
+                sym_name = cand
+                sym_kind = 10
+        else if starts_with(line, "trait ")
+            let after = trim(slice(line, 6, len(line)))
+            let stop = len(after)
+            let sp = find(after, " ")
+            if sp >= 0 and sp < stop
+                stop = sp
+            let cand = slice(after, 0, stop)
+            if len(cand) > 0
+                sym_name = cand
+                sym_kind = 11
+        if len(sym_name) > 0
+            let col = find(raw, sym_name)
+            if col < 0
+                col = 0
+            let name_end = col + len(sym_name)
+            let sym = "\{\"name\":\"" + lsp_escape_json(sym_name) + "\",\"kind\":" + str(sym_kind) + ",\"range\":\{\"start\":\{\"line\":" + str(i) + ",\"character\":0\},\"end\":\{\"line\":" + str(i) + ",\"character\":" + str(len(raw)) + "\}\},\"selectionRange\":\{\"start\":\{\"line\":" + str(i) + ",\"character\":" + str(col) + "\},\"end\":\{\"line\":" + str(i) + ",\"character\":" + str(name_end) + "\}\}\}"
+            push(items, sym)
+        i = i + 1
+    "[" + join(items, ",") + "]"
+
+// ── Find references / rename — token-based (not text-scan) ─────────────────
+// Uses the real tokenizer so string/comment contents are never mistaken for
+// identifier usages (a plain text scan would match "where" inside a comment
+// or a string literal; IDENT tokens cannot appear there). SAME-FILE scope
+// only: a correct workspace-wide index is a separate, larger effort (would
+// need tokenizing every file in the project on every request) and is not
+// attempted here — this is intentionally scoped, not a silent gap.
+fn lsp_find_references(docs: dict, uri: string, word: string) -> list
+    let refs = []
+    if word == "" or not contains(docs, uri)
+        return refs
+    let source = docs[uri]
+    let tokens = tokenize(source)
+    for tok in tokens
+        match tok
+            Token(tk_kind, tk_val, tk_line, tk_col) =>
+                if tk_kind == "IDENT" and tk_val == word
+                    push(refs, [tk_line - 1, tk_col - 1, len(word)])
+    refs
+
+fn lsp_references_response(docs: dict, uri: string, word: string) -> string
+    let refs = lsp_find_references(docs, uri, word)
+    let items = []
+    for r in refs
+        let rl = r[0]
+        let rc = r[1]
+        let rlen = r[2]
+        push(items, "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + rlen) + "\}\}\}")
+    "[" + join(items, ",") + "]"
+
+fn lsp_rename_response(docs: dict, uri: string, word: string, new_name: string) -> string
+    let refs = lsp_find_references(docs, uri, word)
+    if len(refs) == 0
+        return "null"
+    let edits = []
+    for r in refs
+        let rl = r[0]
+        let rc = r[1]
+        let rlen = r[2]
+        push(edits, "\{\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + rlen) + "\}\},\"newText\":\"" + lsp_escape_json(new_name) + "\"\}")
+    "\{\"changes\":\{\"" + lsp_escape_json(uri) + "\":[" + join(edits, ",") + "]\}\}"
+
 fn lsp_server_main()
     write_raw("NOVA LSP server started\n")
     let docs = {}
@@ -29238,7 +29358,7 @@ fn lsp_server_main()
             id = msg["id"]
             has_id = true
         if method == "initialize"
-            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\}\}\}"
+            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":true\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"
             write_raw("NOVA LSP initialized\n")
@@ -29326,6 +29446,39 @@ fn lsp_server_main()
                 let curi = ctd["uri"]
                 let citems = lsp_get_completions(docs, curi)
                 lsp_respond(id, "\{\"isIncomplete\":false,\"items\":[" + citems + "]\}")
+        else if method == "textDocument/documentSymbol"
+            if has_id
+                let sparams = msg["params"]
+                let std = sparams["textDocument"]
+                let suri = std["uri"]
+                lsp_respond(id, lsp_get_document_symbols(docs, suri))
+        else if method == "textDocument/references"
+            if has_id
+                let rparams = msg["params"]
+                let rtd = rparams["textDocument"]
+                let ruri = rtd["uri"]
+                let rpos = rparams["position"]
+                let rline = rpos["line"]
+                let rcol = rpos["character"]
+                let rword = lsp_get_word_at(docs, ruri, rline, rcol)
+                if rword != ""
+                    lsp_respond(id, lsp_references_response(docs, ruri, rword))
+                else
+                    lsp_respond(id, "[]")
+        else if method == "textDocument/rename"
+            if has_id
+                let nparams = msg["params"]
+                let ntd = nparams["textDocument"]
+                let nuri = ntd["uri"]
+                let npos = nparams["position"]
+                let nline = npos["line"]
+                let ncol = npos["character"]
+                let nnew = nparams["newName"]
+                let nword = lsp_get_word_at(docs, nuri, nline, ncol)
+                if nword != "" and nnew != ""
+                    lsp_respond(id, lsp_rename_response(docs, nuri, nword, nnew))
+                else
+                    lsp_respond(id, "null")
         else if has_id
             lsp_error_response(id, -32601, "Method not found: " + method)
 
