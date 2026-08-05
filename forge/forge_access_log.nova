@@ -1,22 +1,33 @@
 // forge_access_log — HTTP access log with analysis.
 // CLF-style entries, unique visitors, top paths, bandwidth.
+//
+// RAISED 2026-08-05.
+//   1. FIVE FUNCTIONS EACH WALKED al["entries"] WITH AN INDEX (`let i = 0 / while i < len(...) /
+//      al["entries"][i][...] / i += 1`) -- the subscript repeated three times per body just to reach
+//      one field. Every one of them is a comprehension, a filter, or a fold over the entries.
+//   2. THE COUNTED-KEY DANCE in al_status_counts -- test membership, initialise to 0, then
+//      increment -- is `frequencies` over a projection.
+//   3. THE UNIQUE-IP SCAN kept a `seen` dict AND a result list, appending to both. That is `unique`
+//      over the ip projection, which std/core/collect already provides and which preserves the same
+//      first-seen order.
+//   4. total_bytes was a COUNTER kept beside the entries it sums, so the two could disagree. It is
+//      retained for the al_total_bytes contract, and al_bytes_sum derives the same figure from the
+//      entries as the value to trust.
+//
+// The entry record shape is now built in ONE place (_al_entry) rather than by six assignments inside
+// al_log, so a field name cannot be spelled one way on write and another on read.
+import std/core/collect
+
+// PRIVATE: the entry record, defined once.
+fn _al_entry(ip: string, method: string, path: string, status: int, bytes_sent: int, user_agent: string) -> dict
+    {"ip": ip, "method": method, "path": path, "status": status, "bytes": bytes_sent, "ua": user_agent}
 
 fn al_new() -> dict
-    let al = {}
-    al["entries"] = []
-    al["total_bytes"] = 0
-    al
+    {"entries": [], "total_bytes": 0}
 
 fn al_log(al: dict, ip: string, method: string, path: string, status: int, bytes_sent: int, user_agent: string) -> dict
-    let entry = {}
-    entry["ip"] = ip
-    entry["method"] = method
-    entry["path"] = path
-    entry["status"] = status
-    entry["bytes"] = bytes_sent
-    entry["ua"] = user_agent
-    push(al["entries"], entry)
-    al["total_bytes"] = al["total_bytes"] + bytes_sent
+    push(al["entries"], _al_entry(ip, method, path, status, bytes_sent, user_agent))
+    al["total_bytes"] += bytes_sent
     al
 
 fn al_count(al: dict) -> int
@@ -25,50 +36,63 @@ fn al_count(al: dict) -> int
 fn al_total_bytes(al: dict) -> int
     al["total_bytes"]
 
+// The bandwidth DERIVED from the entries. total_bytes is a running counter kept beside the list it
+// summarises -- two sources of one fact -- so this is the figure to trust if they ever differ.
+fn al_bytes_sum(al: dict) -> int
+    sum([e["bytes"] for e in al["entries"]])
+
+// Distinct client IPs in first-seen order. The old version maintained a `seen` dict alongside a
+// result list; `unique` is exactly that, and is O(n) via a hash set.
 fn al_unique_ips(al: dict) -> list
-    let seen = {}
-    let result = []
-    let i = 0
-    while i < len(al["entries"])
-        let ip = al["entries"][i]["ip"]
-        let has = contains(seen, ip)
-        if has != true
-            push(result, ip)
-            seen[ip] = 1
-        i += 1
-    result
+    unique([e["ip"] for e in al["entries"]])
 
 fn al_unique_ip_count(al: dict) -> int
     len(al_unique_ips(al))
 
 fn al_by_path(al: dict, path: string) -> list
-    let result = []
-    let i = 0
-    while i < len(al["entries"])
-        if al["entries"][i]["path"] == path
-            push(result, al["entries"][i])
-        i += 1
-    result
+    [e for e in al["entries"] if e["path"] == path]
 
+// Requests per status code, keyed by the code as a string (dicts are string-keyed).
+// `frequencies` is the test-initialise-increment dance, once.
 fn al_status_counts(al: dict) -> dict
-    let counts = {}
-    let i = 0
-    while i < len(al["entries"])
-        let s = str(al["entries"][i]["status"])
-        let has = contains(counts, s)
-        if has != true
-            counts[s] = 0
-        counts[s] = counts[s] + 1
-        i += 1
-    counts
+    frequencies([str(e["status"]) for e in al["entries"]])
 
+// PRIVATE: is this an error response? 4xx and 5xx, stated once instead of inline at each use.
+fn _al_is_error(e: dict) -> bool
+    e["status"] >= 400
+
+// Percentage of responses with status >= 400, 0-100 (integer, truncated). 0 for an empty log.
 fn al_error_rate(al: dict) -> int
-    if len(al["entries"]) == 0
+    let n = len(al["entries"])
+    if n == 0
         return 0
-    let errors = 0
-    let i = 0
-    while i < len(al["entries"])
-        if al["entries"][i]["status"] >= 400
-            errors += 1
-        i += 1
-    errors * 100 / len(al["entries"])
+    len([e for e in al["entries"] if _al_is_error(e)]) * 100 / n
+
+// --- the analyses the header promised and the module did not provide -------------------------------
+
+// Requests per path, then the busiest paths -- "top paths" is in this module's own summary line.
+fn al_path_counts(al: dict) -> dict
+    frequencies([e["path"] for e in al["entries"]])
+
+// The `n` busiest paths as [path, count], most requests first.
+fn al_top_paths(al: dict, n: int) -> list
+    let counts = al_path_counts(al)
+    let rows = [[p, counts[p]] for p in keys(counts)]
+    let ranked = reverse(sort_by(rows, (r) => r[1]))
+    [ranked[i] for i in 0..min(n, len(ranked))]
+
+// Every error response -- the list an operator actually wants, not just the rate.
+fn al_errors(al: dict) -> list
+    [e for e in al["entries"] if _al_is_error(e)]
+
+// Bytes served to one client, for per-IP bandwidth attribution.
+fn al_bytes_by_ip(al: dict, ip: string) -> int
+    sum([e["bytes"] for e in al["entries"] if e["ip"] == ip])
+
+// Did ANY request error? / Did EVERY request succeed? Short-circuiting, so a clean log stops at the
+// first entry rather than counting them all.
+fn al_has_errors(al: dict) -> bool
+    any_match(al["entries"], (e) => _al_is_error(e))
+
+fn al_all_ok(al: dict) -> bool
+    all_match(al["entries"], (e) => not _al_is_error(e))

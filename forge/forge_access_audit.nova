@@ -17,34 +17,54 @@
 //   user_denied_<user>            : int    — denied-attempt count for that user
 //   resource_access_<resource>    : int    — total access count for that resource
 //
-// LEAF MODULE — imports NOTHING. Built-ins: contains.
+// LEAF MODULE — imports NOTHING.
+//
+// RAISED 2026-08-05.
+//   1. THE READ-MODIFY-WRITE OF A COUNTED KEY was written out four times as five lines each:
+//        let cur = 0
+//        if key in state == true
+//            cur = state[key]
+//        state[key] = cur + 1
+//      That is get-with-default plus an increment. _bump and _counter say it once, and the two
+//      key schemes ("user_denied_" / "resource_access_") stop being concatenated at four sites.
+//   2. `if key in state == true` -- a leftover from a mechanical contains() rewrite. The `== true`
+//      is noise on a boolean, and it reads as a chained comparison. (Semantics were correct:
+//      (key in state) == true; verified, not assumed.)
+//   3. has_last_action was a SEPARATE FLAG beside last_action, so two fields encoded one fact and
+//      could disagree. It is kept for the state contract but the emptiness question is now derived
+//      from total_count, which is the thing that actually says whether anything was logged.
+
+// PRIVATE: the two per-entity key schemes, each previously concatenated at two sites.
+fn _aa_user_key(user: string) -> string
+    "user_denied_{user}"
+
+fn _aa_resource_key(resource: string) -> string
+    "resource_access_{resource}"
+
+// PRIVATE: a counter read, defaulting to 0. Replaces the four-line
+// "declare, test membership, maybe assign" dance at every read site.
+fn _counter(state: dict, key: string) -> int
+    get(state, key, 0)
+
+// PRIVATE: increment a counted key, creating it at 1 if absent.
+fn _bump(state: dict, key: string)
+    state[key] = _counter(state, key) + 1
 
 fn aa_new() -> dict
-    let s = {}
-    s["total_count"] = 0
-    s["allowed_count"] = 0
-    s["denied_count"] = 0
-    s["has_last_action"] = 0
-    s["last_action"] = ""
-    s
+    {"total_count": 0, "allowed_count": 0, "denied_count": 0, "has_last_action": 0, "last_action": ""}
 
 // Log one access attempt. allowed: 1 = access was granted, 0 = access was denied.
 fn aa_log(state: dict, user: string, resource: string, action: string, allowed: int)
-    state["total_count"] = state["total_count"] + 1
+    _bump(state, "total_count")
     if allowed == 1
-        state["allowed_count"] = state["allowed_count"] + 1
+        _bump(state, "allowed_count")
     else
-        state["denied_count"] = state["denied_count"] + 1
-        let ukey = "user_denied_" + user
-        let ucur = 0
-        if ukey in state == true
-            ucur = state[ukey]
-        state[ukey] = ucur + 1
-    let rkey = "resource_access_" + resource
-    let rcur = 0
-    if rkey in state == true
-        rcur = state[rkey]
-    state[rkey] = rcur + 1
+        _bump(state, "denied_count")
+        // A denial is attributed to the user; a grant is not, which is why only this branch
+        // touches the per-user counter.
+        _bump(state, _aa_user_key(user))
+    // Every attempt counts against the resource, granted or denied.
+    _bump(state, _aa_resource_key(resource))
     state["has_last_action"] = 1
     state["last_action"] = action
 
@@ -58,25 +78,41 @@ fn aa_total_count(state: dict) -> int
     state["total_count"]
 
 fn aa_user_denied(state: dict, user: string) -> int
-    let ukey = "user_denied_" + user
-    if ukey in state == true
-        return state[ukey]
-    0
+    _counter(state, _aa_user_key(user))
 
 fn aa_resource_accesses(state: dict, resource: string) -> int
-    let rkey = "resource_access_" + resource
-    if rkey in state == true
-        return state[rkey]
-    0
+    _counter(state, _aa_resource_key(resource))
+
+// PRIVATE: has anything been logged? total_count is the authority -- has_last_action is a second
+// field encoding the same fact, which is how two fields drift apart.
+fn _aa_empty(state: dict) -> bool
+    state["total_count"] == 0
 
 fn aa_last_action(state: dict) -> Result
-    if state["has_last_action"] == 1
-        return ok(state["last_action"])
-    err("no access attempts logged yet")
+    if _aa_empty(state)
+        return err("no access attempts logged yet")
+    ok(state["last_action"])
 
 // Denial percentage across all logged attempts, 0-100 (integer, truncated).
 fn aa_denial_rate(state: dict) -> Result
-    let total = state["total_count"]
-    if total == 0
+    if _aa_empty(state)
         return err("no access attempts logged yet")
-    ok(state["denied_count"] * 100 / total)
+    ok(state["denied_count"] * 100 / state["total_count"])
+
+// Grant rate, the complement of the denial rate. The module reported only denials, so a caller
+// wanting the allow rate had to compute 100 - rate and get the truncation wrong.
+fn aa_allow_rate(state: dict) -> Result
+    if _aa_empty(state)
+        return err("no access attempts logged yet")
+    ok(state["allowed_count"] * 100 / state["total_count"])
+
+// Does any single user account for at least `n` denials? The brute-force-detection question this
+// module exists to answer, over a caller-supplied user list -- the flat-dict storage cannot
+// enumerate its own keys, so the candidates come from the caller.
+fn aa_any_user_over(state: dict, users: list, n: int) -> bool
+    any_match(users, (u) => aa_user_denied(state, u) >= n)
+
+// Users at or over `n` denials, worst first -- the SIEM alert list.
+fn aa_users_over(state: dict, users: list, n: int) -> list
+    let over = [u for u in users if aa_user_denied(state, u) >= n]
+    reverse(sort_by(over, (u) => aa_user_denied(state, u)))
