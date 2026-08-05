@@ -4,15 +4,39 @@
 // where the single-pattern `find` builtin would mean re-scanning for every term. Build once, search many texts.
 //
 // The automaton is a dict of parallel structures: "goto" (list of {char -> child-node} dicts), "fail" (list of
-// failure-link node ids), "out" (list of pattern lists ending at each node). Node 0 is the root. LEAF.
+// failure-link node ids), "out" (list of pattern lists ending at each node). Node 0 is the root.
+//
+// NO LONGER A LEAF: imports std/core/collect for unique / frequencies, which the new match-summary
+// helpers need. Re-implementing a dedup and a tally here would be two more copies of functions the
+// standard library already has, and the set-based unique is O(n) where a local scan would be O(n^2).
+//
+// RAISED 2026-08-05. The failure-link WALK -- "follow fail links until this node has an edge for c, or
+// we reach the root" -- was written out THREE times, each as a `done = false / while done == false /
+// if ... done = true / else if ... done = true / else advance` block four levels deep. Two of the three
+// were in ac_build and one in ac_search, and they were subtly DIFFERENT: the build version additionally
+// required `g[f][c] != child` (so a node does not fail-link to itself) while the search version did not.
+// Written out three times, the pairing of those two conditions had to be re-derived each time, and the
+// difference between them was invisible. Each is now one named function whose contract is a sentence.
+//
+// The three loops that copied one list into another (merging outputs along a failure link, collecting a
+// node's outputs into results) were index walks; two are comprehensions and one is a spread.
+//
+// The BFS queue loop STAYS a `while`: it grows while being consumed, which is exactly the case a
+// for-range cannot express (a range bound is evaluated once).
+import std/core/collect
 
 // A new empty automaton (root only).
 fn ac_new() -> dict
-    let ac = {}
-    ac["goto"] = [{}]
-    ac["fail"] = [0]
-    ac["out"] = [[]]
-    ac
+    {"goto": [{}], "fail": [0], "out": [[]]}
+
+// PRIVATE: add a fresh node to every parallel structure at once. The three pushes had to stay in step
+// by hand -- miss one and the lists desynchronise, which shows up much later as an index error.
+fn _ac_new_node(ac: dict) -> int
+    let id = len(ac["goto"])
+    push(ac["goto"], {})
+    push(ac["fail"], 0)
+    push(ac["out"], [])
+    id
 
 // Add a keyword to the trie (call before ac_build).
 fn ac_add(ac: dict, pattern: string) -> dict
@@ -20,56 +44,56 @@ fn ac_add(ac: dict, pattern: string) -> dict
     let node = 0
     for i in 0..len(pattern)
         let c = char_at(pattern, i)
-        let children = g[node]
-        if c not in children
-            let newid = len(g)
-            push(g, {})
-            push(ac["fail"], 0)
-            push(ac["out"], [])
-            children[c] = newid
+        if c not in g[node]
+            g[node][c] = _ac_new_node(ac)
         node = g[node][c]
     push(ac["out"][node], pattern)
     ac
+
+// PRIVATE: follow failure links from `start` until a node has an edge for `c`, or the root is reached.
+// Returns that node. THE search-time walk, stated once.
+fn _ac_fail_to(g: list, fail: list, start: int, c: string) -> int
+    let f = start
+    while c not in g[f] and f != 0
+        f = fail[f]
+    f
+
+// PRIVATE: the BUILD-time walk. Same idea, one extra condition: an edge that leads back to `child`
+// does not count, so a node cannot fail-link to itself. That difference was the only thing separating
+// the two copies in ac_build from the one in ac_search, and it was invisible at a glance.
+fn _ac_fail_to_other(g: list, fail: list, start: int, c: string, child: int) -> int
+    let f = start
+    while f != 0 and not (c in g[f] and g[f][c] != child)
+        f = fail[f]
+    f
+
+// PRIVATE: does node f have an edge for c that goes somewhere other than `child`?
+fn _ac_has_other_edge(g: list, f: int, c: string, child: int) -> bool
+    c in g[f] and g[f][c] != child
 
 // Build the failure links + merged outputs by BFS (call once, after all ac_add).
 fn ac_build(ac: dict) -> dict
     let g = ac["goto"]
     let fail = ac["fail"]
     let out = ac["out"]
-    let queue = []
-    let rk = keys(g[0])
-    for i in 0..len(rk)
-        let child = g[0][rk[i]]
+    // Depth-1 nodes fail to the root. A comprehension over the root's edges replaces the index walk.
+    let queue = [g[0][c] for c in keys(g[0])]
+    for child in queue
         fail[child] = 0
-        push(queue, child)
+    // The queue GROWS while being consumed, so this stays a `while`: a for-range bound is evaluated
+    // once and would miss every node discovered during the traversal.
     let qi = 0
     while qi < len(queue)
         let node = queue[qi]
         qi += 1
-        let cks = keys(g[node])
-        for j in 0..len(cks)
-            let c = cks[j]
+        for c in keys(g[node])
             let child = g[node][c]
             push(queue, child)
-            let f = fail[node]
-            let done = false
-            while done == false
-                if contains(g[f], c) and g[f][c] != child
-                    done = true
-                else
-                    if f == 0
-                        done = true
-                    else
-                        f = fail[f]
-            if contains(g[f], c) and g[f][c] != child
-                fail[child] = g[f][c]
-            else
-                fail[child] = 0
-            let fo = out[fail[child]]
-            let k = 0
-            while k < len(fo)
-                push(out[child], fo[k])
-                k += 1
+            let f = _ac_fail_to_other(g, fail, fail[node], c, child)
+            fail[child] = g[f][c] if _ac_has_other_edge(g, f, c, child) else 0
+            // Merge the failure target's outputs into this node's, so a match at `child` also reports
+            // every shorter pattern ending here. Spread replaces the index-copy loop.
+            out[child] = [...out[child], ...out[fail[child]]]
     ac
 
 // Search `text`; returns a list of [pattern, end_index] matches (end_index is the 0-based position of the last
@@ -82,19 +106,47 @@ fn ac_search(ac: dict, text: string) -> list
     let node = 0
     for i in 0..len(text)
         let c = char_at(text, i)
-        let done = false
-        while done == false
-            if contains(g[node], c)
-                node = g[node][c]
-                done = true
-            else
-                if node == 0
-                    done = true
-                else
-                    node = fail[node]
-        let o = out[node]
-        let j = 0
-        while j < len(o)
-            push(results, [o[j], i])
-            j += 1
+        // Follow failure links, then take the edge if there is one -- the root with no edge stays at 0.
+        let f = _ac_fail_to(g, fail, node, c)
+        node = g[f][c] if c in g[f] else 0
+        for pattern in out[node]
+            push(results, [pattern, i])
     results
+
+// --- the queries a keyword matcher is actually asked ------------------------------------------------
+
+// Build an automaton from a list of keywords in one call. Every caller was writing
+// `let ac = ac_new()` then a loop of ac_add then ac_build.
+fn ac_of(patterns: list) -> dict
+    let ac = ac_new()
+    for p in patterns
+        ac_add(ac, p)
+    ac_build(ac)
+
+// Does `text` contain ANY of the keywords? The filter question -- and it should stop at the first hit
+// rather than collecting every match in the document, which ac_search does.
+fn ac_contains_any(ac: dict, text: string) -> bool
+    let g = ac["goto"]
+    let fail = ac["fail"]
+    let out = ac["out"]
+    let node = 0
+    for i in 0..len(text)
+        let c = char_at(text, i)
+        let f = _ac_fail_to(g, fail, node, c)
+        node = g[f][c] if c in g[f] else 0
+        if len(out[node]) > 0
+            return true
+    false
+
+// The distinct keywords that occur in `text`, in first-match order.
+fn ac_matched_patterns(ac: dict, text: string) -> list
+    unique([m[0] for m in ac_search(ac, text)])
+
+// How many times each keyword occurs: {pattern: count}.
+fn ac_counts(ac: dict, text: string) -> dict
+    frequencies([m[0] for m in ac_search(ac, text)])
+
+// The START index of each match, which is what a highlighter needs -- ac_search reports the END
+// index, so every caller was subtracting len(pattern) - 1 itself.
+fn ac_spans(ac: dict, text: string) -> list
+    [[m[0], m[1] - len(m[0]) + 1, m[1]] for m in ac_search(ac, text)]
