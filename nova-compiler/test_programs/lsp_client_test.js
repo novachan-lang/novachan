@@ -35,9 +35,10 @@ class LspBuffer {
 }
 
 async function main() {
-  const exe = path.resolve('lsp_server.exe');
-  console.log('=== starting server:', exe);
-  const proc = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exe = path.resolve(process.argv[2] || 'nova.exe');
+  const exeArgs = process.argv[2] ? process.argv.slice(3) : ['lsp'];
+  console.log('=== starting server:', exe, exeArgs);
+  const proc = spawn(exe, exeArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 
   const messages = [];
   const buf = new LspBuffer(msg => {
