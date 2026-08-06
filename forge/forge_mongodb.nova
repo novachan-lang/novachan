@@ -100,10 +100,7 @@ fn _mg_read_i32_le(b, pos: int) -> int
     let b2 = bytes_get(b, pos + 2) & 0xFF
     let b3 = bytes_get(b, pos + 3) & 0xFF
     let u = ((b3 << 24) | (b2 << 16)) | ((b1 << 8) | b0)
-    let result = u
-    if u >= 2147483648
-        result = u - 4294967296
-    result
+    (u - 4294967296) if u >= 2147483648 else u
 
 // cstring reader bounded by `limit` -- returns [string, next_pos]. Used only for a document-sequence
 // (kind 0x01) identifier; std/encoding/bson's own cstring reader is private (`_bs_read_cstring`).
@@ -112,9 +109,8 @@ fn _mg_read_cstring(b, pos: int, limit: int) -> any
     while cur < limit and bytes_get(b, cur) != 0
         cur += 1
     let s = bytes_to_str(bytes_slice(b, pos, cur))
-    let next = cur + 1
-    if next > limit
-        next = limit
+    let raw_next = cur + 1
+    let next = limit if raw_next > limit else raw_next
     [s, next]
 
 // ── encode ────────────────────────────────────────────────────────────────────────────────────────────
@@ -145,23 +141,23 @@ fn mongo_op_msg_encode(doc, request_id: int) -> any
 fn mongo_op_msg_decode(b) -> any
     let n = bytes_len(b)
     if n < 16
-        print("mongo_op_msg_decode: truncated header (" + str(n) + " bytes)")
+        print("mongo_op_msg_decode: truncated header ({n} bytes)")
         exit(1)
     let total = _mg_read_i32_le(b, 0)
     if total < 16
-        print("mongo_op_msg_decode: invalid messageLength " + str(total))
+        print("mongo_op_msg_decode: invalid messageLength {total}")
         exit(1)
     if total > n
-        print("mongo_op_msg_decode: messageLength " + str(total) + " exceeds buffer (" + str(n) + " bytes)")
+        print("mongo_op_msg_decode: messageLength {total} exceeds buffer ({n} bytes)")
         exit(1)
     let request_id = _mg_read_i32_le(b, 4)
     let response_to = _mg_read_i32_le(b, 8)
     let op_code = _mg_read_i32_le(b, 12)
     if op_code != _mg_opcode()
-        print("mongo_op_msg_decode: expected opCode 2013 (OP_MSG), got " + str(op_code))
+        print("mongo_op_msg_decode: expected opCode 2013 (OP_MSG), got {op_code}")
         exit(1)
     if total < 20
-        print("mongo_op_msg_decode: message too short for flagBits (" + str(total) + " bytes)")
+        print("mongo_op_msg_decode: message too short for flagBits ({total} bytes)")
         exit(1)
     let flag_bits = _mg_read_i32_le(b, 16)
     let checksum_present = flag_bits & 1
@@ -177,7 +173,7 @@ fn mongo_op_msg_decode(b) -> any
         // malformed-input-silently-accepted (same class this module's other
         // exit(1) guards exist to close).
         if total < 24
-            print("mongo_op_msg_decode: messageLength " + str(total) + " too short for claimed checksum")
+            print("mongo_op_msg_decode: messageLength {total} too short for claimed checksum")
             exit(1)
         sections_end = total - 4
     let pos = 20
@@ -199,12 +195,12 @@ fn mongo_op_msg_decode(b) -> any
                 primary_doc = d
         else if kind == 1
             if pos + 4 > sections_end
-                print("mongo_op_msg_decode: truncated document-sequence size at " + str(pos))
+                print("mongo_op_msg_decode: truncated document-sequence size at {pos}")
                 exit(1)
             let seq_start = pos
             let size = _mg_read_i32_le(b, pos)
             if size < 5
-                print("mongo_op_msg_decode: invalid document-sequence size " + str(size))
+                print("mongo_op_msg_decode: invalid document-sequence size {size}")
                 exit(1)
             let seq_end = seq_start + size
             if seq_end > sections_end
@@ -224,18 +220,9 @@ fn mongo_op_msg_decode(b) -> any
                 exit(1)
             doc_sequences[ident] = seqdocs
         else
-            print("mongo_op_msg_decode: unsupported section kind byte " + str(kind))
+            print("mongo_op_msg_decode: unsupported section kind byte {kind}")
             exit(1)
-    let result = {}
-    result["messageLength"] = total
-    result["requestID"] = request_id
-    result["responseTo"] = response_to
-    result["opCode"] = op_code
-    result["flagBits"] = flag_bits
-    result["doc"] = primary_doc
-    result["docs"] = docs
-    result["docSequences"] = doc_sequences
-    result
+    {"messageLength": total, "requestID": request_id, "responseTo": response_to, "opCode": op_code, "flagBits": flag_bits, "doc": primary_doc, "docs": docs, "docSequences": doc_sequences}
 
 // ── connection / command layer ───────────────────────────────────────────────────────────────────────
 
@@ -243,7 +230,7 @@ fn mongo_op_msg_decode(b) -> any
 fn mongo_connect(host: string, port: int) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
-        return err("mongodb: cannot connect to " + host + ":" + str(port))
+        return err("mongodb: cannot connect to {host}:{port}")
     ok(sock)
 
 // mongo_close: release the socket.
@@ -253,11 +240,8 @@ fn mongo_close(sock: int)
 // _mg_with_db: return a NEW dict equal to `doc` plus "$db" -> db (DEFENSIVE COPY -- never mutates the
 // caller's dict; a command doc that already carries "$db" is returned as an unmodified copy).
 fn _mg_with_db(doc, db: string) -> any
-    let out = {}
-    let ks = keys(doc)
-    for i in 0..len(ks)
-        out[ks[i]] = doc[ks[i]]
-    if "$db" in doc == 0
+    let out = {k: doc[k] for k in keys(doc)}
+    if "$db" not in doc
         out["$db"] = db
     out
 
@@ -279,10 +263,10 @@ fn _mg_read_reply(sock: int) -> any
         return err("mongodb: connection closed before response header")
     let total = _mg_read_i32_le(buf, 0)
     if total < 16
-        return err("mongodb: invalid response messageLength " + str(total))
+        return err("mongodb: invalid response messageLength {total}")
     buf = _mg_recv_at_least(sock, buf, total)
     if bytes_len(buf) < total
-        return err("mongodb: connection closed mid-response (" + str(bytes_len(buf)) + " of " + str(total) + " bytes)")
+        return err("mongodb: connection closed mid-response ({bytes_len(buf)} of {total} bytes)")
     ok(mongo_op_msg_decode(bytes_slice(buf, 0, total)))
 
 // mongo_command: send `command_doc` (a BSON-encodable dict, e.g. {"find":"c"}) as a command against
@@ -300,8 +284,9 @@ fn mongo_command(sock: int, db: string, command_doc) -> any
     if is_err(rr)
         return rr
     let reply = unwrap(rr)
-    if reply["responseTo"] != request_id
-        return err("mongodb: reply responseTo " + str(reply["responseTo"]) + " does not match request " + str(request_id))
+    let rt = reply["responseTo"]
+    if rt != request_id
+        return err("mongodb: reply responseTo {rt} does not match request {request_id}")
     let rdoc = reply["doc"]
     if rdoc == null
         return err("mongodb: reply had no body document")
@@ -317,6 +302,7 @@ fn mongo_command(sock: int, db: string, command_doc) -> any
     if okf < 0.5
         let msg = "mongodb: command failed"
         if "errmsg" in rdoc
-            msg = "mongodb: " + str(rdoc["errmsg"])
+            let em = str(rdoc["errmsg"])
+            msg = "mongodb: {em}"
         return err(msg)
     ok(rdoc)

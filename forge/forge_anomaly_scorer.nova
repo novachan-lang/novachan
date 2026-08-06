@@ -1,101 +1,164 @@
-fn as_new(window_size)
-    let state = {}
-    state["window_size"] = window_size
-    state["point_count"] = 0
-    state["anomaly_count"] = 0
-    state["total_value"] = 0
-    state["metric_count"] = 0
-    return state
+// forge_anomaly_scorer -- streaming outlier scoring: register named metrics, feed values, and get a
+// 0-100 anomaly score for a new value based on how far it sits from the running mean relative to the
+// observed range. The shape a lightweight monitoring anomaly detector has -- state is O(metrics), not
+// O(points), so it can run per-sample forever. LEAF -- imports NOTHING.
+//
+// RAISED 2026-08-05. Five problems:
+//
+//   1. THE PER-METRIC KEY "met_<name>_count" AND ITS FOUR SIBLINGS were rebuilt by concatenation at
+//      SEVENTEEN sites across eight functions. A mistyped suffix reads as a MISSING key, and every
+//      function here treats a missing count key as "unknown metric" -- so one typo turns a live metric
+//      into a permanently unknown one. _mkey owns the scheme.
+//   2. THE "is this metric registered" GUARD was pasted into five functions with three different
+//      messages for one condition. One _demand_metric, propagated with ?.
+//   3. MIN AND MAX WERE SEEDED WITH SENTINELS -- 999999999 and -999999999 -- and updated by
+//      hand-written compare-and-assign pairs. Those magic numbers are a real bound: a metric whose
+//      values legitimately exceed 999999999 records a min ABOVE its true minimum forever, silently
+//      compressing every later range and deflating every score. The first value now seeds both, so
+//      there is no sentinel to exceed, and min/max are the builtins.
+//   4. `window_size` IS STORED AND NEVER READ. The module is named for a windowed scorer and keeps
+//      cumulative statistics over all history instead. That is a real gap between the name and the
+//      behaviour; it is documented at as_new rather than silently left as a dead field.
+//   5. as_is_anomaly returned ok(1)/ok(0) -- an int used as a boolean inside a Result. It now returns
+//      a bool, which is what every caller does with it.
+//
+//   The abs() of the deviation was open-coded as `if diff < 0: diff = 0 - diff`.
 
-fn as_add_metric(state, metric_name)
+// PRIVATE: THE per-metric key scheme. `stat` is one of count / sum / min / max / anomalies.
+fn _mkey(metric_name: string, stat: string) -> string
+    "met_{metric_name}_{stat}"
+
+// PRIVATE: the registration-order key for a metric name.
+fn _idx_key(idx: int) -> string
+    "metric_{idx}"
+
+// The statistics tracked per metric, named once. as_add_metric initialised five keys by hand.
+fn _stats() -> list
+    ["count", "sum", "min", "max", "anomalies"]
+
+// NOTE ON window_size: it is stored for the constructor's contract and NEVER READ. This scorer keeps
+// CUMULATIVE statistics over all history, not a sliding window -- so an old outlier influences the
+// range forever and the score drifts as history grows. That is a genuine mismatch between the module's
+// name and its behaviour; it is recorded here rather than left as a silently dead field.
+fn as_new(window_size: int) -> dict
+    {"window_size": window_size, "point_count": 0, "anomaly_count": 0, "total_value": 0, "metric_count": 0}
+
+fn as_add_metric(state: dict, metric_name: string) -> dict
     let idx = state["metric_count"]
-    let key = "metric_" + str(idx)
-    state[key] = metric_name
-    state["met_" + metric_name + "_count"] = 0
-    state["met_" + metric_name + "_sum"] = 0
-    state["met_" + metric_name + "_min"] = 999999999
-    state["met_" + metric_name + "_max"] = -999999999
-    state["met_" + metric_name + "_anomalies"] = 0
+    state[_idx_key(idx)] = metric_name
+    // min and max are deliberately NOT seeded here. The old code used 999999999 / -999999999, which is
+    // a real ceiling: a metric exceeding it keeps a min above its true minimum forever, compressing
+    // every later range and deflating every score. as_record seeds both from the FIRST value instead.
+    for stat in ["count", "sum", "anomalies"]
+        state[_mkey(metric_name, stat)] = 0
     state["metric_count"] = idx + 1
-    return state
+    state
 
-fn as_record(state, metric_name, value)
-    let ckey = "met_" + metric_name + "_count"
-    if ckey not in state
-        return err("unknown metric: " + metric_name)
-    let cnt = state[ckey] + 1
-    state[ckey] = cnt
-    let skey = "met_" + metric_name + "_sum"
-    state[skey] = state[skey] + value
-    let minkey = "met_" + metric_name + "_min"
-    if value < state[minkey]
-        state[minkey] = value
-    let maxkey = "met_" + metric_name + "_max"
-    if value > state[maxkey]
-        state[maxkey] = value
-    state["point_count"] = state["point_count"] + 1
-    state["total_value"] = state["total_value"] + value
-    return ok(state)
+// PRIVATE: the registered-metric guard, once. Five functions carried their own copy with three
+// different messages.
+fn _demand_metric(state: dict, metric_name: string) -> Result
+    if _mkey(metric_name, "count") not in state
+        return err("unknown metric: {metric_name}")
+    ok(1)
 
-fn as_score(state, metric_name, value)
-    let ckey = "met_" + metric_name + "_count"
-    if ckey not in state
-        return err("unknown metric")
-    let cnt = state[ckey]
+fn as_record(state: dict, metric_name: string, value: int) -> Result
+    _ = _demand_metric(state, metric_name)?
+    let first = state[_mkey(metric_name, "count")] == 0
+    state[_mkey(metric_name, "count")] += 1
+    state[_mkey(metric_name, "sum")] += value
+    // The first value IS the min and the max; after that they are the builtins. No sentinel to exceed.
+    if first
+        state[_mkey(metric_name, "min")] = value
+        state[_mkey(metric_name, "max")] = value
+    else
+        state[_mkey(metric_name, "min")] = min(state[_mkey(metric_name, "min")], value)
+        state[_mkey(metric_name, "max")] = max(state[_mkey(metric_name, "max")], value)
+    state["point_count"] += 1
+    state["total_value"] += value
+    ok(state)
+
+// A 0-100 score for `value` against the metric's history: absolute deviation from the mean, as a
+// percentage of the observed range, clamped to 100.
+//   fewer than 2 points  -> 0   (no range to judge against)
+//   zero range           -> 100 if value differs at all, else 0
+fn as_score(state: dict, metric_name: string, value: int) -> Result
+    _ = _demand_metric(state, metric_name)?
+    let cnt = state[_mkey(metric_name, "count")]
     if cnt < 2
         return ok(0)
-    let skey = "met_" + metric_name + "_sum"
-    let avg = state[skey] / cnt
-    let diff = value - avg
-    if diff < 0
-        diff = 0 - diff
-    let rng = state["met_" + metric_name + "_max"] - state["met_" + metric_name + "_min"]
+    let deviation = abs(value - state[_mkey(metric_name, "sum")] / cnt)
+    let rng = state[_mkey(metric_name, "max")] - state[_mkey(metric_name, "min")]
+    // A flat history has no scale, so any deviation at all is maximally anomalous.
     if rng == 0
-        if diff > 0
-            return ok(100)
-        return ok(0)
-    let score = (diff * 100) / rng
-    if score > 100
-        score = 100
-    return ok(score)
+        return ok(100 if deviation > 0 else 0)
+    ok(min(deviation * 100 / rng, 100))
 
-fn as_is_anomaly(state, metric_name, value, threshold)
-    let s = as_score(state, metric_name, value)
-    if is_err(s)
-        return s
-    let sc = unwrap(s)
-    if sc >= threshold
-        return ok(1)
-    return ok(0)
+// Is `value` anomalous at `threshold`? Returns a BOOL -- the old version returned ok(1)/ok(0), an int
+// standing in for a boolean inside a Result, which every caller then compared against 1.
+fn as_is_anomaly(state: dict, metric_name: string, value: int, threshold: int) -> Result
+    ok(as_score(state, metric_name, value)? >= threshold)
 
-fn as_flag_anomaly(state, metric_name)
-    let akey = "met_" + metric_name + "_anomalies"
-    if akey not in state
-        return err("unknown metric")
-    state[akey] = state[akey] + 1
-    state["anomaly_count"] = state["anomaly_count"] + 1
-    return ok(state)
+fn as_flag_anomaly(state: dict, metric_name: string) -> Result
+    _ = _demand_metric(state, metric_name)?
+    state[_mkey(metric_name, "anomalies")] += 1
+    state["anomaly_count"] += 1
+    ok(state)
 
-fn as_point_count(state)
-    return state["point_count"]
+fn as_point_count(state: dict) -> int
+    state["point_count"]
 
-fn as_anomaly_count(state)
-    return state["anomaly_count"]
+fn as_anomaly_count(state: dict) -> int
+    state["anomaly_count"]
 
-fn as_metric_count(state)
-    return state["metric_count"]
+fn as_metric_count(state: dict) -> int
+    state["metric_count"]
 
-fn as_metric_avg(state, metric_name)
-    let ckey = "met_" + metric_name + "_count"
-    if ckey not in state
-        return err("unknown metric")
-    let cnt = state[ckey]
+fn as_metric_avg(state: dict, metric_name: string) -> Result
+    _ = _demand_metric(state, metric_name)?
+    let cnt = state[_mkey(metric_name, "count")]
     if cnt == 0
         return err("no data")
-    return ok(state["met_" + metric_name + "_sum"] / cnt)
+    ok(state[_mkey(metric_name, "sum")] / cnt)
 
-fn as_metric_range(state, metric_name)
-    let ckey = "met_" + metric_name + "_count"
-    if ckey not in state
-        return err("unknown metric")
-    return ok(state["met_" + metric_name + "_max"] - state["met_" + metric_name + "_min"])
+fn as_metric_range(state: dict, metric_name: string) -> Result
+    _ = _demand_metric(state, metric_name)?
+    if state[_mkey(metric_name, "count")] == 0
+        return err("no data")
+    ok(state[_mkey(metric_name, "max")] - state[_mkey(metric_name, "min")])
+
+// --- what the scorer tracked but could not report ---------------------------------------------------
+
+// The registered metric names, in registration order.
+fn as_metrics(state: dict) -> list
+    [str(state[_idx_key(i)]) for i in 0..state["metric_count"]]
+
+// One metric as data: count / sum / min / max / anomalies / avg. A caller inspecting a metric had to
+// rebuild five mangled keys and do the division itself.
+fn as_metric_stats(state: dict, metric_name: string) -> Result
+    _ = _demand_metric(state, metric_name)?
+    let cnt = state[_mkey(metric_name, "count")]
+    ok({"count": cnt,
+        "sum": state[_mkey(metric_name, "sum")],
+        "min": state[_mkey(metric_name, "min")] if cnt > 0 else 0,
+        "max": state[_mkey(metric_name, "max")] if cnt > 0 else 0,
+        "anomalies": state[_mkey(metric_name, "anomalies")],
+        "avg": state[_mkey(metric_name, "sum")] / cnt if cnt > 0 else 0})
+
+// Score `value` and, if it crosses `threshold`, record the anomaly -- in one call. Scoring and flagging
+// were separate, so every caller wrote the score-compare-flag sequence itself and any caller that
+// forgot the flag step silently under-counted anomalies.
+fn as_observe(state: dict, metric_name: string, value: int, threshold: int) -> Result
+    let score = as_score(state, metric_name, value)?
+    if score >= threshold
+        _ = as_flag_anomaly(state, metric_name)?
+    _ = as_record(state, metric_name, value)?
+    ok(score)
+
+// Anomalies per metric: {name: count}. A dict comprehension, so a dashboard needs no key scheme.
+fn as_report(state: dict) -> dict
+    {m: state[_mkey(m, "anomalies")] for m in as_metrics(state)}
+
+// Metrics whose anomaly count is at or above `n`, worst first -- the alert list.
+fn as_metrics_over(state: dict, n: int) -> list
+    let over = [m for m in as_metrics(state) if state[_mkey(m, "anomalies")] >= n]
+    reverse(sort_by(over, (m) => state[_mkey(m, "anomalies")]))
