@@ -29340,9 +29340,492 @@ fn lsp_rename_response(docs: dict, uri: string, word: string, new_name: string) 
         push(edits, "\{\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + rlen) + "\}\},\"newText\":\"" + lsp_escape_json(new_name) + "\"\}")
     "\{\"changes\":\{\"" + lsp_escape_json(uri) + "\":[" + join(edits, ",") + "]\}\}"
 
+// ── Document highlight — highlights every occurrence of the symbol under the
+// cursor, in the current file. Reuses the same token-based scan as references. ──
+fn lsp_highlight_response(docs: dict, uri: string, word: string) -> string
+    let refs = lsp_find_references(docs, uri, word)
+    let items = []
+    for r in refs
+        let rl = r[0]
+        let rc = r[1]
+        let rlen = r[2]
+        push(items, "\{\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + rlen) + "\}\},\"kind\":1\}")
+    "[" + join(items, ",") + "]"
+
+// ── Prepare rename — returns the exact word-range under the cursor so the
+// editor can show what will be renamed before the user types a new name. ──
+fn lsp_word_range_at(docs: dict, uri: string, line_num: int, col: int) -> list
+    if not contains(docs, uri)
+        return []
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    if line_num >= len(lines)
+        return []
+    let line = lines[line_num]
+    if col > len(line)
+        return []
+    let start = col
+    while start > 0
+        let ch = ord(line[start - 1])
+        if ch == 32 or ch == 40 or ch == 41 or ch == 44 or ch == 61 or ch == 46 or ch == 91 or ch == 93
+            break
+        start = start - 1
+    let wend = col
+    while wend < len(line)
+        let ch = ord(line[wend])
+        if ch == 32 or ch == 40 or ch == 41 or ch == 44 or ch == 61 or ch == 46 or ch == 91 or ch == 93
+            break
+        wend = wend + 1
+    if start >= wend
+        return []
+    [start, wend]
+
+fn lsp_prepare_rename_response(docs: dict, uri: string, line_num: int, col: int) -> string
+    let range = lsp_word_range_at(docs, uri, line_num, col)
+    if len(range) == 0
+        return "null"
+    let start_col = range[0]
+    let end_col = range[1]
+    "\{\"range\":\{\"start\":\{\"line\":" + str(line_num) + ",\"character\":" + str(start_col) + "\},\"end\":\{\"line\":" + str(line_num) + ",\"character\":" + str(end_col) + "\}\}\}"
+
+// ── Folding ranges — NOVA is indentation-based (no braces), so a foldable
+// region is exactly: a line, followed by one or more lines indented DEEPER
+// than it. The fold spans from that line to the last contiguous line at (or
+// below, via nesting) that deeper indent -- i.e. everything before the next
+// line that returns to the original indent level or shallower. ──
+fn _lsp_indent_of(line: string) -> int
+    let i = 0
+    let n = len(line)
+    while i < n
+        let c = line[i]
+        if c != " " and c != "\t"
+            break
+        i = i + 1
+    i
+
+fn lsp_folding_ranges(docs: dict, uri: string) -> string
+    if not contains(docs, uri)
+        return "[]"
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let n = len(lines)
+    let indents = []
+    let i = 0
+    while i < n
+        let trimmed = trim(lines[i])
+        if len(trimmed) == 0
+            push(indents, -1)
+        else
+            push(indents, _lsp_indent_of(lines[i]))
+        i = i + 1
+    let items = []
+    i = 0
+    while i < n
+        let cur = indents[i]
+        if cur >= 0
+            let j = i + 1
+            let deepest_end = i
+            while j < n
+                let ind = indents[j]
+                if ind == -1
+                    j = j + 1
+                    continue
+                if ind > cur
+                    deepest_end = j
+                    j = j + 1
+                else
+                    break
+            if deepest_end > i
+                push(items, "\{\"startLine\":" + str(i) + ",\"endLine\":" + str(deepest_end) + "\}")
+        i = i + 1
+    "[" + join(items, ",") + "]"
+
+// ── Signature help — parameter hints while typing a function call. Scans
+// backward from the cursor on the CURRENT LINE ONLY (multi-line call sites
+// are a known, intentionally scoped-out limitation) to find the enclosing
+// unmatched '(' and count top-level commas before the cursor for the active
+// parameter index, then looks up the callee's signature the same way hover
+// already does (a same-file "fn name(" line scan). ──
+fn lsp_find_fn_line(docs: dict, uri: string, name: string) -> string
+    if not contains(docs, uri)
+        return ""
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if starts_with(line, "fn " + name + "(") or starts_with(line, "fn " + name + "<")
+            return line
+        i = i + 1
+    ""
+
+fn lsp_signature_help_response(docs: dict, uri: string, line_num: int, col: int) -> string
+    if not contains(docs, uri)
+        return "null"
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    if line_num >= len(lines)
+        return "null"
+    let line = lines[line_num]
+    let prefix = slice(line, 0, col)
+    let depth = 0
+    let call_start = -1
+    let active_param = 0
+    let i = len(prefix) - 1
+    while i >= 0
+        let c = prefix[i]
+        if c == ")"
+            depth = depth + 1
+        else if c == "("
+            if depth == 0
+                call_start = i
+                break
+            depth = depth - 1
+        else if c == "," and depth == 0
+            active_param = active_param + 1
+        i = i - 1
+    if call_start < 0
+        return "null"
+    let ident_end = call_start
+    let ident_start = ident_end
+    while ident_start > 0
+        let ch = ord(prefix[ident_start - 1])
+        let is_id = (ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or ch == 95
+        if not is_id
+            break
+        ident_start = ident_start - 1
+    let fn_name = slice(prefix, ident_start, ident_end)
+    if len(fn_name) == 0
+        return "null"
+    let sig_line = lsp_find_fn_line(docs, uri, fn_name)
+    if len(sig_line) == 0
+        return "null"
+    let paren = find(sig_line, "(")
+    let close = find(sig_line, ")")
+    if paren < 0 or close < 0 or close < paren
+        return "null"
+    let params_str = slice(sig_line, paren + 1, close)
+    let param_parts = split(params_str, ",")
+    let param_items = []
+    for p in param_parts
+        let pt = trim(p)
+        if len(pt) > 0
+            push(param_items, "\{\"label\":\"" + lsp_escape_json(pt) + "\"\}")
+    let sig_label = lsp_escape_json(sig_line)
+    "\{\"signatures\":[\{\"label\":\"" + sig_label + "\",\"parameters\":[" + join(param_items, ",") + "]\}],\"activeParameter\":" + str(active_param) + ",\"activeSignature\":0\}"
+
+// ── Formatting — string-in/string-out wrapper over the #34 AST-reprint formatter.
+// nova_fmt_file_ast is hardwired to read_file/write_file (it was built CLI-only),
+// so this mirrors its EXACT gate sequence against an in-memory buffer instead:
+//   Gate A (faithfulness): parse(orig) == parse(reprint)  -- structural AST equality
+//   Gate B (comments):     comment multiset preserved
+// Any gate failure returns "" meaning "decline to format" -- the LSP then sends no
+// edit at all, which is strictly safer than the CLI's whitespace-normalizer fallback
+// (silently reflowing a file the user asked to format is fine; silently reflowing on
+// every editor save is not). ──
+fn lsp_format_source(source: string) -> string
+    if len(source) == 0
+        return ""
+    let tokens1 = tokenize(source)
+    let pe1 = []
+    let stmts1 = fmt_parse_raw(tokens1, pe1)
+    if len(pe1) > 0
+        return ""
+    let ctx = {}
+    ctx["unsupported"] = 0
+    let comments1 = fmt_collect_comments(source, ctx)
+    if ctx["unsupported"] == 1
+        return ""
+    let src2 = fmt_reprint(stmts1, comments1, ctx)
+    if ctx["unsupported"] == 1
+        return ""
+    if len(src2) == 0 and len(stmts1) > 0
+        return ""
+    let tokens2 = tokenize(src2)
+    let pe2 = []
+    let stmts2 = fmt_parse_raw(tokens2, pe2)
+    if len(pe2) > 0
+        return ""
+    if not fmt_ast_equal_list(stmts1, stmts2)
+        return ""
+    let ctx2 = {}
+    ctx2["unsupported"] = 0
+    let comments2 = fmt_collect_comments(src2, ctx2)
+    if ctx2["unsupported"] == 1
+        return ""
+    let texts1 = fmt_comment_texts(comments1)
+    let texts2 = fmt_comment_texts(comments2)
+    if len(texts1) != len(texts2)
+        return ""
+    let ti = 0
+    while ti < len(texts1)
+        if texts1[ti] != texts2[ti]
+            return ""
+        ti = ti + 1
+    src2
+
+fn lsp_formatting_response(docs: dict, uri: string) -> string
+    if not contains(docs, uri)
+        return "null"
+    let source = docs[uri]
+    let formatted = lsp_format_source(source)
+    if len(formatted) == 0
+        return "null"
+    if formatted == source
+        return "[]"
+    // One whole-document replace. The end position is deliberately far past any real
+    // line/column so the edit covers the entire buffer regardless of its length.
+    let lines = split(source, "\n")
+    let last_line = len(lines)
+    "[\{\"range\":\{\"start\":\{\"line\":0,\"character\":0\},\"end\":\{\"line\":" + str(last_line) + ",\"character\":0\}\},\"newText\":\"" + lsp_escape_json(formatted) + "\"\}]"
+
+// ── Workspace-wide index ───────────────────────────────────────────────────
+// dir_walk returns every file AND directory under the root, full-path, flattened.
+// We filter to .nova sources and skip the directories a source index must never
+// descend into (VCS internals, build output, vendored deps) -- dir_walk itself
+// skips only "." and "..", so without this a workspace scan would read thousands
+// of irrelevant files and blow up the request latency.
+fn _lsp_ws_skip(path: string) -> bool
+    contains(path, "\\.git\\") or contains(path, "/.git/") or contains(path, "\\node_modules\\") or contains(path, "/node_modules/") or contains(path, "\\build\\") or contains(path, "/build/") or contains(path, "\\.gradle\\") or contains(path, "/.gradle/") or contains(path, "\\output\\") or contains(path, "/output/") or contains(path, "\\nova_packages\\") or contains(path, "/nova_packages/")
+
+fn lsp_workspace_nova_files(root: string) -> list
+    if len(root) == 0
+        return []
+    let all = dir_walk(root)
+    [f for f in all if ends_with(f, ".nova") and not _lsp_ws_skip(f)]
+
+fn _lsp_path_to_uri(path: string) -> string
+    let p = replace(path, "\\", "/")
+    if not starts_with(p, "/")
+        p = "/" + p
+    "file://" + p
+
+// Every top-level declaration in `source`, as [name, kind, line] triples. Shared by
+// workspace/symbol and the cross-file reference/rename scan so one definition of
+// "what counts as a declaration" serves both.
+fn _lsp_decls_in(source: string) -> list
+    let out = []
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        let nm = ""
+        let kind = 0
+        if starts_with(line, "fn ")
+            let after = slice(line, 3, len(line))
+            let stop = len(after)
+            let paren = find(after, "(")
+            let langle = find(after, "<")
+            if paren >= 0 and paren < stop
+                stop = paren
+            if langle >= 0 and langle < stop
+                stop = langle
+            let cand = trim(slice(after, 0, stop))
+            if len(cand) > 0 and find(cand, " ") < 0
+                nm = cand
+                if find(cand, ".") >= 0
+                    kind = 6
+                else
+                    kind = 12
+        else if starts_with(line, "type ") or starts_with(line, "enum ") or starts_with(line, "trait ")
+            let kw_len = 5
+            if starts_with(line, "trait ")
+                kw_len = 6
+            let after = trim(slice(line, kw_len, len(line)))
+            let stop = len(after)
+            let sp = find(after, " ")
+            let langle = find(after, "<")
+            if sp >= 0 and sp < stop
+                stop = sp
+            if langle >= 0 and langle < stop
+                stop = langle
+            let cand = slice(after, 0, stop)
+            if len(cand) > 0
+                nm = cand
+                if starts_with(line, "type ")
+                    kind = 23
+                else if starts_with(line, "enum ")
+                    kind = 10
+                else
+                    kind = 11
+        if len(nm) > 0
+            push(out, [nm, kind, i])
+        i = i + 1
+    out
+
+// workspace/symbol — Ctrl+T "jump to any symbol in the project". `query` is matched
+// case-insensitively as a SUBSTRING (what editors expect from this endpoint), and
+// results are capped so a one-character query on a large repo cannot return tens of
+// thousands of entries and stall the editor. The cap is reported honestly in the
+// server log rather than silently truncating.
+fn lsp_workspace_symbols(root: string, query: string) -> string
+    let files = lsp_workspace_nova_files(root)
+    let q = lower(query)
+    let items = []
+    let cap = 500
+    for f in files
+        if len(items) >= cap
+            break
+        let content = read_file(f)
+        if len(content) == 0
+            continue
+        let uri = _lsp_path_to_uri(f)
+        for d in _lsp_decls_in(content)
+            if len(items) >= cap
+                break
+            let nm = d[0]
+            if len(q) > 0 and not contains(lower(nm), q)
+                continue
+            let kind = d[1]
+            let ln = d[2]
+            push(items, "\{\"name\":\"" + lsp_escape_json(nm) + "\",\"kind\":" + str(kind) + ",\"location\":\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"range\":\{\"start\":\{\"line\":" + str(ln) + ",\"character\":0\},\"end\":\{\"line\":" + str(ln) + ",\"character\":0\}\}\}\}")
+    if len(items) >= cap
+        write_raw("[nova-lsp] workspace/symbol: capped at " + str(cap) + " results for query '" + query + "'\n")
+    "[" + join(items, ",") + "]"
+
+// Token-based occurrences of `word` in one source string (same rule as the
+// same-file scan: IDENT tokens only, so comments/strings can never match).
+fn _lsp_refs_in_source(source: string, word: string) -> list
+    let refs = []
+    let tokens = tokenize(source)
+    for tok in tokens
+        match tok
+            Token(tk_kind, tk_val, tk_line, tk_col) =>
+                if tk_kind == "IDENT" and tk_val == word
+                    push(refs, [tk_line - 1, tk_col - 1])
+    refs
+
+// Workspace-wide references. `docs` takes precedence over on-disk content for any
+// file that is currently OPEN in the editor -- otherwise an unsaved buffer would be
+// scanned in its stale on-disk form and the user would get wrong positions.
+// Applies the SAME import-scope filter as lsp_workspace_rename (see the long note
+// there): a file that merely reuses the identifier for its own local is not a
+// reference to THIS symbol, so listing it would be a false positive.
+fn lsp_workspace_references(docs: dict, root: string, word: string, decl_uri: string) -> string
+    if len(word) == 0
+        return "[]"
+    let decl_mod = _lsp_module_name_of(lsp_uri_to_path(decl_uri))
+    let files = lsp_workspace_nova_files(root)
+    let items = []
+    for f in files
+        let uri = _lsp_path_to_uri(f)
+        let content = ""
+        if contains(docs, uri) and len(docs[uri]) > 0
+            content = docs[uri]
+        else
+            content = read_file(f)
+        if len(content) == 0
+            continue
+        let is_decl_file = (_lsp_module_name_of(f) == decl_mod)
+        if not is_decl_file and not _lsp_imports_module(content, decl_mod)
+            continue
+        for r in _lsp_refs_in_source(content, word)
+            let rl = r[0]
+            let rc = r[1]
+            push(items, "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + len(word)) + "\}\}\}")
+    "[" + join(items, ",") + "]"
+
+// The module name a file provides, i.e. its basename without ".nova" -- that is
+// exactly what another file writes after `import`.
+fn _lsp_module_name_of(path: string) -> string
+    let last = -1
+    let k = 0
+    while k < len(path)
+        let c = path[k]
+        if c == "/" or c == "\\"
+            last = k
+        k = k + 1
+    let base = slice(path, last + 1, len(path))
+    if ends_with(base, ".nova")
+        return slice(base, 0, len(base) - 5)
+    base
+
+// Does `source` import module `mod_name`?
+fn _lsp_imports_module(source: string, mod_name: string) -> bool
+    for raw in split(source, "\n")
+        let t = trim(raw)
+        if not starts_with(t, "import ")
+            continue
+        let rest = trim(slice(t, 7, len(t)))
+        let name = rest
+        let sp = find(rest, " ")
+        if sp >= 0
+            name = slice(rest, 0, sp)
+        if name == mod_name
+            return true
+        // `import a/b/c` -- the module's own name is the last path segment.
+        let seg_last = -1
+        let i = 0
+        while i < len(name)
+            if name[i] == "/"
+                seg_last = i
+            i = i + 1
+        if seg_last >= 0 and slice(name, seg_last + 1, len(name)) == mod_name
+            return true
+    false
+
+// Workspace-wide rename: one WorkspaceEdit with a per-file edit list. Same
+// open-buffer-wins rule as references above.
+//
+// SCOPE SAFETY -- the reason this is not just "rename every matching IDENT":
+// occurrences are matched by NAME, and NOVA has no cross-file scope resolution
+// here, so a local variable in an unrelated file that happens to share the name
+// would be silently renamed too (measured: renaming a fn `count` also rewrote 4
+// occurrences of an unrelated local `count` in another file). Renaming a common
+// name like `count`/`result` across a large repo would corrupt many files at once
+// and the user would have no idea until compile time.
+// So the edit set is restricted to files that can actually SEE the declaration:
+//   - the file that declares it, and
+//   - files that `import` that module.
+// A file that merely happens to use the same identifier for its own local is left
+// alone. This under-approximates in one direction only (it may MISS a rename in a
+// file that reaches the symbol some other way) which is the safe direction to err:
+// a missed rename is a compile error the user sees immediately, whereas a wrong
+// rename is silent corruption.
+fn lsp_workspace_rename(docs: dict, root: string, word: string, new_name: string, decl_uri: string) -> string
+    if len(word) == 0 or len(new_name) == 0
+        return "null"
+    let decl_path = lsp_uri_to_path(decl_uri)
+    let decl_mod = _lsp_module_name_of(decl_path)
+    let files = lsp_workspace_nova_files(root)
+    let file_entries = []
+    let skipped = 0
+    for f in files
+        let uri = _lsp_path_to_uri(f)
+        let content = ""
+        if contains(docs, uri) and len(docs[uri]) > 0
+            content = docs[uri]
+        else
+            content = read_file(f)
+        if len(content) == 0
+            continue
+        let refs = _lsp_refs_in_source(content, word)
+        if len(refs) == 0
+            continue
+        // Only the declaring file itself, or a file importing that module, may be edited.
+        let is_decl_file = (_lsp_module_name_of(f) == decl_mod)
+        if not is_decl_file and not _lsp_imports_module(content, decl_mod)
+            skipped = skipped + 1
+            continue
+        let edits = []
+        for r in refs
+            let rl = r[0]
+            let rc = r[1]
+            push(edits, "\{\"range\":\{\"start\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc) + "\},\"end\":\{\"line\":" + str(rl) + ",\"character\":" + str(rc + len(word)) + "\}\},\"newText\":\"" + lsp_escape_json(new_name) + "\"\}")
+        push(file_entries, "\"" + lsp_escape_json(uri) + "\":[" + join(edits, ",") + "]")
+    if skipped > 0
+        write_raw("[nova-lsp] rename '" + word + "': skipped " + str(skipped) + " file(s) that use the name but do not import '" + decl_mod + "' (out of scope)\n")
+    if len(file_entries) == 0
+        return "null"
+    "\{\"changes\":\{" + join(file_entries, ",") + "\}\}"
+
 fn lsp_server_main()
     write_raw("NOVA LSP server started\n")
     let docs = {}
+    // Workspace root, captured from the initialize request. Empty until then, and the
+    // workspace-wide handlers degrade to "no results" rather than scanning the whole
+    // filesystem if the client never sends one.
+    let ws_root = ""
     let running = true
     while running
         let body = lsp_read_message()
@@ -29358,7 +29841,25 @@ fn lsp_server_main()
             id = msg["id"]
             has_id = true
         if method == "initialize"
-            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":true\}\}"
+            // Capture the workspace root for the workspace-wide handlers. Prefer
+            // workspaceFolders[0] (the modern field) and fall back to the deprecated
+            // rootUri, which older clients still send.
+            if contains(msg, "params")
+                let iparams = msg["params"]
+                if contains(iparams, "workspaceFolders")
+                    let folders = iparams["workspaceFolders"]
+                    if len(folders) > 0
+                        let f0 = folders[0]
+                        if contains(f0, "uri")
+                            ws_root = lsp_uri_to_path(f0["uri"])
+                if ws_root == "" and contains(iparams, "rootUri")
+                    let ru = iparams["rootUri"]
+                    if ru != ""
+                        ws_root = lsp_uri_to_path(ru)
+                if ws_root == "" and contains(iparams, "rootPath")
+                    ws_root = iparams["rootPath"]
+            write_raw("[nova-lsp] workspace root: " + ws_root + "\n")
+            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":\{\"prepareProvider\":true\},\"documentHighlightProvider\":true,\"foldingRangeProvider\":true,\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"documentFormattingProvider\":true,\"workspaceSymbolProvider\":true\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"
             write_raw("NOVA LSP initialized\n")
@@ -29462,7 +29963,11 @@ fn lsp_server_main()
                 let rcol = rpos["character"]
                 let rword = lsp_get_word_at(docs, ruri, rline, rcol)
                 if rword != ""
-                    lsp_respond(id, lsp_references_response(docs, ruri, rword))
+                    // Workspace-wide when we know the root; same-file otherwise.
+                    if ws_root != ""
+                        lsp_respond(id, lsp_workspace_references(docs, ws_root, rword, ruri))
+                    else
+                        lsp_respond(id, lsp_references_response(docs, ruri, rword))
                 else
                     lsp_respond(id, "[]")
         else if method == "textDocument/rename"
@@ -29476,9 +29981,65 @@ fn lsp_server_main()
                 let nnew = nparams["newName"]
                 let nword = lsp_get_word_at(docs, nuri, nline, ncol)
                 if nword != "" and nnew != ""
-                    lsp_respond(id, lsp_rename_response(docs, nuri, nword, nnew))
+                    if ws_root != ""
+                        lsp_respond(id, lsp_workspace_rename(docs, ws_root, nword, nnew, nuri))
+                    else
+                        lsp_respond(id, lsp_rename_response(docs, nuri, nword, nnew))
                 else
                     lsp_respond(id, "null")
+        else if method == "textDocument/prepareRename"
+            if has_id
+                let pparams = msg["params"]
+                let ptd = pparams["textDocument"]
+                let puri = ptd["uri"]
+                let ppos = pparams["position"]
+                let pline = ppos["line"]
+                let pcol = ppos["character"]
+                lsp_respond(id, lsp_prepare_rename_response(docs, puri, pline, pcol))
+        else if method == "textDocument/documentHighlight"
+            if has_id
+                let hlparams = msg["params"]
+                let hltd = hlparams["textDocument"]
+                let hluri = hltd["uri"]
+                let hlpos = hlparams["position"]
+                let hlline = hlpos["line"]
+                let hlcol = hlpos["character"]
+                let hlword = lsp_get_word_at(docs, hluri, hlline, hlcol)
+                if hlword != ""
+                    lsp_respond(id, lsp_highlight_response(docs, hluri, hlword))
+                else
+                    lsp_respond(id, "[]")
+        else if method == "textDocument/foldingRange"
+            if has_id
+                let fparams = msg["params"]
+                let ftd = fparams["textDocument"]
+                let furi = ftd["uri"]
+                lsp_respond(id, lsp_folding_ranges(docs, furi))
+        else if method == "textDocument/signatureHelp"
+            if has_id
+                let shparams = msg["params"]
+                let shtd = shparams["textDocument"]
+                let shuri = shtd["uri"]
+                let shpos = shparams["position"]
+                let shline = shpos["line"]
+                let shcol = shpos["character"]
+                lsp_respond(id, lsp_signature_help_response(docs, shuri, shline, shcol))
+        else if method == "textDocument/formatting"
+            if has_id
+                let fmparams = msg["params"]
+                let fmtd = fmparams["textDocument"]
+                let fmuri = fmtd["uri"]
+                lsp_respond(id, lsp_formatting_response(docs, fmuri))
+        else if method == "workspace/symbol"
+            if has_id
+                let wsparams = msg["params"]
+                let wsq = ""
+                if contains(wsparams, "query")
+                    wsq = wsparams["query"]
+                if ws_root == ""
+                    lsp_respond(id, "[]")
+                else
+                    lsp_respond(id, lsp_workspace_symbols(ws_root, wsq))
         else if has_id
             lsp_error_response(id, -32601, "Method not found: " + method)
 
