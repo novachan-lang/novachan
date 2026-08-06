@@ -63,12 +63,12 @@ fn _tlss_fill(sock, buf, need: int) -> list
 fn _tlss_read_record(sock, buf) -> list
     let b2 = _tlss_fill(sock, buf, 5)
     if len(b2) < 5
-        return [0 - 1, [], b2]
+        return [-1, [], b2]
     let ct = b2[0]
     let reclen = (b2[3] << 8) | b2[4]
     b2 = _tlss_fill(sock, b2, 5 + reclen)
     if len(b2) < 5 + reclen
-        return [0 - 1, [], b2]
+        return [-1, [], b2]
     [ct, _tlss_slice(b2, 5, 5 + reclen), _tlss_slice(b2, 5 + reclen, len(b2))]
 
 fn _tlss_send_record(sock, ct: int, ver_lo: int, body) -> int
@@ -222,32 +222,27 @@ fn tls13_server_handshake(sock, cert_sk, srv_priv) -> list
     // read client's records until the encrypted Finished (skip ChangeCipherSpec)
     let c_hs_key = tls13_traffic_key(c_hs)
     let c_hs_iv = tls13_traffic_iv(c_hs)
-    let okfin = 0
-    let guard = 0
-    while okfin == 0 and guard < 16
-        guard += 1
+    // bounded retry budget (was a flag `okfin` threaded through a `while okfin == 0 and guard < 16`)
+    for guard in 0..16
         let rec = _tlss_read_record(sock, buf)
         buf = rec[2]
-        if rec[0] == 0 - 1
+        if rec[0] == -1
             return [0]
         if rec[0] == 23
             let opened = tls13_record_open(c_hs_key, c_hs_iv, 0, _tlss_wire(23, rec[1]))
-            if opened[0] != true
+            if not opened[0]
                 return [0]
             // opened[1] = client Finished handshake message
             let cm = tls13_hs_header(opened[1], 0)
             let cvd = _tlss_slice(opened[1], cm[2], cm[3])
             if tls13_verify_server_finished(c_hs, th_sf, cvd) != 1
                 return [0]
-            okfin = 1
-    if okfin != 1
-        return [0]
-
-    // application traffic keys
-    let ms = tls13_master_secret(hs)
-    let c_ap = tls13_derive_secret(ms, "c ap traffic", th_sf)
-    let s_ap = tls13_derive_secret(ms, "s ap traffic", th_sf)
-    [1, tls13_traffic_key(c_ap), tls13_traffic_iv(c_ap), tls13_traffic_key(s_ap), tls13_traffic_iv(s_ap), sock, buf]
+            // application traffic keys
+            let ms = tls13_master_secret(hs)
+            let c_ap = tls13_derive_secret(ms, "c ap traffic", th_sf)
+            let s_ap = tls13_derive_secret(ms, "s ap traffic", th_sf)
+            return [1, tls13_traffic_key(c_ap), tls13_traffic_iv(c_ap), tls13_traffic_key(s_ap), tls13_traffic_iv(s_ap), sock, buf]
+    [0]
 
 // The X25519 base point u=9 (little-endian, 32 bytes).
 fn _tlss_base9() -> list
@@ -296,12 +291,12 @@ fn tls13_serve_once(port: int, response) -> int
     for guard in 0..16
         let rec = _tlss_read_record(conn, buf)
         buf = rec[2]
-        if rec[0] == 0 - 1
+        if rec[0] == -1
             return 0
         if rec[0] == 23
             let opened = tls13_record_open(c_ap_key, c_ap_iv, cseq, _tlss_wire(23, rec[1]))
             cseq += 1
-            if opened[0] != true
+            if not opened[0]
                 return 0
             if opened[2] == 23
                 tcp_send_bytes(conn, _tlss_l2b(tls13_record_seal(s_ap_key, s_ap_iv, 0, response, 23, 0)))
@@ -325,28 +320,17 @@ fn _tlss_content_length(req) -> int
         return 0
     let p = idx + 15
     let n = len(req)
-    let go = 1
-    while go == 1
-        if p >= n
-            go = 0
-        else if req[p] == " "
-            p += 1
-        else
-            go = 0
+    while p < n and req[p] == " "
+        p += 1
     let v = 0
     let seen = 0
-    let go2 = 1
-    while go2 == 1
-        if p >= n
-            go2 = 0
-        else
-            let d = find("0123456789", req[p])
-            if d >= 0
-                v = v * 10 + d
-                seen = 1
-                p += 1
-            else
-                go2 = 0
+    while p < n
+        let d = find("0123456789", req[p])
+        if d < 0
+            break
+        v = v * 10 + d
+        seen = 1
+        p += 1
     if seen == 0
         return 0
     v
@@ -379,12 +363,12 @@ fn _tlss_serve_conn(conn: int, handler, cert_sk, srv_priv) -> int
     for guard in 0..64
         let rec = _tlss_read_record(conn, buf)
         buf = rec[2]
-        if rec[0] == 0 - 1
+        if rec[0] == -1
             return 0
         if rec[0] == 23
             let opened = tls13_record_open(c_ap_key, c_ap_iv, cseq, _tlss_wire(23, rec[1]))
             cseq += 1
-            if opened[0] != true
+            if not opened[0]
                 return 0
             if opened[2] == 23
                 // Reassemble the HTTP request across records; each app record has its own AEAD seq (cseq).
@@ -505,7 +489,7 @@ fn _tlss_read_plain_request(handle) -> string
 // response back encrypted. Returns 1 iff a complete request was actually served.
 fn _tlss_serve_conn_file(handle, handler) -> int
     let acc = _tlss_read_plain_request(handle)
-    if _tlss_req_complete(acc) != true
+    if not _tlss_req_complete(acc)
         return 0
     let resp = handler(acc)
     unsafe nova_rt_tls_send_bytes(handle, str_to_bytes(resp))
