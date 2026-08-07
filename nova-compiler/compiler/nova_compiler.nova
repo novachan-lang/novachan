@@ -12387,12 +12387,22 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     _hof_ai = _hof_ai + 1
                 let dest = ir_fresh_reg(b)
                 let resolved_method = ""
+                // A closure held in a struct FIELD, called as `obj.f(args)`. Without this the
+                // chain below falls through to the free-fn branch (silently calling an unrelated
+                // global `f` with obj injected as arg 0 -- a WRONG ANSWER, no diagnostic) or to
+                // resolve_method_fn, which fails OPEN and fabricates a `@nova_rt_f` symbol that
+                // only explodes at link time. Only set when the receiver's struct type actually
+                // declares the field AND no explicit `Type__f` method claimed it, so real methods
+                // keep winning and every other call lowers exactly as before.
+                let mc_field_stype = ""
                 if len(children) > 0
                     let recv_type = ir_expr_struct_type(b, children[0])
                     if recv_type != ""
                         let typed_m = recv_type + "__" + value
                         if list_contains(b.ir_fnames, typed_m)
                             resolved_method = typed_m
+                        if resolved_method == "" and contains(b.ir_field_types, recv_type + "." + value)
+                            mc_field_stype = recv_type
                 if resolved_method != ""
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, resolved_method, 0)
                 else if contains(b.ir_method_dispatch, value) and len(arg_regs) > 0
@@ -12473,6 +12483,20 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 else if contains(b.ir_methods, value)
                     let user_method = b.ir_methods[value]
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, user_method, 0)
+                else if mc_field_stype != ""
+                    // Load the field, then call it indirectly -- the exact IR the
+                    // `let f = obj.field` / `f(args)` workaround already produces.
+                    // Placed BEFORE the free-fn branch: a field of the receiver's own
+                    // type is more specific than an unrelated global of the same name.
+                    let mc_fld = ir_fresh_reg(b)
+                    let mc_fi = get_ir_field_index_for(b, mc_field_stype, value)
+                    ir_emit_inst(b, "field_get", mc_fld, ir_type_any(), [arg_regs[0]], value, mc_fi)
+                    let mc_args = [mc_fld]
+                    let mc_i = 1
+                    while mc_i < len(arg_regs)
+                        push(mc_args, arg_regs[mc_i])
+                        mc_i = mc_i + 1
+                    ir_emit_side(b, "dyn_call", dest, ir_type_any(), mc_args, "", len(arg_regs) - 1)
                 else if list_contains(b.ir_fnames, value)
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
                 else

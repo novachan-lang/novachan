@@ -22447,17 +22447,23 @@ int64_t nova_rt_target_current(void) {
 #endif
 }
 
-/* nova_rt_target_list: Return list of supported compilation targets. */
+/* nova_rt_target_list: Return list of supported compilation targets.
+   MUST stay in sync with resolve_target()/target_datalayout() in nova_compiler.nova --
+   this list is what `nova targets` shows a user to copy from, so advertising a triple the
+   compiler cannot actually lower is worse than not listing it.
+   - riscv64 and armv7 were removed 2026-08-07: neither resolve_target() nor
+     target_datalayout() has a path for them, so they silently fell through to the generic
+     ELF datalayout and miscompiled.
+   - the macOS entries were "*-apple-macosx", but resolve_target() emits "*-apple-darwin";
+     the advertised list and the accepted list disagreed. Aligned to darwin. */
 int64_t nova_rt_target_list(void) {
     static const char* targets[] = {
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
-        "aarch64-apple-macosx",
-        "x86_64-apple-macosx",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
         "wasm32-unknown-unknown",
-        "riscv64-unknown-linux-gnu",
-        "armv7-unknown-linux-gnueabihf",
         NULL
     };
     int64_t list = nova_rt_list_create();
@@ -25495,7 +25501,8 @@ int64_t c_test_set42(int64_t* out) {
    timestamp; nova_rt_prof_exit("fn_name") accumulates (now - entry) into
    that function's bucket and increments the call count. On program exit,
    atexit-registered nova_rt_prof_dump() prints sorted by total time.
-   The compiler injects these calls when --profile is passed. Names live
+   These calls are MANUAL instrumentation only -- there is no --profile flag in the CLI, so
+   nothing injects them automatically (the previous claim here was stale). Names live
    for the duration of the binary (string literals in .rodata), so we can
    key by pointer + use a tiny linear-probe table without allocation.
    Up to 1024 distinct functions; that covers any realistic NOVA program. */

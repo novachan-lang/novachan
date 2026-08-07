@@ -188,8 +188,10 @@
   disagree, so a user copying a triple straight out of `target_list()` gets a triple the compiler's own
   `resolve_target` passes through unrecognized.
 - **Fix required:**
-  - [ ] Drop riscv64/armv7 from `target_list()` (they are not supported) and align the macOS triples with
-        what `resolve_target` actually produces. Runtime change → needs a full reconverge arc.
+  - [x] ✅ FIXED 2026-08-07. Dropped `riscv64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf`, and
+        aligned the macOS entries `*-apple-macosx` → `*-apple-darwin` to match `resolve_target`. Added a
+        comment tying the list to `resolve_target`/`target_datalayout` so it cannot drift again.
+        Verified no test asserts the list contents. Rode the same reconverge arc as #24.
 - **Files:** `nova_runtime.c:22451`, `nova_compiler.nova` (`resolve_target` ~21889)
 - **Why:** Advertising capabilities that don't work is worse than not having them.
 
@@ -233,7 +235,7 @@
   - [ ] Add Phase 9 (DevX) entries to EXECUTION_STATE.md
   - [ ] Document `nova debug`, `nova cov`, `nova bench`, `nova test`, `nova repl` in user-facing docs
 
-### 24. Closure-valued struct field cannot be CALLED directly — 🔴 REAL COMPILER BUG (found 2026-08-07)
+### 24. Closure-valued struct field cannot be CALLED directly — ✅ FIXED 2026-08-07 (compiler)
 - **Symptom:** `obj.fn_field(args)` emits `call i64 @nova_rt_<fieldname>(...)` — a runtime builtin that does
   not exist — so the program fails to LINK, not to compile.
 - **Root cause (located exactly):** `fn ir_lower_expr` in `nova_compiler.nova` (branch `tag == "method" or
@@ -276,23 +278,33 @@
   CI log shows all 22 as `PASS`; they broke when `recv_fn`/`send_fn` closure fields were added to `WsConn`
   in `02a23b5b` (the wss:// work). Fixed forge-side 2026-08-07 by applying the workaround at the 2 call
   sites; all 22 verified building AND running green again.
-- **Fix required (the proper one, still open) — RED blast radius, needs a full arc:**
-  - [ ] Insert a "does the receiver's struct type declare a field named `value`?" check in `ir_lower_expr`,
-        placed **BEFORE the free-function branch at ~12476** — not merely before the `nova_rt_` fallback at
-        ~12478. Placing it only before the fallback fixes the loud link error and leaves the silent
-        miscompile intact. Lower the hit to `field_get` + `dyn_call` (both IR ops already exist; this is
-        exactly the IR the bind-to-local workaround already produces).
-  - [ ] The data needed is already on the builder: `b.ir_field_types[<StructName> + "." + <field>]`
-        (populated ~24477) and `ir_expr_struct_type` (~12986) to resolve the receiver.
-  - [ ] `ir_lower_expr` is the SHARED IR builder, so one fix covers BOTH LLVM backends. The legacy `cg`
-        path (`codegen_method_call`, ~6274) calls `resolve_method_fn` unguarded and needs its own touch.
-  - [ ] Make `resolve_method_fn` fail CLOSED, or have the fallback raise a real compile-time error
-        ("unknown method or field 'op' on type 'Calc'") instead of fabricating a symbol that only explodes
-        at link time pointing at `@nova_rt_op`.
-  - [ ] **Risk to control:** this changes method-dispatch PRECEDENCE. A field that is not callable but whose
-        name matches a global fn (e.g. `count: int` with a global `count(x)`) currently resolves to the
-        global via UFCS; after the fix it would resolve to the field and fail. Each of the 63 shadowing
-        names must be checked before landing this.
+- **FIX LANDED:** a new branch in `ir_lower_expr` sets `mc_field_stype` when the receiver's struct type
+  declares a field of that name and no explicit `Type__name` method claimed it, then lowers to
+  `field_get` + `dyn_call` — exactly the IR the bind-to-local workaround produced. Placed **between the
+  `ir_methods` branch and the free-function branch**, so real methods still win but a field of the
+  receiver's own type now beats an unrelated global of the same name.
+- **Verified:**
+  - `_closure_field_shadow_probe` now prints **42, 42** (was **999**, 42) — silent miscompile gone.
+  - `_closure_field_probe` now prints **7, 12** (was a link error) — fabricated symbol gone.
+  - `_closure_field_param_probe` (typed fn param, forge's real shape) prints **42, 40**.
+  - forge's `ws.recv_fn()` / `ws.send_fn(frame)` restored to the DIRECT form (workaround reverted);
+    `forge_ws_echo_test` passes end-to-end over a real socket.
+  - Reconverge **gen5.ll == gen6.ll byte-identical** (9D792E7E…).
+- **Precedence-safety audit (3 areas, each adversarially verified) — 0 breaking sites:**
+  - `forge/` — the only 2 changed sites are the intended targets. The 4 field/fn name collisions
+    (`code`, `content_type`, `pattern`, `table`) have ZERO call sites.
+  - `std/` — 0 changed sites. Two latent traps exist (`Gen.fib: int` vs global `fn fib`, `Gen.box: list`
+    vs global `fn box`, both `std/util/coro.nova:21`) but both fields are only ever READ
+    (`fiber_resume(g.fib)`, `g.box[0]`), never called. If anyone ever writes `g.fib(n)` expecting UFCS it
+    would now break — noted as a trip-wire, not a live problem.
+  - `nova_compiler.nova` — 0 sites; 197 field names × 523 global fn names is an EMPTY intersection and the
+    file contains no `recv.FIELD(` form at all. This predicted byte-identical reconverge, which held.
+- **KNOWN REMAINING GAP (documented, not fixed):** the legacy `cg` backend's `codegen_method_call`
+  (~6272) still calls `resolve_method_fn` unguarded, so the two backends now disagree on `recv.field(...)`.
+  That path is reachable ONLY via an explicit `--old` flag (default is `use_ir = 1`), and NO gate exercises
+  it (`grep -c '\-\-old'` over `nova_ci.ps1` / `_run_final_regression.ps1` = 0). Fixing it properly needs
+  receiver-struct-type plumbing that the `CodeGen` struct does not carry, so a half-fix would add risk
+  without benefit. Tracked rather than rushed.
 - **Files:** `nova-compiler/compiler/nova_compiler.nova` (`ir_lower_expr` ~12358-12480, `resolve_method_fn`
   ~9220/9329, legacy `codegen_method_call` ~6274). Repros committed as
   `test_programs/_closure_field_probe.nova`, `_closure_field_shadow_probe.nova`, `_closure_field_workaround.nova`
@@ -304,7 +316,9 @@
 - **Problem:** `nova_runtime.c:25495` comments claim "the compiler injects prof_enter/exit when --profile is passed" but no `--profile` flag exists in the CLI. Profiling is manual-instrumentation only.
 - **Fix required:**
   - [ ] Either add `--profile` flag that auto-injects prof_enter/exit per function OR
-  - [ ] Correct the stale comment in nova_runtime.c
+  - [x] ✅ Corrected the stale comment in `nova_runtime.c` (2026-08-07). Verified first that no `--profile`
+        flag exists in the CLI and nothing auto-injects `nova_rt_prof_enter` — the only hits are the
+        builtin-name mapping and the two `declare` lines. Profiling is manual instrumentation only.
 
 ---
 
