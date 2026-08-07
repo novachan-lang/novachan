@@ -1,3 +1,6 @@
+/* Copyright 2026 Mangesh Mane. Licensed under Apache License 2.0.
+   See LICENSE and NOTICE files at the project root. */
+
 /* _GNU_SOURCE must be defined BEFORE any libc header, or <link.h> will not expose
    dl_iterate_phdr / struct dl_phdr_info — which nova_addr_in_module needs to answer
    "is this a static string literal?" EXACTLY on Linux instead of scanning for a NUL
