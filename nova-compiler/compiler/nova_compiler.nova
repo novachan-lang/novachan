@@ -27442,35 +27442,25 @@ fn _link_path_safe(p: string) -> bool
         return false
     return true
 
+fn nova_warmup_runtime() -> int
+    let rt = nova_find_runtime()
+    let rt_o = replace(rt, ".c", ".o")
+    let c_mt = build_file_mtime(rt)
+    let o_mt = build_file_mtime(rt_o)
+    if o_mt >= 0 and c_mt <= o_mt
+        return 0
+    let cc = "clang -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
+    cc = cc + " \"" + rt + "\" -o \"" + rt_o + "\""
+    let ret = system(cc)
+    return ret
+
 fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: string) -> int
     let rt = nova_find_runtime()
     let resolved = resolve_target(target)
-    // -O0 builds get -g automatically so 'nova build -O0 foo.nova' produces
-    // an LLDB-debuggable binary in one step. The IR pipeline already emits
-    // !dbg metadata for every NOVA statement, so breakpoints resolve to
-    // .nova source lines directly.
-    let cmd = "clang " + opt_level + " -w"
-    if opt_level == "-O0"
-        cmd = cmd + " -g"
-    if target != "" and target != "native" and target != "windows" and target != "win"
-        cmd = cmd + " --target=" + resolved
-    cmd = cmd + " \"" + ll_path + "\" \"" + rt + "\" -o \"" + exe_path + "\""
-    if target_is_windows(resolved) == 1
-        // Runtime uses Wincrypt (random/UUID), WinSock (TCP/UDP), WinHTTP
-        // (http_request), bcrypt (TLS-adjacent). advapi32 covers Wincrypt.
-        cmd = cmd + " -lws2_32 -lwinhttp -ladvapi32 -lbcrypt"
-    // Also propagate @link("libname") LINK_LIB comments emitted by the IR.
     let ll_content = read_file(ll_path)
     let ll_lines = split(ll_content, "\n")
     let extra_libs = ""
     let seen = {}
-    // Demand-driven OpenSSL: the runtime's https/TLS code is gated behind
-    // #ifdef NOVA_HAVE_OPENSSL, so enabling it needs BOTH the define (for the
-    // runtime .c compile in this same clang call) AND -lssl -lcrypto. Pull it in
-    // ONLY when the program actually CALLS a TLS/https builtin (a `call` to one of
-    // the nova_rt_tls_* fns or nova_rt_http_get) -- the unconditional `declare`
-    // lines have no `call`, so a program that never touches TLS/http links exactly
-    // as before (no libssl-dev dependency). POSIX only: Windows uses WinHTTP/bcrypt.
     let needs_ssl = 0
     let needs_sqlite = 0
     let link_srcs = []
@@ -27497,14 +27487,35 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
             needs_ssl = 1
         if contains(line, "call ") and contains(line, "@sqlite3_")
             needs_sqlite = 1
-    if needs_ssl == 1 and target_is_windows(resolved) == 0
+    let rt_link = rt
+    let is_cross = target != "" and target != "native" and target != "windows" and target != "win"
+    let use_ssl_define = needs_ssl == 1 and target_is_windows(resolved) == 0
+    if not is_cross and use_ssl_define == 0
+        let rt_o = replace(rt, ".c", ".o")
+        let c_mt = build_file_mtime(rt)
+        let o_mt = build_file_mtime(rt_o)
+        if o_mt < 0 or c_mt > o_mt
+            let rt_cc = "clang -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
+            if target_is_windows(resolved) == 1
+                rt_cc = rt_cc + " -D_WIN32"
+            rt_cc = rt_cc + " \"" + rt + "\" -o \"" + rt_o + "\""
+            let rt_ret = system(rt_cc)
+            if rt_ret != 0
+                rt_link = rt
+            else
+                rt_link = rt_o
+        else
+            rt_link = rt_o
+    let cmd = "clang " + opt_level + " -w"
+    if opt_level == "-O0"
+        cmd = cmd + " -g"
+    if is_cross
+        cmd = cmd + " --target=" + resolved
+    cmd = cmd + " \"" + ll_path + "\" \"" + rt_link + "\" -o \"" + exe_path + "\""
+    if target_is_windows(resolved) == 1
+        cmd = cmd + " -lws2_32 -lwinhttp -ladvapi32 -lbcrypt"
+    if use_ssl_define
         extra_libs = extra_libs + " -DNOVA_HAVE_OPENSSL -lssl -lcrypto"
-    // Demand-driven SQLite: if the program CALLS a sqlite3_* FFI fn, compile + link the
-    // bundled sqlite3.c amalgamation (cached once as sqlite3.o next to the runtime, since
-    // recompiling the ~9MB amalgamation every build is wasteful). Like the OpenSSL path,
-    // only fires on a real `call @sqlite3_` (the unconditional declares have no `call`), so
-    // a non-DB program links exactly as before. Makes `nova build app.nova` link sqlite so
-    // modular-FFI DB libraries (sqlitex) are usable via the standard build command.
     if needs_sqlite == 1
         let rt_dir = path_parent(rt)
         let sq_c = path_join(rt_dir, "sqlite3.c")
@@ -30417,12 +30428,14 @@ fn compiler_main()
         print("  install               Download all dependencies from nova.toml")
         print("")
         print("Tools:")
+        print("  setup                 Pre-compile build cache (one-time, makes builds instant)")
         print("  version               Show version")
         print("  self-test             Run compiler self-test")
         print("  lsp                   Start LSP server (for IDE integration)")
         print("")
         print("Options:")
-        print("  -O0                   Disable optimizations")
+        print("  -O0                   Disable optimizations (nova run default)")
+        print("  -O2                   Full optimizations (nova build default)")
         print("  -o <output>           Output file path")
         print("  --target <target>     Cross-compile target:")
         print("    linux, linux-arm64, macos, macos-arm64, windows, wasm")
@@ -30438,16 +30451,23 @@ fn compiler_main()
     if cmd == "lsp" or cmd == "--lsp"
         lsp_server_main()
         exit(0)
+    if cmd == "setup"
+        print("Preparing build cache...")
+        let sr = nova_warmup_runtime()
+        if sr == 0
+            print("Build cache ready. Every build will be instant.")
+        else
+            print("warning: runtime cache build failed (builds will still work, just slower)")
+        exit(sr)
     if cmd == "init"
         nova_pkg_init()
+        nova_warmup_runtime()
         exit(0)
     if cmd == "new"
         if len(arguments) < 3
             print("Usage: nova new <name> [--api|--microservice|--frontend|--fullstack|--lib]")
             print("  default: --api (a working Forge REST API)")
             exit(1)
-        // Accept the name and an optional --kind flag in either order. Default kind = api, so the
-        // first thing a new developer builds is a working full-stack-capable Forge app.
         let nn_name = ""
         let nn_kind = "api"
         let ni = 2
@@ -30462,6 +30482,9 @@ fn compiler_main()
             print("Usage: nova new <name> [--api|--microservice|--frontend|--fullstack|--lib]")
             exit(1)
         let nrc = nn_new_project(nn_kind, nn_name)
+        if nrc == 0
+            print("Preparing build cache...")
+            nova_warmup_runtime()
         exit(nrc)
     if cmd == "clean"
         nova_pkg_clean()
@@ -30768,7 +30791,10 @@ fn compiler_main()
         exit(0)
     if cmd == "run" or cmd == "build" or cmd == "compile"
         let use_ir = 1
-        let opt_level = "-O2"
+        let opt_level = if cmd == "run"
+            "-O0"
+        else
+            "-O2"
         let output_file = ""
         let input_file = ""
         let target = ""
@@ -30779,6 +30805,8 @@ fn compiler_main()
                 use_ir = 0
             else if a == "-O0"
                 opt_level = "-O0"
+            else if a == "-O2"
+                opt_level = "-O2"
             else if a == "-o"
                 i = i + 1
                 if i < len(arguments)

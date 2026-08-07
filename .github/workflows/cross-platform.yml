@@ -40,17 +40,11 @@ jobs:
           }
         timeout-minutes: 10
 
-  # ─── Linux: build Kotlin compiler, compile + run core tests ───────
-  linux-test:
+  # ─── Linux: self-hosted compiler (the LIVE compiler, not Kotlin) ───
+  linux-selfhosted:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
 
       - name: Install LLVM/Clang
         run: |
@@ -58,27 +52,48 @@ jobs:
           sudo apt-get install -y clang lld
           clang --version
 
-      - name: Build NOVA compiler (Kotlin)
+      - name: Build self-hosted compiler from checked-in IR
+        run: |
+          cd nova-compiler/compiler
+          clang -O2 -o nova nova_compiler.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          echo "Built native Linux compiler:"
+          ls -la nova
+          ./nova --version || true
+
+      - name: Reconverge check (gen5 == gen6)
+        run: |
+          cd nova-compiler/compiler
+          export NOVA_NO_CACHE=1
+          echo "=== gen5: compile compiler with itself ==="
+          ./nova nova_compiler.nova
+          cp nova_compiler.ll nova_compiler_gen5.ll
+          echo "=== Build gen5 binary ==="
+          clang -O2 -o nova_gen5 nova_compiler.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          echo "=== gen6: compile compiler with gen5 ==="
+          ./nova_gen5 nova_compiler.nova
+          cp nova_compiler.ll nova_compiler_gen6.ll
+          echo "=== Compare gen5 vs gen6 ==="
+          if diff -q nova_compiler_gen5.ll nova_compiler_gen6.ll; then
+            echo "RECONVERGED: gen5 == gen6 (byte-identical)"
+          else
+            echo "DIVERGED: gen5 != gen6"
+            diff nova_compiler_gen5.ll nova_compiler_gen6.ll | head -40
+            exit 1
+          fi
+          rm -f nova_gen5 nova_compiler_gen5.ll nova_compiler_gen6.ll
+        timeout-minutes: 30
+
+      - name: Run core test suite
         run: |
           cd nova-compiler
-          chmod +x gradlew
-          ./gradlew fatJar --no-daemon -q
-          ls -la build/libs/*-all.jar
+          export NOVA_NO_CACHE=1
+          export NOVA_HOME="$(pwd)"
+          NOVA="compiler/nova"
+          RUNTIME="compiler/nova_runtime.c"
 
-      - name: Compile and run core tests
-        run: |
-          cd nova-compiler/test_programs
-          COMPILER_JAR="../build/libs/nova-compiler-0.1.0-all.jar"
-          RUNTIME="../nova_runtime.c"
-
-          # Use the output runtime if available
-          if [ -f "../compiler/nova_runtime.c" ]; then
-            RUNTIME="../compiler/nova_runtime.c"
-          fi
-
+          cd test_programs
           PASS=0; FAIL=0; SKIP=0; FAILURES=""
 
-          # Core language tests (no networking, no Windows-specific)
           TESTS=(
             float_test while_test list_test string_test for_test
             closure_test combined_test nested_fn_test
@@ -115,8 +130,7 @@ jobs:
               continue
             fi
 
-            # Compile NOVA -> LLVM IR
-            if ! java -jar "$COMPILER_JAR" "$nova" > /dev/null 2>&1; then
+            if ! "../${NOVA}" "$nova" > /dev/null 2>&1; then
               echo "FAIL compile: $t"
               FAILURES="$FAILURES $t(COMPILE)"
               FAIL=$((FAIL + 1))
@@ -130,8 +144,7 @@ jobs:
               continue
             fi
 
-            # Link
-            if ! clang -O2 -o "$exe" "$ll" "$RUNTIME" -lpthread -ldl -lm -Wno-everything 2>/dev/null; then
+            if ! clang -O2 -o "$exe" "$ll" "../${RUNTIME}" -lpthread -ldl -lm -Wno-everything 2>/dev/null; then
               echo "FAIL link: $t"
               FAILURES="$FAILURES $t(LINK)"
               FAIL=$((FAIL + 1))
@@ -139,7 +152,6 @@ jobs:
               continue
             fi
 
-            # Run with timeout
             if timeout 15 ./"$exe" > /tmp/test_out.txt 2>/tmp/test_err.txt; then
               if grep -q "FAIL assert" /tmp/test_err.txt 2>/dev/null; then
                 echo "FAIL assert: $t"
@@ -171,7 +183,251 @@ jobs:
           fi
           if [ $FAIL -gt 0 ]; then exit 1; fi
 
-  # ─── macOS: build Kotlin compiler, compile + run core tests ───────
+  # ─── Linux (Kotlin bootstrap, legacy reference) ───────
+  linux-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install LLVM/Clang
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld
+          clang --version
+
+      - name: Build NOVA compiler (Kotlin)
+        run: |
+          cd nova-compiler
+          chmod +x gradlew
+          ./gradlew fatJar --no-daemon -q
+          ls -la build/libs/*-all.jar
+
+      - name: Compile and run core tests
+        run: |
+          cd nova-compiler/test_programs
+          COMPILER_JAR="../build/libs/nova-compiler-0.1.0-all.jar"
+          RUNTIME="../nova_runtime.c"
+
+          if [ -f "../compiler/nova_runtime.c" ]; then
+            RUNTIME="../compiler/nova_runtime.c"
+          fi
+
+          PASS=0; FAIL=0; SKIP=0; FAILURES=""
+
+          TESTS=(
+            float_test while_test list_test string_test for_test
+            closure_test combined_test nested_fn_test
+            struct_test struct_advanced_test struct_mutate_test
+            match_test match_advanced_test higher_order_test
+            enum_test range_test string_methods_test dict_test
+            math_test string_stdlib_test list_methods_test
+            type_conv_test slice_test defaults_test
+            in_operator_test struct_methods_test
+            generics_test match_guard_test trait_test
+            destructure_test assert_test string_index_test
+            string_iter_test string_ops_test
+            list_struct_test list_struct_loop_test
+            string_accum_test string_accum_fn_test
+            codegen_pattern_test match_expr_test
+            map_filter_test bitwise_test
+            closure_ir_test error_test tiny_test match_str_test
+            default_params_test tuple_test method_test
+            math_quick_test else_sibling_test
+            mini_struct_test mini2_test
+            stdlib_test mixed_arith_test
+            shadow_test json_float_test nested_float_test
+            dict_float_test bool_json_test nested_bool_test
+            float_list_ops_test
+          )
+
+          for t in "${TESTS[@]}"; do
+            nova="${t}.nova"
+            ll="${t}.ll"
+            exe="${t}"
+
+            if [ ! -f "$nova" ]; then
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            if ! java -jar "$COMPILER_JAR" "$nova" > /dev/null 2>&1; then
+              echo "FAIL compile: $t"
+              FAILURES="$FAILURES $t(COMPILE)"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            if [ ! -f "$ll" ]; then
+              echo "FAIL compile: $t (no .ll)"
+              FAILURES="$FAILURES $t(NO_LL)"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            if ! clang -O2 -o "$exe" "$ll" "$RUNTIME" -lpthread -ldl -lm -Wno-everything 2>/dev/null; then
+              echo "FAIL link: $t"
+              FAILURES="$FAILURES $t(LINK)"
+              FAIL=$((FAIL + 1))
+              rm -f "$ll"
+              continue
+            fi
+
+            if timeout 15 ./"$exe" > /tmp/test_out.txt 2>/tmp/test_err.txt; then
+              if grep -q "FAIL assert" /tmp/test_err.txt 2>/dev/null; then
+                echo "FAIL assert: $t"
+                FAILURES="$FAILURES $t(ASSERT)"
+                FAIL=$((FAIL + 1))
+              else
+                echo "PASS $t"
+                PASS=$((PASS + 1))
+              fi
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "FAIL timeout: $t"
+                FAILURES="$FAILURES $t(TIMEOUT)"
+              else
+                echo "FAIL run: $t (exit=$EXIT_CODE)"
+                FAILURES="$FAILURES $t(RUN)"
+              fi
+              FAIL=$((FAIL + 1))
+            fi
+
+            rm -f "$ll" "$exe"
+          done
+
+          echo ""
+          echo "=== RESULTS: $PASS PASS, $FAIL FAIL, $SKIP SKIP ==="
+          if [ -n "$FAILURES" ]; then
+            echo "Failures:$FAILURES"
+          fi
+          if [ $FAIL -gt 0 ]; then exit 1; fi
+
+  # ─── macOS: self-hosted compiler (the LIVE compiler, not Kotlin) ───
+  macos-selfhosted:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify clang
+        run: clang --version
+
+      - name: Build self-hosted compiler from checked-in IR
+        run: |
+          cd nova-compiler/compiler
+          # macOS: no -lpthread -ldl needed (part of system libs)
+          clang -O2 -o nova nova_compiler.ll nova_runtime.c -lm -Wno-everything -D_DARWIN_C_SOURCE
+          echo "Built native macOS compiler:"
+          ls -la nova
+          ./nova --version || true
+
+      - name: Run core test suite
+        run: |
+          cd nova-compiler
+          export NOVA_NO_CACHE=1
+          export NOVA_HOME="$(pwd)"
+          NOVA="compiler/nova"
+          RUNTIME="compiler/nova_runtime.c"
+
+          cd test_programs
+          PASS=0; FAIL=0; SKIP=0; FAILURES=""
+
+          TESTS=(
+            float_test while_test list_test string_test for_test
+            closure_test combined_test nested_fn_test
+            struct_test struct_advanced_test struct_mutate_test
+            match_test match_advanced_test higher_order_test
+            enum_test range_test string_methods_test dict_test
+            math_test string_stdlib_test list_methods_test
+            type_conv_test slice_test defaults_test
+            in_operator_test struct_methods_test
+            generics_test match_guard_test trait_test
+            destructure_test assert_test string_index_test
+            string_iter_test string_ops_test
+            list_struct_test list_struct_loop_test
+            string_accum_test string_accum_fn_test
+            codegen_pattern_test match_expr_test
+            map_filter_test bitwise_test
+            closure_ir_test error_test tiny_test match_str_test
+            default_params_test tuple_test method_test
+            math_quick_test else_sibling_test
+            mini_struct_test mini2_test
+            stdlib_test mixed_arith_test
+            shadow_test json_float_test nested_float_test
+            dict_float_test bool_json_test nested_bool_test
+            float_list_ops_test
+          )
+
+          for t in "${TESTS[@]}"; do
+            nova="${t}.nova"
+            ll="${t}.ll"
+            exe="${t}"
+
+            if [ ! -f "$nova" ]; then
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            if ! "../${NOVA}" "$nova" > /dev/null 2>&1; then
+              echo "FAIL compile: $t"
+              FAILURES="$FAILURES $t(COMPILE)"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            if [ ! -f "$ll" ]; then
+              echo "FAIL compile: $t (no .ll)"
+              FAILURES="$FAILURES $t(NO_LL)"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            if ! clang -O2 -o "$exe" "$ll" "../${RUNTIME}" -lm -Wno-everything -D_DARWIN_C_SOURCE 2>/dev/null; then
+              echo "FAIL link: $t"
+              FAILURES="$FAILURES $t(LINK)"
+              FAIL=$((FAIL + 1))
+              rm -f "$ll"
+              continue
+            fi
+
+            if timeout 15 ./"$exe" > /tmp/test_out.txt 2>/tmp/test_err.txt; then
+              if grep -q "FAIL assert" /tmp/test_err.txt 2>/dev/null; then
+                echo "FAIL assert: $t"
+                FAILURES="$FAILURES $t(ASSERT)"
+                FAIL=$((FAIL + 1))
+              else
+                echo "PASS $t"
+                PASS=$((PASS + 1))
+              fi
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "FAIL timeout: $t"
+                FAILURES="$FAILURES $t(TIMEOUT)"
+              else
+                echo "FAIL run: $t (exit=$EXIT_CODE)"
+                FAILURES="$FAILURES $t(RUN)"
+              fi
+              FAIL=$((FAIL + 1))
+            fi
+
+            rm -f "$ll" "$exe"
+          done
+
+          echo ""
+          echo "=== RESULTS: $PASS PASS, $FAIL FAIL, $SKIP SKIP ==="
+          if [ -n "$FAILURES" ]; then
+            echo "Failures:$FAILURES"
+          fi
+          if [ $FAIL -gt 0 ]; then exit 1; fi
+
+  # ─── macOS (Kotlin bootstrap, legacy reference) ───────
   macos-test:
     runs-on: macos-latest
     steps:

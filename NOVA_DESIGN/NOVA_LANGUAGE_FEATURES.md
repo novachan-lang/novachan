@@ -2,11 +2,16 @@
 
 This is the authoritative catalog of NOVA's high-level features. Write NOVA from THIS toolkit by default — reach for the highest-level construct that fits, not hand-rolled if/else + index loops + any+type_of. Every example here was verified against the live parser/stdlib.
 
-Sourced from a 5-agent feature audit (242 raw entries) deduplicated into the sections below. When two constructs overlap, the entry lives in its most natural home and is cross-referenced rather than repeated.
+Sourced from a multi-agent feature audit (242+ raw entries) deduplicated into the sections below. When two constructs overlap, the entry lives in its most natural home and is cross-referenced rather than repeated.
 
-**Sections 1–5** are that audit (2026-07-25). **Section 6** lists everything added since, each
-entry verified by EXECUTING a probe program; where the two disagree, section 6 wins. **Section 7**
-is the trap list — read it before writing NOVA, it is short and every item cost real time.
+**PART I — Coding Features (sections 1–19):** everything you use when writing `.nova` code.
+- **Sections 1–5:** Core language (syntax, collections, types, concurrency, annotations) — original audit (2026-07-25), verified correct.
+- **Section 6:** Features added since the original audit, each verified by EXECUTING a probe program; where sections 1–5 disagree, section 6 wins.
+- **Section 7:** TRAPS — read before writing NOVA; every item cost real debugging time.
+- **Sections 8–18:** Extended features (data structures, iterators, systems, crypto, networking, process, logging, testing, tensors, hot reload, annotations) — added 2026-08-07.
+- **Section 19:** Compiler intelligence — what's optional (13 items), what the compiler does automatically (24 items), syntactic sugar (14 items), what doesn't exist (13 items), and complete best practices summary.
+
+**PART II — Toolchain & CLI (sections 20–21):** compiler commands and dev tools, NOT language syntax.
 
 > **MAINTENANCE RULE: a new language feature goes into this file in the SAME COMMIT that lands
 > it.** A feature nobody wrote down is a feature nobody reaches for, so it stays untested and
@@ -48,6 +53,25 @@ is the trap list — read it before writing NOVA, it is short and every item cos
 | where clause | `E where a = e1, b = e2` | `let r = x * y where x = 6, y = 7` |
 | group_by | `fg_group_by(keyfn, xs)` | `fg_group_by(fn(x) x % 3, [1,2,3,4,5,6])` |
 | memo | `fn f(n) -> int memo` | `fn fib(n: int) -> int memo` |
+| else fallback | `expr else default` | `let port = parse_int_safe(env("PORT")) else 8080` |
+| `-> T or E` | `fn f() -> T or Error` | `fn push(rb, v) -> bool or Error` |
+| Lazy iterators | `iter_range \|> iter_filter \|> iter_collect` | `iter_range(0,1000000) \|> iter_take(5) \|> iter_collect()` |
+| Priority queue | `pq_create()` / `pq_push` / `pq_pop` | `pq_push(pq, 1, "critical"); pq_pop(pq)` |
+| LRU cache | `lru_create(cap)` / `lru_put` / `lru_get` | `lru_put(cache, "k", v); lru_get(cache, "k")` |
+| Buffer (string builder) | `buffer()` / `buf_append` / `buf_to_str` | `buf_append(b, name); buf_to_str(b)` |
+| Atomic ops | `atomic_new` / `atomic_add` / `atomic_cas` | `atomic_add(counter, 1)` |
+| SHA-256 | `sha256(str)` | `let digest = sha256("hello world")` |
+| TCP networking | `tcp_listen` / `tcp_accept` / `tcp_recv` | `let client = tcp_accept(listener)` |
+| TLS | `tls_connect` / `tls_send` / `tls_recv` | `let fd = tls_connect("api.example.com", 443)` |
+| Structured logging | `log_info(tag, msg)` | `log_info("http", "listening on :8080")` |
+| Profiling | `prof_start` / `prof_stop` / `prof_report` | `let h = prof_start("parse"); ... prof_stop(h)` |
+| Assertions | `assert_eq` / `assert_approx` / `assert_throws` | `assert_eq(fib(10), 55)` |
+| Tensors | `tensor_zeros` / `tensor_matmul` / `tensor_softmax` | `let c = tensor_matmul(a, b)` |
+| Hot reload | `hot_load` / `hot_sym` / `hot_reload` | `hot_reload(lib); hot_call1(step_fn, world)` |
+| `@test` | `@test` on `fn -> bool` | `@test fn t_add() -> bool` |
+| `@entity("table")` | ORM annotation | `@entity("users") type User` |
+| `nova run` / `nova build` | CLI build commands | `nova run app.nova` / `nova build app.nova` |
+| `nova setup` | Pre-compile cache (38x speedup) | Run once after install |
 
 ---
 
@@ -1276,24 +1300,7 @@ fn main()
 
 ---
 
-## Highest-leverage features to adopt first
-
-These are the constructs most likely being hand-rolled today (as if/else + index loops + `any`+`type_of`) that this toolkit replaces:
-
-1. **List / dict / set comprehensions** — `[x*2 for x in xs if x>3]` instead of a `for` + `push` loop.
-2. **map / filter / reduce (+ UFCS chaining)** — `xs.filter(...).map(...)` instead of manual index loops.
-3. **Pipe `|>`** — `xs |> filter(...) |> map(...)` instead of nested calls or throwaway temporaries.
-4. **match + ADT destructuring + exhaustiveness** — `match shape { Circle(r) => ... }` instead of `if type_of(x) == ...` ladders; the compiler forces you to handle every case.
-5. **Result + `?` + `with/else`** — one-word error propagation with automatic context threading, instead of manual error-check branching.
-6. **String interpolation + format spec** — `"{n:04d} {name}"` instead of `"..." + str(...) + "..."` concatenation.
-7. **for-in destructuring, enumerate, zip** — `for i, v in xs` and `xs.zip(ys)` instead of `for i in 0..len(xs)` index arithmetic.
-8. **Automatic struct derivation** — `print(p)`, `p.to_json()`, `a == b`, `copy(a)` for free on every struct; never hand-write a serializer or equality method (and never reach for `@derive`).
-9. **std/functional + std/itertools** — `fg_group_by`, `ftw_take_while`, `itw_pairwise`, `itc_chunk`, `ita_sums` instead of bespoke grouping/windowing/chunking loops.
-10. **spawn + channels + selective receive** — cheap green-task concurrency (`spawn fn() ...`, `receive ... after`) instead of hand-rolled OS threads and shared mutable state.
-
----
-
-## 6. Added since the original audit (2026-07-25 → 2026-08-04)
+## 6. Added since the original audit (2026-07-25 → 2026-08-07)
 
 Every entry below was **verified by executing a probe program**, not inferred from the source.
 Sections 1–5 above predate these; this section is authoritative where they disagree.
@@ -1491,8 +1498,1467 @@ BEHAVIOUR DIFF caught it. **Compiling is not passing.**
    `enumerate` is for when you want the pair list as a VALUE. Wrapping the loop form binds `v`
    to the pair, which silently stores a list pointer where a scalar was expected.
 
-9. **Enum variant constructors return the VARIANT type, not the enum type** — a function that
+10. **Enum variant constructors return the VARIANT type, not the enum type** — a function that
    `match`es over an enum usually leaves its parameter unannotated (`fn area(s)`).
+
+---
+
+## 8. Builtin Data Structures
+
+NOVA ships these as zero-import runtime builtins — no `import` needed, always available. Each is a handle (opaque `int`) created by a constructor and passed to every operation. All are single-process-owned values; do NOT share across `spawn` boundaries without explicit `copy()`.
+
+### Priority Queue (min-heap)
+Syntax: `pq_create()` -> handle · `pq_push(pq, priority, value)` · `pq_pop(pq)` -> value with lowest priority · `pq_peek(pq)` -> value · `pq_peek_priority(pq)` -> priority · `pq_len(pq)` · `pq_is_empty(pq)`
+```nova
+let pq = pq_create()
+pq_push(pq, 3, "low")
+pq_push(pq, 1, "critical")
+pq_push(pq, 2, "medium")
+let next = pq_pop(pq)       // "critical" (priority 1 = lowest = first out)
+```
+Use case: task scheduling, Dijkstra's algorithm, event-driven simulation, any "process the most urgent item next" pattern.
+
+### Deque (double-ended queue)
+Syntax: `deque_create()` -> handle · `deque_push_back(d, v)` · `deque_push_front(d, v)` · `deque_pop_front(d)` · `deque_pop_back(d)` · `deque_front(d)` · `deque_back(d)` · `deque_get(d, i)` · `deque_len(d)` · `deque_is_empty(d)` · `deque_to_list(d)`
+```nova
+let d = deque_create()
+deque_push_back(d, 1)
+deque_push_back(d, 2)
+deque_push_front(d, 0)
+let first = deque_pop_front(d)   // 0
+let last  = deque_pop_back(d)    // 2
+let mid   = deque_get(d, 0)      // 1
+let xs    = deque_to_list(d)     // [1]
+```
+Use case: BFS queues, sliding window algorithms, work-stealing deques, undo/redo stacks.
+
+### Sorted Map (string-keyed, ordered)
+Syntax: `smap_create()` -> handle · `smap_set(m, key, val)` · `smap_get(m, key)` · `smap_has(m, key)` · `smap_del(m, key)` · `smap_len(m)` · `smap_keys(m)` -> sorted list · `smap_values(m)` -> list in key order · `smap_range(m, lo, hi)` -> list of values whose keys fall in [lo, hi]
+```nova
+let m = smap_create()
+smap_set(m, "banana", 2)
+smap_set(m, "apple", 5)
+smap_set(m, "cherry", 1)
+let ks = smap_keys(m)             // ["apple", "banana", "cherry"]
+let mid = smap_range(m, "b", "d") // [2, 1]  (banana, cherry)
+```
+Use case: ordered key-value storage, range queries, leaderboards, prefix-based lookups.
+
+Gotcha: keys are **string-only** (the type signature enforces `string`). For integer-keyed ordering, convert with `str()` or use a list of pairs with `sort_by`.
+
+### LRU Cache (bounded, evicts least-recently-used)
+Syntax: `lru_create(capacity)` -> handle · `lru_put(c, key, value)` · `lru_get(c, key)` · `lru_has(c, key)` · `lru_len(c)` · `lru_cap(c)` · `lru_hits(c)` · `lru_misses(c)`
+```nova
+let cache = lru_create(100)
+lru_put(cache, "user:42", user_data)
+let v = lru_get(cache, "user:42")   // returns cached value, marks as recently used
+let ratio = lru_hits(cache) * 100 / (lru_hits(cache) + lru_misses(cache))
+```
+Use case: bounded caching with automatic eviction, database query caches, API response caches, memoization with memory limits.
+
+Gotcha: there is no explicit `lru_delete` — items are only evicted by the capacity limit when new entries are inserted.
+
+### Counter (frequency map)
+Syntax: `counter_create()` -> handle · `counter_inc(c, key)` (by 1) · `counter_add(c, key, n)` (by n) · `counter_get(c, key)` · `counter_total(c)` · `counter_most_common(c, n)` -> list of [key, count] pairs
+```nova
+let c = counter_create()
+for word in split(text, " ")
+    counter_inc(c, word)
+let top5 = counter_most_common(c, 5)   // [["the", 42], ["a", 31], ...]
+let total = counter_total(c)
+```
+Use case: word frequency, histogram building, vote tallying, event counting.
+
+### Ring Buffer (fixed-size circular)
+Syntax: `ringbuf_create(capacity)` -> handle · `ringbuf_push(rb, value)` · `ringbuf_pop(rb)` · `ringbuf_len(rb)` · `ringbuf_cap(rb)` · `ringbuf_is_full(rb)`
+```nova
+let rb = ringbuf_create(3)
+ringbuf_push(rb, "a")
+ringbuf_push(rb, "b")
+ringbuf_push(rb, "c")
+ringbuf_push(rb, "d")             // overwrites "a" (oldest)
+let v = ringbuf_pop(rb)           // "b"
+```
+Use case: fixed-size log retention, streaming data windows, bounded producer-consumer buffers.
+
+### Buffer (string builder)
+Syntax: `buffer()` | `buffer_create()` | `buffer_cap(n)` -> handle · `buf_append(b, str)` · `buf_append_char(b, charcode)` · `buf_append_int(b, n)` · `buf_append_float(b, f)` · `buf_to_str(b)` | `buf_str(b)` · `buf_len(b)` · `buf_clear(b)`
+```nova
+let b = buffer()
+buf_append(b, "Hello, ")
+buf_append(b, name)
+buf_append_char(b, 33)            // '!'
+let greeting = buf_to_str(b)      // "Hello, Alice!"
+```
+Use case: efficient string building (O(1) amortized append vs O(n) concatenation), template rendering, serialization output, CSV/JSON generation.
+
+Note: `buffer_cap(n)` pre-allocates `n` bytes — use when the final size is known. `buf_clear(b)` resets the length to 0 without freeing the backing memory, so the buffer can be reused across iterations.
+
+### Arena Allocator
+
+NOVA provides TWO arena mechanisms for different scoping patterns.
+
+**Thread-local bump arena** — bracket a region of code; all allocations inside are freed in bulk.
+Syntax: `arena_enter()` -> cookie · `arena_exit(cookie)` · `set_arena_mode(flag)` · `is_arena_mode()`
+```nova
+let mark = arena_enter()
+// all allocations here use the bump allocator
+let items = [process(x) for x in batch]
+let result = summarize(items)
+arena_exit(mark)                  // everything allocated since arena_enter() is freed
+```
+Use case: per-request memory in servers (Forge uses this for every HTTP request), parser scratch space, batch processing where intermediate results are discarded.
+
+**Explicit arena handle** — a named arena for manual control.
+Syntax: `arena_create()` -> handle · `arena_alloc(a, size)` · `arena_reset(a)` · `arena_free(a)` · `arena_used(a)`
+```nova
+let a = arena_create()
+let block = arena_alloc(a, 1024)
+let used = arena_used(a)          // bytes consumed so far
+arena_reset(a)                    // rewind to zero, reuse all memory
+arena_free(a)                     // release the arena entirely
+```
+
+Gotcha: `arena_enter`/`arena_exit` pairs MUST be balanced — a missing `arena_exit` leaks every allocation made since the corresponding `arena_enter`. Nesting is safe as long as exits match enters in reverse order (stack discipline).
+
+---
+
+## 9. Lazy Iterator Protocol
+
+The `iter_*` family provides **lazy, pull-based** iteration. Nothing materializes until a consumer is called — transforms build up a pipeline description, and elements flow through one at a time.
+
+### Creating iterators
+Syntax: `iter(list)` -> lazy iterator over the list's elements · `iter_range(lo, hi)` -> lazy integer range [lo, hi) · `iter_range_step(lo, hi, step)` -> lazy stepped range
+```nova
+let it = iter([10, 20, 30])           // lazy wrapper — no copy
+let r = iter_range(0, 1000000)        // no list allocated
+let odds = iter_range_step(1, 100, 2) // 1, 3, 5, ..., 99
+```
+Note: `iter_range` is distinct from `0..n` — the range literal eagerly creates a list, while `iter_range` produces elements on demand. For large ranges, `iter_range` uses constant memory.
+
+### Iterator transforms (lazy — nothing runs until consumed)
+Syntax: `iter_map(it, f)` · `iter_filter(it, pred)` · `iter_take(it, n)` · `iter_skip(it, n)` · `iter_zip(a, b)` · `iter_chain(a, b)` · `iter_enumerate(it)` · `iter_flat_map(it, f)`
+```nova
+let pipeline = iter_range(0, 1000000)
+    |> iter_filter(fn(x) x % 2 == 0)
+    |> iter_map(fn(x) x * x)
+    |> iter_take(10)
+// nothing has executed yet — pipeline is a description
+```
+
+### Iterator consumers (trigger evaluation)
+Syntax: `iter_next(it)` -> pull one value · `iter_collect(it)` -> materialize to list · `iter_reduce(it, init, f)` · `iter_for_each(it, f)` · `iter_count(it)` · `iter_sum(it)` · `iter_any(it, pred)` · `iter_all(it, pred)` · `iter_find(it, pred)`
+```nova
+let first_val = iter_next(pipeline)   // pulls just the first element: 0
+let results = iter_collect(pipeline)  // materializes remaining: [4, 16, 36, 64, 100, 144, 196, 256, 324]
+```
+
+### Comprehensive example — lazy vs eager
+```nova
+// EAGER: allocates 3 intermediate lists, processes all 1M elements
+let result = filter(map(filter(range(0, 1000000),
+    fn(x) x % 3 == 0), fn(x) x * x), fn(x) x < 10000)
+
+// LAZY: zero intermediate lists, stops as soon as 5 results are found
+let result = iter_range(0, 1000000)
+    |> iter_filter(fn(x) x % 3 == 0)
+    |> iter_map(fn(x) x * x)
+    |> iter_filter(fn(x) x < 10000)
+    |> iter_take(5)
+    |> iter_collect()
+// result: [0, 9, 36, 81, 144]
+```
+The lazy version processes only the elements needed to fill 5 results; the eager version processes all one million and allocates three full-length intermediate lists.
+
+Gotcha: the `iter_*` family is **distinct** from the eager builtins (`map`, `filter`, `reduce`). The eager builtins take and return lists; the `iter_*` builtins take and return iterator handles. Do not mix them — `map(iter, f)` treats the iterator handle as a one-element list, it does not iterate. For small collections where all elements are needed, the eager builtins are simpler and faster (no per-element closure dispatch overhead).
+
+Gotcha: `iter_skip` is the name, not `iter_drop`. The naming follows "skip N elements, then yield the rest."
+
+---
+
+## 10. Systems & Low-level Programming
+
+### Atomic operations
+Syntax: `atomic_new(val)`, `atomic_get(a)`, `atomic_set(a, val)`, `atomic_add(a, val)`, `atomic_cas(a, expected, desired)` — lock-free atomic integer operations; `atomic_cas` returns the previous value (compare-and-swap succeeds when previous == expected).
+```nova
+let counter = atomic_new(0)
+atomic_add(counter, 1)
+let prev = atomic_cas(counter, 1, 5)   // prev == 1, counter now 5
+let val = atomic_get(counter)           // 5
+```
+Use case: lock-free counters, concurrent statistics, CAS-based algorithms without channel overhead.
+
+### Checked arithmetic
+Syntax: `checked_add(a, b)`, `checked_sub(a, b)`, `checked_mul(a, b)` — integer arithmetic that panics on overflow instead of wrapping silently; `overflow_panic()` triggers a crash directly.
+```nova
+let total = checked_add(balance, deposit)   // panics if balance + deposit overflows i64
+let scaled = checked_mul(price, quantity)
+```
+Use case: financial calculations, safety-critical code, input validation where silent wrapping would corrupt data.
+Gotcha: these PANIC on overflow, they do not return a Result. For recoverable overflow detection, test bounds manually before the operation.
+
+### Weak references
+Syntax: `weak_create(obj)` -> weak handle, `weak_upgrade(w)` -> the object or null, `weak_alive(w)` -> bool, `weak_invalidate(w)` — non-preventing references that do not keep an object alive for RC collection.
+```nova
+let obj = {"name": "cache_entry", "data": big_payload}
+let w = weak_create(obj)
+// ... later, obj may have been collected ...
+if weak_alive(w)
+    let recovered = weak_upgrade(w)
+    print(recovered)
+```
+Use case: caches that do not prevent collection, observer patterns, breaking reference cycles in graph structures.
+Gotcha: `weak_upgrade` returns null if the referent has been collected — always check `weak_alive` or null-check the result.
+
+### Offheap memory
+Syntax: `offheap_create(size)` -> handle, `offheap_len(h)` -> int, `offheap_get(h, offset)` / `offheap_set(h, offset, value)` — unmanaged byte buffer outside the GC; `offheap_get_f64(h, offset)` / `offheap_set_f64(h, offset, value)` for typed float access; `offheap_free(h)` releases it.
+```nova
+let buf = offheap_create(1024)
+offheap_set(buf, 0, 42)
+let v = offheap_get(buf, 0)         // 42
+offheap_set_f64(buf, 8, 3.14)
+let f = offheap_get_f64(buf, 8)     // 3.14
+offheap_free(buf)
+```
+Use case: large numeric arrays, memory-mapped data structures, bypassing GC for hot data paths.
+Gotcha: offheap memory is NOT reference-counted. You must call `offheap_free` manually or it leaks. Offsets are in bytes and bounds-checked at runtime.
+
+### Memory-mapped files
+Syntax: `mmap_open(path)` -> handle, `mmap_len(m)` -> int (file size in bytes), `mmap_byte(m, i)` -> int (single byte), `mmap_close(m)` — maps a file into the address space for zero-copy random reads.
+```nova
+let m = mmap_open("data/log.bin")
+let size = mmap_len(m)
+let first = mmap_byte(m, 0)
+let last = mmap_byte(m, size - 1)
+mmap_close(m)
+```
+Use case: reading large files without loading into heap memory, database engines, log analysis, binary file parsing.
+Gotcha: `mmap_byte` is bounds-checked; reading past `mmap_len` sets an error. Always `mmap_close` when done.
+
+### SIMD primitives
+Syntax: `simd_add(a, b)`, `simd_sub(a, b)`, `simd_mul(a, b)` — element-wise vector ops; `simd_scale(a, scalar)` — scalar multiply; `simd_dot(a, b)` -> float — dot product; `simd_sum(a)` -> float — horizontal sum; `simd_ready(a)` -> bool — checks alignment/packing.
+```nova
+let a = [1.0, 2.0, 3.0, 4.0]
+let b = [5.0, 6.0, 7.0, 8.0]
+let c = simd_add(a, b)              // [6.0, 8.0, 10.0, 12.0]
+let d = simd_dot(a, b)              // 70.0
+let s = simd_scale(a, 10.0)         // [10.0, 20.0, 30.0, 40.0]
+```
+Use case: vector math, signal processing, physics engines, high-performance numeric code.
+Gotcha: operates on float arrays (typed). Check `simd_ready(a)` to confirm the array is packed and aligned before hot loops. Regular heterogeneous lists will not vectorize.
+
+### Raw pointer operations (unsafe)
+Syntax: `ptr_read(p)` / `ptr_write(p, v)` — read/write a NOVA value at a raw address; typed variants `ptr_read_u8` / `ptr_read_i8` / `ptr_read_u16` / ... / `ptr_read_f64` and `ptr_write_u8` / ... / `ptr_write_f64` for sized access; `ptr_add(p, offset)` / `ptr_diff(a, b)` — pointer arithmetic; `memcpy_unsafe(dst, src, n)` / `memset_unsafe(dst, val, n)` — bulk memory ops; `alloc_raw(n)` / `free_raw(p)` — raw heap; `null_ptr()` / `is_null(p)` — null sentinel; `cstr_of(s)` / `str_from_cstr(p)` — C string conversion.
+```nova
+unsafe
+    let p = alloc_raw(64)
+    ptr_write_u8(p, 0xFF)
+    let v = ptr_read_u8(p)       // 255
+    let q = ptr_add(p, 8)
+    ptr_write_f64(q, 3.14)
+    free_raw(p)
+```
+Use case: FFI interop, custom allocators, memory-mapped hardware, embedded systems.
+Gotcha: ALL pointer operations require an enclosing `unsafe` block — the compiler rejects them in safe code. No bounds checking, no type safety, no RC tracking. A wrong offset is a CVE.
+
+---
+
+## 11. Hashing, Crypto & Serialization
+
+### Cryptographic hashing (SHA-256)
+Syntax: `sha256(str)` -> hex string, `sha256_of_bytes(bytes_handle)` -> hex string, `sha256_bytes(bytes_handle, n)` -> hex string (first n bytes only) — SHA-256 digest.
+```nova
+let digest = sha256("hello world")
+print(digest)                        // "b94d27b9934d3e..."
+```
+Use case: integrity checks, content addressing, password storage (with salt), file deduplication.
+
+### HMAC
+Syntax: `hmac_sha256(key, msg)` -> hex string — keyed-hash message authentication code using SHA-256.
+```nova
+let sig = hmac_sha256(secret_key, request_body)
+if sig != expected_sig
+    return err("invalid signature")
+```
+Use case: API authentication (JWT, webhooks), message integrity verification, signed cookies.
+
+### Fast hashing (non-cryptographic)
+Syntax: `crc32(str)` -> int, `fnv1a(str)` -> int, `murmur3(str, seed)` -> int — fast, non-cryptographic hash functions.
+```nova
+let checksum = crc32("payload data")
+let bucket = murmur3(key, 0) % num_buckets
+let fingerprint = fnv1a(token)
+```
+Use case: hash tables, checksums, data partitioning, bloom filters, consistent hashing.
+Gotcha: these are NOT cryptographically secure. Do not use for signatures, passwords, or anything adversarial — use `sha256` / `hmac_sha256` instead.
+
+### Generic hash
+Syntax: `hash(value)` -> int — structural hash over any NOVA value (recursive over lists, dicts, structs).
+```nova
+let h = hash([1, 2, 3])
+let h2 = hash({"name": "Alice"})
+```
+Use case: custom hash maps, deduplication, cache keys. Cross-ref: also in section 2 (collections).
+
+### Binary serialization (term encoding)
+Syntax: `term_encode(value)` -> bytes, `term_decode(data)` -> value — Erlang-style external term format for cross-node message serialization.
+```nova
+let wire = term_encode({"cmd": "ping", "ts": now()})
+send_bytes(socket, wire)
+// on the other side:
+let msg = term_decode(recv_bytes(socket))
+```
+Use case: distributed channel messages, cross-process term storage, language-agnostic wire format.
+
+---
+
+## 12. Networking & I/O
+
+All networking builtins are zero-import (no `import` needed). Connections are represented as integer file descriptors. Errors are signaled by return values (fd <= 0 for connection failures, empty string for recv failures) — wrap in `Result` at the application layer if desired.
+
+### Low-level TCP
+Syntax: `tcp_connect(host, port)` -> fd · `tcp_listen(port)` -> listener fd · `tcp_accept(listener)` -> client fd · `tcp_send(fd, data)` · `tcp_send_bytes(fd, bytes)` · `tcp_recv(fd)` -> string · `tcp_recv_bytes(fd, n)` -> bytes · `tcp_close(fd)` · `tcp_peer_addr(fd)` -> ip string · `tcp_peer_port(fd)` -> int · `tcp_wait_readable(fd, timeout_ms)` -> bool
+```nova
+let listener = tcp_listen(8080)
+let client = tcp_accept(listener)
+let data = tcp_recv(client)
+tcp_send(client, "HTTP/1.1 200 OK\r\n\r\nHello")
+let addr = tcp_peer_addr(client)
+tcp_close(client)
+tcp_close(listener)
+```
+Use case: custom protocol servers, raw network programming, building higher-level abstractions on top.
+
+Gotcha: `tcp_recv` may return partial data — production code must loop and accumulate until a delimiter or expected byte count is reached. `tcp_connect` returns fd <= 0 on failure; always check before sending.
+
+### Low-level UDP
+Syntax: `udp_bind(port)` -> fd · `udp_send(fd, host, port, data)` · `udp_recv(fd, bufsize)` -> data · `udp_recv_from(fd, bufsize)` -> [data, addr, port]
+```nova
+let sock = udp_bind(9000)
+udp_send(sock, "127.0.0.1", 9001, "ping")
+let reply = udp_recv_from(sock, 1024)  // ["pong", "127.0.0.1", "9001"]
+let data = reply[0]
+let sender = reply[1]
+```
+Use case: DNS clients, game networking, real-time streaming, discovery protocols, any latency-sensitive fire-and-forget messaging.
+
+Gotcha: `udp_recv_from` returns a **list** of `[data, addr, port]`, not a struct. Access fields by index.
+
+### Socket options
+Syntax: `socket_option(fd, name, value)` -> bool · `io_set_nonblocking(fd)`
+```nova
+socket_option(fd, "TCP_NODELAY", 1)     // disable Nagle's algorithm
+socket_option(fd, "SO_REUSEADDR", 1)    // allow port reuse after restart
+io_set_nonblocking(fd)                  // switch to non-blocking I/O
+```
+Use case: tuning TCP behavior (latency vs throughput), enabling non-blocking I/O for event loops, setting buffer sizes.
+
+### I/O polling (epoll/kqueue/IOCP abstraction)
+Syntax: `io_poll_create()` -> poll handle · `io_poll_add(poll, fd, events)` · `io_poll_wait(poll, timeout_ms)` -> list of ready fds · `io_poll_remove(poll, fd)` · `io_poll_close(poll)`
+```nova
+let poll = io_poll_create()
+io_poll_add(poll, listener, "read")
+io_poll_add(poll, client1, "read")
+let ready = io_poll_wait(poll, 1000)    // block up to 1s
+for fd in ready
+    let data = tcp_recv(fd)
+    // handle data
+io_poll_close(poll)
+```
+Use case: event-driven servers multiplexing many connections, building reactors, high-connection-count services without one-thread-per-connection.
+
+Note: the runtime maps to `epoll` on Linux, `kqueue` on macOS, and `IOCP` on Windows — same API everywhere.
+
+### TLS (encrypted networking)
+Syntax: `tls_connect(host, port)` -> fd · `tls_connect_insecure(host, port)` -> fd · `tls_connect_alpn(host, port, protocols)` -> fd · `tls_listen(port, cert_path, key_path)` -> listener fd · `tls_listen_alpn(port, cert_path, key_path, protocols)` -> listener fd · `tls_accept(listener)` -> client fd · `tls_send(fd, data)` · `tls_send_bytes(fd, bytes)` · `tls_recv(fd)` -> string · `tls_recv_bytes(fd, n)` -> bytes · `tls_close(fd)` · `tls_alpn(fd)` -> negotiated protocol · `tls_upgrade(fd)` -> tls fd
+```nova
+// HTTPS client
+let fd = tls_connect("api.example.com", 443)
+tls_send(fd, "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+let response = tls_recv(fd)
+tls_close(fd)
+
+// HTTPS server
+let listener = tls_listen(443, "cert.pem", "key.pem")
+let client = tls_accept(listener)
+let request = tls_recv(client)
+tls_send(client, "HTTP/1.1 200 OK\r\n\r\nSecure Hello")
+tls_close(client)
+```
+Use case: HTTPS clients and servers, secure API calls, mTLS, any encrypted network communication.
+
+Gotcha: `tls_connect_insecure` **skips certificate verification** — use only for development and testing, never in production. `tls_upgrade(fd)` converts an existing plain TCP connection to TLS in-place (STARTTLS pattern).
+
+### WebSocket
+Syntax: `ws_upgrade(fd)` -> ws handle · `ws_send(ws, message)` · `ws_recv(ws, timeout_ms)` -> message · `ws_close(ws)` · `ws_accept_key(key)` -> accept header value
+```nova
+// Server-side: upgrade an accepted HTTP connection
+let ws = ws_upgrade(client_fd)
+let msg = ws_recv(ws, 5000)           // wait up to 5 seconds
+ws_send(ws, "echo: {msg}")
+ws_close(ws)
+```
+Use case: real-time applications, chat, live dashboards, streaming APIs, push notifications.
+
+Note: `ws_accept_key` computes the `Sec-WebSocket-Accept` header value from a client key — used when implementing the upgrade handshake manually. For Forge applications, `@websocket` routes handle the upgrade automatically.
+
+### DNS
+Syntax: `dns_resolve(hostname)` -> ip string · `dns_resolve_all(hostname)` -> list of ip strings · `reverse_dns(ip)` -> hostname
+```nova
+let ip = dns_resolve("example.com")          // "93.184.216.34"
+let all_ips = dns_resolve_all("google.com")  // ["142.250.80.46", ...]
+let host = reverse_dns("8.8.8.8")           // "dns.google"
+```
+Use case: custom DNS clients, service discovery, network diagnostics, load balancer target resolution.
+
+---
+
+## 13. Process & System Utilities
+
+### Subprocess management
+Syntax: `proc_open(cmd)` -> handle, `proc_write_stdin(h, data)`, `proc_read_stdout(h)` -> string, `proc_close_stdin(h)`, `proc_wait(h)` -> exit_code — spawn and interact with an external process via pipes.
+```nova
+let h = proc_open("sort")
+proc_write_stdin(h, "banana\napple\ncherry\n")
+proc_close_stdin(h)
+let sorted = proc_read_stdout(h)
+let code = proc_wait(h)
+```
+Use case: running external tools, piping data to/from subprocesses, build scripts, shell pipelines.
+Gotcha: `proc_open` takes a single shell command string (parsed by the OS shell). Always `proc_close_stdin` before reading stdout to avoid deadlock on pipes.
+
+### Shell execution
+Syntax: `shell(cmd)` -> output string — run a command through the OS shell and capture its combined output.
+```nova
+let branch = shell("git rev-parse --abbrev-ref HEAD")
+print("On branch: {branch}")
+```
+Use case: quick system commands, dev tooling, scripts where you just need the output.
+
+### Process info
+Syntax: `getpid()` -> int, `hostname()` -> string, `cpu_count()` -> int, `os_name()` -> string, `arch_name()` -> string, `self_exe_path()` -> string — runtime environment introspection.
+```nova
+print("PID {getpid()} on {hostname()}, {os_name()}/{arch_name()}, {cpu_count()} cores")
+print("Running from: {self_exe_path()}")
+```
+Use case: runtime diagnostics, platform-specific behavior, structured logging context, multi-process coordination.
+
+### File system traversal
+Syntax: `dir_walk(path)` -> list of all file paths recursively, `list_dir(path)` -> list of direct entries, `cwd()` -> string, `chdir(path)` — file system navigation.
+```nova
+let all_nova = [f for f in dir_walk(".") if f.ends_with(".nova")]
+let entries = list_dir("/tmp")
+print("Working in: {cwd()}")
+```
+Use case: file discovery, project scanning, build systems, test harnesses.
+
+### Program lookup
+Syntax: `which(cmd)` -> string — resolve an executable name to its absolute path; returns empty string if not found.
+```nova
+let cc = which("clang")
+if cc == ""
+    print("clang not found, falling back to gcc")
+    cc = which("gcc")
+```
+Use case: checking tool availability before invoking subprocesses, portable build scripts.
+
+### Standard I/O
+Syntax: `stdin_read_n(n)` -> string — read up to n bytes from stdin; `stdout_write(s)` — write to stdout without a trailing newline.
+```nova
+stdout_write("Enter name: ")
+let name = stdin_read_n(256)
+print("Hello, {name}")
+```
+Use case: interactive programs, piped data processing, REPLs, progress indicators.
+
+### Graceful shutdown
+Syntax: `shutdown_requested()` -> int (1 once a SIGINT/SIGTERM has arrived), `reload_requested()` -> int (1 once since last poll a SIGHUP arrived; consumes the flag), `at_exit(fn)` — register a cleanup callback.
+```nova
+at_exit(fn() print("shutting down..."))
+
+while not shutdown_requested()
+    let conn = accept(server)
+    handle(conn)
+// falls through here after Ctrl+C
+```
+Use case: long-running servers, cleanup on Ctrl+C, graceful drain of connections, config reload on SIGHUP.
+Note: a second SIGINT/SIGTERM force-exits the process immediately, so it always remains killable. `reload_requested` consumes the flag on read so each SIGHUP is handled exactly once.
+
+---
+
+## 14. Logging, Profiling & Diagnostics
+
+### Structured logging
+Syntax: `log_trace(tag, msg)` · `log_debug(tag, msg)` · `log_info(tag, msg)` · `log_warn(tag, msg)` · `log_error(tag, msg)` · `log_fatal(tag, msg)` — emit a log line at the given severity. `log_set_level(level)` sets the minimum severity (0=trace, 1=debug, 2=info, 3=warn, 4=error, 5=fatal). `log_get_level()` returns the current level. `log_set_json(flag)` switches output to JSON when flag is 1.
+```nova
+log_set_level(2)                         // only info and above
+log_info("http", "listening on :8080")   // printed
+log_debug("http", "header dump")         // filtered out
+
+log_set_json(1)                          // {"level":"INFO","tag":"http","msg":"..."}
+log_error("db", "connection refused")
+```
+Use case: production logging with severity filtering, observability pipelines (ELK, Loki, Datadog). Tag-based filtering lets different subsystems log at different granularity.
+
+Gotcha: `log_fatal` logs the message but does NOT terminate the process — use `panic()` after it if you want a crash.
+
+### Profiling
+Syntax: `prof_start(name)` -> handle · `prof_stop(handle)` — bracket a named timing region. `prof_get_ns(name)` -> nanoseconds elapsed. `prof_report()` -> formatted string of all regions. `prof_reset()` clears all data. `prof_export_flame(path)` writes flamegraph-compatible data. `prof_enter(name)` · `prof_exit(name)` are the string-keyed variant (no handle).
+```nova
+let h = prof_start("parse")
+let ast = parse(source)
+prof_stop(h)
+
+prof_enter("codegen")
+let ir = codegen(ast)
+prof_exit("codegen")
+
+print(prof_report())                     // tabulated name / elapsed_ns / calls
+prof_export_flame("profile.folded")      // for flamegraph.pl or speedscope
+```
+Use case: performance optimization, CI regression detection (assert `prof_get_ns("parse") < 50000000`), production hot-path analysis.
+
+Gotcha: `prof_enter`/`prof_exit` are matched by name string, not by handle — mismatched names silently create orphan regions.
+
+### Coverage
+Syntax: `cov_mark(file, line)` — record a hit at the given source location. `cov_get(file, line)` -> hit count. `cov_report()` -> formatted coverage summary. `cov_reset()` clears all data. `cov_export_lcov(path)` writes LCOV-format data for external tools.
+```nova
+cov_mark("parser.nova", 42)
+cov_mark("parser.nova", 42)              // second hit
+assert_eq(cov_get("parser.nova", 42), 2)
+
+cov_export_lcov("coverage.lcov")         // import into genhtml / codecov / coveralls
+print(cov_report())
+```
+Use case: test coverage tracking, CI quality gates ("fail if coverage < 80%"), finding dead code paths.
+
+Note: coverage is manual instrumentation — the compiler does not auto-insert `cov_mark` calls. Use it in test harnesses or inject via `@test` hooks.
+
+### Debug Adapter Protocol (DAP)
+Syntax: `dap_log(category, msg)` · `dap_breakpoint(file, line)` · `dap_send(msg)` — DAP wire protocol helpers. `dbg_set_bp(file, line)` -> id · `dbg_remove_bp(id)` · `dbg_list_bps()` — programmatic breakpoint management. `dbg_push_frame(name, file, line)` · `dbg_pop_frame()` · `dbg_backtrace()` — call stack tracking. `dbg_hook(fn)` · `dbg_enable()` · `dbg_disable()` — step-through debugging control.
+```nova
+dbg_enable()
+dbg_set_bp("main.nova", 10)
+
+dbg_push_frame("process_request", "server.nova", 42)
+// ... function body ...
+dbg_pop_frame()
+
+let bt = dbg_backtrace()                 // list of frame info
+dap_log("console", "hit breakpoint")
+dbg_disable()                            // resume full-speed execution
+```
+Use case: IDE debugging integration (VS Code DAP), programmatic breakpoints in test harnesses, custom debugger tools, post-mortem analysis.
+
+Note: `dbg_push_frame` / `dbg_pop_frame` must be balanced on every code path, including error returns. An unbalanced stack corrupts the backtrace.
+
+---
+
+## 15. Testing & Assertions
+
+### Basic assertions
+Syntax: `assert(cond, msg)` — panics with `msg` if `cond` is false. `assert_eq(a, b)` · `assert_ne(a, b)` — equality/inequality with automatic diff in the panic message. `assert_true(cond)` · `assert_false(cond)` — boolean checks.
+```nova
+assert(len(items) > 0, "items must not be empty")
+assert_eq(fib(10), 55)
+assert_ne(hash(a), hash(b))
+assert_true(is_valid(token))
+assert_false(is_expired(session))
+```
+Use case: KAT tests, unit tests, invariant checking. The `_eq`/`_ne` variants print both values on failure, which `assert(a == b, "...")` does not.
+
+### Extended assertions
+Syntax: `assert_contains(collection, item)` — panics if `item` is not in `collection`. `assert_approx(actual, expected, tolerance)` — panics if `abs(actual - expected) > tolerance`. `assert_throws(fn, expected_msg)` — calls `fn()` and panics if it does NOT raise an error containing `expected_msg`.
+```nova
+assert_contains([10, 20, 30], 20)
+assert_approx(sin(3.14159), 0.0, 0.001)   // within epsilon
+assert_throws(fn() parse_int_safe("abc"), "invalid")
+```
+Use case: collection membership tests, floating-point math verification (never use `assert_eq` on floats), error-path testing without manual try/catch.
+
+Gotcha: `assert_throws` takes a zero-argument function, not a bare expression. Wrap the call in `fn() ...`.
+
+### TAP test runner
+Syntax: `test_run_tap(name, fn, id)` — runs `fn()`, catches panics, and prints TAP-formatted output (`ok <id> - <name>` or `not ok <id> - <name>`).
+```nova
+test_run_tap("addition", fn() assert_eq(1 + 1, 2), 1)
+test_run_tap("division by zero", fn() assert_throws(fn() 1 / 0, "divide"), 2)
+// Output:
+// ok 1 - addition
+// not ok 2 - division by zero
+```
+Use case: CI integration (TAP is understood by Jenkins, GitHub Actions, prove, tap-spec), standardized test output, building test frameworks.
+
+Note: print `1..<N>` before the first test to produce a valid TAP plan header.
+
+### Semver utilities
+Syntax: `semver_parse(str)` -> list of ints `[major, minor, patch]`. `semver_compare(a, b)` -> -1/0/1. `semver_satisfies(version, constraint)` -> bool. `semver_format(parsed)` -> string. `semver_compatible(a, b)` -> int (1 if compatible under semver rules).
+```nova
+let v = semver_parse("2.3.1")            // [2, 3, 1]
+assert_eq(semver_compare("1.0.0", "2.0.0"), -1)
+assert_true(semver_satisfies("1.5.3", ">=1.0.0"))
+assert_eq(semver_format("1.2.3"), "1.2.3")
+```
+Use case: dependency resolution, version constraint checking, package management, upgrade compatibility gates.
+
+---
+
+## 16. Tensor & GPU Compute
+
+### Tensor creation
+Syntax: `tensor_zeros(shape)` — create a zero-filled tensor; shape is a list of ints (e.g. `[2, 3]` for a 2x3 matrix). `tensor_from_list(data, shape)` — create from flat data + shape.
+```nova
+let m = tensor_zeros([3, 3])             // 3x3 zero matrix
+let v = tensor_from_list([1.0, 2.0, 3.0, 4.0], [2, 2])  // 2x2 matrix
+```
+
+### Tensor inspection
+Syntax: `tensor_shape(t)` -> list of ints · `tensor_size(t)` -> total element count · `tensor_rank(t)` -> number of dimensions · `tensor_get(t, indices)` -> float · `tensor_set(t, indices, value)` — mutate in place.
+```nova
+let t = tensor_zeros([2, 3])
+assert_eq(tensor_shape(t), [2, 3])
+assert_eq(tensor_rank(t), 2)
+assert_eq(tensor_size(t), 6)
+tensor_set(t, [0, 1], 5.0)
+assert_approx(tensor_get(t, [0, 1]), 5.0, 0.001)
+```
+
+### Tensor math
+Syntax: `tensor_add(a, b)` · `tensor_sub(a, b)` · `tensor_mul(a, b)` · `tensor_div(a, b)` — element-wise arithmetic, shapes must match. `tensor_scale(t, scalar)` — multiply every element. `tensor_matmul(a, b)` — matrix multiplication (inner dimensions must agree). `tensor_sum(t)` -> scalar sum of all elements.
+```nova
+let a = tensor_from_list([1.0, 2.0, 3.0, 4.0], [2, 2])
+let b = tensor_from_list([5.0, 6.0, 7.0, 8.0], [2, 2])
+let c = tensor_add(a, b)                 // element-wise: [6, 8, 10, 12]
+let d = tensor_matmul(a, b)              // matrix product: [19, 22, 43, 50]
+let s = tensor_scale(a, 2.0)             // [2, 4, 6, 8]
+```
+
+### Tensor ML operations
+Syntax: `tensor_relu(t)` · `tensor_sigmoid(t)` · `tensor_tanh(t)` · `tensor_softmax(t)` · `tensor_exp(t)` · `tensor_log(t)` — element-wise activation / math functions. `tensor_argmax(t)` -> int index of the largest element. `tensor_add_bias(t, bias)` — add a bias vector to each row.
+```nova
+let logits = tensor_from_list([2.0, 1.0, 0.1], [1, 3])
+let probs = tensor_softmax(logits)       // [0.659, 0.242, 0.099]
+let pred = tensor_argmax(probs)          // 0
+let activated = tensor_relu(tensor_from_list([-1.0, 0.0, 3.0], [1, 3]))  // [0, 0, 3]
+```
+
+### Tensor manipulation
+Syntax: `tensor_transpose(t)` — swap rows and columns (2D). `tensor_reshape(t, new_shape)` — reinterpret with a new shape (total size must match). `tensor_to_list(t)` -> flat list of values.
+```nova
+let m = tensor_from_list([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])
+let mt = tensor_transpose(m)             // shape [3, 2]
+let flat = tensor_reshape(m, [6])        // shape [6]
+let vals = tensor_to_list(m)             // [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+```
+
+### Neural network forward pass (example)
+A complete 2-layer neural network inference in NOVA:
+```nova
+let x = tensor_from_list([0.5, 0.8, 0.2], [1, 3])
+
+let w1 = tensor_from_list([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2], [3, 4])
+let b1 = tensor_from_list([0.01, 0.01, 0.01, 0.01], [1, 4])
+let h = tensor_relu(tensor_add_bias(tensor_matmul(x, w1), b1))
+
+let w2 = tensor_from_list([0.2, 0.3, 0.5, 0.1, 0.4, 0.2, 0.6, 0.1, 0.3, 0.3, 0.7, 0.1], [4, 3])
+let b2 = tensor_from_list([0.0, 0.0, 0.0], [1, 3])
+let logits = tensor_add_bias(tensor_matmul(h, w2), b2)
+let probs = tensor_softmax(logits)
+
+let predicted_class = tensor_argmax(probs)
+print("prediction: class {predicted_class}")
+```
+Use case: machine learning inference, neural network forward passes, scientific computing, linear algebra. All tensor operations are runtime builtins — no external library or FFI needed.
+
+Gotcha: tensors are opaque handles, not NOVA lists. Use `tensor_to_list` to extract values for normal NOVA operations. `tensor_mul` is element-wise; use `tensor_matmul` for matrix multiplication.
+
+---
+
+## 17. Hot Reload, ECS & Advanced
+
+### Hot-code reload
+Syntax: `hot_load(path)` -> handle — load a shared library (.dll/.so). `hot_unload(handle)` — unload it. `hot_reload(handle)` — reload the library at the same path. `hot_sym(handle, name)` -> function pointer — look up a symbol by name. `hot_call0(sym)` · `hot_call1(sym, arg)` · `hot_call2(sym, a, b)` · `hot_call3(sym, a, b, c)` — call the looked-up function with 0-3 arguments.
+```nova
+let lib = hot_load("plugins/physics.dll")
+let step_fn = hot_sym(lib, "physics_step")
+hot_call1(step_fn, world)                // call physics_step(world)
+
+// after editing physics.dll:
+hot_reload(lib)                          // pick up changes
+let step_fn = hot_sym(lib, "physics_step")
+hot_call1(step_fn, world)                // runs new version
+```
+Use case: live-reloading game logic during development, plugin systems, dev servers that update without restart.
+
+### Hot-reload file watcher
+Syntax: `hot_reload_watch(path)` -> handle — watch a file or directory for changes. `hot_reload_check()` -> bool — returns true if any watched path changed since last check. `hot_reload_path(id)` -> string — get the path of a watched entry.
+```nova
+let w = hot_reload_watch("src/")
+while true
+    if hot_reload_check()
+        print("source changed, reloading...")
+        reload_modules()
+    sleep(500)
+```
+Use case: development tooling, auto-rebuild on save, live preview servers.
+
+### ECS (Entity Component System)
+Syntax: `ecs_world()` -> world handle. `ecs_entity(world)` -> entity id. `ecs_set(world, entity, component_name, value)` · `ecs_get(world, entity, component_name)` · `ecs_has(world, entity, component_name)` — per-entity component access by string key. `ecs_query(world, component_name)` -> list of entities that have the component. `ecs_destroy(world, entity)` — remove an entity and all its components.
+```nova
+let world = ecs_world()
+let player = ecs_entity(world)
+ecs_set(world, player, "pos_x", 100)
+ecs_set(world, player, "pos_y", 200)
+ecs_set(world, player, "health", 100)
+
+let enemy = ecs_entity(world)
+ecs_set(world, enemy, "pos_x", 300)
+ecs_set(world, enemy, "health", 50)
+
+let alive = ecs_query(world, "health")   // [player, enemy]
+for e in alive
+    let hp = ecs_get(world, e, "health")
+    print("entity {e}: hp={hp}")
+```
+Use case: game development, simulation, data-oriented design where entities are bags of components rather than class hierarchies.
+
+Note: components are keyed by string name and store a single value. For compound data (e.g. a position), use separate components (`"pos_x"`, `"pos_y"`) or store a dict.
+
+### ABI version
+Syntax: `abi_version()` -> int — returns the runtime ABI version number.
+```nova
+print("runtime ABI: {abi_version()}")
+```
+Use case: runtime version checking, compatibility verification between separately compiled modules or plugins loaded via `hot_load`.
+
+### Stepped range
+Syntax: `range_step(start, stop, step)` -> list of ints — eagerly creates the full list from `start` to `stop` (exclusive) with the given step.
+```nova
+let evens = range_step(0, 10, 2)         // [0, 2, 4, 6, 8]
+let countdown = range_step(10, 0, -1)    // [10, 9, 8, ..., 1]
+```
+Use case: iterating with custom step sizes, generating numeric sequences.
+
+Note: unlike `iter_range_step(start, stop, step)` which is lazy (returns an iterator), `range_step` allocates the entire list up front. Use `iter_range_step` in `for` loops over large ranges.
+
+### Safe parse builtins
+Syntax: `parse_int_safe(s)` -> Result<int, string> · `parse_float_safe(s)` -> Result<float, string> — parse a string to a number, returning `ok(value)` on success or `err(reason)` on failure.
+```nova
+match parse_int_safe(user_input)
+    Ok(n) => print("got number: {n}")
+    Err(e) => print("bad input: {e}")
+
+match parse_float_safe("3.14")
+    Ok(f) => print("pi ~ {f}")
+    Err(e) => print("not a float: {e}")
+```
+Use case: user input parsing, config file loading, CSV processing — anywhere failure is expected and should be handled, not crashed on.
+
+Gotcha: these return `Result`, not a raw value. Use `match` or `unwrap_or` to extract. The `err` payload is a string describing why parsing failed.
+
+### Structural type cast
+Syntax: `form_as<T>(value)` -> Result<T, string> — attempt a runtime structural cast of `value` (typically a dict) into struct `T`, matching by field name.
+```nova
+type User
+    name: string
+    age: int
+
+let raw = {"name": "Alice", "age": "30"}
+match form_as<User>(raw)
+    Ok(u) => print("welcome, {u.name}")
+    Err(e) => print("bad form: {e}")
+```
+Use case: JSON-to-struct conversion, HTTP form body parsing, database row mapping.
+
+Gotcha: `form_as` expects a dict with string keys. Integer fields are parsed from their string representation internally.
+
+---
+
+## 18. Additional Annotations
+
+Annotations are processed at compile time via `@name` or `@name("arg")` syntax. There are two tiers:
+- **Tier 1** — deeply integrated, modifying codegen, AST, or runtime behavior
+- **Tier 2** — metadata-only, generating `__annotationname` companion query functions that can be called at runtime
+
+### Tier 1 annotations (modify behavior)
+
+**`@cdecl`** — C calling convention. Emits the function with `ccc` (C calling convention) in LLVM IR instead of NOVA's default ABI. Required for FFI callbacks (e.g., passing a NOVA function to C's `qsort`).
+```nova
+@cdecl
+fn compare(a: int, b: int) -> int
+    a - b
+```
+Use case: FFI callbacks, C-callable function pointers.
+
+**`@comptime`** — Compile-time evaluation. The function body is evaluated at compile time; calls are replaced with computed constants. Requires an explicit `return` statement (bare expression bodies fold to 0 — see Trap 2).
+```nova
+@comptime
+fn table_size() -> int
+    return 16 * 4    // folded to 64 at compile time
+```
+Use case: compile-time constants that depend on computation, lookup table sizes, configuration.
+
+**`@deprecated` / `@deprecated("msg")`** — Deprecation warning. Injects a `deprecated_warn(name, msg)` call at function entry, emitting a runtime warning on first use.
+```nova
+@deprecated("use new_api() instead")
+fn old_api() -> int
+    42
+```
+Use case: API migration, soft removal of functions, guiding users to replacements.
+
+**`@log`** — Entry logging. Injects a `log_fn_entry(name)` call at function entry, recording every invocation.
+```nova
+@log
+fn process_payment(amount: int) -> bool
+    // log_fn_entry("process_payment") is auto-injected here
+    charge(amount)
+```
+Use case: audit trails, debugging call sequences, performance tracing.
+
+**`@redact`** — Field-level security (LOCK-7). Applied to struct fields; masks the field value in `show`, serialization, and `to_json` output. The actual value is stored normally but never reaches log lines or wire output.
+```nova
+type Credentials
+    username: string
+    @redact
+    password: string
+
+print(Credentials("admin", "s3cret"))    // Credentials { username: admin, password: [REDACTED] }
+```
+Use case: PII protection, credential masking, GDPR compliance, security audit requirements.
+
+**`@builder`** — Builder pattern generation. Generates `<T>__builder()` (returns a dict), `<T>__set_<field>(b, val)` (chainable setters), and `<T>__build(b)` (constructs the struct from accumulated values).
+```nova
+@builder
+type Config
+    host: string
+    port: int
+    debug: bool
+
+let c = Config__builder()
+let c = Config__set_host(c, "localhost")
+let c = Config__set_port(c, 8080)
+let cfg = Config__build(c)
+```
+Use case: complex struct construction with optional fields, configuration objects, fluent APIs.
+
+### Tier 2 annotations (metadata query only)
+
+These annotations generate companion `__name` functions that return metadata at runtime. They do NOT modify the annotated function/type's behavior.
+
+**`@entity` / `@entity("table_name")`** — ORM entity metadata. Generates `__table_name`, `__primary_key`, `__insert_sql`, `__create_table_sql`.
+```nova
+@entity("users")
+type User
+    id: int
+    name: string
+    email: string
+
+let sql = User__create_table_sql()       // CREATE TABLE users (id INTEGER, name TEXT, ...)
+let insert = User__insert_sql()          // INSERT INTO users (id, name, email) VALUES (?, ?, ?)
+```
+Use case: database ORM, schema generation, query building.
+
+**`@service` / `@service("name")`** — Service registry. Generates `__service_name`, `__is_service`, `__dependencies`.
+Use case: microservice architecture, dependency injection, service discovery.
+
+**`@inject`** — Dependency injection. Generates `__is_injectable`, `__inject_deps`, `__inject_name`.
+Use case: IoC containers, test mocking, service composition.
+
+**`@middleware` / `@middleware("name")`** — Middleware registration. Generates `__middleware_name`, `__is_middleware`.
+Use case: HTTP middleware chains, request/response pipelines, plugin systems.
+
+**`@validate`** — Validation metadata. Generates `__has_validation`, `__validate_fields`, `__field_count`.
+Use case: form validation, API input checking, schema enforcement.
+
+**`@retry` / `@retry(N)`** — Retry policy. Generates `__max_retries` (default 3), `__is_retryable`.
+Use case: network request retries, transient failure handling, resilience patterns.
+
+**`@timeout` / `@timeout(ms)`** — Timeout policy. Generates `__timeout_ms` (default 5000), `__has_timeout`.
+Use case: HTTP request timeouts, operation deadlines, circuit breakers.
+
+**`@singleton`** — Singleton marker. Generates `__is_singleton`, `__singleton_name`.
+Use case: single-instance services, global state management, resource pools.
+
+**`@observable`** — Observable marker. Generates `__is_observable`, `__observable_fields`.
+Use case: reactive programming, change detection, data binding.
+
+**`@async`** — Async marker. Generates `__is_async`.
+Use case: async function identification, middleware that handles async differently.
+
+**`@cache` / `@cache(ttl)`** — Cache policy. Generates `__is_cached`, `__cache_ttl` (default 60 seconds).
+Use case: response caching, memoization with TTL, CDN cache control.
+
+**`@event` / `@event("name")`** — Event handler. Generates `__event_name`, `__is_event_handler`.
+Use case: event-driven architecture, pub/sub systems, webhook handlers.
+
+---
+
+## 19. Compiler Intelligence & Best Practices
+
+NOVA's compiler (Hindley-Milner type inference, ownership analysis, escape analysis, constant folding) does enormous amounts of work so you don't have to. This section documents three things:
+- **19.A** — What you can OMIT (keywords, annotations, syntax the compiler handles if missing)
+- **19.B** — What the compiler DOES FOR YOU automatically (invisible behaviors)
+- **19.C** — Syntactic sugar & shorthands not covered in sections 1–18
+- **19.D** — What does NOT exist in NOVA (for developers coming from other languages)
+- **19.E** — Complete best practices summary table
+
+The rule of thumb: **the compiler is the genius, the developer writes clear code.** Omit ceremony that adds no information; annotate where it helps a reader or catches a mistake.
+
+---
+
+### 19.A — What You Can Omit
+
+Everything in this table is OPTIONAL — the compiler handles it if you leave it out.
+
+#### 19.A.1 `let` keyword
+
+`let` is **not required**. Both `x = 42` and `let x = 42` compile to identical code.
+
+```nova
+x = 42              // works — compiler creates x as int
+let x = 42          // also works — identical output
+let x: int = 42     // explicit type — redundant but valid
+```
+**Best practice:** Write `let` — it signals "new variable" vs. "reassignment of existing one." Omit the type annotation on locals — the RHS documents the type. Exception: `let user: User = from_json(data)` triggers typed deserialization.
+
+#### 19.A.2 `return` keyword (implicit return)
+
+The **last expression** in a function body is automatically returned. No `return` needed.
+
+```nova
+fn double(x: int) -> int
+    x * 2                    // auto-returned — no 'return' keyword
+
+fn greet(name: string) -> string
+    "Hello, {name}!"         // auto-returned
+```
+This works in regular functions, match arms, if/else tails, and lambdas. The compiler recurses into blocks and nested control flow to find the tail expression.
+
+**Best practice:** Omit `return` for single-expression bodies and when the value is the natural last expression. Write `return` for early exits and multi-path functions where clarity helps.
+
+#### 19.A.3 Type annotations on local variables
+
+The compiler infers the type from the RHS expression.
+
+```nova
+let x = 42              // inferred: int
+let name = "Alice"       // inferred: string
+let users = []           // inferred: list
+let point = Point(3, 4)  // inferred: Point
+```
+**Best practice:** Skip type annotations on locals. Write them only when the RHS is ambiguous or when using typed deserialization (`let p: Point = from_json(data)`).
+
+#### 19.A.4 Type annotations on function parameters
+
+Untyped parameters become type variables resolved at each call site.
+
+```nova
+fn double(x)        // x's type inferred from usage — works
+fn double(x: int)   // explicit — catches misuse at compile time
+```
+**Best practice:** Always annotate parameter types on **public/exported functions** — untyped params silently accept `any`, deferring type errors to runtime. For private helpers and lambdas, omitting types is fine.
+
+#### 19.A.5 Return type annotations
+
+The compiler analyzes all return paths and infers the return type. If paths disagree, it widens to `any`.
+
+```nova
+fn add(a: int, b: int)          // return type inferred as int
+fn add(a: int, b: int) -> int   // explicit — documents the contract
+```
+**Best practice:** Annotate return types on public functions (`-> T or Error`). Skip on private helpers.
+
+#### 19.A.6 `f"..."` string prefix (all strings auto-interpolate)
+
+The `f` prefix is purely cosmetic. ALL double-quoted strings in NOVA support `{expr}` interpolation. Both `"hello {name}"` and `f"hello {name}"` produce identical code.
+
+```nova
+"Hello, {name}!"        // interpolated — no f prefix needed
+f"Hello, {name}!"       // identical — f is a historical alias
+"Pi = {pi:.4f}"         // format specs work in both forms
+```
+**Best practice:** Omit `f` — all strings interpolate by default. Use `\{` to escape a literal brace.
+
+#### 19.A.7 `self` parameter in struct methods
+
+When you declare `fn Type.method(...)`, the compiler auto-injects `self` as the first parameter if you don't write it.
+
+```nova
+fn Point.magnitude() -> float                   // self auto-injected
+    sqrt(self.x * self.x + self.y * self.y)
+
+fn Point.magnitude(self: Point) -> float        // explicit self — same result
+    sqrt(self.x * self.x + self.y * self.y)
+```
+**Best practice:** Omit `self` — the compiler injects it. Write it explicitly only if you need to annotate its type.
+
+#### 19.A.8 `=` sign in `const` declarations
+
+Both `const PI = 3.14` and `const PI 3.14` are valid — the `=` is optional.
+
+**Best practice:** Write `=` for clarity: `const MAX_SIZE = 1024`.
+
+#### 19.A.9 `else` branch in `if` statements
+
+`else` is optional on `if`. Omit when there's no alternative action.
+
+#### 19.A.10 Wildcard `_` in `match`
+
+For non-enum types, a wildcard arm is optional. For enum/ADT types, the compiler checks exhaustiveness and warns if variants are uncovered. Add `_ =>` as a catch-all if you don't want to handle every variant explicitly.
+
+#### 19.A.11 Trailing commas
+
+Trailing commas are allowed in lists, dicts, function calls, function parameters, and struct initializers.
+
+```nova
+let items = [1, 2, 3,]        // trailing comma — valid
+f(a, b, c,)                   // trailing comma — valid
+```
+
+#### 19.A.12 Generic constraints
+
+Generic type parameters can be unconstrained or constrained with `: Trait`.
+
+```nova
+fn <T> identity(x: T) -> T            // unconstrained — any type
+fn <T: Comparable> sort(xs: list<T>)   // constrained — T must be Comparable
+```
+**Best practice:** Omit constraints unless the function body uses trait-specific methods.
+
+#### 19.A.13 `ok()` wrapper — NOT optional
+
+Unlike the items above, `ok(value)` is **required** in Result-returning functions. There is no auto-wrapping. You must write `ok(value)` and `err(reason)` explicitly.
+
+```nova
+fn safe_divide(a: int, b: int) -> int or Error
+    if b == 0
+        return err("division by zero")
+    ok(a / b)                    // ok() is REQUIRED — no auto-wrap
+```
+
+---
+
+### 19.B — What the Compiler Does For You Automatically
+
+These are invisible behaviors — the compiler generates code, inserts checks, or optimizes without you writing anything.
+
+#### 19.B.1 1,335 builtins — no import needed
+
+NOVA has 1,335 builtin functions available globally without any `import`. This includes: `print`, `len`, `push`, `pop`, `map`, `filter`, `sort`, `split`, `join`, `contains`, `keys`, `values`, `read_file`, `write_file`, `parse_int`, `range`, `str`, `int`, `float`, `copy`, `assert`, `type_of`, `exit`, `sleep`, `args`, `sha256`, `json_parse`, `json_stringify`, and hundreds more.
+
+Only `std/` library modules and user modules need `import`. Builtins are free.
+
+```nova
+fn main()
+    print("hello")          // no import needed
+    let data = read_file("config.json")   // no import needed
+    let parsed = json_parse(data)         // no import needed
+```
+
+#### 19.B.2 Automatic struct derivation (11 methods, zero annotation)
+
+For EVERY struct, the compiler auto-generates:
+
+| Auto-generated | What it does | How you use it |
+|---|---|---|
+| `show` | Pretty-prints `TypeName { field: value, ... }` | `print(p)` or `str(p)` |
+| `to_json` | Serializes to JSON (nested structs recurse) | `json_stringify(p)` |
+| `from_json` | Deserializes from JSON dict | `from_json(data)` as `Point` |
+| `from_json_safe` | Safe deserialization → `Result<T, string>` | `from_json_safe(data)` as `Point` |
+| `from_dict` | Construct from dict (DB rows, form bodies) | `from_dict(row)` as `User` |
+| `from_dict_list` | Map list of dicts → `list<T>` | `from_dict_list(rows)` as `User` |
+| `fields` | List of all field values | `p.fields()` → `[3, 4]` |
+| `field_names` | List of field name strings | `Point.field_names()` → `["x", "y"]` |
+| `field_types` | List of field type strings | `Point.field_types()` → `["int", "int"]` |
+| `field_get` | Dynamic field access by name | `p.field_get("x")` → `3` |
+| `type_name` | Returns struct's name as string | `p.type_name()` → `"Point"` |
+
+Additionally, `==` (structural equality), `hash` (structural hash), and `copy()` (deep clone) work on ALL values universally. If you write `@derive`, the compiler gives a helpful error explaining that derivation is automatic. Use `@redact` to hide fields from `show`/`to_json`.
+
+#### 19.B.3 Automatic reference counting
+
+The compiler inserts `rc_inc`/`rc_dec` at assignment and scope exit. You never call `alloc`/`free`. Per-struct managed-slot bitmaps ensure only heap-pointer fields are decremented. In FULLRC mode, the compiler's pre-pass identifies always-owned never-escaped slots and inserts `rc_dec` on overwrite automatically.
+
+#### 19.B.4 Automatic boxing/unboxing
+
+When a typed value (float, bool) enters an `any`-typed slot, the compiler auto-inserts boxing:
+- Function call args to `any`-typed params → `nova_rt_box_float`
+- Channel send with float payload → auto-boxed
+- `ok()`/`err()`/`some()` with float args → auto-boxed
+- String interpolation → auto-boxed
+- Lambda capture of float locals → auto-boxed
+- `push(list, float)` → uses `list_append_fbox`
+
+You just write `push(mylist, 3.14)` or `send(ch, temperature)` — boxing is invisible.
+
+#### 19.B.5 Automatic string conversion
+
+`print(anything)` works on any type — the runtime dispatches on the type tag. String interpolation `"value is {x}"` auto-converts each `{expr}` via `any_to_str` then concatenates. No `.toString()` or `__str__` needed.
+
+#### 19.B.6 Automatic deep copy on channel send
+
+`send(ch, value)` deep-copies the value. The runtime recursively copies lists, dicts, structs, and bytes. If the sent value is the last use (referenced exactly once), the compiler optimizes it to `send_move` (zero-copy transfer).
+
+#### 19.B.7 Ownership and memory inference
+
+No lifetime annotations, no borrow annotations, no manual allocation. Process isolation IS memory safety. Escape analysis for typed arrays. Auto-arena mode when no `spawn`. See section 19.A for what you omit; the compiler does all the rest.
+
+#### 19.B.8 Process erasure
+
+The compiler scans for `spawn`. If none found, ALL concurrency overhead is erased. Sequential code compiles to C-equivalent with zero overhead.
+
+#### 19.B.9 Constant folding and `@comptime`
+
+Three levels: (1) Module-level `let` with literals auto-inlined everywhere. (2) IR-level arithmetic on constants folded. (3) `@comptime` functions evaluated by a mini-interpreter. Also: `type_of(x)` folds to a constant string when the static type is known.
+
+#### 19.B.10 UFCS (Uniform Function Call Syntax)
+
+Any `fn f(x, ...)` can be called as `x.f(...)`. Resolution: struct method → module function → stdlib builtin → runtime function. Enables natural chaining: `data.filter(...).map(...).sort_by(...)`.
+
+#### 19.B.11 Error context threading with `?`
+
+`?` auto-captures the function name + source line, wraps the error with context, and propagates. You get stack-trace-like messages with zero manual wrapping.
+
+#### 19.B.12 Pattern match exhaustiveness checking
+
+For enum/ADT types, the compiler warns on uncovered variants.
+
+#### 19.B.13 Lambda lifting and closure capture
+
+The compiler identifies captured variables, packs them into a closure struct, lifts the lambda to a top-level function. Captured values use copy semantics (value at capture time).
+
+#### 19.B.14 Unused Result warning
+
+If a `Result`-returning function's return value is ignored, the compiler emits a warning with fix suggestions.
+
+#### 19.B.15 Float specialization
+
+The compiler tracks provably-float registers. When proven, `sqrt`, `abs`, `sin`, `cos`, `floor`, `ceil`, `round` are inlined to native LLVM intrinsics — zero call overhead.
+
+#### 19.B.16 Struct operator dispatch
+
+Define `index(self, i)` and `x[i]` works. Define `iter(self)` and `for item in x` works. Define `call(self, args...)` and `x(args)` works. Also: `+`, `-`, `*`, `==`, `<` dispatch to `Type__add`, `Type__sub`, etc. if defined.
+
+#### 19.B.17 Automatic zero initialization
+
+All local variables start as 0 (every `alloca i64` is followed by `store i64 0`). All heap allocations are zeroed. `null` compiles to literal `0`.
+
+#### 19.B.18 Automatic bounds checking
+
+All `list[i]` and `str[i]` access goes through runtime bounds checking. OOB reads return 0; OOB writes are silently dropped.
+
+#### 19.B.19 Automatic string interning
+
+String literals are deduplicated within a compilation unit. The runtime has a full intern table with FNV-1a hashing and thread-safe locking.
+
+#### 19.B.20 Automatic module initialization and main detection
+
+All top-level statements execute at program start. `fn main()` is auto-detected, renamed internally to `nova_user_main`, and called after module init. If no `main` exists but `@test` functions do, the compiler synthesizes a test runner automatically.
+
+#### 19.B.21 Automatic test runner synthesis
+
+When `@test` functions exist and no `main` is defined, the compiler generates a full test runner: calls each test, tallies passes/failures, prints results. Zero boilerplate.
+
+#### 19.B.22 Automatic width wrapping for sized numerics
+
+Operations on `u8`, `i16`, `u32`, etc. are automatically followed by mask/sign-extend to keep values in range. Unsigned wraps with `(1<<bits)-1`; signed uses `shl`/`ashr`.
+
+#### 19.B.23 Automatic annotation-driven code generation
+
+20 annotations processed at compile time in a fixed pipeline order via AST injection: `@ensures` → `@memo` → `@test` → routes → `@comptime` → `@deprecated` → `@inject` → `@middleware` → `@service` → `@entity` → `@singleton` → `@timeout` → `@retry` → `@log` → `@validate` → `@builder` → `@event` → `@cache` → `@async` → `@observable`. Each wraps/transforms the annotated function automatically.
+
+#### 19.B.24 Automatic field coercion in `from_dict`
+
+When constructing a struct from a dict (DB rows, form bodies), string values are auto-converted to the target field type (int, float, bool). No manual parsing needed.
+
+---
+
+### 19.C — Syntactic Sugar & Shorthands
+
+These shorthands are not covered (or only briefly mentioned) in sections 1–18.
+
+#### 19.C.1 Chained comparisons
+
+`a < b < c` desugars to `(a < b) and (b < c)`. Works with all comparison ops.
+
+```nova
+if 0 <= x <= 100       // desugars to: 0 <= x and x <= 100
+if a < b < c < d       // chains: a < b and b < c and c < d
+```
+
+#### 19.C.2 `matches` operator
+
+`x matches Pattern` — boolean pattern-match test. Same precedence as comparisons.
+
+```nova
+if value matches Ok(v)
+    print("success: {v}")
+```
+
+#### 19.C.3 `if let` pattern matching
+
+`if let Pattern = expr` desugars to a `match` with two arms (pattern arm + wildcard else arm).
+
+```nova
+if let Ok(user) = find_user(id)
+    print(user.name)
+else
+    print("not found")
+```
+
+#### 19.C.4 Multi-assign and swap
+
+`a, b = b, a` uses temporaries for safe swap. Works with any number of variables.
+
+```nova
+a, b = b, a              // safe swap — no temp variable needed
+x, y, z = 1, 2, 3        // parallel assignment
+```
+
+#### 19.C.5 `until` loop
+
+`until cond` desugars to `while not cond`.
+
+```nova
+until done
+    process_next()
+```
+
+#### 19.C.6 `for...else` and `while...else`
+
+An `else` block on a loop runs if the loop completes WITHOUT hitting `break`.
+
+```nova
+for item in items
+    if item == target
+        print("found!")
+        break
+else
+    print("not found")    // only runs if no break
+```
+
+#### 19.C.7 For-loop inline filter
+
+`for x in iter if cond` filters the iteration inline.
+
+```nova
+for x in items if x > 0
+    print(x)              // only items > 0
+```
+
+#### 19.C.8 `-> T or E` return type sugar
+
+`fn f() -> int or Error` desugars to `fn f() -> Result<int, Error>`.
+
+#### 19.C.9 Four lambda forms
+
+All produce identical compiled code:
+```nova
+fn(x) x * 2              // fn-lambda
+|x| x * 2                // bar-lambda
+x => x * 2               // arrow-lambda
+x =>                      // block-lambda (multi-line)
+    let result = x * 2
+    result
+```
+
+#### 19.C.10 `const` keyword
+
+`const` declares compile-time constants. The `=` sign is optional.
+
+```nova
+const MAX_SIZE = 1024     // with =
+const MAX_SIZE 1024       // without = — same result
+```
+
+#### 19.C.11 `let mut` for mutable bindings
+
+Plain `let` is immutable. `let mut` marks a binding as mutable.
+
+```nova
+let x = 5                // immutable
+let mut counter = 0       // mutable — can be reassigned
+counter = counter + 1
+```
+
+#### 19.C.12 `T?` optional type sugar
+
+`int?` desugars to `Option<int>`. Works on params, fields, let-types, and return types.
+
+#### 19.C.13 `T...` variadic params
+
+`fn log(args: string...)` collects trailing args into a list.
+
+#### 19.C.14 Named arguments — two spellings
+
+Both `name: value` and `name = value` accepted in function calls. Can mix with positional args.
+
+```nova
+greet(name: "Alice", greeting: "Hi")   // colon form
+greet(name = "Alice", greeting = "Hi") // equals form — same result
+```
+
+---
+
+### 19.D — What Does NOT Exist in NOVA
+
+For developers coming from other languages — these features are absent by design:
+
+| From | Feature | NOVA equivalent |
+|---|---|---|
+| C/C++/Java | Semicolons `;` | Newlines are statement separators. `;` is a lex error with a message. |
+| C++/Java | `new` keyword | `Point(3, 4)` or `Point{x: 3, y: 4}` — constructors are calls. |
+| Java/C# | `public`/`private`/`protected` | `_prefix` = private, no prefix = public. No other access levels. |
+| Java/Go | `package`/`module` declaration | File = module, automatically. Module name = filename without `.nova`. |
+| C/Java/Rust | Braces `{ }` for blocks | Indentation-based blocks (Python-style). Braces only for struct init, dict/set literals. |
+| Python | `"a" * 3` string repeat | Use `str_mul("a", 3)` or `"a".str_mul(3)` via UFCS. |
+| Rust/Haskell | `@derive(Show, Eq, ...)` | Automatic — `print`, `==`, `hash`, `json`, `copy` all just work. Writing `@derive` gives a helpful error. |
+| Rust | Lifetime annotations `'a` | Never needed — process-based ownership. |
+| C/C++ | `malloc`/`free` | Never needed — automatic reference counting. |
+| Rust/C++ | Tail call optimization | Not implemented. All calls use regular stack frames. |
+| Rust | `0..=5` inclusive range | Use `range_inclusive(0, 5)` builtin. |
+| Most languages | Arity-based overloading | Not supported. Use guard clauses: `fn f(x) when x > 0` for dispatch. |
+| Python/Ruby | `fn name` without parens | Parens required: `fn main()`. |
+| Kotlin/Scala | Single-expression named fns | Named functions require indented body. Lambdas can be single-expression. |
+
+---
+
+### 19.E — Complete Best Practices Summary
+
+| Feature | Required? | Best practice |
+|---|---|---|
+| `let` keyword | No — `x = 5` works | **Write `let`** — signals new variable |
+| `return` keyword | No — last expr auto-returned | **Omit** for single-expression; **write** for early exits |
+| Type on local `let` | No — compiler infers | **Skip** — RHS documents the type |
+| Type on public fn params | No — inferred as `any` | **Write** — catches misuse at compile time |
+| Return type on public fns | No — compiler infers | **Write** (`-> T or Error`) — documents the API |
+| Return type on private fns | No — compiler infers | **Skip** — less noise |
+| `f"..."` prefix | No — all strings interpolate | **Skip** — just use `"..."` |
+| `self` in struct methods | No — auto-injected | **Skip** — compiler adds it |
+| `=` in `const` | No — `const X 5` works | **Write `=`** for clarity |
+| `ok()` wrapper | Yes — no auto-wrap | **Required** — always write `ok(value)` |
+| `()` on fn declarations | Yes — always required | **Required** — `fn main()` not `fn main` |
+| Semicolons | N/A — don't exist | **Never** — causes lex error |
+| Generic `<T>` declarations | Yes for generic fns | **Write** — `fn <T> f(x: T)`, not untyped `fn f(x)` |
+| Type args at call sites | Not supported | N/A — compiler always infers |
+| `@derive(...)` | Not needed | **Never** — show/json/eq/hash/copy are automatic |
+| Lifetime annotations | Not needed | **Never** — process ownership handles this |
+| Memory management | Not needed | **Never** — RC is automatic |
+| Error context in `?` | Automatic | **Never** wrap manually — compiler threads fn+line |
+| `@redact` on sensitive fields | Optional | **Write** — hides passwords/tokens from show/json |
+| `return` in `@comptime` | Required | **Write** — bare expression folds to 0 (Trap 2) |
+| `let mut` for mutation | Yes if you reassign | **Write** — `let mut counter = 0` |
+| Import for builtins | Not needed | **Never** — 1335 builtins are global |
+| Import for std/ modules | Yes | **Write** — `import std/data/json` |
+
+---
+
+## Highest-leverage features to adopt first
+
+These are the constructs most likely being hand-rolled today (as if/else + index loops + `any`+`type_of`) that this toolkit replaces:
+
+1. **List / dict / set comprehensions** — `[x*2 for x in xs if x>3]` instead of a `for` + `push` loop.
+2. **map / filter / reduce (+ UFCS chaining)** — `xs.filter(...).map(...)` instead of manual index loops.
+3. **Pipe `|>`** — `xs |> filter(...) |> map(...)` instead of nested calls or throwaway temporaries.
+4. **match + ADT destructuring + exhaustiveness** — `match shape { Circle(r) => ... }` instead of `if type_of(x) == ...` ladders; the compiler forces you to handle every case.
+5. **Result + `?` + `with/else`** — one-word error propagation with automatic context threading, instead of manual error-check branching.
+6. **String interpolation + format spec** — `"{n:04d} {name}"` instead of `"..." + str(...) + "..."` concatenation.
+7. **for-in destructuring, enumerate, zip** — `for i, v in xs` and `xs.zip(ys)` instead of `for i in 0..len(xs)` index arithmetic.
+8. **Automatic struct derivation** — `print(p)`, `p.to_json()`, `a == b`, `copy(a)` for free on every struct; never hand-write a serializer or equality method (and never reach for `@derive`).
+9. **std/functional + std/itertools** — `fg_group_by`, `ftw_take_while`, `itw_pairwise`, `itc_chunk`, `ita_sums` instead of bespoke grouping/windowing/chunking loops.
+10. **spawn + channels + selective receive** — cheap green-task concurrency (`spawn fn() ...`, `receive ... after`) instead of hand-rolled OS threads and shared mutable state.
+11. **Lazy iterators** — `iter_range(0, 1000000) |> iter_filter(...) |> iter_take(5) |> iter_collect()` instead of allocating huge intermediate lists.
+12. **Builtin data structures** — `pq_create()`, `lru_create(100)`, `deque_create()` instead of hand-rolling priority queues, caches, and deques.
+13. **Tensor operations** — `tensor_matmul(a, b)`, `tensor_softmax(logits)` instead of manual matrix loops.
+
+---
+
+# PART II: TOOLCHAIN & CLI (sections 20–21)
+
+These are NOT language features used in `.nova` source code. They are the **compiler commands and development tools** used to build, run, test, and manage NOVA projects.
+
+---
+
+## 20. CLI Commands
+
+### Project management
+| Command | Description |
+|---|---|
+| `nova new <name>` | Create project skeleton (options: `--api`, `--microservice`, `--frontend`, `--fullstack`, `--lib`; default: `--api`) |
+| `nova init` | Create `nova.toml` in current directory |
+| `nova setup` | Pre-compile runtime cache — run once after install, makes every build 38x faster (170ms vs 6500ms) |
+| `nova clean` | Remove `.ll`, `.exe` build artifacts |
+
+### Build & run
+| Command | Description |
+|---|---|
+| `nova run [file]` | Build and run (default `-O0` for fast iteration) |
+| `nova build [file]` | Build to executable (default `-O2` for production) |
+| `nova compile <file>` | Compile to LLVM IR only (`.ll` output) |
+| `nova emit <file>` | Print generated LLVM IR to stdout (`--asm` for native assembly, `--target <t>` for cross-compile) |
+| `nova wasm <file>` | Compile to runnable WASM bundle (`.wasm` + `.run.cjs` + `_wasm_runtime.cjs`; options: `-o output`, `-O0`/`-O1`) |
+| `nova eval "<expr>"` | Tree-walk interpret a single expression (no LLVM compile) |
+
+### Build options (for `run` / `build` / `compile`)
+| Option | Description |
+|---|---|
+| `-O0` | No optimization (default for `nova run`) |
+| `-O2` | Full optimization (default for `nova build`) |
+| `-o <path>` | Output file path |
+| `--target <target>` | Cross-compilation target (see section 21) |
+| `--old` | Use legacy non-IR compiler backend |
+
+### Testing & quality
+| Command | Description |
+|---|---|
+| `nova test` | Run all `*_test.nova` files in `tests/` and `./` |
+| `nova bench <file>` | Build `-O2` then time N runs (min/mean/max; default 10 iterations, set with `-n`) |
+| `nova cov <file>` | Build with coverage, run, report per-line coverage on exit (alias: `nova coverage`) |
+| `nova check <file>` | Parse + type-check only (no codegen) — fast syntax/type verification |
+| `nova lint <file>` | Static checks (tabs, line length, TODOs) |
+| `nova fmt <file>` | Format source (whitespace normalization; alias: `nova format`) |
+
+### Interactive & debugging
+| Command | Description |
+|---|---|
+| `nova repl` | Start interactive shell (read-eval-print loop) |
+| `nova debug <file>` | Build with debug info and launch `lldb` |
+| `nova lsp` | Start LSP server for IDE integration (also `nova --lsp`) |
+
+### Package management
+| Command | Description |
+|---|---|
+| `nova get <package>[@ver]` | Add dependency to `nova.toml` |
+| `nova install` | Download all dependencies from `nova.toml` |
+
+### Utility
+| Command | Description |
+|---|---|
+| `nova version` | Show version (also `nova --version`; current: v0.1.0) |
+| `nova self-test` | Run compiler self-test |
+
+---
+
+## 21. Cross-Compilation Targets
+
+Use `--target <value>` with `nova build` / `nova emit` / `nova compile`:
+
+| `--target` value | LLVM triple | Platform |
+|---|---|---|
+| `native` / `windows` / `win` | `x86_64-pc-windows-msvc` | Windows x64 (default on Windows) |
+| `linux` / `linux-x64` | `x86_64-unknown-linux-gnu` | Linux x64 |
+| `linux-arm64` / `linux-aarch64` | `aarch64-unknown-linux-gnu` | Linux ARM64 |
+| `macos` / `darwin` / `macos-x64` | `x86_64-apple-darwin` | macOS Intel |
+| `macos-arm64` / `darwin-arm64` | `aarch64-apple-darwin` | macOS Apple Silicon |
+| `wasm` / `wasm32` | `wasm32-unknown-unknown` | WebAssembly |
+
+Any unrecognized value is passed through verbatim as a LLVM triple.
+
+```bash
+nova build myapp.nova --target linux          # cross-compile for Linux
+nova build myapp.nova --target wasm           # compile to WebAssembly
+nova emit myapp.nova --target macos-arm64     # inspect ARM64 IR
+```
 
 ---
 

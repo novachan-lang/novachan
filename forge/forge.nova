@@ -1000,7 +1000,7 @@ fn ws_try_decode_n_checked(buf, start: int, avail: int, require_masked: int) -> 
 // across reads (partial/pipelined frames). blen: count of valid bytes in buf. closed: 1 once we've sent a
 // Close frame (idempotency). Per-message allocations live in a per-message arena and are freed wholesale;
 // the fixed buf is the only connection-lived heap -> FLAT memory across millions of messages.
-type Ws
+type WsConn
     fd: int
     open: int
     path: string
@@ -1040,7 +1040,7 @@ fn ws_is_upgrade(req: Request) -> bool
         return false
     ws_key_ok(req_header(req, "sec-websocket-key"))
 
-// Register a WebSocket route. handler: fn(ws: Ws, msg) -> unit, called once per inbound message (the msg
+// Register a WebSocket route. handler: fn(ws: WsConn, msg) -> unit, called once per inbound message (the msg
 // bytes are arena-scoped to the call). Stored in a SEPARATE a["ws_routes"] table so
 // the HTTP dispatch path stays byte-identical. The pattern + handler are registered at app-config time
 // (active_arena == NULL) so they are connection-lived (non-arena) -- safe to hold across a request arena.
@@ -1061,15 +1061,15 @@ fn ws(a, pattern: string, handler)
 // called per inbound message -- typically calls room_say(hub, ...) to fan a message out to EVERY connection
 // on that hub. The framework runs the dual-task model (reader + single writer) and auto-subscribes /
 // unsubscribes the connection. A 3-element route [pattern, handler, hub] selects _ws_run_room.
-fn ws_room(a, pattern: string, hub, handler)
-    _push_route(a, "ws_routes", [pattern, handler, hub])
+fn ws_room(a, pattern: string, h, handler)
+    _push_route(a, "ws_routes", [pattern, handler, h])
 
 // A room route WITH lifecycle hooks for presence: on_join(ws, hub) fires when a client joins (e.g.
 // room_say(hub, "* a user joined *")), on_msg(ws, msg, hub) per message, on_leave(ws, hub) when it
 // disconnects. The join broadcast reaches the joiner too; the leave broadcast reaches the rest of the room.
 // Route = [pattern, on_msg, hub, on_join, on_leave] (length 5 selects the hook path in _ws_run_room).
-fn ws_room_ex(a, pattern: string, hub, on_join, on_msg, on_leave)
-    _push_route(a, "ws_routes", [pattern, on_msg, hub, on_join, on_leave])
+fn ws_room_ex(a, pattern: string, h, on_join, on_msg, on_leave)
+    _push_route(a, "ws_routes", [pattern, on_msg, h, on_join, on_leave])
 
 // First row of route table `key` whose pattern matches `path`, or []. The ws / sse / stream lookups
 // below were three byte-identical copies of this scan differing only in the table name and in the
@@ -1303,7 +1303,7 @@ fn wss_try_upgrade(a, handle: int, raw_request: string) -> int
 // error (-1002 bad frame / -1009 frame exceeds the fixed buffer). Reads via the green-aware (netpoller-
 // parking) tcp_recv_bytes and copies into the FIXED buffer via bytes_set (NO reallocation, so ws.buf stays
 // connection-lived across the per-message arena boundary). Does NOT consume -- caller calls _ws_consume.
-fn _ws_fill_frame(ws: Ws) -> WsFrame
+fn _ws_fill_frame(ws: WsConn) -> WsFrame
     let guard = 0
     while guard < 2000000000
         guard += 1
@@ -1340,7 +1340,7 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
     WsFrame(0 - 1, 0, 0, 0, bytes(0))
 
 // Drop the first `n` bytes of ws.buf, compacting the leftover to the front IN PLACE (bytes_set, no alloc).
-fn _ws_consume(ws: Ws, n: int)
+fn _ws_consume(ws: WsConn, n: int)
     let rem = ws.blen - n
     // Forward compaction: every read is from a HIGHER index than the write, so a counted walk is
     // exactly the in-place move the manual index performed.
@@ -1349,7 +1349,7 @@ fn _ws_consume(ws: Ws, n: int)
     ws.blen = rem
 
 // Read ONE complete frame and consume it from the buffer. status 1 = frame in opcode/fin/payload; <0 sentinel.
-fn _ws_next_frame(ws: Ws) -> WsFrame
+fn _ws_next_frame(ws: WsConn) -> WsFrame
     let fr = _ws_fill_frame(ws)
     if fr.status == 1
         _ws_consume(ws, fr.consumed)
@@ -1360,7 +1360,7 @@ fn _ws_next_frame(ws: Ws) -> WsFrame
 // broadcasts and the reader's own pong/close frames can never interleave on the wire (the single-writer
 // rule). channel send deep-copies, so routing an arena-scoped payload to the writer is sound. In basic
 // mode (outbound==0) the reader writes the socket directly.
-fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
+fn _ws_send_frame(ws: WsConn, opcode: int, payload) -> int
     if ws.outbound != 0
         send(ws.outbound, [opcode, payload])
         return 0
@@ -1368,7 +1368,7 @@ fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
     ws.send_fn(frame)
 
 // Send a Close frame with a 2-byte status code (idempotent: only the first call sends).
-fn _ws_send_close(ws: Ws, code: int) -> int
+fn _ws_send_close(ws: WsConn, code: int) -> int
     if ws.closed == 1
         return 0
     ws.closed = 1
@@ -1380,7 +1380,7 @@ fn _ws_send_close(ws: Ws, code: int) -> int
 // Read the next complete application message (reassembling fragments, answering pings, bounding control
 // frames -- CRIT-2 a bounded WHILE loop, never recursion). Returns the message bytes; sets ws.open=0 and
 // returns whatever is assembled on close/EOF/error. On a protocol error or oversize, replies Close.
-fn _ws_read_message(ws: Ws) -> any
+fn _ws_read_message(ws: WsConn) -> any
     if ws.open == 0
         return bytes(0)
     let assembled = bytes(0)
@@ -1429,19 +1429,19 @@ fn _ws_read_message(ws: Ws) -> any
 // Messages are PUSHED to the handler fn(ws, msg_bytes) per inbound message (Phoenix-style), so there is no
 // pull verb -- the per-message arena needs the message lifetime bounded by the callback.
 // Send a text message.
-fn ws_emit(ws: Ws, msg: string) -> int
+fn ws_emit(ws: WsConn, msg: string) -> int
     _ws_send_frame(ws, 1, str_to_bytes(msg))
 
 // Send a binary message (NUL-safe).
-fn ws_emit_bin(ws: Ws, data) -> int
+fn ws_emit_bin(ws: WsConn, data) -> int
     _ws_send_frame(ws, 2, data)
 
 // Is the connection still open?
-fn ws_open(ws: Ws) -> bool
+fn ws_open(ws: WsConn) -> bool
     ws.open == 1
 
 // Initiate a clean close (send Close 1000); the drain + fd close happen in _ws_finish.
-fn ws_done(ws: Ws)
+fn ws_done(ws: WsConn)
     _ws_send_close(ws, 1000)
     ws.open = 0
 
@@ -1449,23 +1449,23 @@ fn ws_done(ws: Ws)
 // Stored in ws.assigns (a dict {}), which is a reference-semantic field on the reference-semantic Ws
 // struct -- mutations are visible everywhere the Ws is held. Set at any point in a handler;
 // retrieved with ws_get (returns "" if the key was never set).
-fn ws_assign(ws: Ws, key: string, val: string)
+fn ws_assign(ws: WsConn, key: string, val: string)
     ws.assigns[key] = val
 
 // Retrieve a value previously set with ws_assign. Returns "" when the key is absent.
-fn ws_get(ws: Ws, key: string) -> string
+fn ws_get(ws: WsConn, key: string) -> string
     _get_or(ws.assigns, key, "")
 
 // Create a mock Ws with an empty assigns dict and an invalid (zero) fd. The fd is unusable for
 // actual I/O (no open socket); only ws_assign/ws_get are safe to call on the result. Intended for
 // unit tests that want to verify assigns logic without opening a real socket connection.
-fn ws_mock() -> Ws
-    Ws(0, 0, "", bytes(0), 0, 0, 0, 0, 0, {}, fn() bytes(0), fn(d) 0, 0)
+fn ws_mock() -> WsConn
+    WsConn(0, 0, "", bytes(0), 0, 0, 0, 0, 0, {}, fn() bytes(0), fn(d) 0, 0)
 
 // Two-phase close (CRIT-4): send Close, drain a bounded number of frames awaiting the peer's Close (so the
 // peer's buffered data isn't RST-dropped), then close the fd EXACTLY once (CONCERN-3: _ws_run is the sole
 // owner of tcp_close -- _serve_conn returns without falling through to its tcp_close).
-fn _ws_finish(ws: Ws)
+fn _ws_finish(ws: WsConn)
     _ws_send_close(ws, 1000)
     let tries = 0
     while tries < 8
@@ -1479,7 +1479,7 @@ fn _ws_finish(ws: Ws)
                 tries += 1
     tcp_close(ws.fd)
 
-fn _ws_finish_tls(ws: Ws, close_fn)
+fn _ws_finish_tls(ws: WsConn, close_fn)
     _ws_send_close(ws, 1000)
     let tries = 0
     while tries < 8
@@ -1519,15 +1519,16 @@ fn _ws_run(conn: int, route, ka: int)
     // paths are NOT wrapped: their per-connection `outbound` channel is referenced by the hub/writer task
     // and MUST outlive the frame loop, so a connection arena there would free a still-referenced channel.
     let cprev = arena_enter()
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
+    let path = str(route[0])
     let handler = route[1]
-    while ws.open == 1
+    let wsc = WsConn(conn, 1, path, bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
-            handler(ws, msg)
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
+            handler(wsc, msg)
         arena_exit(prev)
-    _ws_finish(ws)
+    _ws_finish(wsc)
     arena_exit(cprev)
 
 fn _ws_run_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
@@ -1538,20 +1539,22 @@ fn _ws_run_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
         _ws_run_room_tls(handle, route, ka, recv_fn, send_fn, close_fn)
         return
     let cprev = arena_enter()
-    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, recv_fn, send_fn, 1)
+    let path = str(route[0])
     let handler = route[1]
-    while ws.open == 1
+    let wsc = WsConn(handle, 1, path, bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, recv_fn, send_fn, 1)
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
-            handler(ws, msg)
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
+            handler(wsc, msg)
         arena_exit(prev)
-    _ws_finish_tls(ws, close_fn)
+    _ws_finish_tls(wsc, close_fn)
     arena_exit(cprev)
 
 fn _ws_run_live_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
+    let path = str(route[0])
     let outbound = channel_bounded(256)
-    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
+    let wsc = WsConn(handle, 1, path, bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
     let view_fn = route[1]
     let update_fn = route[2]
     let init_fn = route[3]
@@ -1562,10 +1565,10 @@ fn _ws_run_live_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
     let init_state = init_fn()
     spawn live_conn(statics, view_fn, update_fn, init_state, events, frames)
     spawn _live_frame_pump(frames, outbound)
-    while ws.open == 1
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
             send(events, bytes_to_str(msg))
         arena_exit(prev)
     send(events, "__stop__")
@@ -1573,31 +1576,32 @@ fn _ws_run_live_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
     send(outbound, [0 - 1, 0])
 
 fn _ws_run_room_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
-    let hub = route[2]
+    let path = str(route[0])
+    let h = route[2]
     let outbound = channel_bounded(256)
-    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
+    let wsc = WsConn(handle, 1, path, bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
     let handler = route[1]
     let has_hooks = len(route) >= 5
-    hub_sub(hub, handle, outbound)
+    hub_sub(h, handle, outbound)
     spawn fn()
         _ws_writer(handle, outbound, send_fn, close_fn)
     if has_hooks
         let pj = arena_enter()
         let on_join = route[3]
-        on_join(ws, hub)
+        on_join(wsc, h)
         arena_exit(pj)
-    while ws.open == 1
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
-            handler(ws, msg, hub)
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
+            handler(wsc, msg, h)
         arena_exit(prev)
     if has_hooks
         let pl = arena_enter()
         let on_leave = route[4]
-        on_leave(ws, hub)
+        on_leave(wsc, h)
         arena_exit(pl)
-    hub_unsub(hub, handle)
+    hub_unsub(h, handle)
     send(outbound, [0 - 1, 0])
 
 // ── LiveView WebSocket runner (per-connection live view over the socket) ──────────────────────────────
@@ -1626,8 +1630,9 @@ fn _live_frame_pump(frames, outbound)
 // owns the socket + the fd close (single-writer rule); live_conn emits string frames; _live_frame_pump
 // bridges them to the writer. This reader forwards each client message (an event string) to live_conn.
 fn _ws_run_live(conn: int, route, ka: int)
+    let path = str(route[0])
     let outbound = channel_bounded(256)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
+    let wsc = WsConn(conn, 1, path, bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
     let view_fn = route[1]
     let update_fn = route[2]
     let init_fn = route[3]
@@ -1638,10 +1643,10 @@ fn _ws_run_live(conn: int, route, ka: int)
     let init_state = init_fn()
     spawn live_conn(statics, view_fn, update_fn, init_state, events, frames)
     spawn _live_frame_pump(frames, outbound)
-    while ws.open == 1
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
             send(events, bytes_to_str(msg))
         arena_exit(prev)
     send(events, "__stop__")
@@ -1670,46 +1675,45 @@ fn _ws_writer(fd: int, outbound, send_fn, close_fn)
 // routed through ws.outbound to the single writer (no interleaving). On disconnect: unsubscribe from the
 // hub and stop the writer (which owns the fd close). route = [pattern, handler, hub].
 fn _ws_run_room(conn: int, route, ka: int)
-    let hub = route[2]
+    let path = str(route[0])
+    let h = route[2]
     // bounded outbound: caps how many broadcasts can queue for THIS connection's writer. If the client
     // stops reading, its writer stalls, the queue fills, and the hub's try_send drops further broadcasts
     // to it -- so one slow client can't grow memory unbounded or stall the room.
     let outbound = channel_bounded(256)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
+    let wsc = WsConn(conn, 1, path, bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
     let handler = route[1]
     let has_hooks = len(route) >= 5
-    hub_sub(hub, conn, outbound)
+    hub_sub(h, conn, outbound)
     spawn fn()
         _ws_writer(conn, outbound, fn(d) tcp_send_bytes(conn, d), fn() tcp_close(conn))
-    // lifecycle: on_join fires AFTER subscribe + writer spawn (so its broadcast reaches this client too)
     if has_hooks
         let pj = arena_enter()
         let on_join = route[3]
-        on_join(ws, hub)
+        on_join(wsc, h)
         arena_exit(pj)
-    while ws.open == 1
+    while wsc.open == 1
         let prev = arena_enter()
-        let msg = _ws_read_message(ws)
-        if ws.open == 1
-            handler(ws, msg, hub)
+        let msg = _ws_read_message(wsc)
+        if wsc.open == 1
+            handler(wsc, msg, h)
         arena_exit(prev)
-    // lifecycle: on_leave fires while still subscribed (its broadcast reaches the rest of the room)
     if has_hooks
         let pl = arena_enter()
         let on_leave = route[4]
-        on_leave(ws, hub)
+        on_leave(wsc, h)
         arena_exit(pl)
     // disconnect: stop receiving broadcasts, then tell the writer to flush + close the socket (single owner)
-    hub_unsub(hub, conn)
+    hub_unsub(h, conn)
     send(outbound, [0 - 1, 0])
 
 // Broadcast a TEXT message to every subscriber of `hub` (each connection's writer sends it as a text frame).
-fn room_say(hub, text: string)
-    hub_pub(hub, [1, str_to_bytes(text)])
+fn room_say(h, text: string)
+    hub_pub(h, [1, str_to_bytes(text)])
 
 // Broadcast BINARY bytes to every subscriber of `hub`.
-fn room_say_bin(hub, data)
-    hub_pub(hub, [2, data])
+fn room_say_bin(h, data)
+    hub_pub(h, [2, data])
 
 // ── Server-Sent Events (SSE) ────────────────────────────────────────────────────────────────────────
 // HTTP server->client streaming (live dashboards / notifications), powered by the SAME pub/sub hub. A GET
@@ -1717,14 +1721,14 @@ fn room_say_bin(hub, data)
 // every published STRING as "data: <msg>\n\n". Simpler than WebSockets (no handshake/framing, one-way), no
 // new protocol. NOTE: give SSE its own hub (it publishes plain strings; ws_room publishes [opcode,bytes]).
 // Register an SSE endpoint bound to `hub`. publish with sse_send(hub, text).
-fn sse(a, pattern: string, hub)
-    sse_every(a, pattern, hub, 15000)
+fn sse(a, pattern: string, h)
+    sse_every(a, pattern, h, 15000)
 
 // Register an SSE endpoint with an explicit keepalive interval (ms, 0 = none). On `ka_ms` of idle the stream
 // emits an SSE comment line: it keeps proxies from dropping the connection AND reaps a silently-dead client
 // (the comment send fails -> the stream exits + unsubscribes). Route = [pattern, hub, ka_ms].
-fn sse_every(a, pattern: string, hub, ka_ms: int)
-    _push_route(a, "sse_routes", [pattern, hub, ka_ms])
+fn sse_every(a, pattern: string, h, ka_ms: int)
+    _push_route(a, "sse_routes", [pattern, h, ka_ms])
 
 // A sentinel value the per-connection keepalive ticker sends on the outbound channel -- distinguished from
 // real published events (which are plain text). The leading NUL makes a collision with real data impossible.
@@ -1755,13 +1759,19 @@ fn _sse_lookup(a, req: Request) -> list
 // arena_exit'd). On a failed send (client gone) it unsubscribes and closes the fd (single owner). A client
 // disconnect is detected on the NEXT publish (recv blocks on the hub) -- keepalive/idle-timeout is a tracked
 // follow-up (needs the timed netpoller park). Per-message arena keeps the format+send buffers flat.
+fn _sse_sub(h, id: int, outbound)
+    send(h, ["sub", id, outbound])
+
+fn _sse_unsub(h, id: int)
+    send(h, ["unsub", id, 0])
+
 fn _sse_run(conn: int, route)
-    let hub = route[1]
+    let h = route[1]
     let ka = route[2]
     tcp_send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
     let outbound = channel_bounded(256)
     let stopch = channel()
-    hub_sub(hub, conn, outbound)
+    _sse_sub(h, conn, outbound)
     // keepalive ticker (opt-in, ka>0): wakes the idle stream every ka ms so it emits a comment and notices
     // a dead peer. The marker is sent on the SAME outbound channel and filtered out below.
     if ka > 0
@@ -1779,14 +1789,15 @@ fn _sse_run(conn: int, route)
         arena_exit(prev)
         if n <= 0
             alive = false
-    hub_unsub(hub, conn)
+    _sse_unsub(h, conn)
     if ka > 0
         send(stopch, 1)
     tcp_close(conn)
 
-// Publish a plain-text SSE event to all subscribers of `hub`.
-fn sse_send(hub, msg: string)
-    hub_pub(hub, msg)
+// Publish a plain-text SSE event to all subscribers of `hub`. Uses a separate send path from hub_pub
+// (which sends List<any> for WS rooms) so HM doesn't cross-unify string and list message types.
+fn sse_send(h, msg: string)
+    send(h, ["pub", 0, msg])
 
 // Format a message as a complete SSE event's data block, INJECTION-SAFELY: each line of `msg` gets its own
 // "data: " prefix (per the EventSource spec), then a blank line terminates the event. A newline embedded in
@@ -2997,7 +3008,7 @@ fn if_match_check(req: Request, current_etag: string) -> int
 // [status, body, content-type]. N>1-safe (only the actor touches the cache; keys are born in the loop,
 // avoiding the deep-copied-dict new-key hazard). Pair with mw_idempotent.
 fn _idem_loop(st)
-    let cache = {}
+    let kv = {}
     let running = 1
     while running == 1
         let env = receive(st["req"])
@@ -3005,12 +3016,12 @@ fn _idem_loop(st)
         if op == "stop"
             running = 0
         else if op == "get"
-            if env["key"] in cache
-                send(env["reply"], cache[env["key"]])
+            if env["key"] in kv
+                send(env["reply"], kv[env["key"]])
             else
                 send(env["reply"], [])
         else if op == "put"
-            cache[env["key"]] = env["val"]
+            kv[env["key"]] = env["val"]
 
 fn idempotency_store() -> any
     let st = {}
@@ -3228,7 +3239,7 @@ type ErrorBody
     error: string
 
 fn resp_error(status: int, msg: string) -> Response
-    resp_json(status, ErrorBody(msg))
+    _json_resp(status, json_stringify(ErrorBody(msg)))
 
 // ── REST response helpers (correct status codes without hand-setting) ────────────────────────────────
 // 201 Created carries the new resource's Location; 202 Accepted for async work; 204 No Content for a
@@ -3438,7 +3449,7 @@ fn _model_check(value, model_sample)
 fn resp_model(status: int, value, model_sample) -> Response
     if is_err(_model_check(value, model_sample))
         return resp_error(500, "response model mismatch")
-    resp_json(status, _project(value, model_sample))
+    _json_resp(status, json_stringify(_project(value, model_sample)))
 
 // Collection variant: project EVERY item of a list<struct> through the model -> a JSON array of objects.
 // This is the common REST shape (GET /users): without it, a bare `return list_of_users` serializes every
@@ -3451,7 +3462,7 @@ fn resp_model_list(status: int, values, model_sample) -> Response
         if is_err(_model_check(v, model_sample))
             return resp_error(500, "response model mismatch")
         push(out, _project(v, model_sample))
-    resp_json(status, out)
+    _json_resp(status, json_stringify(out))
 
 // Register a custom 404 handler: on_not_found(app, fn(req) -> Response|value). Used when no route
 // matches (after static). Lets an app return a branded 404 page or a JSON error.
@@ -3503,10 +3514,13 @@ fn body_of(resp: Response) -> string
 // resp_json: serialize ANY value (struct via the RTTI keystone / list / dict / scalar) into
 // a JSON Response. A handler can `return forge.resp_json(200, user)` and the client gets a
 // JSON object -- zero annotation.
-fn resp_json(status: int, value) -> Response
+fn _json_resp(status: int, body: string) -> Response
     let h = {}
     h["Content-Type"] = "application/json"
-    Response(status, h, json_stringify(value), false, [])
+    Response(status, h, body, false, [])
+
+fn resp_json(status: int, value) -> Response
+    _json_resp(status, json_stringify(value))
 
 // Set/overwrite a header on a Response (returns it for chaining). O(1) dict write -- the
 // typed answer to the dict router's string-surgery _fr_add_header.
@@ -4156,7 +4170,7 @@ fn validate_typed(value, rules)
 fn errors_response(errs) -> Response
     let body = {}
     body["errors"] = errs
-    resp_json(422, body)
+    _json_resp(422, json_stringify(body))
 
 // ── OpenAPI 3.0 generation (Moat: live API docs from declared types) ─────────────────────────────────
 // HONEST SCOPE (designed + adversary-reviewed, workflow wbu20zrcn). Routes opt INTO docs by passing
@@ -4392,7 +4406,7 @@ fn _swagger_html(spec_url: string) -> string
 
 // Closures capture the prebuilt spec/html (long-lived; built at startup, read-only inside request arenas).
 fn _oapi_serve_spec(spec)
-    return fn(req) resp_json(200, spec)
+    return fn(req) _json_resp(200, json_stringify(spec))
 fn _oapi_serve_docs(page: string)
     return fn(req) resp_html(200, page)
 
@@ -4420,7 +4434,7 @@ fn _coerce(v) -> Response
         return resp_text(200, v)
     if tn == "bytes"
         return resp_bytes(200, v, "application/octet-stream")
-    resp_json(200, v)
+    _json_resp(200, json_stringify(v))
 
 // Model-aware coercion: a doc route that declared a response model (resp_s) auto-projects a bare-struct
 // return through it -- so the SAME sample drives the wire body AND the OpenAPI 200 schema (no-drift, no
@@ -4436,7 +4450,7 @@ fn _coerce_model(v, model_sample) -> Response
     if tn == "bytes"
         return resp_bytes(200, v, "application/octet-stream")
     if len(field_names(model_sample)) == 0
-        return resp_json(200, v)
+        return _json_resp(200, json_stringify(v))
     resp_model(200, v, model_sample)
 
 // ── Typed dispatch (Phase 1) ─ fn(Request) -> Response handlers ───────────────
@@ -4457,7 +4471,7 @@ extern fn nova_rt_path_within(root: string, path: string) -> int
 // path_within(root, path): true iff the OS-canonical `path` (symlinks followed) stays inside `root`.
 // The last line of defense for static serving AND a public utility for any app that resolves user paths.
 fn path_within(root: string, path: string) -> bool
-    nova_rt_path_within(root, path) == 1
+    unsafe nova_rt_path_within(root, path) == 1
 
 // static(a, url_prefix, root_dir) mounts a directory: a GET/HEAD whose path begins with
 // url_prefix (at a segment boundary) is served from root_dir. Two layers of containment: (1) _safe_subpath
@@ -4885,8 +4899,8 @@ fn _health_run_checks(checks: list) -> Response
         let name = check[0]
         let f = check[1]
         if f() == false
-            return resp_json(503, {"status": "not ready", "failed": name})
-    resp_json(200, Health("ok"))
+            return _json_resp(503, json_stringify({"status": "not ready", "failed": name}))
+    _json_resp(200, json_stringify(Health("ok")))
 
 fn health_route(a)
     get(a, "/health", fn(req) _health_run_checks([]))
