@@ -1011,6 +1011,9 @@ type Ws
     ka: int          // keepalive interval in ms (0 = disabled); idle reads wake to send a ping
     pings: int       // consecutive unanswered keepalive pings; >2 -> the peer is dead, reap it
     assigns: any     // per-connection scratch dict (ws_assign/ws_get); always a dict {}
+    recv_fn: any     // closure() -> bytes: reads from the transport
+    send_fn: any     // closure(data) -> int: writes to the transport
+    tls: int         // 1 = TLS transport (disables tcp_wait_readable keepalive)
 
 fn _ws_bufcap() -> int
     262144
@@ -1108,7 +1111,14 @@ fn _ws_client_mask() -> list
 // handshake). Accepts ws:// or http:// (both plaintext here).
 fn ws_connect(url: string) -> Result<any>
     let rest = url
-    if starts_with(url, "ws://")
+    let is_tls = false
+    if starts_with(url, "wss://")
+        rest = slice(url, 6, len(url))
+        is_tls = true
+    else if starts_with(url, "https://")
+        rest = slice(url, 8, len(url))
+        is_tls = true
+    else if starts_with(url, "ws://")
         rest = slice(url, 5, len(url))
     else if starts_with(url, "http://")
         rest = slice(url, 7, len(url))
@@ -1119,7 +1129,7 @@ fn ws_connect(url: string) -> Result<any>
         hostport = slice(rest, 0, slash)
         path = slice(rest, slash, len(rest))
     let host = hostport
-    let port = 80
+    let port = 443 if is_tls else 80
     let colon = find(hostport, ":")
     if colon >= 0
         host = slice(hostport, 0, colon)
@@ -1129,20 +1139,27 @@ fn ws_connect(url: string) -> Result<any>
     let sock = tcp_connect(host, port)
     if sock <= 0
         return err("ws connect failed: {host}:{port}")
+    let tls_handle = 0
+    if is_tls
+        tls_handle = tls_upgrade(sock, host, 1)
+        if tls_handle == 0
+            tcp_close(sock)
+            return err("wss: TLS handshake failed for {host}:{port}")
     let key = _ws_client_key()
-    tcp_send(sock, "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-    // Read the 101 handshake response as text up to the terminator (headers are ASCII/NUL-free -- the
-    // tcp_recv string path, same as forge_ws_echo_test's client). The frame buffer starts EMPTY: a WS
-    // server sends frames only after the client does, so no server frame is concatenated with the 101.
-    // Binary-safe handshake read (same tcp_recv_bytes path as ws_client_recv -- do NOT mix in the
-    // string tcp_recv, which NUL-truncates and races): accumulate bytes until the header terminator via
-    // _find_header_end, keeping any bytes past it as the start of the frame stream.
+    let upgrade_req = "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    if is_tls
+        tls_send_bytes(tls_handle, str_to_bytes(upgrade_req))
+    else
+        tcp_send(sock, upgrade_req)
     let buf = bytes(0)
     let sep = 0 - 1
     while sep < 0
-        let more = tcp_recv_bytes(sock)
+        let more = tls_recv_bytes(tls_handle) if is_tls else tcp_recv_bytes(sock)
         if bytes_len(more) == 0
-            tcp_close(sock)
+            if is_tls
+                tls_close(tls_handle)
+            else
+                tcp_close(sock)
             return err("ws: connection closed before handshake")
         let scanned = bytes_len(buf) - 3
         if scanned < 0
@@ -1151,26 +1168,39 @@ fn ws_connect(url: string) -> Result<any>
         sep = _find_header_end(buf, scanned)
     let head = bytes_to_str(bytes_slice(buf, 0, sep))
     if find(head, " 101 ") < 0
-        tcp_close(sock)
+        if is_tls
+            tls_close(tls_handle)
+        else
+            tcp_close(sock)
         return err("ws: server did not switch protocols (expected 101)")
     if find(lower(head), lower("sec-websocket-accept: " + ws_compute_accept(key))) < 0
-        tcp_close(sock)
+        if is_tls
+            tls_close(tls_handle)
+        else
+            tcp_close(sock)
         return err("ws: invalid Sec-WebSocket-Accept")
     let s = {}
     s["sock"] = sock
     s["buf"] = bytes_slice(buf, sep + 4, bytes_len(buf))
+    if is_tls
+        let th = tls_handle
+        s["tls"] = tls_handle
+        s["recv"] = fn() tls_recv_bytes(th)
+        s["send"] = fn(d) tls_send_bytes(th, d)
+        s["close"] = fn() tls_close(th)
     ok(s)
 
-// ws_client_send(c, msg): send a MASKED text frame (client->server frames MUST be masked).
 fn ws_client_send(c, msg: string) -> int
-    tcp_send_bytes(c["sock"], ws_encode_frame(1, 1, str_to_bytes(msg), _ws_client_mask()))
+    let frame = ws_encode_frame(1, 1, str_to_bytes(msg), _ws_client_mask())
+    if "send" in c
+        c["send"](frame)
+    else
+        tcp_send_bytes(c["sock"], frame)
 
-// ws_client_recv(c) -> Result<string>: read + decode ONE server frame (text). Fills until a complete
-// frame is present. Close (opcode 8) or EOF -> err; ping (9) -> "" (v1). Advances the buffer.
 fn ws_client_recv(c) -> Result<string>
     let fr = ws_try_decode(c["buf"], 0)
     while fr.status == 0
-        let more = tcp_recv_bytes(c["sock"])
+        let more = c["recv"]() if "recv" in c else tcp_recv_bytes(c["sock"])
         if bytes_len(more) == 0
             return err("ws: connection closed")
         c["buf"] = _append_chunk(c["buf"], more)
@@ -1184,10 +1214,16 @@ fn ws_client_recv(c) -> Result<string>
         return ok("")
     ok(bytes_to_str(fr.payload))
 
-// ws_client_close(c): send a masked Close frame, then close the socket.
 fn ws_client_close(c)
-    tcp_send_bytes(c["sock"], ws_encode_frame(1, 8, bytes(0), _ws_client_mask()))
-    tcp_close(c["sock"])
+    let frame = ws_encode_frame(1, 8, bytes(0), _ws_client_mask())
+    if "send" in c
+        c["send"](frame)
+    else
+        tcp_send_bytes(c["sock"], frame)
+    if "close" in c
+        c["close"]()
+    else
+        tcp_close(c["sock"])
 
 
 // ââ WebSocket join authorization (PRE-101) âââââââââââââââââââââââ
@@ -1236,6 +1272,32 @@ fn ws_handshake(conn: int, req: Request) -> int
     tcp_send(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
     1
 
+fn ws_handshake_tls(handle: int, req: Request, send_fn) -> int
+    let key = req_header(req, "sec-websocket-key")
+    if ws_key_ok(key) == false
+        send_fn(str_to_bytes("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
+        return 0
+    let accept = ws_compute_accept(key)
+    send_fn(str_to_bytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"))
+    1
+
+fn wss_try_upgrade(a, handle: int, raw_request: string) -> int
+    let req = build_request(raw_request, handle)
+    let route = _ws_lookup(a, req)
+    if len(route) < 2
+        return 0
+    let recv_fn = fn() tls_recv_bytes(handle)
+    let send_fn = fn(d) tls_send_bytes(handle, d)
+    let close_fn = fn() tls_close(handle)
+    if not ws_authz_ok(a, req, route[0])
+        send_fn(str_to_bytes("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+        return 0 - 1
+    let kams = _ws_app_ka(a)
+    if ws_handshake_tls(handle, req, send_fn) == 1
+        _ws_run_tls(handle, route, kams, recv_fn, send_fn, close_fn)
+        return 1
+    0
+
 // Fill ws.buf until it holds >= one complete frame, then return that frame DECODED (status 1; the payload
 // is sliced -- arena-allocated when called inside the per-message arena). status<0 = EOF (-1) or protocol
 // error (-1002 bad frame / -1009 frame exceeds the fixed buffer). Reads via the green-aware (netpoller-
@@ -1252,7 +1314,9 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
         // KEEPALIVE (opt-in, ws.ka>0): wait for data up to ws.ka ms (parks the green task on the netpoller
         // -- yields the carrier, no busy-poll). On idle, send a ping; a peer that ignores 3 pings is dead ->
         // EOF. When ws.ka==0 this whole block is skipped -> identical to a plain blocking read.
-        if ws.ka > 0
+        // NOTE: keepalive is DISABLED for TLS transports (recv_fn != 0) because tcp_wait_readable operates
+        // on raw FDs, not TLS handles. TLS connections rely on recv timeout instead.
+        if ws.ka > 0 and ws.tls == 0
             let wr = tcp_wait_readable(ws.fd, ws.ka)
             if wr < 0
                 return WsFrame(0 - 1, 0, 0, 0, bytes(0))
@@ -1263,7 +1327,7 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
                 _ws_send_frame(ws, 9, bytes(0))
                 do_recv = false
         if do_recv
-            let chunk = tcp_recv_bytes(ws.fd)
+            let chunk = ws.recv_fn()
             let cn = bytes_len(chunk)
             if cn == 0
                 return WsFrame(0 - 1, 0, 0, 0, bytes(0))
@@ -1272,7 +1336,7 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
             for k in 0..cn
                 bytes_set(ws.buf, ws.blen + k, bytes_get(chunk, k))
             ws.blen = ws.blen + cn
-            ws.pings = 0   // got data (incl. a pong) -> the peer is alive; reset the keepalive counter
+            ws.pings = 0
     WsFrame(0 - 1, 0, 0, 0, bytes(0))
 
 // Drop the first `n` bytes of ws.buf, compacting the leftover to the front IN PLACE (bytes_set, no alloc).
@@ -1300,7 +1364,8 @@ fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
     if ws.outbound != 0
         send(ws.outbound, [opcode, payload])
         return 0
-    tcp_send_bytes(ws.fd, ws_encode_frame(1, opcode, payload, []))
+    let frame = ws_encode_frame(1, opcode, payload, [])
+    ws.send_fn(frame)
 
 // Send a Close frame with a 2-byte status code (idempotent: only the first call sends).
 fn _ws_send_close(ws: Ws, code: int) -> int
@@ -1395,7 +1460,7 @@ fn ws_get(ws: Ws, key: string) -> string
 // actual I/O (no open socket); only ws_assign/ws_get are safe to call on the result. Intended for
 // unit tests that want to verify assigns logic without opening a real socket connection.
 fn ws_mock() -> Ws
-    Ws(0, 0, "", bytes(0), 0, 0, 0, 0, 0, {})
+    Ws(0, 0, "", bytes(0), 0, 0, 0, 0, 0, {}, fn() bytes(0), fn(d) 0, 0)
 
 // Two-phase close (CRIT-4): send Close, drain a bounded number of frames awaiting the peer's Close (so the
 // peer's buffered data isn't RST-dropped), then close the fd EXACTLY once (CONCERN-3: _ws_run is the sole
@@ -1413,6 +1478,20 @@ fn _ws_finish(ws: Ws)
             else
                 tries += 1
     tcp_close(ws.fd)
+
+fn _ws_finish_tls(ws: Ws, close_fn)
+    _ws_send_close(ws, 1000)
+    let tries = 0
+    while tries < 8
+        let fr = _ws_next_frame(ws)
+        if fr.status != 1
+            tries = 8
+        else
+            if fr.opcode == 8
+                tries = 8
+            else
+                tries += 1
+    close_fn()
 
 // Own the connection for its lifetime. PRECONDITION: active_arena == NULL (the caller arena_exit'd before
 // this). EACH inbound message is processed inside its OWN per-message arena: the message bytes, decoded
@@ -1440,7 +1519,7 @@ fn _ws_run(conn: int, route, ka: int)
     // paths are NOT wrapped: their per-connection `outbound` channel is referenced by the hub/writer task
     // and MUST outlive the frame loop, so a connection arena there would free a still-referenced channel.
     let cprev = arena_enter()
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {})
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
     let handler = route[1]
     while ws.open == 1
         let prev = arena_enter()
@@ -1450,6 +1529,76 @@ fn _ws_run(conn: int, route, ka: int)
         arena_exit(prev)
     _ws_finish(ws)
     arena_exit(cprev)
+
+fn _ws_run_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
+    if len(route) == 6
+        _ws_run_live_tls(handle, route, ka, recv_fn, send_fn, close_fn)
+        return
+    if len(route) >= 3
+        _ws_run_room_tls(handle, route, ka, recv_fn, send_fn, close_fn)
+        return
+    let cprev = arena_enter()
+    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0, {}, recv_fn, send_fn, 1)
+    let handler = route[1]
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            handler(ws, msg)
+        arena_exit(prev)
+    _ws_finish_tls(ws, close_fn)
+    arena_exit(cprev)
+
+fn _ws_run_live_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
+    let outbound = channel_bounded(256)
+    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
+    let view_fn = route[1]
+    let update_fn = route[2]
+    let init_fn = route[3]
+    let statics = route[4]
+    spawn _ws_writer(handle, outbound, send_fn, close_fn)
+    let events = channel()
+    let frames = channel()
+    let init_state = init_fn()
+    spawn live_conn(statics, view_fn, update_fn, init_state, events, frames)
+    spawn _live_frame_pump(frames, outbound)
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            send(events, bytes_to_str(msg))
+        arena_exit(prev)
+    send(events, "__stop__")
+    send(frames, "__pump_stop__")
+    send(outbound, [0 - 1, 0])
+
+fn _ws_run_room_tls(handle: int, route, ka: int, recv_fn, send_fn, close_fn)
+    let hub = route[2]
+    let outbound = channel_bounded(256)
+    let ws = Ws(handle, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, recv_fn, send_fn, 1)
+    let handler = route[1]
+    let has_hooks = len(route) >= 5
+    hub_sub(hub, handle, outbound)
+    spawn fn()
+        _ws_writer(handle, outbound, send_fn, close_fn)
+    if has_hooks
+        let pj = arena_enter()
+        let on_join = route[3]
+        on_join(ws, hub)
+        arena_exit(pj)
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            handler(ws, msg, hub)
+        arena_exit(prev)
+    if has_hooks
+        let pl = arena_enter()
+        let on_leave = route[4]
+        on_leave(ws, hub)
+        arena_exit(pl)
+    hub_unsub(hub, handle)
+    send(outbound, [0 - 1, 0])
 
 // ── LiveView WebSocket runner (per-connection live view over the socket) ──────────────────────────────
 // Register a LiveView route: on connect the server PUSHES a mount frame (statics once + initial
@@ -1478,12 +1627,12 @@ fn _live_frame_pump(frames, outbound)
 // bridges them to the writer. This reader forwards each client message (an event string) to live_conn.
 fn _ws_run_live(conn: int, route, ka: int)
     let outbound = channel_bounded(256)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {})
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
     let view_fn = route[1]
     let update_fn = route[2]
     let init_fn = route[3]
     let statics = route[4]
-    spawn _ws_writer(conn, outbound)
+    spawn _ws_writer(conn, outbound, fn(d) tcp_send_bytes(conn, d), fn() tcp_close(conn))
     let events = channel()
     let frames = channel()
     let init_state = init_fn()
@@ -1503,7 +1652,7 @@ fn _ws_run_live(conn: int, route, ka: int)
 // The single writer task for a connection: the SOLE socket writer. It drains the outbound channel (fed by
 // the hub's broadcasts AND the reader's routed pong/close frames) and writes each as a WS frame. An item is
 // [opcode, payload] (opcode 1 text / 2 binary / 8 close / 10 pong), or [-1, 0] = stop -> close the fd once.
-fn _ws_writer(fd: int, outbound)
+fn _ws_writer(fd: int, outbound, send_fn, close_fn)
     let running = true
     while running
         let item = recv(outbound)
@@ -1511,9 +1660,10 @@ fn _ws_writer(fd: int, outbound)
             running = false
         else
             let prev = arena_enter()
-            tcp_send_bytes(fd, ws_encode_frame(1, item[0], item[1], []))
+            let frame = ws_encode_frame(1, item[0], item[1], [])
+            send_fn(frame)
             arena_exit(prev)
-    tcp_close(fd)
+    close_fn()
 
 // Room runner: a per-connection READER (this task) + a spawned WRITER, joined by the hub. The reader reads
 // frames and calls handler(ws, msg, hub) (which typically broadcasts via hub_pub); every outbound frame is
@@ -1525,12 +1675,12 @@ fn _ws_run_room(conn: int, route, ka: int)
     // stops reading, its writer stalls, the queue fills, and the hub's try_send drops further broadcasts
     // to it -- so one slow client can't grow memory unbounded or stall the room.
     let outbound = channel_bounded(256)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {})
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0, {}, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d), 0)
     let handler = route[1]
     let has_hooks = len(route) >= 5
     hub_sub(hub, conn, outbound)
     spawn fn()
-        _ws_writer(conn, outbound)
+        _ws_writer(conn, outbound, fn(d) tcp_send_bytes(conn, d), fn() tcp_close(conn))
     // lifecycle: on_join fires AFTER subscribe + writer spawn (so its broadcast reaches this client too)
     if has_hooks
         let pj = arena_enter()
@@ -3309,6 +3459,12 @@ fn on_not_found(a, handler)
     a["not_found"] = handler
     a
 
+fn on_crash(a, handler)
+    if "crash_handlers" not in a
+        a["crash_handlers"] = []
+    a["crash_handlers"].push(handler)
+    a
+
 // Serve a HANDLER-CHOSEN file as a Response (content-type by extension) -- `return forge.file(
 // "templates/page.html")`. For app-controlled paths (NOT user input -- use static() for URL-mapped
 // trees, which is traversal-safe). 404 if the file is missing. TEXT assets (text/*, json, js, xml) read
@@ -4997,7 +5153,10 @@ fn dispatch_safe(a, req: Request) -> Response
     let st = receive(m)
     if st == 0
         return receive(rc)
-    _log_crash(req, p)
+    let reason = _log_crash(req, p)
+    if "crash_handlers" in a
+        for h in a["crash_handlers"]
+            h(req, reason)
     resp_text(500, "Internal Server Error")
 
 // Crash-isolated per-connection handling: a handler panic returns a clean 500 to the client

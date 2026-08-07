@@ -10461,20 +10461,35 @@ static void* nova_watchdog_thread(void* arg) {
 #endif
 }
 
+int64_t nova_rt_cpu_count(void);  /* fwd: defined further down (Auto-Parallelization Primitives) */
+
 void nova_rt_main_dispatch(int64_t main_fn) {
     if (nova_green_enabled()) {
         int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
         if (rec) {
             rec[0] = main_fn;
             nova_sched_root_exit = 0;
-            /* M:N carrier count: NOVA_CARRIERS overrides; default 1 = single-carrier
-               (byte-identical to the pre-M:N hot path — M:N is opt-in until validated). */
+            /* M:N carrier count: NOVA_CARRIERS overrides. When unset (or empty), auto-detect the
+               host's CPU count via nova_rt_cpu_count() (GetSystemInfo on Windows / sysconf on
+               Linux+macOS — see its definition below) and use that, capped at 16 — matching the
+               existing nova_pmap_thread_count() convention elsewhere in this file, and well under
+               the NOVA_WS_MAX_WORKERS=64 hard ceiling reserved for an explicit override. This
+               changed 2026-08: N>1 multi-carrier is now validated (full-arc + N>1 regression green),
+               so auto-parallelism is the right default rather than a silent single-core fallback.
+               An explicit NOVA_CARRIERS still always wins — including NOVA_CARRIERS=1, which forces
+               the single-carrier hot path (byte-identical to the pre-M:N code path) for anyone who
+               needs deterministic single-threaded behavior. */
             int ncar = 1;
             const char* cenv = getenv("NOVA_CARRIERS");
             if (cenv && cenv[0]) {
                 ncar = atoi(cenv);
                 if (ncar < 1) ncar = 1;
                 if (ncar > 64) ncar = 64;   /* hard cap (matches NOVA_WS_MAX_WORKERS, #defined later) */
+            } else {
+                int64_t detected = nova_rt_cpu_count();
+                ncar = (detected > 0) ? (int)detected : 1;
+                if (ncar > 16) ncar = 16;
+                if (ncar < 1) ncar = 1;
             }
             if (ncar > 1) {
                 /* Engage the locks/atomics/F1-spins BEFORE any task can run. */

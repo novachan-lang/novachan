@@ -495,15 +495,33 @@ fn _tlss_serve_conn_file(handle, handler) -> int
     unsafe nova_rt_tls_send_bytes(handle, str_to_bytes(resp))
     1
 
-// Crash-isolation inner worker, mirrors _tlss_run for the OS-native path.
+fn _tlss_serve_conn_file_ws(handle, handler, ws_check) -> int
+    let acc = _tlss_read_plain_request(handle)
+    if not _tlss_req_complete(acc)
+        return 0
+    let ws_result = ws_check(handle, acc)
+    if ws_result != 0
+        return 1
+    let resp = handler(acc)
+    unsafe nova_rt_tls_send_bytes(handle, str_to_bytes(resp))
+    1
+
 fn _tlss_run_file(handle, handler)
     _tlss_serve_conn_file(handle, handler)
 
-// Crash-isolated per-connection wrapper, mirrors _tlss_serve_spawned for the OS-native path: whether the
-// serve returns cleanly or PANICS, this frame (never panics) always closes the connection handle, releases
-// the admission-control permit, and signals done -- no leaked fd, no leaked permit, no hung drain.
+fn _tlss_run_file_ws(handle, handler, ws_check)
+    _tlss_serve_conn_file_ws(handle, handler, ws_check)
+
 fn _tlss_serve_spawned_file(handle, handler, done_ch, guard)
     let p = spawn _tlss_run_file(handle, handler)
+    let m = monitor(p)
+    receive(m)
+    tls_close(handle)
+    cg_release(guard)
+    send(done_ch, 1)
+
+fn _tlss_serve_spawned_file_ws(handle, handler, ws_check, done_ch, guard)
+    let p = spawn _tlss_run_file_ws(handle, handler, ws_check)
     let m = monitor(p)
     receive(m)
     tls_close(handle)
@@ -543,4 +561,25 @@ fn forge_serve_tls_file(port: int, cert_path: string, key_path: string, handler,
     // _tls_server_test.nova never closes its listener either). Per-CONNECTION handles from tls_accept ARE
     // the connection struct type and ARE safely closed above. Leaking the listener's one fd+struct until
     // process exit is the correct tradeoff until the runtime grows a dedicated listener-close primitive.
+    1
+
+fn forge_serve_wss_file(port: int, cert_path: string, key_path: string, handler, ws_check, n: int) -> int
+    let srv = tls_listen(port, cert_path, key_path)
+    if srv == 0
+        return 0
+    let done_ch = channel()
+    let guard = conn_guard(_tlss_max_conns())
+    let spawned = 0
+    while spawned < n
+        let handle = tls_accept(srv)
+        if handle == 0
+            break
+        if cg_acquire(guard) != 1
+            tls_close(handle)
+        else
+            spawn _tlss_serve_spawned_file_ws(handle, handler, ws_check, done_ch, guard)
+            spawned += 1
+    for got in 0..spawned
+        receive(done_ch)
+    conn_guard_stop(guard)
     1

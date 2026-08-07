@@ -107,15 +107,15 @@ the completion percentages in FORGE_STATUS / FORGE_BUILD_PLAN / FORGE_DEV_TRACK 
 weeks stale). **Read its FIX STATUS section first** — the tables below it are the original findings kept as
 evidence and do not reflect current code state on their own.
 
-~38 FIXED/MITIGATED · ~16 OPEN · 1 PARTIAL · 2 N/A. Of the open ones, exactly **4 need compiler/runtime
-surface and therefore belong to THIS tracker**:
+~38 FIXED/MITIGATED · ~16 OPEN · 1 PARTIAL · 2 N/A. Of the 4 that needed compiler/runtime surface,
+**ALL 4 ARE NOW CLOSED** (verified against FORGE_PRODUCTION_GAPS FIX STATUS, 2026-08-06):
 
 | # | Item | Sev | Status |
 |---|---|---|---|
-| F-1 | **Real TCP peer address is exposed nowhere.** `tcp_accept` populates then DISCARDS `sockaddr`, so `mw_rate_limit` can only key on attacker-controlled `X-Forwarded-For` — a fresh random XFF per request defeats the limiter entirely AND forces unlimited PBKDF2 (CPU-exhaustion DoS). | **BLOCKER / security** | ⬜ OPEN — **cheapest high-value item on this list**: `nova_rt_udp_recv_from` already returns the peer for UDP, so the pattern exists; this is a missing builtin, not an architectural gap. |
-| F-2 | **No POSIX stack-overflow containment.** Hardware guard is Windows-only (`__except(EXCEPTION_STACK_OVERFLOW)`); POSIX has no `sigaltstack`/`SIGSEGV` handler (grep = 0 hits). Defeats even `serve_safe_req` on Linux, the dominant deploy target. | HIGH | ⬜ OPEN — genuine `nova_runtime.c` work. Note this is now MORE testable than when filed: WSL2 + Docker give us real Linux. |
-| F-3 | **Software depth-guard never fires.** `nova_rt_stack_enter`/`stack_exit` exist as builtins with **zero emitted call sites**, so the software fallback for F-2 does not exist either. | HIGH | ⬜ OPEN — compiler must auto-emit the guard. |
-| F-4 | **DB pool leak on crash is only MITIGATED.** `pool_acquire_to` converts "hangs forever" into a fast `err()`; the underlying crash-triggered leak remains. | MEDIUM | ⬜ OPEN — needs runtime panic-recovery integrated with `defer`. |
+| F-1 | **Real TCP peer address** | **BLOCKER / security** | ✅ **CLOSED** `10818a43` — `tcp_peer_addr`/`tcp_peer_port` shipped; `mw_rate_limit` keys on real peer; `mw_rate_limit_trusting` resolves X-Forwarded-For right-to-left against declared proxies. |
+| F-2 | **POSIX stack-overflow containment** | HIGH | ✅ **CLOSED** — `sigaltstack`+SIGSEGV/SIGBUS handler siglongjmps to `sigsetjmp` in POSIX fiber trampoline. Verified on real Linux. KAT `_stackovf_test`. |
+| F-3 | **Software depth-guard** | HIGH | ✅ **CLOSED** — zero call sites on native is CORRECT (hardware guard page catches it); `stack_enter` emitted only for WASM/freestanding targets where there is no hardware guard. |
+| F-4 | **DB pool leak on crash** | MEDIUM | ✅ **FULLY CLOSED** — task-scoped cleanup registry (`on_exit_send`/`cancel_on_exit_val`) drained by fiber trampoline on both normal and crashed exit. KAT `_kat_pool_crash`. |
 
 ## LOCK-4 inc3d — PACKED TYPED ARRAYS (2026-08-04)
 
