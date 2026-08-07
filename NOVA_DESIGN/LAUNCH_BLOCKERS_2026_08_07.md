@@ -211,12 +211,16 @@
   - [ ] Track progress: goal is compiler demonstrates NOVA's own high-level style
 - **Why:** "The compiler that implements generics doesn't use generics" undermines credibility.
 
-### 13. Duplicate Modules (166 forge/std overlaps)
+### 13. Duplicate Modules (166 forge/std overlaps) — IN PROGRESS
 - **Problem:** 166 modules exist in both `forge/` and `std/` (independently authored during different campaigns). See `NOVA_DESIGN/DUPLICATE_MODULES_TRACKER.md`.
 - **Fix required:**
-  - [ ] For each pair, decide: keep forge version (delete std), keep std version (forge imports std), or merge
-  - [ ] Update all imports across the codebase
-  - [ ] Delete the duplicates
+  - [x] Audit all 166 pairs: 59 safe to delete (zero imports), 8 false positives (keep), ~99 need wrapper conversion
+  - [x] Delete 59 zero-import forge duplicates (+ their nova-compiler/lib/ mirrors)
+  - [x] Clean up `_sweeplist.txt` (6 stale entries removed)
+  - [x] Update `DUPLICATE_MODULES_TRACKER.md` with `[D]` markers for all 59
+  - [ ] Convert remaining ~99 to thin wrappers (function names differ — per-module mapping needed)
+  - [ ] Update `_sweeplist.txt` as wrappers are created
+- **Progress:** 59/166 deleted (36%). Remaining ~99 have test imports with different function names between forge/std — need wrapper conversion with per-module function mapping.
 - **Why:** Duplicates confuse contributors and waste maintenance effort.
 
 ### 14. Untested Forge Modules (~115 of 570)
