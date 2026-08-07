@@ -34,24 +34,56 @@
         Windows reconverge stays byte-identical; only non-Windows hosts change behavior.
   - [x] `target_datalayout()` already handles linux/apple/wasm correctly — it dispatches on the triple
         string, so it was never the problem; it was only ever fed a wrong triple.
-  - [ ] Check in a Linux bootstrap IR or cross-compile one from Windows
-  - [x] `.github/workflows/cross-platform.yml` — `linux-selfhosted` job added (`ce4bd6a9`) that builds the
-        real compiler from checked-in IR and runs a reconverge check
-  - [ ] Verify full reconverge (gen5.ll == gen6.ll) natively ON Linux (the CI job does this; needs a green run)
+  - [x] **Linux bootstrap IR checked in** (`compiler/nova_compiler_linux.ll`, 2026-08-07). Cross-compiled
+        from Windows with `--target linux` so it carries the ELF datalayout (`e-m:e`) rather than the
+        Windows one. **The previously-referenced `nova_compiler.ll` was NEVER TRACKED IN GIT** — the CI job
+        added in `ce4bd6a9` would have failed on a clean checkout — and the local copy was Windows-targeted
+        anyway, so it could not have produced a working Linux compiler.
+  - [x] **`bootstrap_linux.sh`** — one command to build natively on Linux, with `--check` to run a full
+        self-host reconverge. Guards against a wrong-target seed and a missing toolchain.
+  - [x] **PROVEN ON REAL LINUX (WSL2 Ubuntu):** the bootstrap IR → ELF object → linked with gcc → the
+        binary runs (`NOVA v0.1.0 (self-hosted, IR pipeline)`) → and compiling a program on Linux with NO
+        `--target` flag autonomously emits `x86_64-unknown-linux-gnu`. That last part is `native_target_triple`
+        confirmed on a real native host, not inferred.
+  - [x] CI hardened: asserts the seed is Linux-targeted, and asserts native host targeting resolves to Linux.
+        Also fixed a CLI bug in the job — bare `nova -o out.ll in.nova` does NOT work (`-o` is not a
+        top-level flag; the form is positional, or `nova compile -o`).
+  - [ ] Green run of the Linux CI job on GitHub's runners (needs a push; the local WSL equivalent passed)
 - **Files:** `nova-compiler/compiler/nova_compiler.nova` (`native_target_triple`/`resolve_target` ~21889),
   `.github/workflows/cross-platform.yml`
 - **Why critical:** 70%+ of developers use Linux/macOS. No Linux = no adoption.
 
-### 2. Package Registry
-- **Problem:** `nova_registry_url()` at `nova_compiler.nova:28833` points to `bitbucket.org/manemangesh/packages` — returns HTTP 404, workspace does not exist.
-- **Problem:** No transitive dependency resolution in the live `nova install` path (only fetches direct deps).
-- **Problem:** A more complete solver prototype exists in `test_programs/nova_pkg.nova` with real semver + transitive resolution, but is NOT wired into the main CLI.
-- **Fix required:**
-  - [ ] Create the Bitbucket (or GitHub) registry repo and push the 5 existing packages (greet, dotenv, uuid, args, semver) from `packages/`
-  - [ ] Wire the transitive solver from `nova_pkg.nova` into the main `nova_pkg_install()` path
-  - [ ] Test `nova install` end-to-end: fresh project → add dependency to nova.toml → `nova install` → import works
-  - [ ] Add 10-20 useful packages to the registry (http-router helpers, date/time, logging, env config, etc.)
-- **Files:** `nova-compiler/compiler/nova_compiler.nova` (nova_registry_url at 28833, nova_pkg_install at 28886), `test_programs/nova_pkg.nova`, `packages/`
+### 2. Package Registry — ✅ TOOLING FIXED 2026-08-07 (one hosting step left, see below)
+- **Problem:** `nova_registry_url()` pointed at a dead Bitbucket URL (HTTP 404), `nova install` fetched
+  ONLY direct deps, and the working solver prototype was never wired in.
+- **Fixed:**
+  - [x] **`NOVA_REGISTRY` env var** — retarget the registry (any host, or a local dir) WITHOUT rebuilding
+        the compiler. The dead URL is now only a fallback default.
+  - [x] **Filesystem registries** — if `NOVA_REGISTRY` is a path, packages are read off disk. The registry
+        bundled in `packages/registry/` now resolves with **zero network**, which is what turns
+        "0 installable packages" into 5 working ones today.
+  - [x] **Relative `source` paths** — `source = "greet/greet.nova"` resolves relative to the registry root,
+        so a registry VENDORS its sources beside each `index.toml`. One repo is enough; you no longer need
+        a separate hosted repo per package. Falls back to the `<pkg>/<pkg>.nova` convention if `source` is absent.
+  - [x] **TRANSITIVE resolution** (`nova_pkg_resolve_all`) — a package's own `[dependencies]` are now pulled
+        in. Before, a dependency-of-a-dependency silently never arrived and the build failed at `import`
+        with no hint why. Worklist, not recursion, so a dependency CYCLE terminates instead of hanging.
+  - [x] **Two TOML parser bugs** — a trailing `# comment` was swallowed INTO the value, so
+        `source = "x.nova"  # note` resolved to the literal `x.nova"  # note`. The identical bug corrupted
+        dependency VERSIONS in `nova_parse_toml_deps`. Both now end a quoted value at its closing quote.
+  - [x] **CI gate** — `_pkg_install_gate.ps1`, wired as stage 2c2. Proves offline install + import + correct
+        runtime output + transitive + cycle. **Verified it FAILS on the pre-fix compiler (5 checks) and
+        passes on the fixed one**, so it is a real gate, not decoration.
+- **Verified end-to-end:** fresh project → `nova install` (offline, local registry) → `import greet` →
+  compiles → runs → prints `Hello, NOVA!`.
+- **STILL NEEDS A HUMAN (cannot be automated from here):**
+  - [ ] Push `packages/registry/` to a public host and publish the raw base URL. Documented as a
+        copy-paste sequence in `packages/README.md`. This needs your credentials — it is the only
+        remaining step, and the tooling no longer depends on it (a local registry works today).
+  - [ ] Grow the registry beyond the 5 bundled packages.
+  - [ ] Real semver CONSTRAINT SOLVING — versions are recorded and pinned, but on conflict first-writer
+        wins rather than computing a compatible intersection. `test_programs/nova_pkg.nova` already has
+        semver with caret/tilde matching to lift.
 - **Why critical:** A language with zero installable packages is a dead end for any real project.
 
 ### 3. Clean Repo for Public
@@ -127,14 +159,29 @@
 - **Files:** `.github/workflows/cross-platform.yml`
 - **Depends on:** #1 (Linux self-hosting)
 
-### 10. Getting Started Tutorial
+### 10. Getting Started Tutorial — ✅ DEMOS DONE 2026-08-07
 - **Fix required:**
-  - [ ] Write a 5-minute tutorial: install → hello world → web API → database → deploy
-  - [ ] Create 3 demo programs that compile and run out of the box:
-    - Demo 1: Full-stack REST API with database (under 100 lines)
-    - Demo 2: Concurrent data pipeline with spawn/channels (under 50 lines)
-    - Demo 3: CLI tool (under 40 lines)
-  - [ ] Test on a fresh machine (not the dev machine)
+  - [x] Tutorial already existed and is thorough — `docs/TUTORIAL.md`, 6,513 lines, with DO/DON'T boxes and
+        explicit comparisons to Python/Go/Rust/JS. The real gap was runnable demos, not prose.
+  - [x] **3 demos in `examples/`, each verified compiling AND running** (outputs in `examples/README.md`
+        are captured from real runs):
+    - `rest_api.nova` (85 lines) — CRUD over real SQLite. Every endpoint exercised with curl:
+      POST/GET/GET-by-id/404/400-validation/DELETE. **Injection safety was TESTED, not asserted** —
+      a `'); DROP TABLE tasks; --` payload stored as literal text, table intact.
+    - `pipeline.nova` (45 lines) — spawn/channel fan-out/fan-in; prints 9592, the true count of primes
+      below 100,000.
+    - `cli_wordcount.nova` (30 lines) — args, file IO, dicts, `sort_by`, comprehensions, zero local
+      type annotations.
+  - [ ] Test on a genuinely fresh machine (dev machine only so far)
+- **Four real bugs surfaced while writing these — fixed, not shipped:**
+  1. tokenizer merged `dog\nthe` into `dogthe` (normalize whitespace BEFORE splitting)
+  2. `else` fallback does not parse inside an argument list (trap #3)
+  3. a literal `{` in a string got interpolated away (trap #5)
+  4. **POST returned `"id":1` but GET returned `"id":"1"`** — SQLite returns TEXT columns and the struct's
+     declared `int` fields do not coerce, so the same resource serialized differently by path
+- **NEW papercut found (not blocking, worth fixing):** `slice()` is string-only, so `slice(list, 0, n)` is a
+  type error; lists need `xs[0:n]` or `list_slice`. A beginner hits this within minutes and the error message
+  ("use str() to convert to string") points the wrong way.
 - **Why:** Without a tutorial, even interested developers bounce.
 
 ### 11. CONTRIBUTING.md + CODE_OF_CONDUCT.md

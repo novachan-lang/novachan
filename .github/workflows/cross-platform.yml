@@ -52,35 +52,54 @@ jobs:
           sudo apt-get install -y clang lld
           clang --version
 
-      - name: Build self-hosted compiler from checked-in IR
+      # nova_compiler_linux.ll is the checked-in BOOTSTRAP SEED: the compiler's own IR, emitted
+      # with --target linux so it carries the ELF datalayout (e-m:e) rather than the Windows one.
+      # This is the chicken-and-egg break -- you need a NOVA compiler to build the NOVA compiler,
+      # so one generation ships as IR. Regenerate with:
+      #     nova compile --target linux -o nova_compiler_linux.ll nova_compiler.nova
+      - name: Build self-hosted compiler from checked-in Linux bootstrap IR
         run: |
           cd nova-compiler/compiler
-          clang -O2 -o nova nova_compiler.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          test -f nova_compiler_linux.ll || { echo "bootstrap IR missing"; exit 1; }
+          grep -q 'x86_64-unknown-linux-gnu' nova_compiler_linux.ll || { echo "bootstrap IR is not Linux-targeted"; exit 1; }
+          clang -O2 -o nova nova_compiler_linux.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
           echo "Built native Linux compiler:"
           ls -la nova
-          ./nova --version || true
+          ./nova --version
+
+      # A native host must pick its OWN triple. Before native_target_triple() landed,
+      # resolve_target("") was hardcoded to Windows, so a Linux build silently emitted
+      # x86_64-pc-windows-msvc. Assert the compiler self-identifies as Linux.
+      - name: Native host targeting
+        run: |
+          cd nova-compiler/compiler
+          printf 'fn main()\n    print(os_name())\n' > /tmp/hostprobe.nova
+          ./nova compile -o /tmp/hostprobe.ll /tmp/hostprobe.nova
+          grep -q 'target triple = "x86_64-unknown-linux-gnu"' /tmp/hostprobe.ll \
+            || { echo "FAIL: native build did not target Linux"; grep '^target ' /tmp/hostprobe.ll; exit 1; }
+          echo "OK: native host targeting resolves to Linux"
 
       - name: Reconverge check (gen5 == gen6)
         run: |
           cd nova-compiler/compiler
           export NOVA_NO_CACHE=1
+          # NOTE: bare `-o` is NOT a top-level flag -- `nova <in.nova> <out.ll>` is positional.
+          # (`nova compile -o <out> <in>` is the flag form, used in the probe step above.)
           echo "=== gen5: compile compiler with itself ==="
-          ./nova nova_compiler.nova
-          cp nova_compiler.ll nova_compiler_gen5.ll
+          ./nova nova_compiler.nova gen5.ll
           echo "=== Build gen5 binary ==="
-          clang -O2 -o nova_gen5 nova_compiler.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          clang -O2 -o nova_gen5 gen5.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
           echo "=== gen6: compile compiler with gen5 ==="
-          ./nova_gen5 nova_compiler.nova
-          cp nova_compiler.ll nova_compiler_gen6.ll
+          ./nova_gen5 nova_compiler.nova gen6.ll
           echo "=== Compare gen5 vs gen6 ==="
-          if diff -q nova_compiler_gen5.ll nova_compiler_gen6.ll; then
+          if diff -q gen5.ll gen6.ll; then
             echo "RECONVERGED: gen5 == gen6 (byte-identical)"
           else
             echo "DIVERGED: gen5 != gen6"
-            diff nova_compiler_gen5.ll nova_compiler_gen6.ll | head -40
+            diff gen5.ll gen6.ll | head -40
             exit 1
           fi
-          rm -f nova_gen5 nova_compiler_gen5.ll nova_compiler_gen6.ll
+          rm -f nova_gen5 gen5.ll gen6.ll
         timeout-minutes: 30
 
       - name: Run core test suite

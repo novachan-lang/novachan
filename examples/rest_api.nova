@@ -1,0 +1,96 @@
+// DEMO 3 — a REST API backed by a real SQLite database, in under 100 lines.
+//
+//   nova run rest_api.nova
+//   curl localhost:8080/tasks
+//   curl -X POST localhost:8080/tasks -d '{"title":"write nova","done":0}'
+//   curl localhost:8080/tasks/1
+//
+// Shows: routing, JSON in/out, a pooled SQLite connection, parameterized (injection-safe)
+// queries, and structs that serialize themselves. There is no ORM ceremony and no annotations
+// beyond function signatures — everything else is inferred.
+//
+// The connection pool is a CHANNEL: acquiring is `recv`, releasing is `send`. When every
+// connection is busy the next request simply parks, which is backpressure for free rather than
+// an unbounded queue that falls over under load.
+import forge
+import forge_db
+
+let DB_PATH = "tasks.db"
+
+type Task
+    id: int
+    title: string
+    done: int
+
+fn _schema(pool)
+    forge_db.pool_exec(pool, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
+
+// SQLite hands every column back as TEXT, so convert explicitly. Without the int() calls the
+// struct still builds (the fields are populated from `any`), but `id` and `done` serialize as
+// JSON strings on read and as numbers on write — the same endpoint would answer "id":"1" and
+// "id":1 depending on the path taken. Convert at the boundary, once.
+fn _row_to_task(row) -> Task
+    Task(int(row[0]), str(row[1]), int(row[2]))
+
+// GET /tasks -> every task as JSON
+fn list_tasks(pool) -> Response
+    let rows = forge_db.pool_query(pool, "SELECT id, title, done FROM tasks ORDER BY id", [])
+    let tasks = [_row_to_task(r) for r in rows]
+    forge.resp_json(200, tasks)
+
+// GET /tasks/<id> -> one task, or a 404 that says what was missing
+fn get_task(pool, id_str: string) -> Response
+    let id = int(id_str)
+    let rows = forge_db.pool_query(pool, "SELECT id, title, done FROM tasks WHERE id = ?", [id])
+    if len(rows) == 0
+        return forge.resp_json(404, {"error": "no task with id {id}"})
+    forge.resp_json(200, _row_to_task(rows[0]))
+
+// POST /tasks -> create. The `?` placeholders are bound positionally, so a title containing
+// "'; DROP TABLE tasks; --" is stored as literal text, not executed.
+fn create_task(pool, req: Request) -> Response
+    let body = json_parse(req.body)
+    // NOTE: `expr else fallback` is STATEMENT-level — it does not parse inside an argument
+    // list, so bind it first rather than writing `str(body["title"] else "")`.
+    let raw_title = ""
+    if contains(body, "title")
+        raw_title = str(body["title"])
+    let title = trim(raw_title)
+    if len(title) == 0
+        return forge.resp_json(400, {"error": "title is required"})
+    let done = 0
+    if contains(body, "done")
+        done = int(body["done"])
+    let new_id = forge_db.pool_insert(pool, "INSERT INTO tasks (title, done) VALUES (?, ?)", [title, done])
+    forge.resp_json(201, Task(new_id, title, done))
+
+// DELETE /tasks/<id>
+fn delete_task(pool, id_str: string) -> Response
+    let id = int(id_str)
+    forge_db.db_delete(pool, "tasks", id)
+    forge.resp_json(200, {"deleted": id})
+
+fn main()
+    let pool = forge_db.pool_open(DB_PATH, 4)
+    _schema(pool)
+
+    let a = forge.app()
+
+    forge.get(a, "/tasks", fn(req) list_tasks(pool))
+    forge.get(a, "/tasks/:id", fn(req) get_task(pool, req.params["id"]))
+    forge.post(a, "/tasks", fn(req) create_task(pool, req))
+    forge.delete(a, "/tasks/:id", fn(req) delete_task(pool, req.params["id"]))
+
+    forge.get(a, "/health", fn(req) forge.resp_json(200, {"status": "ok"}))
+
+    print("REST API listening on http://localhost:8080")
+    print("  GET    /tasks")
+    // NOTE: ALL strings interpolate `{...}` — a literal brace must be escaped as \{ or it is
+    // parsed as an expression and silently replaced.
+    print("  POST   /tasks      \{\"title\": \"...\", \"done\": 0}")
+    print("  GET    /tasks/:id")
+    print("  DELETE /tasks/:id")
+    // Use serve_req (the typed Request -> Response server), NOT serve_app. serve_app dispatches
+    // the UNTYPED string API (handlers returning forge.text/forge.json strings); handing it a
+    // typed Response struct sends the struct raw and the client sees a malformed HTTP/0.9 reply.
+    forge.serve_req(a, 8080)

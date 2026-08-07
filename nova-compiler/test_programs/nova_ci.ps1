@@ -60,6 +60,10 @@ Write-Host "`n[CI 2c/3] #25 C-ABI @export gate (NOVA lib called from a pure-C ho
 & .\_s25_export_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2c (@export C-ABI) ==="; exit 1 }
 
+Write-Host "`n[CI 2c2/3] #2 package-manager gate (offline install + import + transitive + cycle)..."
+& .\_pkg_install_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2c2 (package manager) ==="; exit 1 }
+
 Write-Host "`n[CI 2d/3] #27 no_std freestanding-allocator gate (static buffer, no libc malloc)..."
 & .\_s27_freestanding_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2d (freestanding allocator) ==="; exit 1 }

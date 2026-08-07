@@ -12,8 +12,20 @@ Run with:
 
 param(
     [string]$Mode = "default",     # default | no_track8 | track8_drop | auto_arena
-    [switch]$NoCommitAppend         # skip writing to history.jsonl (use for one-off runs)
+    [switch]$NoCommitAppend,        # skip writing to history.jsonl (use for one-off runs)
+    [int]$Repeat = 3                # samples per bench; the MINIMUM is recorded (see below)
 )
+
+# WHY BEST-OF-N: this harness used to record a SINGLE run, which made history.jsonl only as
+# trustworthy as the quietest moment on the host. On 2026-08-07 a float_array_sum sample taken
+# while six agents + the full CI were saturating the CPU landed at 431 ms against a 178 ms
+# baseline -- a phantom "+142% REGRESSION" that cost real investigation time and, worse, was
+# APPENDED to history, where it would have poisoned every later comparison against that commit.
+# Re-measured on a quiet host the same binary ran 150/153/152 ms.
+# Noise on a benchmark is one-directional: contention, scheduling and cache eviction can only
+# ever make a run SLOWER, never faster. So min-of-N is the cleanest available estimator of true
+# cost -- the same reason hyperfine and Google Benchmark report a minimum/trimmed statistic
+# rather than a lone sample. N=3 costs a few extra seconds across 6 sub-second benches.
 
 $ErrorActionPreference = "Stop"
 
@@ -85,27 +97,41 @@ foreach ($name in $benches) {
         continue
     }
 
-    # Run
-    $rr = Invoke-Timed -FilePath $exePath -Arguments "" -TimeoutMs 30000 -WorkingDirectory $progDir
-    if ($rr.TimedOut -or $rr.ExitCode -ne 0) {
-        Write-Host "FAIL run: $name (exit=$($rr.ExitCode))"
+    # Run $Repeat times and keep the FASTEST sample (see the best-of-N note in the param block).
+    $samples = @()
+    $rr      = $null
+    $runFailed = $false
+    for ($rep = 1; $rep -le $Repeat; $rep++) {
+        $thisRun = Invoke-Timed -FilePath $exePath -Arguments "" -TimeoutMs 30000 -WorkingDirectory $progDir
+        if ($thisRun.TimedOut -or $thisRun.ExitCode -ne 0) {
+            Write-Host "FAIL run: $name (exit=$($thisRun.ExitCode), sample $rep/$Repeat)"
+            $runFailed = $true
+            break
+        }
+        $sLine = ($thisRun.StdOut -split "`n") | Where-Object { $_ -like "BENCH *" } | Select-Object -First 1
+        if (-not $sLine) {
+            Write-Host "FAIL parse: $name (no BENCH line, sample $rep/$Repeat)"
+            $runFailed = $true
+            break
+        }
+        if ($sLine -match "elapsed_ms=(\d+)") { $samples += [int]$Matches[1] }
+        # Keep the LAST successful run's streams for the rc_stats parse below. RC counts are
+        # deterministic for a given binary, so any sample is equivalent for that purpose.
+        $rr = $thisRun
+    }
+    if ($runFailed -or $samples.Count -eq 0) {
         $totalFail++
         Remove-Item -Force $llPath, $exePath -ErrorAction SilentlyContinue
         continue
     }
 
-    # Parse 'BENCH <name> elapsed_ms=<n>' from stdout
-    $line = ($rr.StdOut -split "`n") | Where-Object { $_ -like "BENCH *" } | Select-Object -First 1
-    if (-not $line) {
-        Write-Host "FAIL parse: $name (no BENCH line)"
-        $totalFail++
-        Remove-Item -Force $llPath, $exePath -ErrorAction SilentlyContinue
-        continue
-    }
-
-    $elapsed = 0
-    if ($line -match "elapsed_ms=(\d+)") {
-        $elapsed = [int]$Matches[1]
+    $elapsed = ($samples | Measure-Object -Minimum).Minimum
+    $spread  = ($samples | Measure-Object -Maximum).Maximum - $elapsed
+    # A wide spread means the host was busy; the min is still sound, but say so out loud rather
+    # than silently recording a number whose provenance nobody can reconstruct later.
+    $sampleNote = "min of $($samples.Count) [$($samples -join ', ')]"
+    if ($elapsed -gt 0 -and $spread * 100 / $elapsed -gt 25) {
+        $sampleNote += " NOISY-HOST(spread ${spread}ms)"
     }
 
     # Parse RC stats from stderr
@@ -127,7 +153,7 @@ foreach ($name in $benches) {
     }
     $results += $rec
 
-    Write-Host "PASS $name  elapsed_ms=$elapsed  rc_inc=$rcInc  rc_dec=$rcDec"
+    Write-Host "PASS $name  elapsed_ms=$elapsed  rc_inc=$rcInc  rc_dec=$rcDec  ($sampleNote)"
     $totalPass++
 
     Remove-Item -Force $llPath, $exePath -ErrorAction SilentlyContinue

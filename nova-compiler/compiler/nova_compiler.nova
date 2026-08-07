@@ -28882,16 +28882,87 @@ fn nova_parse_toml_deps(content: string) -> dict
                 if eq_pos >= 0
                     let key = trim(slice(trimmed, 0, eq_pos))
                     let val = trim(slice(trimmed, eq_pos + 1, len(trimmed)))
-                    if len(val) >= 2
-                        let vfirst = slice(val, 0, 1)
-                        if vfirst == "\""
-                            val = slice(val, 1, len(val) - 1)
+                    // End a quoted version at its CLOSING quote, not at end-of-line, so
+                    // `greet = "0.1.0"  # pinned` yields 0.1.0 and not `0.1.0"  # pinned`.
+                    if len(val) >= 1 and slice(val, 0, 1) == "\""
+                        let vrest = slice(val, 1, len(val))
+                        let vclose = find(vrest, "\"")
+                        if vclose >= 0
+                            val = slice(vrest, 0, vclose)
+                        else
+                            val = vrest
+                    else
+                        let vhash = find(val, "#")
+                        if vhash >= 0
+                            val = trim(slice(val, 0, vhash))
                     deps[key] = val
         idx = idx + 1
     deps
 
+// Registry base. NOVA_REGISTRY overrides the default so a user can point at their own host
+// (or a vendored/air-gapped copy) WITHOUT rebuilding the compiler. Two forms are accepted:
+//   https://host/path/   -> fetched over HTTP
+//   /some/dir  or  C:\d  -> read straight off the filesystem
+// The filesystem form is what makes `nova install` work with zero network: point it at this
+// repo's own `packages/registry/` and the bundled packages resolve offline.
 fn nova_registry_url() -> string
+    let env_reg = env("NOVA_REGISTRY")
+    if len(env_reg) > 0
+        if ends_with(env_reg, "/") or ends_with(env_reg, "\\")
+            return env_reg
+        return env_reg + "/"
     "https://bitbucket.org/manemangesh/packages/raw/main/registry/"
+
+fn nova_registry_is_http(base: string) -> int
+    if starts_with(base, "http://") or starts_with(base, "https://")
+        return 1
+    0
+
+// Read `rel` from the registry, over HTTP or off disk depending on the base form.
+// Returns "" when absent -- callers treat empty as "not in this registry" and fall back.
+fn nova_registry_fetch(rel: string) -> string
+    let base = nova_registry_url()
+    if nova_registry_is_http(base) == 1
+        return http_get(base + rel)
+    let p = base + rel
+    if path_exists(p) == 1
+        return read_file(p)
+    ""
+
+// Resolve a package's `source` field. An absolute http(s) URL is fetched as-is; anything else
+// is treated as RELATIVE TO THE REGISTRY, so a registry can vendor `<pkg>/<pkg>.nova` right
+// next to its index.toml instead of needing one hosted repo per package.
+fn nova_registry_fetch_source(src: string, pkg_name: string) -> string
+    if starts_with(src, "http://") or starts_with(src, "https://")
+        return http_get(src)
+    nova_registry_fetch(src)
+
+// Pull `key = "value"` out of a flat TOML-ish line set.
+// A QUOTED value ends at its closing quote, so a trailing `# comment` is discarded rather than
+// swallowed into the value (that bug made `source = "a/b.nova"  # note` resolve to the literal
+// string `a/b.nova"   # note`). An unquoted value runs to an unquoted `#` or end of line.
+fn nova_toml_scalar(content: string, key: string) -> string
+    let out = ""
+    for line in split(content, "\n")
+        let trimmed = trim(line)
+        let eq = find(trimmed, "=")
+        if eq >= 0
+            let lhs = trim(slice(trimmed, 0, eq))
+            if lhs == key
+                let v = trim(slice(trimmed, eq + 1, len(trimmed)))
+                if len(v) >= 1 and slice(v, 0, 1) == "\""
+                    let rest = slice(v, 1, len(v))
+                    let close = find(rest, "\"")
+                    if close >= 0
+                        out = slice(rest, 0, close)
+                    else
+                        out = rest
+                else
+                    let hash = find(v, "#")
+                    if hash >= 0
+                        v = trim(slice(v, 0, hash))
+                    out = v
+    out
 
 fn nova_pkg_is_valid_source(content: string) -> int
     if len(content) == 0
@@ -28905,43 +28976,72 @@ fn nova_pkg_is_valid_source(content: string) -> int
         return 1
     return 0
 
+// A package's OWN dependencies, read from its registry index.toml `[dependencies]` section.
+// Returns {} when the package declares none (or is not in this registry). This is what makes
+// TRANSITIVE resolution possible -- see nova_pkg_resolve_all.
+fn nova_pkg_deps_of(pkg_name: string) -> dict
+    let index_content = nova_registry_fetch(pkg_name + "/index.toml")
+    if len(index_content) == 0
+        return {}
+    if nova_pkg_is_valid_source(index_content) == 1
+        return {}
+    nova_parse_toml_deps(index_content)
+
 fn nova_pkg_download(pkg_name: string, pkg_version: string) -> int
     let pkg_dir = path_join("nova_packages", pkg_name)
     let marker = path_join(pkg_dir, pkg_name + ".nova")
     if path_exists(marker) == 1
         return 1
     mkdir_p(path_join("nova_packages", pkg_name))
-    let registry = nova_registry_url()
-    let index_url = registry + pkg_name + "/index.toml"
-    let index_content = http_get(index_url)
+    let index_content = nova_registry_fetch(pkg_name + "/index.toml")
     if len(index_content) > 0 and nova_pkg_is_valid_source(index_content) == 0
-        let lines = split(index_content, "\n")
-        let src_url = ""
-        for line in lines
-            let trimmed = trim(line)
-            if starts_with(trimmed, "source")
-                let eq = find(trimmed, "=")
-                if eq >= 0
-                    src_url = trim(slice(trimmed, eq + 1, len(trimmed)))
-                    if len(src_url) >= 2 and slice(src_url, 0, 1) == "\""
-                        src_url = slice(src_url, 1, len(src_url) - 1)
+        let src_url = nova_toml_scalar(index_content, "source")
         if len(src_url) > 0
-            let content = http_get(src_url)
+            let content = nova_registry_fetch_source(src_url, pkg_name)
             if nova_pkg_is_valid_source(content) == 1
                 write_file(marker, content)
                 print("  Downloaded " + pkg_name)
                 return 1
             else
-                print("  warning: " + pkg_name + " source URL returned invalid content")
+                print("  warning: " + pkg_name + " source '" + src_url + "' returned invalid content")
+        // No `source` key: fall back to the convention that a registry vendors the package
+        // source beside its index as <pkg>/<pkg>.nova.
+        let vendored = nova_registry_fetch(pkg_name + "/" + pkg_name + ".nova")
+        if nova_pkg_is_valid_source(vendored) == 1
+            write_file(marker, vendored)
+            print("  Downloaded " + pkg_name)
+            return 1
     let gh_url = "https://bitbucket.org/manemangesh/pkg-" + pkg_name + "/raw/main/" + pkg_name + ".nova"
     let content = http_get(gh_url)
     if nova_pkg_is_valid_source(content) == 1
         write_file(marker, content)
-        print("  Downloaded " + pkg_name + " (github)")
+        print("  Downloaded " + pkg_name + " (direct repo)")
         return 1
-    print("  error: could not download " + pkg_name + " — package not found in registry or github")
-    print("  Place " + pkg_name + ".nova in nova_packages/" + pkg_name + "/ manually")
+    print("  error: could not download " + pkg_name + " — not found in registry " + nova_registry_url())
+    print("  Set NOVA_REGISTRY to a reachable registry, or place " + pkg_name + ".nova in nova_packages/" + pkg_name + "/ manually")
     return 0
+
+// Transitive closure of `direct` over each package's declared dependencies.
+// Worklist, not recursion: a package already in `seen` is never revisited, so a dependency
+// CYCLE terminates instead of hanging. First-writer-wins on version, matching the existing
+// direct-dep behavior; a real SAT/semver solver is the follow-up, but this at least stops
+// silently ignoring everything below depth 1.
+fn nova_pkg_resolve_all(direct: dict) -> dict
+    let seen = {}
+    let queue = []
+    for k in keys(direct)
+        push(queue, k)
+        seen[k] = direct[k]
+    let qi = 0
+    while qi < len(queue)
+        let name = queue[qi]
+        qi = qi + 1
+        let sub = nova_pkg_deps_of(name)
+        for dep in keys(sub)
+            if not contains(seen, dep)
+                seen[dep] = sub[dep]
+                push(queue, dep)
+    seen
 
 fn nova_pkg_install()
     let toml = read_file("nova.toml")
@@ -28961,7 +29061,14 @@ fn nova_pkg_install()
         deps = locked
         print("Installing from nova.lock (pinned versions)...")
     else
-        deps = nova_parse_toml_deps(toml)
+        // Resolve TRANSITIVELY. Before this, only the packages literally listed in nova.toml were
+        // fetched, so a dependency-of-a-dependency silently never arrived and the build failed at
+        // `import` with no hint why. A lockfile is already a full closure, so it is used verbatim.
+        let direct = nova_parse_toml_deps(toml)
+        deps = nova_pkg_resolve_all(direct)
+        let extra = len(keys(deps)) - len(keys(direct))
+        if extra > 0
+            print("Resolved " + str(extra) + " transitive dependency(ies)")
     let dep_keys = keys(deps)
     if len(dep_keys) == 0
         print("No dependencies to install")
