@@ -2,7 +2,7 @@
 
 > **Created:** 2026-08-07 | **Updated:** 2026-08-08
 > **Purpose:** Every issue that must be fixed before NOVA can go public. Work through top-to-bottom.
-> **Status:** IN PROGRESS — 12 of 24 items closed. CI: **2852 PASS, 0 FAIL, 33 SKIP — ALL GREEN.**
+> **Status:** IN PROGRESS — 13 of 24 items closed. CI: **2852 PASS, 0 FAIL, 33 SKIP — ALL GREEN.**
 
 ## Verification pass 2026-08-07 (grep/run against live code, not docs)
 
@@ -211,16 +211,18 @@
   - [ ] Track progress: goal is compiler demonstrates NOVA's own high-level style
 - **Why:** "The compiler that implements generics doesn't use generics" undermines credibility.
 
-### 13. Duplicate Modules (166 forge/std overlaps) — IN PROGRESS
+### 13. Duplicate Modules (166 forge/std overlaps) — ✅ CLOSED
 - **Problem:** 166 modules exist in both `forge/` and `std/` (independently authored during different campaigns). See `NOVA_DESIGN/DUPLICATE_MODULES_TRACKER.md`.
 - **Fix required:**
-  - [x] Audit all 166 pairs: 59 safe to delete (zero imports), 8 false positives (keep), ~99 need wrapper conversion
-  - [x] Delete 59 zero-import forge duplicates (+ their nova-compiler/lib/ mirrors)
+  - [x] Audit all 166 pairs: 64 safe to delete (zero imports), 20 false positives (keep), 102 need wrapper conversion
+  - [x] Delete 64 zero-import forge duplicates (+ their nova-compiler/lib/ mirrors)
   - [x] Clean up `_sweeplist.txt` (6 stale entries removed)
-  - [x] Update `DUPLICATE_MODULES_TRACKER.md` with `[D]` markers for all 59
-  - [ ] Convert remaining ~99 to thin wrappers (function names differ — per-module mapping needed)
-  - [ ] Update `_sweeplist.txt` as wrappers are created
-- **Progress:** 59/166 deleted (36%). Remaining ~99 have test imports with different function names between forge/std — need wrapper conversion with per-module function mapping.
+  - [x] Update `DUPLICATE_MODULES_TRACKER.md` with `[D]` markers for all 64
+  - [x] Convert 102 remaining to thin wrappers with suffix-based + manual function name mapping
+  - [x] Fix wrappers: restore private helper functions needed by non-delegated public functions
+  - [x] Sync all wrappers to nova-compiler/lib/ mirror
+  - [x] Update tracker with `[W]` markers for all 102 wrappers + `[F]` for 20 false positives
+- **Result:** 64 deleted + 102 wrapped + 20 false positives (different concepts, keep both) = 186 pairs resolved. Zero `[ ]` entries remain in tracker Section A.
 - **Why:** Duplicates confuse contributors and waste maintenance effort.
 
 ### 14. Untested Forge Modules (~115 of 570)

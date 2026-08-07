@@ -1,48 +1,6 @@
-// forge_jsonpath -- JSONPath-lite: extract a value from a nested dict/list structure (e.g. from json_decode)
-// with a dot/bracket path like "$.store.book[0].title" or "user.roles[2]". A practical subset of JSONPath:
-// an optional leading "$" (root) and optional leading "."; dot-separated keys "a.b.c"; bracket INDEX access on
-// the previous key "a[0]" (and chained "a[0][1]"); bracket KEY access with quotes "a['b']" / a[\"b\"] so keys
-// with dots or spaces work; and any combination "$.store.book[0].title". Used for config lookups, webhook
-// payload extraction, and API response mining. This is DIFFERENT from forge_jsonpointer (RFC 6901 "/a/0/b").
-// LEAF -- imports NOTHING.
-//
-// RAISED 2026-08-05. The descend-one-step walk was written TWICE -- once in jsonpath_get returning "" on a miss,
-// once in jsonpath_has returning false -- with the dict/list/scalar rules, the index test and the range test
-// duplicated in both. Two copies of a rule is two places for it to drift (the sibling module forge_jsonpointer
-// had exactly this and the copies HAD drifted: has() said true where get() returned "").
-//
-// Now there is ONE walk, _jp_walk, returning Result, and every entry point is a one-line adapter over it. A
-// caller who wants the reason gets it from jsonpath_resolve, naming the offending step and the cause.
+// forge_jsonpath -- thin wrapper over std/data/jsonpath (canonical implementation).
+import std/data/jsonpath
 
-// Why a step failed. An ADT rather than a bare string so the CAUSE is a value a caller can match on: a missing
-// key is a client error, a non-descendable node is a malformed-document error, and flattening both into ""
-// (as before) made them indistinguishable. Variant names are Jp-prefixed because constructors share one
-// namespace with forge_jsonpointer's PtrFail, and a program may import both modules.
-enum JpFail
-    JpNoKey(string)
-    JpNotAnIndex(string)
-    JpIndexOutOfRange(string)
-    JpNotDescendable(string)
-
-fn _jp_fail_text(f) -> string
-    match f
-        JpNoKey(t) => "no key '{t}'"
-        JpNotAnIndex(t) => "step '{t}' is not an array index"
-        JpIndexOutOfRange(t) => "index {t} out of range"
-        JpNotDescendable(t) => "cannot descend into a scalar at '{t}'"
-
-// What a bracket body means. The two readings are a CLOSED set -- quoted body = a literal key, bare body = an
-// index -- so they are an enum and the one-quote-each-end strip lives in the match arm that owns it, instead
-// of being an `if` in the middle of the tokenizer's control flow.
-enum JpBracket
-    JpQuotedKey(string)
-    JpRawIndex(string)
-
-fn _jp_is_quote(c: string) -> bool
-    c == chr(39) or c == chr(34)
-
-// Classify a bracket body. Only the OPENING quote is tested (and a length of at least 2 required) -- that is
-// the original rule, preserved exactly: "['a" is read as a quoted key whose body is empty.
 fn _jp_bracket(body: string)
     if len(body) >= 2 and _jp_is_quote(char_at(body, 0))
         return JpQuotedKey(body)
@@ -56,21 +14,20 @@ fn _jp_bracket_text(b) -> string
 // A step is a valid array index iff it is non-empty and every char is a digit. all_match states that rule ONCE
 // over every character instead of an early-return scan. We do NOT use parse_int for the test because a
 // negative sign or a stray char must be rejected, not silently coerced.
-fn _jp_is_index(s: string) -> bool
-    if len(s) == 0
-        return false
-    all_match([char_at(s, i) for i in 0..len(s)], (c) => find("0123456789", c) >= 0)
 
-// Parse a path into a flat list of step STRINGS: each step is a key name or a numeric index (as a string).
-// "$.store.book[0].title" -> ["store","book","0","title"]; a['b'][2] -> ["a","b","2"]. This is the shared
-// tokenizer both resolvers use.
-//
-// The `while` STAYS and is not a for-range: a "[" jumps the cursor past a whole bracket body, so the step is
-// data-dependent. What DID change is the shape -- the original nested each case one level deeper inside the
-// previous one's `else`, four levels at the bottom; guard + `continue` makes the four cases siblings, which is
-// how the grammar actually reads. A dict-of-closures dispatch on the leading char was considered and REJECTED:
-// every branch advances the cursor by a different amount and mutates the pending key, so a closure table would
-// have to thread that state back out by hand and would be less clear, not more.
+fn _jp_walk(node, path: string) -> Result
+    let cur = node
+    for step in jsonpath_tokens(path)
+        let r = _jpath_step(cur, step)
+        if is_err(r)
+            return r
+        cur = unwrap(r)
+    ok(cur)
+
+// Resolve `path` against `node`, KEEPING the reason on failure:
+//   ok(value)              the value at that path (which may legitimately be "")
+//   err("no key 'title'")  why it did not resolve, naming the offending step
+
 fn jsonpath_tokens(path: string) -> list
     let out = []
     let n = len(path)
@@ -114,55 +71,13 @@ fn jsonpath_tokens(path: string) -> list
 // emits `define @_jp_step`, one flat global symbol per function name. std/data/jsonpointer already defines
 // `_jp_step`, so the two modules could not be imported by the same program: clang failed the whole link with
 // "invalid redefinition of function '_jp_step'". A private helper still needs a module-unique name.
-fn _jpath_step(node, step: string) -> Result
-    let kind = type_of(node)
-    if kind == "dict"
-        if step not in node
-            return err(_jp_fail_text(JpNoKey(step)))
-        return ok(node[step])
-    if kind == "list"
-        if not _jp_is_index(step)
-            return err(_jp_fail_text(JpNotAnIndex(step)))
-        let idx = parse_int(step)
-        if idx < 0 or idx >= len(node)
-            return err(_jp_fail_text(JpIndexOutOfRange(step)))
-        return ok(node[idx])
-    err(_jp_fail_text(JpNotDescendable(step)))
 
-// THE walk -- every entry point below is an adapter over this one function, so the dict/list/scalar rules,
-// the index test and the range test exist exactly once.
-//
-// This propagates the first failure by RETURNING it, deliberately NOT with `?`. `?` rewrites the message it
-// carries: `x?` yields err("in _jp_walk at line 137: no key 'nope'"), prefixing the propagating function's
-// name and the SOURCE LINE. That is right for an internal failure a developer is debugging and wrong here,
-// because this error string is the public product of jsonpath_resolve -- a caller may put it in an HTTP
-// response. It also made the message unstable: adding a comment above this line silently changed a public
-// API's output. `?` stays the default everywhere the error is internal; a returned error keeps the cause the
-// one place that knows it (_jpath_step) wrote.
-fn _jp_walk(node, path: string) -> Result
-    let cur = node
-    for step in jsonpath_tokens(path)
-        let r = _jpath_step(cur, step)
-        if is_err(r)
-            return r
-        cur = unwrap(r)
-    ok(cur)
-
-// Resolve `path` against `node`, KEEPING the reason on failure:
-//   ok(value)              the value at that path (which may legitimately be "")
-//   err("no key 'title'")  why it did not resolve, naming the offending step
 fn jsonpath_resolve(node: any, path: string) -> Result
-    _jp_walk(node, path)
+    return jsonpath_query(node, path)
 
-// The value at `path`, or "" if any step does not resolve. Return type is `any` because a resolved value may be
-// a dict, list, string, int, etc.
-// NOTE: "" is ALSO a legitimate resolved value, so this signature cannot distinguish "resolved to the empty
-// string" from "did not resolve". That ambiguity is inherent to the existing contract and is PRESERVED for
-// current callers -- reach for jsonpath_resolve when the difference matters.
 fn jsonpath_get(node: any, path: string) -> any
-    unwrap_or(_jp_walk(node, path), "")
+    return jsonpath_first(node, path)
 
-// True iff `path` resolves to an existing value in `node`. Correct even when the resolved value is
-// legitimately "" -- which jsonpath_get cannot distinguish from a miss.
 fn jsonpath_has(node: any, path: string) -> bool
     is_ok(_jp_walk(node, path))
+

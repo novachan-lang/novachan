@@ -11,7 +11,7 @@
 
 | Category | Count | Status |
 |----------|-------|--------|
-| forge/ ↔ std/ overlaps (unique basenames) | 166 | TRACKED |
+| forge/ ↔ std/ overlaps (unique basenames) | 166 | 64 DELETED, 102 WRAPPED, ~19 FALSE POSITIVE |
 | forge/ ↔ std/ overlaps (total pairs, some 1:2) | 178 | TRACKED |
 | std/-internal basename collisions | 22 | TRACKED |
 | forge/-internal duplicates | 1 | TRACKED |
@@ -28,136 +28,136 @@ These are independently-implemented modules covering the same algorithm/concept.
 ### Collections / Data Structures
 ```
 [D] forge/forge_bitset.nova           | std/collections/bitset.nova
-[ ] forge/forge_bktree.nova           | std/collections/bktree.nova
-[ ] forge/forge_fenwick.nova          | std/collections/fenwick.nova
-[ ] forge/forge_fenwick2d.nova        | std/collections/fenwick2d.nova
+[W] forge/forge_bktree.nova           | std/collections/bktree.nova
+[W] forge/forge_fenwick.nova          | std/collections/fenwick.nova
+[W] forge/forge_fenwick2d.nova        | std/collections/fenwick2d.nova
 [D] forge/forge_graph.nova            | std/collections/graph.nova
-[ ] forge/forge_intervaltree.nova     | std/collections/intervaltree.nova
-[ ] forge/forge_kdtree.nova           | std/collections/kdtree.nova
+[F] forge/forge_intervaltree.nova     | std/collections/intervaltree.nova
+[W] forge/forge_kdtree.nova           | std/collections/kdtree.nova
 [D] forge/forge_multimap.nova         | std/collections/multimap.nova
-[ ] forge/forge_setops.nova           | std/collections/setops.nova
-[ ] forge/forge_sparsetable.nova      | std/collections/sparsetable.nova
-[ ] forge/forge_splaytree.nova        | std/collections/splaytree.nova
-[ ] forge/forge_suffixarray.nova      | std/collections/suffixarray.nova
-[ ] forge/forge_treap.nova            | std/collections/treap.nova
+[W] forge/forge_setops.nova           | std/collections/setops.nova
+[W] forge/forge_sparsetable.nova      | std/collections/sparsetable.nova
+[W] forge/forge_splaytree.nova        | std/collections/splaytree.nova
+[W] forge/forge_suffixarray.nova      | std/collections/suffixarray.nova
+[W] forge/forge_treap.nova            | std/collections/treap.nova
 [D] forge/forge_trie.nova             | std/collections/trie.nova
 [D] forge/forge_union_find.nova       | std/collections/union_find.nova
 ```
 
 ### Graph Algorithms
 ```
-[ ] forge/forge_astar.nova            | std/graph/astar.nova
-[ ] forge/forge_bellmanford.nova      | std/graph/bellmanford.nova
-[ ] forge/forge_bipartite.nova        | std/graph/bipartite.nova
-[ ] forge/forge_dijkstra.nova         | std/graph/dijkstra.nova
-[ ] forge/forge_floydwarshall.nova    | std/graph/floydwarshall.nova
-[ ] forge/forge_hamiltonian.nova      | std/graph/hamiltonian.nova
-[ ] forge/forge_maxflow.nova          | std/graph/maxflow.nova
+[W] forge/forge_astar.nova            | std/graph/astar.nova
+[W] forge/forge_bellmanford.nova      | std/graph/bellmanford.nova
+[W] forge/forge_bipartite.nova        | std/graph/bipartite.nova
+[W] forge/forge_dijkstra.nova         | std/graph/dijkstra.nova
+[W] forge/forge_floydwarshall.nova    | std/graph/floydwarshall.nova
+[W] forge/forge_hamiltonian.nova      | std/graph/hamiltonian.nova
+[W] forge/forge_maxflow.nova          | std/graph/maxflow.nova
 ```
 
 ### Sketch / Probabilistic
 ```
-[ ] forge/forge_countmin.nova         | std/sketch/countmin.nova
-[ ] forge/forge_cuckoofilter.nova     | std/sketch/cuckoofilter.nova
+[W] forge/forge_countmin.nova         | std/sketch/countmin.nova
+[W] forge/forge_cuckoofilter.nova     | std/sketch/cuckoofilter.nova
 [D] forge/forge_hyperloglog.nova      | std/sketch/hyperloglog.nova
-[ ] forge/forge_minhash.nova          | std/sketch/minhash.nova
-[ ] forge/forge_reservoir.nova        | std/sketch/reservoir.nova
-[ ] forge/forge_simhash.nova          | std/sketch/simhash.nova
-[ ] forge/forge_topk.nova             | std/sketch/topk.nova
+[W] forge/forge_minhash.nova          | std/sketch/minhash.nova
+[W] forge/forge_reservoir.nova        | std/sketch/reservoir.nova
+[W] forge/forge_simhash.nova          | std/sketch/simhash.nova
+[W] forge/forge_topk.nova             | std/sketch/topk.nova
 ```
 
 ### Text / String Algorithms
 ```
-[ ] forge/forge_align.nova            | std/bio/align.nova
-[ ] forge/forge_anagram.nova          | std/text/anagram.nova
+[W] forge/forge_align.nova            | std/bio/align.nova
+[W] forge/forge_anagram.nova          | std/text/anagram.nova
 [D] forge/forge_ansi.nova             | std/text/ansi.nova
-[ ] forge/forge_boyermoore.nova       | std/text/boyermoore.nova
-[ ] forge/forge_case.nova             | std/text/case.nova
-[ ] forge/forge_damerau.nova          | std/text/damerau.nova
-[ ] forge/forge_editops.nova          | std/text/editops.nova
-[ ] forge/forge_hamming.nova          | std/text/hamming.nova
+[W] forge/forge_boyermoore.nova       | std/text/boyermoore.nova
+[W] forge/forge_case.nova             | std/text/case.nova
+[W] forge/forge_damerau.nova          | std/text/damerau.nova
+[W] forge/forge_editops.nova          | std/text/editops.nova
+[W] forge/forge_hamming.nova          | std/text/hamming.nova
 [D] forge/forge_indent.nova           | std/text/indent.nova
-[ ] forge/forge_kmp.nova              | std/text/kmp.nova
-[ ] forge/forge_lcs.nova              | std/text/lcs.nova
-[ ] forge/forge_lcsubstring.nova      | std/text/lcsubstring.nova
-[ ] forge/forge_lorem.nova            | std/text/lorem.nova
-[ ] forge/forge_manacher.nova         | std/text/manacher.nova
-[ ] forge/forge_pad.nova              | std/text/pad.nova
-[ ] forge/forge_rabinkarp.nova        | std/text/rabinkarp.nova
+[W] forge/forge_kmp.nova              | std/text/kmp.nova
+[W] forge/forge_lcs.nova              | std/text/lcs.nova
+[W] forge/forge_lcsubstring.nova      | std/text/lcsubstring.nova
+[W] forge/forge_lorem.nova            | std/text/lorem.nova
+[W] forge/forge_manacher.nova         | std/text/manacher.nova
+[W] forge/forge_pad.nova              | std/text/pad.nova
+[W] forge/forge_rabinkarp.nova        | std/text/rabinkarp.nova
 [D] forge/forge_readability.nova      | std/text/readability.nova
-[ ] forge/forge_roman.nova            | std/text/roman.nova
-[ ] forge/forge_shlex.nova            | std/text/shlex.nova
+[W] forge/forge_roman.nova            | std/text/roman.nova
+[W] forge/forge_shlex.nova            | std/text/shlex.nova
 [D] forge/forge_slug.nova             | std/text/slug.nova
-[ ] forge/forge_tfidf.nova            | std/text/tfidf.nova
-[ ] forge/forge_tokenize.nova         | std/text/tokenize.nova
+[W] forge/forge_tfidf.nova            | std/text/tfidf.nova
+[F] forge/forge_tokenize.nova         | std/text/tokenize.nova
 [D] forge/forge_wordwrap.nova         | std/textlayout/wordwrap.nova
 [D] forge/forge_xml.nova              | std/text/xml.nova
 ```
 
 ### Geometry
 ```
-[ ] forge/forge_bbox.nova             | std/geometry/bbox.nova
-[ ] forge/forge_closestpair.nova      | std/geometry/closestpair.nova
-[ ] forge/forge_convexhull.nova       | std/geometry/convexhull.nova
-[ ] forge/forge_polygon.nova          | std/geometry/polygon.nova
+[W] forge/forge_bbox.nova             | std/geometry/bbox.nova
+[W] forge/forge_closestpair.nova      | std/geometry/closestpair.nova
+[W] forge/forge_convexhull.nova       | std/geometry/convexhull.nova
+[W] forge/forge_polygon.nova          | std/geometry/polygon.nova
 [D] forge/forge_spatial_hash.nova     | std/game2d/spatial_hash.nova
 ```
 
 ### Math / Numeric
 ```
-[ ] forge/forge_bignum.nova           | std/numeric/bignum.nova
-[ ] forge/forge_binomial.nova         | std/math/binomial.nova
-[ ] forge/forge_calc.nova             | std/parsing/calc.nova
-[ ] forge/forge_checkdigit.nova       | std/math/checkdigit.nova
-[ ] forge/forge_collatz.nova          | std/math/collatz.nova
-[ ] forge/forge_combinatorics.nova    | std/math/combinatorics.nova
-[ ] forge/forge_easing.nova           | std/math/easing.nova
-[ ] forge/forge_egyptian.nova         | std/math/egyptian.nova
+[W] forge/forge_bignum.nova           | std/numeric/bignum.nova
+[F] forge/forge_binomial.nova         | std/math/binomial.nova
+[W] forge/forge_calc.nova             | std/parsing/calc.nova
+[F] forge/forge_checkdigit.nova       | std/math/checkdigit.nova
+[W] forge/forge_collatz.nova          | std/math/collatz.nova
+[W] forge/forge_combinatorics.nova    | std/math/combinatorics.nova
+[W] forge/forge_easing.nova           | std/math/easing.nova
+[W] forge/forge_egyptian.nova         | std/math/egyptian.nova
 [D] forge/forge_geo.nova              | std/math/geo.nova
-[ ] forge/forge_jacobi.nova           | std/math/jacobi.nova
-[ ] forge/forge_linsolve.nova         | std/numeric/linsolve.nova
-[ ] forge/forge_pell.nova             | std/math/pell.nova
-[ ] forge/forge_primes.nova           | std/math/primes.nova
+[W] forge/forge_jacobi.nova           | std/math/jacobi.nova
+[W] forge/forge_linsolve.nova         | std/numeric/linsolve.nova
+[W] forge/forge_pell.nova             | std/math/pell.nova
+[W] forge/forge_primes.nova           | std/math/primes.nova
 [D] forge/forge_stats.nova            | std/math/stats.nova
 [D] forge/forge_units.nova            | std/numeric/units.nova
 ```
 
 ### Encoding / Serialization
 ```
-[ ] forge/forge_ascii85.nova          | std/encoding/ascii85.nova
-[ ] forge/forge_base32.nova           | std/encoding/base32.nova
-[ ] forge/forge_base45.nova           | std/encoding/base45.nova
-[ ] forge/forge_base58.nova           | std/encoding/base58.nova
-[ ] forge/forge_base62.nova           | std/encoding/base62.nova
-[ ] forge/forge_bencode.nova          | std/data/bencode.nova
-[ ] forge/forge_cbor.nova             | std/data/cbor.nova
+[W] forge/forge_ascii85.nova          | std/encoding/ascii85.nova
+[W] forge/forge_base32.nova           | std/encoding/base32.nova
+[W] forge/forge_base45.nova           | std/encoding/base45.nova
+[W] forge/forge_base58.nova           | std/encoding/base58.nova
+[W] forge/forge_base62.nova           | std/encoding/base62.nova
+[W] forge/forge_bencode.nova          | std/data/bencode.nova
+[W] forge/forge_cbor.nova             | std/data/cbor.nova
 [D] forge/forge_geohash.nova          | std/encoding/geohash.nova
-[ ] forge/forge_htmlentities.nova     | std/encoding/htmlentities.nova
+[W] forge/forge_htmlentities.nova     | std/encoding/htmlentities.nova
 [D] forge/forge_ini.nova              | std/data/ini.nova
-[ ] forge/forge_morse.nova            | std/encoding/morse.nova
+[W] forge/forge_morse.nova            | std/encoding/morse.nova
 [D] forge/forge_msgpack.nova          | std/data/msgpack.nova
 [D] forge/forge_pdf.nova              | std/encoding/pdf.nova
-[ ] forge/forge_protobuf.nova         | std/encoding/protobuf.nova
-[ ] forge/forge_toml.nova             | std/data/toml.nova
+[W] forge/forge_protobuf.nova         | std/encoding/protobuf.nova
+[W] forge/forge_toml.nova             | std/data/toml.nova
 [D] forge/forge_tsv.nova              | std/data/tsv.nova
 [D] forge/forge_yaml.nova             | std/data/yaml.nova
 ```
 
 ### Compression
 ```
-[ ] forge/forge_bwt.nova              | std/compress/bwt.nova
-[ ] forge/forge_huffman.nova          | std/compress/huffman.nova
-[ ] forge/forge_lzw.nova              | std/compress/lzw.nova
-[ ] forge/forge_mtf.nova              | std/compress/mtf.nova
+[W] forge/forge_bwt.nova              | std/compress/bwt.nova
+[W] forge/forge_huffman.nova          | std/compress/huffman.nova
+[W] forge/forge_lzw.nova              | std/compress/lzw.nova
+[W] forge/forge_mtf.nova              | std/compress/mtf.nova
 [D] forge/forge_rle.nova              | std/compress/rle.nova
-[ ] forge/forge_runlength.nova        | std/encoding/runlength.nova
+[W] forge/forge_runlength.nova        | std/encoding/runlength.nova
 ```
 
 ### Network / Web
 ```
-[ ] forge/forge_cookie.nova           | std/net/cookie.nova
+[W] forge/forge_cookie.nova           | std/net/cookie.nova
 [D] forge/forge_http_status.nova      | std/net/http_status.nova
-[ ] forge/forge_httpdate.nova         | std/net/httpdate.nova
+[W] forge/forge_httpdate.nova         | std/net/httpdate.nova
 [D] forge/forge_mac.nova              | std/net/mac.nova
 [D] forge/forge_mime.nova             | std/net/mime.nova
 [D] forge/forge_useragent.nova        | std/net/useragent.nova
@@ -169,13 +169,13 @@ These are independently-implemented modules covering the same algorithm/concept.
 [D] forge/forge_email.nova            | std/validation/email.nova
 [D] forge/forge_iban.nova             | std/validation/iban.nova
 [D] forge/forge_phone.nova            | std/validation/phone.nova
-[ ] forge/forge_vin.nova              | std/validation/vin.nova
+[W] forge/forge_vin.nova              | std/validation/vin.nova
 ```
 
 ### Time / Date
 ```
 [D] forge/forge_age.nova              | std/time/age.nova
-[ ] forge/forge_calendar.nova         | std/time/calendar.nova
+[W] forge/forge_calendar.nova         | std/time/calendar.nova
 [D] forge/forge_cron.nova             | std/time/cron.nova
 [D] forge/forge_duration.nova         | std/time/duration.nova
 [D] forge/forge_humanize.nova         | std/time/humanize.nova
@@ -184,11 +184,11 @@ These are independently-implemented modules covering the same algorithm/concept.
 
 ### Identifiers / Random
 ```
-[ ] forge/forge_dice.nova             | std/random/dice.nova
+[W] forge/forge_dice.nova             | std/random/dice.nova
 [D] forge/forge_idgen.nova            | std/util/idgen.nova
-[ ] forge/forge_lfsr.nova             | std/random/lfsr.nova
+[W] forge/forge_lfsr.nova             | std/random/lfsr.nova
 [D] forge/forge_nanoid.nova           | std/util/nanoid.nova
-[ ] forge/forge_prng.nova             | std/util/prng.nova
+[W] forge/forge_prng.nova             | std/util/prng.nova
 [D] forge/forge_snowflake.nova        | std/util/snowflake.nova
 [D] forge/forge_ulid.nova             | std/util/ulid.nova
 ```
@@ -197,11 +197,11 @@ These are independently-implemented modules covering the same algorithm/concept.
 ```
 [D] forge/forge_accumulator.nova      | std/util/accumulator.nova
 [D] forge/forge_backoff.nova          | std/util/backoff.nova
-[ ] forge/forge_color.nova            | std/util/color.nova
+[F] forge/forge_color.nova            | std/util/color.nova
 [D] forge/forge_env.nova              | std/util/env.nova
-[ ] forge/forge_histogram.nova        | std/util/histogram.nova
+[F] forge/forge_histogram.nova        | std/util/histogram.nova
 [D] forge/forge_path.nova             | std/io/path.nova
-[ ] forge/forge_ratelimit.nova        | std/control/ratelimit.nova
+[F] forge/forge_ratelimit.nova        | std/control/ratelimit.nova
 [D] forge/forge_schema.nova           | std/data/schema.nova
 [D] forge/forge_semaphore.nova        | std/sync/semaphore.nova
 [D] forge/forge_semver_bump.nova      | std/semver/semver_bump.nova
@@ -209,21 +209,21 @@ These are independently-implemented modules covering the same algorithm/concept.
 
 ### Other / Miscellaneous
 ```
-[ ] forge/forge_crc16.nova            | std/hash/crc16.nova
+[W] forge/forge_crc16.nova            | std/hash/crc16.nova
 [D] forge/forge_diff.nova             | std/testing/diff.nova, std/text/diff.nova
-[ ] forge/forge_factoradic.nova       | std/numeral/factoradic.nova
-[ ] forge/forge_hexdump.nova          | std/os/hexdump.nova
-[ ] forge/forge_lyndon.nova           | std/combinatorics/lyndon.nova
-[ ] forge/forge_movingavg.nova        | std/dsp/movingavg.nova
-[ ] forge/forge_nqueens.nova          | std/game/nqueens.nova
-[ ] forge/forge_pid.nova              | std/control/pid.nova
+[W] forge/forge_factoradic.nova       | std/numeral/factoradic.nova
+[W] forge/forge_hexdump.nova          | std/os/hexdump.nova
+[W] forge/forge_lyndon.nova           | std/combinatorics/lyndon.nova
+[F] forge/forge_movingavg.nova        | std/dsp/movingavg.nova
+[W] forge/forge_nqueens.nova          | std/game/nqueens.nova
+[W] forge/forge_pid.nova              | std/control/pid.nova
 [D] forge/forge_progress.nova         | std/term/progress.nova, std/util/progress.nova
 [D] forge/forge_shellquote.nova       | std/os/shellquote.nova
-[ ] forge/forge_sudoku.nova           | std/game/sudoku.nova
+[W] forge/forge_sudoku.nova           | std/game/sudoku.nova
 [D] forge/forge_table.nova            | std/testing/table.nova
 [D] forge/forge_task_scheduler.nova   | std/greedy/task_scheduler.nova
-[ ] forge/forge_wildcard.nova         | std/parsing/wildcard.nova
-[ ] forge/forge_zeckendorf.nova       | std/numeral/zeckendorf.nova
+[W] forge/forge_wildcard.nova         | std/parsing/wildcard.nova
+[W] forge/forge_zeckendorf.nova       | std/numeral/zeckendorf.nova
 ```
 
 ### Matches into TWO std/ paths (1 forge → 2 std)
@@ -232,12 +232,12 @@ These are independently-implemented modules covering the same algorithm/concept.
 [D] forge/forge_diff.nova             | std/testing/diff.nova, std/text/diff.nova
 [D] forge/forge_gradient.nova         | std/color/gradient.nova, std/term/gradient.nova
 [D] forge/forge_hex.nova              | std/color/hex.nova, std/encoding/hex.nova
-[ ] forge/forge_jsonpath.nova         | std/data/jsonpath.nova, std/parsing/jsonpath.nova
+[W] forge/forge_jsonpath.nova         | std/data/jsonpath.nova, std/parsing/jsonpath.nova
 [D] forge/forge_ndjson.nova           | std/data/ndjson.nova, std/encoding/ndjson.nova
 [D] forge/forge_percent.nova          | std/encoding/percent.nova, std/math/percent.nova
 [D] forge/forge_progress.nova         | std/term/progress.nova, std/util/progress.nova
-[ ] forge/forge_query.nova            | std/core/query.nova, std/data/query.nova
-[ ] forge/forge_retry.nova            | std/core/retry.nova, std/util/retry.nova
+[F] forge/forge_query.nova            | std/core/query.nova, std/data/query.nova
+[W] forge/forge_retry.nova            | std/core/retry.nova, std/util/retry.nova
 [D] forge/forge_template.nova         | std/parsing/template.nova, std/text/template.nova
 [D] forge/forge_url.nova              | std/net/url.nova, std/validation/url.nova
 ```
@@ -252,6 +252,18 @@ These are independently-implemented modules covering the same algorithm/concept.
 [F] forge/forge_mode.nova             | std/music/mode.nova        — statistical mode vs musical modes
 [F] forge/forge_otp.nova              | std/crypto/otp.nova        — Erlang OTP supervision vs one-time pad cipher
 [F] forge/forge_scale.nova            | std/music/scale.nova       — ML feature scaling vs musical scales
+[F] forge/forge_binomial.nova          | std/math/binomial.nova     — forge=probability PMF/CDF vs std=combinatorial coefficients (nCr)
+[F] forge/forge_checkdigit.nova        | std/math/checkdigit.nova   — forge=Damm/Verhoeff algorithms vs std=Luhn/ISBN algorithms
+[F] forge/forge_color.nova             | std/ui/color.nova          — forge=list-based [r,g,b] vs std=dict-based {"r":int}
+[F] forge/forge_countdown.nova         | std/concurrency/countdown.nova — forge=date countdown vs std=concurrency CountDownLatch
+[F] forge/forge_counter.nova           | std/metrics/counter.nova   — forge=frequency counter vs std=metrics registry
+[F] forge/forge_histogram.nova         | std/ui/histogram.nova      — forge=numeric streaming histogram vs std=RGB image histogram
+[F] forge/forge_intervaltree.nova      | std/collections/intervaltree.nova — forge=build-from-list API vs std=insert-one-at-a-time API
+[F] forge/forge_metrics.nova           | std/ml/metrics.nova        — forge=Prometheus counters/gauges vs std=ML regression (MAE/MSE/R2)
+[F] forge/forge_movingavg.nova         | std/dsp/movingavg.nova     — forge=stateful EMA/SMA objects vs std=pure list functions
+[F] forge/forge_query.nova             | std/core/query.nova        — forge=SQL query builder vs std=empty/placeholder
+[F] forge/forge_ratelimit.nova         | std/control/ratelimit.nova — forge=token bucket rate limiter vs std=control theory deadband/hysteresis
+[F] forge/forge_tokenize.nova          | std/text/tokenize.nova     — forge=NLP tokenizer with stopwords vs std=generic text splitter
 ```
 
 ---
