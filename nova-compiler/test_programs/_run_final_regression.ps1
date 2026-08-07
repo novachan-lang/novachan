@@ -3,6 +3,9 @@ Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
 $env:NOVA_NO_CACHE = "1"
+if (-not $env:NOVA_HOME) {
+    $env:NOVA_HOME = (Resolve-Path "$PSScriptRoot\..").Path
+}
 $compilerName = if ($env:NOVA_REGRESSION_COMPILER) { $env:NOVA_REGRESSION_COMPILER } else { "gen3_test.exe" }
 $compiler = (Resolve-Path "$PSScriptRoot\$compilerName").Path
 $runtimeSrc = "$PSScriptRoot\..\compiler\nova_runtime.c"
