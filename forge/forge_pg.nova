@@ -10,6 +10,11 @@ type PgConn
     pid: int
     secret: int
     params: dict
+    // Per-connection PREPARED-STATEMENT CACHE: sql -> server-side statement name. Lives on the
+    // connection because a prepared statement belongs to the SESSION, so it must travel with the
+    // connection through the pool channel (verified: a struct's dict survives the round-trip and
+    // stays mutable). An empty-string value means "evicted, re-Parse it".
+    pscache: dict
 
 type PgMsg
     tag: int
@@ -227,7 +232,7 @@ fn pg_error_code(errmsg: string) -> string
 
 // ── connect + handshake ─────────────────────────────────────────────────────────────────────────
 fn _pg_conn_new(kind: int, handle: int) -> PgConn
-    PgConn(kind, handle, 0, 0, {})
+    PgConn(kind, handle, 0, 0, {}, {})
 
 fn _pg_handshake(conn: PgConn, user: string, db: string, password: string) -> any
     _pg_send(conn, pg_startup_message(user, db))
@@ -412,13 +417,13 @@ fn pg_wait_notify(conn: PgConn, timeout_ms: int) -> any
     ok(null)
 
 // ── parameterized queries (extended protocol, injection-safe) ───────────────────────────────────
-fn _pg_parse_msg(sql: string) -> any
-    let payload = bytes_concat(_cstr(""), bytes_concat(_cstr(sql), pg_be16(0)))
+fn _pg_parse_msg(stmt: string, sql: string) -> any
+    let payload = bytes_concat(_cstr(stmt), bytes_concat(_cstr(sql), pg_be16(0)))
     _pg_msg(80, payload)
 
 // Bind: null params -> 4 bytes 0xFF (wire -1), others stringified as text.
-fn _pg_bind_msg(params: list) -> any
-    let payload = bytes_concat(_cstr(""), _cstr(""))
+fn _pg_bind_msg(stmt: string, params: list) -> any
+    let payload = bytes_concat(_cstr(""), _cstr(stmt))
     payload = bytes_concat(payload, pg_be16(0))
     payload = bytes_concat(payload, pg_be16(len(params)))
     for p in params
@@ -454,14 +459,54 @@ fn pg_cmd_affected(tag: string) -> int
     parse_int(parts[len(parts) - 1])
 
 // Run Parse/Bind/Describe/Execute/Sync batch -> PgBatchResult struct.
-fn _pg_run_batch(conn: PgConn, sql: string, params: list) -> PgBatchResult
-    // COALESCED WRITE: Parse + Bind + Describe + Execute + Sync go out as ONE send instead of five.
-    // Each _pg_send is a separate write() syscall, and with TCP_NODELAY semantics each tends to become
-    // its own packet -- five syscalls and up to five round-trip-exposed segments for every single query.
-    // The protocol is identical (the backend reads a byte stream, not discrete writes); only the framing
-    // of the writes changes. On a remote database this is the difference between one network write per
-    // query and five.
-    let out = bytes_concat(_pg_parse_msg(sql), _pg_bind_msg(params))
+// ── prepared-statement cache ────────────────────────────────────────────────────────────────────
+// Every query used to send an UNNAMED Parse, so PostgreSQL re-parsed AND re-planned the same SQL on
+// every single execution -- the standard cost a real driver removes (pgx, node-postgres, JDBC and
+// Hibernate all cache server-side statements). Naming the statement lets repeat executions send only
+// Bind/Describe/Execute/Sync, so the server reuses the existing parse tree and plan.
+// Cap the cache: an app that builds unbounded distinct SQL (string-concatenated filters) would
+// otherwise accumulate server-side statements forever. Past the cap we fall back to the unnamed
+// statement, i.e. exactly the previous behaviour -- degraded, never broken.
+fn _pg_ps_cap() -> int
+    200
+
+// Cached server-side name for this SQL, or "" when it is not cached (or was evicted).
+fn _pg_ps_name(conn: PgConn, sql: string) -> string
+    if sql in conn.pscache
+        return str(conn.pscache[sql])
+    ""
+
+// Allocate the next name for this connection. Returns "" (the unnamed statement) once the cap is hit.
+// The counter is kept in the cache itself under a key no SQL string can collide with.
+fn _pg_ps_alloc(conn: PgConn, sql: string) -> string
+    if len(conn.pscache) >= _pg_ps_cap()
+        return ""
+    let n = 0
+    if "n" in conn.pscache
+        n = parse_int(str(conn.pscache["n"]))
+    n += 1
+    conn.pscache["n"] = str(n)
+    let nm = "nps{n}"
+    conn.pscache[sql] = nm
+    nm
+
+// A CACHED statement can fail for reasons that are not the query's fault: DDL changed the result type
+// ("cached plan must not change result type", SQLSTATE 0A000 -- which a DROP/CREATE TABLE triggers
+// immediately), or the server no longer has the statement (26000). Those are the only errors worth
+// retrying; retrying anything else would mask the real error and, inside a transaction, replace it
+// with the far less useful "current transaction is aborted".
+fn _pg_ps_is_stale(msg: string) -> bool
+    find(msg, "cached plan") >= 0 or find(msg, "prepared statement") >= 0
+
+// Send one Parse?/Bind/Describe/Execute/Sync batch and read the response.
+// COALESCED WRITE: these go out as ONE send instead of five. Each _pg_send is a separate write()
+// syscall and tends to become its own TCP segment; the backend reads a byte stream, not discrete
+// writes, so the protocol is identical and only the write framing changes.
+fn _pg_send_batch(conn: PgConn, do_parse: int, sql: string, stmt: string, params: list) -> PgBatchResult
+    let out = bytes(0)
+    if do_parse == 1
+        out = _pg_parse_msg(stmt, sql)
+    out = bytes_concat(out, _pg_bind_msg(stmt, params))
     out = bytes_concat(out, _pg_describe_portal_msg())
     out = bytes_concat(out, _pg_execute_msg())
     out = bytes_concat(out, _pg_msg(83, bytes(0)))
@@ -505,14 +550,32 @@ fn _pg_run_batch(conn: PgConn, sql: string, params: list) -> PgBatchResult
             done = 1
     PgBatchResult(had_err, errmsg, rows, affected)
 
+// Run a parameterized statement, reusing this connection's cached server-side prepared statement when
+// there is one. Fast path (already cached): Bind/Describe/Execute/Sync only -- no Parse, so the server
+// skips parsing AND planning. Slow path (first time): Parse+Bind+Describe+Execute+Sync, and remember
+// the name. If a cached statement goes stale (DDL changed the result type, or the server dropped it),
+// evict and retry ONCE with a fresh Parse -- so a DROP/CREATE TABLE mid-process self-heals instead of
+// erroring for the life of the connection.
+fn _pg_run_batch_cached(conn: PgConn, sql: string, params: list) -> PgBatchResult
+    let cached = _pg_ps_name(conn, sql)
+    if len(cached) > 0
+        let r = _pg_send_batch(conn, 0, sql, cached, params)
+        if r.had_err == 0
+            return r
+        if not _pg_ps_is_stale(r.errmsg)
+            return r
+        conn.pscache[sql] = ""
+    let nm = _pg_ps_alloc(conn, sql)
+    _pg_send_batch(conn, 1, sql, nm, params)
+
 fn pg_query_params(conn: PgConn, sql: string, params: list) -> any
-    let r = _pg_run_batch(conn, sql, params)
+    let r = _pg_run_batch_cached(conn, sql, params)
     if r.had_err == 1
         return err("pg: {r.errmsg}")
     ok(r.rows)
 
 fn pg_exec_params(conn: PgConn, sql: string, params: list) -> any
-    let r = _pg_run_batch(conn, sql, params)
+    let r = _pg_run_batch_cached(conn, sql, params)
     if r.had_err == 1
         return err("pg: {r.errmsg}")
     ok(r.affected)
