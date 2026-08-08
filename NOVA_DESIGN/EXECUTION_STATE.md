@@ -723,6 +723,105 @@ The concurrency gap on ARM is therefore now a MEASURED fact rather than an infer
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
+## Current focus — UPDATED 2026-08-08 (ORM HARDENING: 3 commits, 12/12 green incl. live PG)
+
+**Committed** on `highlevel-upgrade`: `9c8e1f84` (data integrity + pool corruption),
+`e0f0f5a1`-range (typed enum handle + MySQL pooling + transactions), `318cf3ee` (measured perf).
+
+⚠️ **These commits also swept in the previously-UNCOMMITTED DB-driver rewrite** that the note below
+attributes to a concurrent session — `forge_pg.nova` / `forge_mysql.nova` / `forge_orm.nova` were
+already modified in the working tree, so staging them committed that work too (commit 1 reports a
+60% rewrite of `forge_pg.nova`, larger than this session's own edits). Nothing was lost or reverted,
+and the full ORM suite is green, but the authorship of those diffs is mixed.
+
+**What was broken and is now fixed** (each verified by reading the source, then by test):
+- `_pg_run_batch` / `pg_exec` treated **EOF mid-query as SUCCESS** → a dead connection returned
+  `ok([])` from a SELECT and `ok(0)` from a write. A DB outage was indistinguishable from "0 rows";
+  a write that never happened reported success; and `pg_ping` (being `is_ok(pg_exec ...)`) declared
+  a DEAD connection healthy, so the pool kept handing it out. One missing `had_err = 1`.
+- `pg_with_tx` / `mysql_with_tx` **discarded BEGIN, COMMIT and ROLLBACK results** and returned the
+  BODY's Result → a failed COMMIT (deferred FK, serialization failure, deadlock, dropped conn)
+  reported success for data the server had just rolled back. A failed BEGIN ran the body with no
+  transaction at all.
+- Every pooled path released with `defer send(pool, conn)`, which is **not crash-safe** (defer
+  inlines at exit points; a panic longjmps past them) → pool drained to empty, then unbounded
+  `recv` parked forever. Now `on_exit_send` + `cancel_on_exit_val` + bounded `select_timeout`.
+- forge_orm's sqlite path paired `pool_acquire_to` (which REGISTERS a release) with a bare
+  `defer send` (which never cancels it) → **connection returned TWICE**, duplicate handles in the
+  pool, two tasks sharing one physical connection. KAT measured 14 connections in a pool of 3.
+- **Bools were bound to PostgreSQL as `"true"`**, which PG rejects for an int column (22P02) →
+  EVERY `orm_insert`/`orm_update` of a struct with a bool field failed on PG while silently
+  succeeding on SQLite. Root cause: a bool reads as `int`/`"1"` inline but `bool`/`"true"` across a
+  function-call boundary (measured — see memory).
+- **MySQL had no pool at all** through the ORM (one shared socket; MySQL's per-command packet
+  sequence number means concurrent queries corrupt each other). `forge_mysql` already had the whole
+  pool API — `orm_open` simply never wired it.
+
+**Now**: handle is an `enum OrmDrv` (exhaustiveness-checked, E1009) inside an `OrmDb` struct; every
+dispatch is a `match`; `orm_rows` is the sound Result primitive; `orm_exec` returns `Result` so an
+**ignored write error is a compile error**; `orm_with_tx` gives driver-agnostic transactions.
+PostgreSQL read path is **2.21× faster** (measured A/B: 1383 ms → 626 ms).
+
+**Next on this thread**: prepared-statement caching (every query still sends an UNNAMED Parse, so
+the server re-parses and re-plans each time) — the largest remaining win. Then streaming cursors and
+a batch/COPY path; both are absent today, so a large SELECT materialises entirely in memory.
+
+---
+
+## Current focus — UPDATED 2026-08-08 (DISTRIBUTION: bundled toolchains SHIPPED)
+
+**⚠️ THE WORKING TREE HAS SUBSTANTIAL UNCOMMITTED WORK. Nothing below is committed yet.**
+Branch `highlevel-upgrade`, on top of `98cce24f`. Another session is concurrently rewriting the
+DB drivers (`forge_pg.nova` / `forge_mysql.nova` / `forge_orm.nova` / `forge_storage.nova`) —
+those diffs are NOT from this work; leave them alone.
+
+**SHIPPED — NOVA now distributes as ONE self-contained download per platform, LLVM included.**
+Live at `https://novachan.org/download.html` (Vercel; the repo remote is Bitbucket).
+- `nova-0.1.0-windows-x64.zip` (81MB) — TRULY zero-dependency (llvm-mingw bundles a full
+  mingw-w64 UCRT sysroot). Proven: built + ran with `PATH` = `C:\Windows\system32` only.
+- `nova-0.1.0-linux-x64.tar.xz` (86MB) — proven building with a **completely empty `PATH`**.
+  Needs system `libc6-dev` only (official LLVM ships no libc). NOT "zero-dependency" — say so.
+- macOS: NOT built. Blocked on CI, not engineering — see the release-pipeline note below.
+
+**BUGS THIS FOUND AND FIXED (all in `nova_compiler.nova`, reconverged Windows AND Linux):**
+- 🔴 **`nova build` could NEVER link on Linux.** `nova_link()` had a Windows lib branch and NO
+  Unix branch — no `-lm`/`-lpthread`/`-ldl`, while `nova_runtime.c` always references libm.
+  Invisible because Linux was only ever exercised via `bootstrap_linux.sh`, which passes those
+  flags in its own hand-written clang command. `-lpthread -ldl` are gated on `linux` because
+  macOS has no `libdl.dylib` (`-ldl` = hard link error there).
+- `-fms-extensions` is needed at **THREE** sites, not two (`nova_warmup_runtime`, `nova_link`'s
+  `rt_cc`, AND the main link `cmd` — the last covers every explicit `--target` build).
+- Windows `cmd.exe` mis-parses a quoted space-containing first token → `_win_wrap_cmd()`.
+- New: `nova_find_clang()`, `nova_find_version()`, `nova toolchain status|path|install`,
+  exe-relative fallbacks in `resolve_module_file()`, and the default Windows triple moved
+  msvc → gnu (decision recorded in `NOVA_DESIGN/decisions/windows_toolchain_abi.md`).
+
+**FORGE/STD DUPLICATE-SYMBOL CLASS — CLOSED.** Full gate went **2831 PASS/21 FAIL → 2851/1**.
+19 forge wrappers collided with the `std/` module they imported (NOVA does not mangle per
+module). **Do NOT "fix" this class by adding mangling** — the link errors were MASKING
+self-recursive stubs (`fn f(x) -> return f(x)`) and real hangs; mangling turns a loud link
+failure into a silent stack overflow. Correct pattern = zero name overlap (see
+`lib/forge_anagram.nova`). Remaining 1 FAIL = `forge_pg_test`, the other session's WIP.
+
+**GATE STATUS (full arc, complete):** reconverge gen5==gen6 byte-identical on **Windows AND
+Linux**; regression NORMAL 2851/1/33 and FULLRC 2851/1/33 — *identical*, which is the proof
+that none of the above introduced a refcount/leak regression.
+
+**OPEN / NEXT:**
+- ⏸️ **Decision pending (owner):** bundle musl so Linux needs no system glibc and output
+  binaries are fully static — would make Linux match Windows. Real work, not a flag.
+- ⏸️ **GitHub mirror** — owner said yes, after the above. `.github/workflows/release.yml` is
+  written and correct but CANNOT run: the remote is Bitbucket. This is the ONLY thing blocking
+  macOS + automated releases. Until then `site/downloads/` holds hand-built archives and is
+  gitignored so 86MB binaries never enter git history.
+- 12 `_proof_*_test` files have **never run**: `_orphan_coverage_manifest.txt` lists them with a
+  trailing `.nova` and the harness appends `.nova` again → double extension → silent SKIP.
+- False-passes: `wasm_compute_test` (computes a value nothing checks — the WASM runner calls
+  `nova_user_main()` and ignores the result), `discovery_test` (needs `nova test` discovery mode;
+  the harness only builds+runs, so its 4 `assert`s never execute).
+- ⚠️ A fleet agent's `rm -f _audit_*` destroyed ~22 untracked scratch files belonging to the
+  concurrent session (unrecoverable). Fan-out prompts MUST mandate a run-unique scratch prefix.
+
 ## Current focus — UPDATED 2026-08-01 (rapid-dev: BUILTIN SOUNDNESS CAMPAIGN)
 
 **⚠️ READ FIRST — the builtin mass-production era is OVER; it was shipping broken code.**
