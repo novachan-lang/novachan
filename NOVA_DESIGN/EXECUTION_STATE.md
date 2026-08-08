@@ -723,6 +723,30 @@ The concurrency gap on ARM is therefore now a MEASURED fact rather than an infer
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
+## LAND FIRST — Windows 15.6 ms timer quantum caps ALL network I/O (VERIFIED 8x, NOT committed)
+
+Every NOVA network operation on Windows costs a FIXED ~15.4 ms regardless of what it does
+(INSERT 4643ms/300 = 15.5, SELECT 617/40 = 15.4, EXISTS 3084/200 = 15.4 — three different
+operations, identical per-op cost). That is ~65 queries/sec/connection.
+
+**Cause**: Windows' default timer resolution is 15.6 ms; the netpoller idles on `Sleep(1)`
+(`nova_runtime.c` ~10389) which rounds up to a full tick, and the runtime never calls
+`timeBeginPeriod(1)`. A task parking on I/O waits for the poller's next tick.
+
+**Patch** (in `nova_rt_init`, ~11184): `#ifdef _WIN32  timeBeginPeriod(1);  #endif` +
+`#include <mmsystem.h>` + link `-lwinmm`.
+
+**Measured**: INSERT 4643→**593 ms** (7.8x), SELECT 617→**171 ms** (3.6x), EXISTS 3084→**387 ms**
+(8.0x). Per-query 15.4 ms → ~2 ms.
+
+**NOT COMMITTED** — `nova_runtime.c` is RED-class and needs the full arc (reconverge gen5==gen6 +
+both-mode CI + perf gate), which did not fit the session budget; the runtime was reverted to
+pristine rather than committed ungated. Land this FIRST next session, then re-benchmark the Forge
+HTTP server, which is throttled by the same quantum. Full detail in memory
+`project_windows_timer_quantum_15ms_io`.
+
+---
+
 ## Current focus — UPDATED 2026-08-08 (ORM HARDENING: 3 commits, 12/12 green incl. live PG)
 
 **Committed** on `highlevel-upgrade`: `9c8e1f84` (data integrity + pool corruption),
