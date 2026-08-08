@@ -21,14 +21,21 @@ let _DB_ACQUIRE_TIMEOUT_MS = 5000
 // pool_acquire already does) would have to be added seven times. It is GENERIC in the body's result:
 // db_query yields a list of rows, db_last_id/db_affected/db_exec yield an int, db_query_named yields a
 // list of dicts -- <T> carries each through unboxed instead of collapsing them all to `any`.
-// NOTE (unchanged behaviour, pre-existing gap): like the old open-coded form this uses a bare
-// recv/send, so a panic inside `body` still leaks the connection. Only the transaction helpers
-// (with_tx / tx) take the crash-safe pool_acquire_to + pool_release path. Now there is exactly one
-// place to fix that.
+// CRASH SAFETY (was the "exactly one place to fix that" the previous note pointed at, now fixed):
+// this used a bare recv/send, so a panic inside `body` longjmped past the send and leaked the
+// connection permanently -- after N panics (N = pool size) the pool was empty and every later
+// request parked forever on recv. pool_acquire registers an on_exit_send that the fiber trampoline
+// drains on BOTH the normal and the crashed exit path, and pool_release cancels that registration
+// on the normal path, so the connection is returned EXACTLY ONCE either way. Fixing it here fixes
+// all seven non-transactional entry points (pool_query / pool_insert / pool_exec / db_insert /
+// db_delete / db_all / db_find) at once.
+// NOTE: pair pool_acquire with pool_release and NEVER with a bare `send` -- a bare send does not
+// cancel the registration, which returns the connection TWICE and puts duplicate handles in the
+// pool (two tasks then share one connection). That exact bug was live in forge_orm's sqlite path.
 fn <T> _with_conn(pool, body) -> T
-    let db = recv(pool)
+    let db = pool_acquire(pool)
     let r = body(db)
-    send(pool, db)
+    pool_release(pool, db)
     r
 
 // One positional row -> a dict keyed by `cols` (cols[i] names row[i]). Extra column names past the
@@ -77,9 +84,9 @@ fn pool_acquire_to(pool, ms: int) -> Result<int>
     if r[0] == 0
         // same crash-safe registration as pool_acquire -- see the note there
         on_exit_send(pool, r[1])
-        ok(r[1])
+        return ok(r[1])
     else
-        err("pool acquire timeout")
+        return err("pool acquire timeout")
 
 // Forge T2.7: run a body inside a DB TRANSACTION on a SINGLE pooled connection. Acquire one connection
 // (timeout-bounded -- a saturated pool returns err("pool acquire timeout") fast instead of parking this

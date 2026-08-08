@@ -1,27 +1,33 @@
-// forge_pg -- a pure-NOVA PostgreSQL driver. v1 = the wire-protocol ENCODING/PARSING (PG frontend/backend
-// protocol v3 = length-prefixed big-endian binary messages). This slice builds the client messages and
-// parses the key server replies; it is fully unit-testable WITHOUT a live PG server. The live connection
-// (TCP + the auth handshake incl. SCRAM-SHA-256 + the typed-query/pool integration parallel to forge_db)
-// is specified in NOVA_DESIGN/POSTGRES_DRIVER_DESIGN.md and built in a focused session (the test harness
-// has no PG server to gate against).
-
-// Big-endian int32 / int16 (PG is big-endian on the wire). Lengths are non-negative; the NULL marker (-1)
-// is emitted as four 0xFF bytes by the wire and read back as 0xFFFFFFFF, handled on parse.
+// forge_pg -- pure-NOVA PostgreSQL wire-protocol driver (v3). Big-endian framing, SCRAM-SHA-256 /
+// MD5 / cleartext auth, simple + extended (parameterized) query, LISTEN/NOTIFY, connection pool,
+// transactions, and query cancellation. Rows come back as name-keyed string/null dicts.
 import forge_crypto
 
+// ── data types ──────────────────────────────────────────────────────────────────────────────────
+type PgConn
+    kind: int
+    handle: int
+    pid: int
+    secret: int
+    params: dict
+
+type PgMsg
+    tag: int
+    body: bytes
+    leftover: bytes
+
+type PgBatchResult
+    had_err: int
+    errmsg: string
+    rows: list
+    affected: int
+
+// ── big-endian helpers ──────────────────────────────────────────────────────────────────────────
 fn pg_be32(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, (n / 16777216) % 256)
-    b = bytes_append(b, (n / 65536) % 256)
-    b = bytes_append(b, (n / 256) % 256)
-    b = bytes_append(b, n % 256)
-    b
+    bytes_from_list([(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255])
 
 fn pg_be16(n: int) -> any
-    let b = bytes(0)
-    b = bytes_append(b, (n / 256) % 256)
-    b = bytes_append(b, n % 256)
-    b
+    bytes_from_list([(n >> 8) & 255, n & 255])
 
 fn pg_rd_be32(b, off: int) -> int
     (bytes_get(b, off) * 16777216) + (bytes_get(b, off + 1) * 65536) + (bytes_get(b, off + 2) * 256) + bytes_get(b, off + 3)
@@ -29,14 +35,10 @@ fn pg_rd_be32(b, off: int) -> int
 fn pg_rd_be16(b, off: int) -> int
     (bytes_get(b, off) * 256) + bytes_get(b, off + 1)
 
-// A C string (NUL-terminated) as bytes.
 fn _cstr(s: string) -> any
     bytes_append(str_to_bytes(s), 0)
 
-// Read a C string from `b` at `p` -> [string, next_offset_after_NUL].
 fn _rd_cstr(b, p: int) -> any
-    // The scan is data-dependent (stop at the NUL), so the `while` stays -- but the string is built by
-    // pushing one char per byte and join()ing ONCE. `s = s + chr(..)` was quadratic (realloc+copy per byte).
     let parts = []
     let i = p
     while bytes_get(b, i) != 0
@@ -44,8 +46,7 @@ fn _rd_cstr(b, p: int) -> any
         i += 1
     [join(parts, ""), i + 1]
 
-// StartupMessage: int32 length (incl. itself) + int32 protocol (196608 = v3.0) + "user\0<u>\0database\0<d>\0"
-// + a final \0 (empty key terminates the parameter list).
+// ── message builders ────────────────────────────────────────────────────────────────────────────
 fn pg_startup_message(user: string, db: string) -> any
     let body = pg_be32(196608)
     body = bytes_concat(body, _cstr("user"))
@@ -55,17 +56,13 @@ fn pg_startup_message(user: string, db: string) -> any
     body = bytes_append(body, 0)
     bytes_concat(pg_be32(bytes_len(body) + 4), body)
 
-// Simple-query message: 'Q' + int32 length (excludes the tag, includes itself) + sql + \0.
 fn pg_query_message(sql: string) -> any
     let payload = _cstr(sql)
-    let msg = bytes(0)
-    msg = bytes_append(msg, 81)
+    let msg = bytes_append(bytes(0), 81)
     msg = bytes_concat(msg, pg_be32(bytes_len(payload) + 4))
     bytes_concat(msg, payload)
 
-// Parse a RowDescription ('T') message at `off` -> the list of column names. Layout: tag(1) + len(4) +
-// int16 field-count, then per field a C-string name + 18 metadata bytes (table oid 4, col 2, type oid 4,
-// type size 2, type mod 4, format 2).
+// ── parse helpers ───────────────────────────────────────────────────────────────────────────────
 fn pg_parse_row_description(b, off: int) -> any
     let count = pg_rd_be16(b, off + 5)
     let names = []
@@ -76,8 +73,7 @@ fn pg_parse_row_description(b, off: int) -> any
         p = r[1] + 18
     names
 
-// Parse a DataRow ('D') message at `off` -> the list of column value strings ("" for SQL NULL). Layout:
-// tag(1) + len(4) + int16 column-count, then per column an int32 value-length (-1 = NULL) + that many bytes.
+// DataRow -> list of string/null values. SQL NULL (vlen == -1) -> NOVA null.
 fn pg_parse_data_row(b, off: int) -> any
     let count = pg_rd_be16(b, off + 5)
     let vals = []
@@ -86,28 +82,21 @@ fn pg_parse_data_row(b, off: int) -> any
         let vlen = pg_rd_be32(b, p)
         p += 4
         if vlen > 2147483647
-            push(vals, "")
+            push(vals, null)
         else
-            // was a quadratic `s = s + chr(..)` per byte -> one comprehension + a single join.
             push(vals, join([chr(bytes_get(b, p + j)) for j in 0..vlen], ""))
             p += vlen
     vals
 
-// ── SCRAM-SHA-256 client (RFC 5802 / RFC 7677), pure-NOVA via forge_crypto ─────────────────────────
-// The auth handshake Postgres uses by default. All pure computation (no socket): given the user, the
-// password, the client nonce, and the server-first message, produce the client-final message (with the
-// ClientProof) and the expected ServerSignature (to verify the server-final). gs2 header "n,," -> "biws".
-
+// ── SCRAM-SHA-256 (RFC 5802 / RFC 7677) ────────────────────────────────────────────────────────
 fn pg_scram_client_first(user: string, cnonce: string) -> string
     "n,,n={user},r={cnonce}"
 
-// Parse "r=<rnonce>,s=<b64salt>,i=<iter>" -> [rnonce, salt_b64, iter].
 fn _pg_scram_parse_sf(sf: string) -> any
-    let parts = split(sf, ",")
     let rnonce = ""
     let salt_b64 = ""
     let iter = 0
-    for p in parts
+    for p in split(sf, ",")
         if len(p) >= 2
             let tag = slice(p, 0, 2)
             let val = slice(p, 2, len(p))
@@ -119,17 +108,11 @@ fn _pg_scram_parse_sf(sf: string) -> any
                 iter = parse_int(val)
     [rnonce, salt_b64, iter]
 
-// Finish the exchange: returns [client_final_message, expected_server_signature_b64]. The caller sends
-// out[0] and checks the server-final "v=" against out[1].
 fn pg_scram_finish(user: string, password: string, cnonce: string, server_first: string) -> any
     let sf = _pg_scram_parse_sf(server_first)
     let rnonce = sf[0]
     let salt = b64_decode_blist(sf[1])
     let iter = sf[2]
-    // RFC 5802: the server nonce MUST begin with (and extend) the client nonce -- this proves our nonce was
-    // incorporated and defends against a server/MITM substituting its own. Also reject a non-positive
-    // iteration count (a malformed or hostile server-first that would make PBKDF2 trivial). On any failure
-    // return [] (empty) so the caller aborts the handshake instead of authenticating to an unverified server.
     if not starts_with(rnonce, cnonce)
         return []
     if len(rnonce) <= len(cnonce)
@@ -144,94 +127,101 @@ fn pg_scram_finish(user: string, password: string, cnonce: string, server_first:
     let client_key = hmac_sha256_bytes(salted, str_to_blist("Client Key"))
     let stored_key = sha256_bytes(client_key)
     let client_sig = hmac_sha256_bytes(stored_key, am)
-    // ClientProof = ClientKey XOR ClientSignature, byte-for-byte (RFC 5802 §3). Same arithmetic, one
-    // comprehension -- this is NOT a crypto round, just the final XOR fold.
     let proof = [client_key[j] ^ client_sig[j] for j in 0..len(client_key)]
     let client_final = "{client_final_noproof},p={b64_encode_blist(proof)}"
     let server_key = hmac_sha256_bytes(salted, str_to_blist("Server Key"))
     let server_sig = hmac_sha256_bytes(server_key, am)
     [client_final, b64_encode_blist(server_sig)]
 
-// PG MD5 auth (legacy AuthenticationMD5Password). The client sends "md5" + md5(md5(password + user) +
-// salt), where `salt` is the 4 random bytes the server sent. SCRAM (above) is the modern default; this is
-// only for old servers. PG MD5 is structurally weak by design -- compatibility, not security.
 fn pg_md5_auth(user: string, password: string, salt) -> string
     let inner = md5_hex(password + user)
     let outer_in = [...str_to_blist(inner), ...salt]
     "md5{hex_of(md5_bytes(outer_in))}"
 
-// ── v2: LIVE driver (real socket; PLAINTEXT over tcp_* OR TLS via SChannel/OpenSSL) ──────────────────
-// A connection is [kind, handle]: kind 0 = plaintext (handle = tcp sock fd), 1 = TLS (handle = tls handle).
-// ALL wire I/O goes through _pg_send / _pg_recv_chunk, so the startup+auth+query logic is transport-agnostic.
+// ── transport (dispatch on conn.kind) ───────────────────────────────────────────────────────────
 extern fn nova_rt_os_random(n: int) -> bytes
 extern fn nova_rt_tls_upgrade(sock: int, host: string, verify: int) -> int
 extern fn nova_rt_tls_send_bytes(handle: int, b: bytes) -> int
 extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
-// (tls_close is already a compiler builtin -- used directly below, NOT re-declared as extern.)
 
-// A SCRAM client nonce: 18 CSPRNG bytes, base64'd (its alphabet excludes ',' so it is a valid nonce as-is).
 fn _pg_gen_nonce() -> string
     let rb = unsafe nova_rt_os_random(18)
     b64_encode_blist([bytes_get(rb, i) for i in 0..bytes_len(rb)])
 
-// Tagged frontend message: tag(1) + int32 len(payload+4) + payload.
 fn _pg_msg(tag: int, payload) -> any
-    let m = bytes(0)
-    m = bytes_append(m, tag)
+    let m = bytes_append(bytes(0), tag)
     m = bytes_concat(m, pg_be32(bytes_len(payload) + 4))
     bytes_concat(m, payload)
 
-// Transport-agnostic send (conn = [kind, handle]).
-fn _pg_send(conn, data)
-    if conn[0] == 1
-        unsafe nova_rt_tls_send_bytes(conn[1], data)
+fn _pg_send(conn: PgConn, data)
+    if conn.kind == 1
+        unsafe nova_rt_tls_send_bytes(conn.handle, data)
     else
-        tcp_send_bytes(conn[1], data)
+        tcp_send_bytes(conn.handle, data)
 
-// Transport-agnostic recv of the next chunk; empty bytes on EOF.
-fn _pg_recv_chunk(conn) -> any
-    if conn[0] == 1
-        return unsafe nova_rt_tls_recv_bytes(conn[1])
-    tcp_recv_bytes(conn[1])
+fn _pg_recv_chunk(conn: PgConn) -> any
+    if conn.kind == 1
+        return unsafe nova_rt_tls_recv_bytes(conn.handle)
+    tcp_recv_bytes(conn.handle)
 
-fn _pg_close_transport(conn)
-    if conn[0] == 1
-        tls_close(conn[1])
+fn _pg_close_transport(conn: PgConn)
+    if conn.kind == 1
+        tls_close(conn.handle)
     else
-        tcp_close(conn[1])
+        tcp_close(conn.handle)
 
-// Read exactly ONE backend message off the transport (accumulating across chunks). Returns
-// [tag(int), full_message_bytes (tag+len+body -> pg_parse_* take off=0), leftover_bytes]. tag -1 = EOF.
-fn _pg_recv_msg(conn, buf) -> any
-    // Both `while`s are data-dependent socket reads (read until enough bytes) -- NOT convertible.
+// Read one backend message -> PgMsg. tag == -1 means EOF.
+fn _pg_recv_msg(conn: PgConn, buf) -> PgMsg
     while bytes_len(buf) < 5
         let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
-            return [0 - 1, bytes(0), buf]
+            return PgMsg(0 - 1, bytes(0), buf)
         buf = bytes_concat(buf, chunk)
     let tag = bytes_get(buf, 0)
     let total = 1 + pg_rd_be32(buf, 1)
     while bytes_len(buf) < total
         let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
-            return [0 - 1, bytes(0), buf]
+            return PgMsg(0 - 1, bytes(0), buf)
         buf = bytes_concat(buf, chunk)
-    [tag, bytes_slice(buf, 0, total), bytes_slice(buf, total, bytes_len(buf))]
+    PgMsg(tag, bytes_slice(buf, 0, total), bytes_slice(buf, total, bytes_len(buf)))
 
-// Parse an ErrorResponse ('E') / NoticeResponse ('N') -> the primary human message (field 'M').
-fn _pg_parse_error(msg) -> string
+// ── error parsing ───────────────────────────────────────────────────────────────────────────────
+fn _pg_parse_error_full(msg) -> dict
+    let result = {"severity": "", "code": "", "message": "unknown error", "detail": "", "hint": "", "position": ""}
     let p = 5
-    let out = "unknown error"
     while bytes_get(msg, p) != 0
         let ftype = bytes_get(msg, p)
         let r = _rd_cstr(msg, p + 1)
         p = r[1]
-        if ftype == 77
-            out = r[0]
-    out
+        match ftype
+            83 => result["severity"] = r[0]
+            67 => result["code"] = r[0]
+            77 => result["message"] = r[0]
+            68 => result["detail"] = r[0]
+            72 => result["hint"] = r[0]
+            80 => result["position"] = r[0]
+            _ => _ = 0
+    result
 
-// Shared startup + auth handshake over an established transport. Returns ok(conn) ready for queries, or err.
-fn _pg_handshake(conn, user: string, db: string, password: string) -> any
+fn _pg_parse_error(msg) -> string
+    let e = _pg_parse_error_full(msg)
+    if len(e["code"]) > 0
+        return "{e["severity"]}: [{e["code"]}] {e["message"]}"
+    e["message"]
+
+fn pg_error_code(errmsg: string) -> string
+    let start = find(errmsg, "[")
+    let end_idx = find(errmsg, "]")
+    if start >= 0 and end_idx > start
+        return slice(errmsg, start + 1, end_idx)
+    ""
+
+// ── connect + handshake ─────────────────────────────────────────────────────────────────────────
+fn _pg_conn_new(kind: int, handle: int) -> PgConn
+    PgConn(kind, handle, 0, 0, {})
+
+fn _pg_handshake(conn: PgConn, user: string, db: string, password: string) -> any
     _pg_send(conn, pg_startup_message(user, db))
     let buf = bytes(0)
     let cnonce = ""
@@ -239,69 +229,67 @@ fn _pg_handshake(conn, user: string, db: string, password: string) -> any
     let done = 0
     while done == 0
         let m = _pg_recv_msg(conn, buf)
-        let tag = m[0]
-        let msg = m[1]
-        buf = m[2]
-        if tag == 0 - 1
+        buf = m.leftover
+        if m.tag == 0 - 1
             _pg_close_transport(conn)
             return err("pg: connection closed during startup/auth")
-        else if tag == 82
-            let code = pg_rd_be32(msg, 5)
-            if code == 0
-                done = 0
-            else if code == 3
-                _pg_send(conn, _pg_msg(112, _cstr(password)))
-            else if code == 5
-                let salt = [bytes_get(msg, 9 + si) for si in 0..4]
-                _pg_send(conn, _pg_msg(112, _cstr(pg_md5_auth(user, password, salt))))
-            else if code == 10
-                cnonce = _pg_gen_nonce()
-                let cfb = str_to_bytes(pg_scram_client_first(user, cnonce))
-                let payload = _cstr("SCRAM-SHA-256")
-                payload = bytes_concat(payload, pg_be32(bytes_len(cfb)))
-                payload = bytes_concat(payload, cfb)
-                _pg_send(conn, _pg_msg(112, payload))
-            else if code == 11
-                let sf = bytes_to_str(bytes_slice(msg, 9, bytes_len(msg)))
-                let fin = pg_scram_finish(user, password, cnonce, sf)
-                if len(fin) == 0
+        if m.tag == 82
+            let code = pg_rd_be32(m.body, 5)
+            match code
+                0 => _ = 0
+                3 => _pg_send(conn, _pg_msg(112, _cstr(password)))
+                5 =>
+                    let salt = [bytes_get(m.body, 9 + si) for si in 0..4]
+                    _pg_send(conn, _pg_msg(112, _cstr(pg_md5_auth(user, password, salt))))
+                10 =>
+                    cnonce = _pg_gen_nonce()
+                    let cfb = str_to_bytes(pg_scram_client_first(user, cnonce))
+                    let scram_payload = _cstr("SCRAM-SHA-256")
+                    scram_payload = bytes_concat(scram_payload, pg_be32(bytes_len(cfb)))
+                    scram_payload = bytes_concat(scram_payload, cfb)
+                    _pg_send(conn, _pg_msg(112, scram_payload))
+                11 =>
+                    let sf = bytes_to_str(bytes_slice(m.body, 9, bytes_len(m.body)))
+                    let fin = pg_scram_finish(user, password, cnonce, sf)
+                    if len(fin) == 0
+                        _pg_close_transport(conn)
+                        return err("pg: SCRAM server-first rejected (nonce/iteration check)")
+                    expected_sig = fin[1]
+                    _pg_send(conn, _pg_msg(112, str_to_bytes(fin[0])))
+                12 =>
+                    let svf = bytes_to_str(bytes_slice(m.body, 9, bytes_len(m.body)))
+                    if svf != "v={expected_sig}"
+                        _pg_close_transport(conn)
+                        return err("pg: SCRAM server signature mismatch (possible MITM)")
+                _ =>
                     _pg_close_transport(conn)
-                    return err("pg: SCRAM server-first rejected (nonce/iteration check)")
-                expected_sig = fin[1]
-                _pg_send(conn, _pg_msg(112, str_to_bytes(fin[0])))
-            else if code == 12
-                let svf = bytes_to_str(bytes_slice(msg, 9, bytes_len(msg)))
-                if svf != "v={expected_sig}"
-                    _pg_close_transport(conn)
-                    return err("pg: SCRAM server signature mismatch (possible MITM)")
-            else
-                _pg_close_transport(conn)
-                return err("pg: unsupported auth code {code}")
-        else if tag == 69
-            let e = _pg_parse_error(msg)
+                    return err("pg: unsupported auth code {code}")
+        else if m.tag == 83
+            let key = _rd_cstr(m.body, 5)
+            let val = _rd_cstr(m.body, key[1])
+            conn.params[key[0]] = val[0]
+        else if m.tag == 75
+            conn.pid = pg_rd_be32(m.body, 5)
+            conn.secret = pg_rd_be32(m.body, 9)
+        else if m.tag == 69
+            let e = _pg_parse_error(m.body)
             _pg_close_transport(conn)
             return err("pg: {e}")
-        else if tag == 90
+        else if m.tag == 90
             done = 1
     ok(conn)
 
-// Plaintext connect -> ok([0, sock]) ready for queries, or err.
 fn pg_connect(host: string, port: int, user: string, db: string, password: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
         return err("pg: cannot connect to {host}:{port}")
-    _pg_handshake([0, sock], user, db, password)
+    _pg_handshake(_pg_conn_new(0, sock), user, db, password)
 
-// TLS connect: PG SSLRequest ([int32 8][int32 80877103]); on 'S' upgrade the socket to TLS and run the SAME
-// startup+auth over the encrypted transport. `sslmode`: "require" = encrypt only (no cert check -- works
-// with a self-signed dev server); "verify-full" (or "verify-ca") = validate the cert chain to a trusted
-// root AND the hostname (MITM-safe). On 'N' the server declined TLS -> fail closed.
 fn pg_connect_tls(host: string, port: int, user: string, db: string, password: string, sslmode: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
         return err("pg: cannot connect to {host}:{port}")
-    let req = pg_be32(8)
-    req = bytes_concat(req, pg_be32(80877103))
+    let req = bytes_concat(pg_be32(8), pg_be32(80877103))
     tcp_send_bytes(sock, req)
     let reply = tcp_recv_bytes(sock)
     if bytes_len(reply) < 1
@@ -315,10 +303,28 @@ fn pg_connect_tls(host: string, port: int, user: string, db: string, password: s
     if tls == 0
         tcp_close(sock)
         return err("pg: TLS handshake/verification failed (sslmode={sslmode})")
-    _pg_handshake([1, tls], user, db, password)
+    _pg_handshake(_pg_conn_new(1, tls), user, db, password)
 
-// Run a simple-protocol query -> ok(list of name-keyed row dicts; "" for SQL NULL) or err.
-fn pg_exec(conn, sql: string) -> any
+fn pg_server_param(conn: PgConn, key: string) -> string
+    if key in conn.params
+        return conn.params[key]
+    ""
+
+fn pg_backend_pid(conn: PgConn) -> int
+    conn.pid
+
+// CancelRequest on a separate unauthenticated connection.
+fn pg_cancel(host: string, port: int, conn: PgConn) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("pg: cannot connect to {host}:{port} for cancel")
+    let msg = bytes_concat(pg_be32(16), bytes_concat(pg_be32(80877102), bytes_concat(pg_be32(conn.pid), pg_be32(conn.secret))))
+    tcp_send_bytes(sock, msg)
+    tcp_close(sock)
+    ok(null)
+
+// ── simple query ────────────────────────────────────────────────────────────────────────────────
+fn pg_exec(conn: PgConn, sql: string) -> any
     _pg_send(conn, pg_query_message(sql))
     let buf = bytes(0)
     let names = []
@@ -328,80 +334,103 @@ fn pg_exec(conn, sql: string) -> any
     let had_err = 0
     while done == 0
         let m = _pg_recv_msg(conn, buf)
-        let tag = m[0]
-        let msg = m[1]
-        buf = m[2]
-        if tag == 0 - 1
+        buf = m.leftover
+        if m.tag == 0 - 1
+            // EOF MID-QUERY IS A FAILURE, NOT AN EMPTY RESULT. This previously did only `done = 1`,
+            // leaving had_err = 0, so a dead connection (server restart, backend crash, network drop,
+            // idle-timeout reap) returned ok([]) from a SELECT and ok(0) from a write. Three
+            // catastrophic consequences composed out of that one omission:
+            //   1. a DB outage was indistinguishable from "0 rows" -- reads silently returned empty,
+            //   2. a write that NEVER HAPPENED reported success to the caller,
+            //   3. pg_ping is `is_ok(pg_exec(conn, "SELECT 1"))`, so it declared a DEAD connection
+            //      HEALTHY -- the pool's own health check lied and kept handing the corpse out.
+            // A normal query always ends at ReadyForQuery (tag 90) BEFORE any close, so reaching EOF
+            // here only ever means abnormal termination. Keep the FIRST error when one was already
+            // reported (an ErrorResponse is more diagnostic than the EOF that followed it).
+            if had_err == 0
+                errmsg = "connection closed mid-query (EOF)"
+            had_err = 1
             done = 1
-        else if tag == 84
-            names = pg_parse_row_description(msg, 0)
-        else if tag == 68
-            let vals = pg_parse_data_row(msg, 0)
+        else if m.tag == 84
+            names = pg_parse_row_description(m.body, 0)
+        else if m.tag == 68
+            let vals = pg_parse_data_row(m.body, 0)
             let row = {}
             for i, nm in names
                 if i < len(vals)
                     row[nm] = vals[i]
             push(rows, row)
-        else if tag == 69
-            errmsg = _pg_parse_error(msg)
+        else if m.tag == 69
+            errmsg = _pg_parse_error(m.body)
             had_err = 1
-        else if tag == 90
+        else if m.tag == 65
+            _ = 0
+        else if m.tag == 71
+            let fail_msg = _cstr("COPY FROM STDIN not supported by this driver")
+            _pg_send(conn, _pg_msg(102, fail_msg))
+            had_err = 1
+            errmsg = "COPY FROM STDIN is not supported by this driver"
+        else if m.tag == 72
+            had_err = 1
+            errmsg = "COPY TO STDOUT is not supported by this driver; use pg_query_params with a SELECT instead"
+        else if m.tag == 90
             done = 1
     if had_err == 1
         return err("pg: {errmsg}")
     ok(rows)
 
-// Close cleanly: Terminate ('X') then close the transport.
-fn pg_close(conn)
+// Terminate ('X') + close.
+fn pg_close(conn: PgConn)
     _pg_send(conn, _pg_msg(88, bytes(0)))
     _pg_close_transport(conn)
 
-// ── PARAMETERIZED queries (extended protocol) — INJECTION-SAFE ──────────────────────────────────────
-// The SQL uses $1,$2,... placeholders; the values are sent as SEPARATE Bind parameters and are NEVER
-// concatenated into the SQL string, so a value like "x'; DROP TABLE t; --" is bound as a literal, never
-// parsed as SQL. This is the production-grade, injection-safe path (vs pg_exec's simple-query string).
-// All params are sent in TEXT format; the server coerces per the column/placeholder type.
+// ── LISTEN/NOTIFY ───────────────────────────────────────────────────────────────────────────────
+fn pg_listen(conn: PgConn, channel_name: string) -> any
+    pg_exec(conn, "LISTEN {channel_name}")
 
-// Parse ('P'): unnamed statement + query + int16(0 param-type OIDs -> server infers).
+fn pg_notify(conn: PgConn, channel_name: string, payload: string) -> any
+    pg_exec(conn, "NOTIFY {channel_name}, '{payload}'")
+
+fn pg_wait_notify(conn: PgConn, timeout_ms: int) -> any
+    let buf = bytes(0)
+    let m = _pg_recv_msg(conn, buf)
+    if m.tag == 0 - 1
+        return err("pg: connection closed while waiting for notification")
+    if m.tag == 65
+        let pid = pg_rd_be32(m.body, 5)
+        let ch = _rd_cstr(m.body, 9)
+        let pl = _rd_cstr(m.body, ch[1])
+        return ok({"pid": pid, "channel": ch[0], "payload": pl[0]})
+    ok(null)
+
+// ── parameterized queries (extended protocol, injection-safe) ───────────────────────────────────
 fn _pg_parse_msg(sql: string) -> any
-    let payload = _cstr("")
-    payload = bytes_concat(payload, _cstr(sql))
-    payload = bytes_concat(payload, pg_be16(0))
+    let payload = bytes_concat(_cstr(""), bytes_concat(_cstr(sql), pg_be16(0)))
     _pg_msg(80, payload)
 
-// Bind ('B'): unnamed portal + unnamed statement + int16(0 param fmt codes = all text) + int16(nparams)
-// + per param [int32 len + bytes] + int16(0 result fmt codes = all text).
+// Bind: null params -> 4 bytes 0xFF (wire -1), others stringified as text.
 fn _pg_bind_msg(params: list) -> any
-    let payload = _cstr("")
-    payload = bytes_concat(payload, _cstr(""))
+    let payload = bytes_concat(_cstr(""), _cstr(""))
     payload = bytes_concat(payload, pg_be16(0))
     payload = bytes_concat(payload, pg_be16(len(params)))
     for p in params
-        let pb = str_to_bytes(p)
-        payload = bytes_concat(payload, pg_be32(bytes_len(pb)))
-        payload = bytes_concat(payload, pb)
+        if p == null
+            payload = bytes_concat(payload, bytes_from_list([255, 255, 255, 255]))
+        else
+            let pb = str_to_bytes(str(p))
+            payload = bytes_concat(payload, bytes_concat(pg_be32(bytes_len(pb)), pb))
     payload = bytes_concat(payload, pg_be16(0))
     _pg_msg(66, payload)
 
-// Describe ('D') the unnamed PORTAL ('P') -> the server returns RowDescription so we get column names.
 fn _pg_describe_portal_msg() -> any
-    let payload = bytes(0)
-    payload = bytes_append(payload, 80)
+    let payload = bytes_append(bytes(0), 80)
     payload = bytes_concat(payload, _cstr(""))
     _pg_msg(68, payload)
 
-// Execute ('E') the unnamed portal, int32 max_rows = 0 (all).
 fn _pg_execute_msg() -> any
-    let payload = _cstr("")
-    payload = bytes_concat(payload, pg_be32(0))
-    _pg_msg(69, payload)
+    _pg_msg(69, bytes_concat(_cstr(""), pg_be32(0)))
 
-// Run a parameterized query. `params` = a list of string values bound to $1,$2,... (text format; NULL
-// params are not yet supported -- a tracked limitation). Returns ok(list of name-keyed row dicts) or err.
-// PRIVATE: read a NUL-terminated ASCII C-string from bytes `b` at `off`. Command tags are ASCII
-// (0x00-free until the terminator), so chr()-building is safe here.
 fn _pg_cstr(b, off: int) -> string
-    // Short-circuiting NUL scan -> the `while` stays; the string is joined ONCE instead of `s = s + c`.
     let parts = []
     let i = off
     let n = bytes_len(b)
@@ -410,21 +439,14 @@ fn _pg_cstr(b, off: int) -> string
         i += 1
     join(parts, "")
 
-// affected-row count from a CommandComplete tag (libpq's PQcmdTuples). Postgres tags: "INSERT <oid>
-// <rows>", "UPDATE <rows>", "DELETE <rows>", "SELECT <rows>", "MOVE <n>", "FETCH <n>", "COPY <n>"; the
-// count is always the LAST space-separated token. DDL tags ("CREATE TABLE", "BEGIN") have no count -> the
-// last token is non-numeric -> parse_int -> 0 (DDL affects 0 rows).
 fn pg_cmd_affected(tag: string) -> int
     let parts = split(tag, " ")
     if len(parts) == 0
         return 0
     parse_int(parts[len(parts) - 1])
 
-// PRIVATE: run the extended-query batch (Parse/Bind/Describe/Execute/Sync), reading to ReadyForQuery
-// (Sync's error recovery guarantees a 'Z' even on error). Returns [had_err, errmsg, rows, affected].
-// affected comes from the CommandComplete ('C'=67) command tag; msg carries the 5-byte header so the
-// tag string starts at offset 5 (same convention as _pg_parse_error / pg_parse_data_row).
-fn _pg_run_batch(conn, sql: string, params: list) -> list
+// Run Parse/Bind/Describe/Execute/Sync batch -> PgBatchResult struct.
+fn _pg_run_batch(conn: PgConn, sql: string, params: list) -> PgBatchResult
     _pg_send(conn, _pg_parse_msg(sql))
     _pg_send(conn, _pg_bind_msg(params))
     _pg_send(conn, _pg_describe_portal_msg())
@@ -439,55 +461,54 @@ fn _pg_run_batch(conn, sql: string, params: list) -> list
     let affected = 0
     while done == 0
         let m = _pg_recv_msg(conn, buf)
-        let tag = m[0]
-        let msg = m[1]
-        buf = m[2]
-        if tag == 0 - 1
+        buf = m.leftover
+        if m.tag == 0 - 1
+            // Same defect as the simple-query loop in pg_exec -- see the long note there. EOF left
+            // had_err = 0, so the extended (parameterized) protocol -- which is the path the ORM and
+            // every pooled query use -- reported a dead connection as ok([]) / ok(0 affected).
+            // pg_with_tx compounded it: BEGIN, the body, and COMMIT all "succeeded" on a corpse.
+            if had_err == 0
+                errmsg = "connection closed mid-query (EOF)"
+            had_err = 1
             done = 1
-        else if tag == 84
-            names = pg_parse_row_description(msg, 0)
-        else if tag == 68
-            let vals = pg_parse_data_row(msg, 0)
+        else if m.tag == 84
+            names = pg_parse_row_description(m.body, 0)
+        else if m.tag == 68
+            let vals = pg_parse_data_row(m.body, 0)
             let row = {}
             for i, nm in names
                 if i < len(vals)
                     row[nm] = vals[i]
             push(rows, row)
-        else if tag == 67
-            affected = pg_cmd_affected(_pg_cstr(msg, 5))
-        else if tag == 69
-            errmsg = _pg_parse_error(msg)
+        else if m.tag == 67
+            affected = pg_cmd_affected(_pg_cstr(m.body, 5))
+        else if m.tag == 69
+            errmsg = _pg_parse_error(m.body)
             had_err = 1
-        else if tag == 90
+        else if m.tag == 65
+            _ = 0
+        else if m.tag == 90
             done = 1
-    [had_err, errmsg, rows, affected]
+    PgBatchResult(had_err, errmsg, rows, affected)
 
-// Parameterized (injection-safe) query -> ok(list of name-keyed row dicts) or err.
-fn pg_query_params(conn, sql: string, params: list) -> any
+fn pg_query_params(conn: PgConn, sql: string, params: list) -> any
     let r = _pg_run_batch(conn, sql, params)
-    if r[0] == 1
-        return err("pg: {r[1]}")
-    ok(r[2])
+    if r.had_err == 1
+        return err("pg: {r.errmsg}")
+    ok(r.rows)
 
-// Like pg_query_params but for INSERT/UPDATE/DELETE/DDL: returns ok(affected_row_count) parsed from the
-// CommandComplete tag (0 for DDL / no-count statements). Reads to ReadyForQuery like the query path.
-fn pg_exec_params(conn, sql: string, params: list) -> any
+fn pg_exec_params(conn: PgConn, sql: string, params: list) -> any
     let r = _pg_run_batch(conn, sql, params)
-    if r[0] == 1
-        return err("pg: {r[1]}")
-    ok(r[3])
+    if r.had_err == 1
+        return err("pg: {r.errmsg}")
+    ok(r.affected)
 
-// ── connection POOL + transactions (parallel to forge_db pool_*/with_tx) ─────────────────────────────
-// A pool is a channel of authenticated connections; acquire = recv (parks until one frees), release = send.
-// Opens n plaintext connections; on ANY failure cleanly closes those already opened and returns the err.
+// ── connection pool + transactions ──────────────────────────────────────────────────────────────
 fn pg_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
     let ch = channel()
     let opened = 0
     for i in 0..n
         let r = pg_connect(host, port, user, db, password)
-        // is_ok/unwrap (runtime Result-tag checks) -- NOT `match Ok/Err`. A match on the any-typed
-        // pg_connect() result mis-resolves the constructor inside this module (tracked compiler bug); the
-        // runtime tag ops are unaffected. On failure, return r (already an Err Result) after closing opened.
         if is_ok(r)
             send(ch, unwrap(r))
             opened += 1
@@ -497,47 +518,207 @@ fn pg_pool_open(host: string, port: int, user: string, db: string, password: str
             return r
     ok(ch)
 
+// Default bounded-acquire budget. A saturated pool degrades to a fast, catchable err() instead of
+// parking the calling task forever. (Module-level INT is safe; a module-level dict literal reads back
+// EMPTY on this toolchain, so never hoist config into one.)
+let _PG_ACQUIRE_TIMEOUT_MS = 5000
+
+// ── crash-safe, bounded pool acquire/release ────────────────────────────────────────────────────
+// `defer send(pool, conn)` -- what every pooled function below used to do -- is NOT crash-safe.
+// `defer` is a COMPILE-TIME construct: the deferred expression is inlined at the function's exit
+// points, and a panic longjmps to the task's fault boundary straight PAST all of them. So a request
+// handler that panicked while holding a pooled connection leaked it permanently. After N such
+// crashes (N = pool size) the pool was empty and every later `recv(pool)` -- itself unbounded --
+// parked FOREVER: a slow-motion outage that reads as a hang rather than a 500.
+//
+// The fix is the task-scoped cleanup registry, which the fiber trampoline drains on BOTH the normal
+// and the crashed exit path: on_exit_send registers the release, cancel_on_exit_val cancels it once
+// the normal path has released. forge_db.pool_acquire has used this since Forge blocker #3; forge_pg
+// had never adopted it. select_timeout additionally BOUNDS the wait (verified to preserve a struct
+// payload intact, which matters here because this pool carries PgConn structs, not int handles).
+fn _pg_acq(pool, ms: int) -> any
+    let r = select_timeout(pool, ms)
+    if r[0] == 0
+        on_exit_send(pool, r[1])
+        return ok(r[1])
+    err("pg: pool acquire timeout after {ms}ms (all connections busy)")
+
+fn _pg_rel(pool, conn)
+    send(pool, conn)
+    cancel_on_exit_val(pool, conn)
+
+// A connection-level failure means THIS connection is unusable, not that the query was invalid.
+// Returning such a connection to the pool re-poisons it for the next caller, so it is closed and
+// DROPPED instead (the pool shrinks by one rather than serving a corpse). Its cleanup registration
+// is cancelled first so the trampoline does not resurrect it at task exit.
+fn _pg_discard(pool, conn)
+    cancel_on_exit_val(pool, conn)
+    pg_close(conn)
+
+fn _pg_is_conn_err(msg: string) -> bool
+    find(msg, "connection closed mid-query") >= 0 or find(msg, "EOF") >= 0
+
+// Real liveness check. This used to be `is_ok(pg_exec(conn, "SELECT 1"))`, which was worthless while
+// pg_exec reported EOF as success -- it declared a DEAD connection healthy. Now that EOF is an error
+// it works, but it additionally VALIDATES THE ANSWER: a connection left mid-protocol by an earlier
+// aborted query can return a previous query's rows, and only checking the value catches that.
+fn pg_ping(conn: PgConn) -> bool
+    let r = pg_exec(conn, "SELECT 1 AS ping")
+    if is_err(r)
+        return false
+    let rows = unwrap(r)
+    if len(rows) != 1
+        return false
+    str(rows[0]["ping"]) == "1"
+
+// Health-checked acquire, BOUNDED. The old version closed a dead connection and RECURSED, which
+// permanently shrank the pool and, once it emptied, parked forever on recv. Now: at most
+// `max_tries` attempts, each with a bounded wait, dead connections dropped, and a clear err()
+// instead of an unbounded recursion. (Opening a REPLACEMENT connection needs the DSN, which a bare
+// channel cannot carry -- see pg_pool_open's note.)
+fn pg_acquire_checked(pool, ms: int, max_tries: int) -> any
+    let tries = 0
+    while tries < max_tries
+        let a = _pg_acq(pool, ms)
+        if is_err(a)
+            return a
+        let conn: PgConn = unwrap(a)
+        if pg_ping(conn)
+            return ok(conn)
+        _pg_discard(pool, conn)
+        tries += 1
+    err("pg: no live connection after {max_tries} attempts")
+
+// Back-compat shim for the previous unchecked signature. Returns the connection directly (not a
+// Result), so it cannot report exhaustion -- prefer pg_acquire_checked.
 fn pg_acquire(pool)
-    recv(pool)
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return null
+    unwrap(a)
 
-fn pg_release(pool, conn)
-    send(pool, conn)
+fn pg_release(pool, conn: PgConn)
+    _pg_rel(pool, conn)
 
-// Acquire -> query -> release. Returns ok(list of name-keyed row dicts) or err.
+// ── pooled queries ──────────────────────────────────────────────────────────────────────────────
+// Each acquires crash-safely + bounded, runs the statement, and releases. A connection-level failure
+// discards the connection rather than handing a broken one to the next caller.
 fn pg_query(pool, sql: string) -> any
-    let conn = recv(pool)
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: PgConn = unwrap(a)
     let r = pg_exec(conn, sql)
-    send(pool, conn)
+    if is_err(r) and _pg_is_conn_err(str(unwrap_err(r)))
+        _pg_discard(pool, conn)
+        return r
+    _pg_rel(pool, conn)
     r
 
-// Parameterized (injection-safe) pooled query: acquire -> pg_query_params -> release.
 fn pg_query_params_pool(pool, sql: string, params: list) -> any
-    let conn = recv(pool)
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: PgConn = unwrap(a)
     let r = pg_query_params(conn, sql, params)
-    send(pool, conn)
+    if is_err(r) and _pg_is_conn_err(str(unwrap_err(r)))
+        _pg_discard(pool, conn)
+        return r
+    _pg_rel(pool, conn)
     r
 
-// Pooled exec for INSERT/UPDATE/DELETE/DDL: acquire -> pg_exec_params -> release. Returns ok(affected).
 fn pg_exec_params_pool(pool, sql: string, params: list) -> any
-    let conn = recv(pool)
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: PgConn = unwrap(a)
     let r = pg_exec_params(conn, sql, params)
-    send(pool, conn)
+    if is_err(r) and _pg_is_conn_err(str(unwrap_err(r)))
+        _pg_discard(pool, conn)
+        return r
+    _pg_rel(pool, conn)
     r
 
-// Run body_fn(conn) in a transaction on ONE pooled connection: BEGIN, then COMMIT if body returns ok(..)
-// or ROLLBACK if it returns err(..). The connection is released either way. Returns the body's Result.
+// BEGIN -> body_fn(conn) -> COMMIT on ok / ROLLBACK on err, with EVERY step's result checked.
+//
+// The previous version DISCARDED the result of BEGIN, COMMIT and ROLLBACK and returned the BODY's
+// Result, which produced two silent data-integrity failures -- the worst class of ORM bug, because
+// the caller is told the write succeeded:
+//   1. BEGIN failed  -> the body then ran with NO transaction open, so its statements auto-committed
+//      individually. A "transaction" that provided zero atomicity, reported as a transaction.
+//   2. COMMIT failed -> returned the body's ok(...). A deferred FK violation, a serialization
+//      failure (SQLSTATE 40001), a disk-full, or a connection drop all abort the transaction AT
+//      COMMIT; the caller believed data was persisted that PostgreSQL had just rolled back.
+// A failed COMMIT now surfaces as err(), and the connection is treated as suspect. (2) was
+// demonstrated against a live server by _tbadv_prod_d1.nova using a DEFERRABLE INITIALLY DEFERRED
+// FK, which is exactly the case where only COMMIT can fail.
 fn pg_with_tx(pool, body_fn) -> any
-    let conn = recv(pool)
-    pg_exec(conn, "BEGIN")
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: PgConn = unwrap(a)
+    let b = pg_exec(conn, "BEGIN")
+    if is_err(b)
+        // No transaction was opened -- do NOT run the body, or it would silently autocommit.
+        let bmsg = str(unwrap_err(b))
+        if _pg_is_conn_err(bmsg)
+            _pg_discard(pool, conn)
+        else
+            _pg_rel(pool, conn)
+        return err("pg tx: BEGIN failed: {bmsg}")
     let r = body_fn(conn)
-    if is_ok(r)
-        pg_exec(conn, "COMMIT")
-    else
-        pg_exec(conn, "ROLLBACK")
-    send(pool, conn)
+    if is_err(r)
+        // Body failed -> roll back. A ROLLBACK that itself fails means the connection is unusable
+        // (the server is gone, or the session is stuck in a failed transaction), so drop it rather
+        // than return a connection still inside an aborted transaction to the next caller.
+        let rb = pg_exec(conn, "ROLLBACK")
+        if is_err(rb)
+            _pg_discard(pool, conn)
+        else
+            _pg_rel(pool, conn)
+        return r
+    let c = pg_exec(conn, "COMMIT")
+    if is_err(c)
+        let cmsg = str(unwrap_err(c))
+        if _pg_is_conn_err(cmsg)
+            _pg_discard(pool, conn)
+        else
+            _pg_rel(pool, conn)
+        return err("pg tx: COMMIT failed, transaction did NOT persist: {cmsg}")
+    _pg_rel(pool, conn)
     r
 
-// Close all n pooled connections (drain + Terminate + close each).
+// Drain and close up to n pooled connections. Bounded so shutdown cannot hang: connections that were
+// discarded (a dead one dropped by _pg_discard) or are still checked out by an in-flight request mean
+// fewer than n are in the channel, and the old unbounded `recv(pool)` parked FOREVER on the first
+// missing one -- turning a graceful shutdown into a hung process.
 fn pg_pool_close(pool, n: int)
+    let closed = 0
     for i in 0..n
-        pg_close(recv(pool))
+        let r = select_timeout(pool, 2000)
+        if r[0] == 0
+            let c: PgConn = r[1]
+            pg_close(c)
+            closed += 1
+    closed
+
+// ── typed-value convenience (heuristic coercion from text wire format) ──────────────────────────
+fn pg_typed_val(val, col_name: string) -> any
+    if val == null
+        return null
+    let s = str(val)
+    if s == "t"
+        return true
+    if s == "f"
+        return false
+    if len(s) > 0 and (s[0] == "-" or (s[0] >= "0" and s[0] <= "9"))
+        if contains(s, ".")
+            return parse_float(s)
+        return parse_int(s)
+    s
+
+fn pg_typed_row(row: dict) -> dict
+    let out = {}
+    for k in keys(row)
+        out[k] = pg_typed_val(row[k], k)
+    out

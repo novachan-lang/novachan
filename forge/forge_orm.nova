@@ -19,6 +19,10 @@
 import forge_db
 import forge_pg
 import forge_mysql
+// sqlitex is imported directly (not just transitively via forge_db) so db_query_named/db_write are in
+// scope for the sqlite branches of orm_all/orm_exec below -- NOVA does not re-export an imported module's
+// names through a second hop (forge_db importing sqlitex does not put sqlitex's names in forge_orm's scope).
+import sqlitex
 
 // Default acquire timeout for the sqlite pool paths below (orm_all / orm_exec): a saturated pool degrades
 // to a fast, catchable err()/[] instead of parking the calling task forever -- see forge_db.pool_acquire_to.
@@ -54,9 +58,31 @@ fn _orm_pg_sql(sql: string) -> string
             push(parts, ch)
     join(parts, "")
 
-// PostgreSQL binds parameters in text format -> stringify every value uniformly.
+// PostgreSQL binds parameters in TEXT format -> stringify every value uniformly.
+//
+// BOOL ENCODING (was a total failure of the PG write path for any struct with a bool field): a NOVA
+// bool must be sent as "1"/"0", NOT as str()'s "true"/"false". PostgreSQL accepts '1'/'0' as valid
+// input for BOTH a boolean column AND an integer column, whereas 'true' into an INTEGER column is
+// rejected outright with `invalid input syntax for type integer: "true"`. Storing a bool in an int
+// column is exactly how bools are kept portable across sqlite/PG/MySQL, so EVERY orm_insert/orm_update
+// of a struct carrying a bool field silently failed on PostgreSQL -- and silently SUCCEEDED on SQLite,
+// which is loosely typed and accepts 'true' in an int column. That is why this only ever showed up on
+// the live-PG path, which is skipped in CI unless PGPASSWORD is set.
+//
+// Detecting the bool is subtle, and MEASURED rather than assumed: a NOVA bool reports DIFFERENTLY
+// depending on where it is observed. Read inline in a `for` loop it is str()="1" / type_name()="int";
+// passed across a FUNCTION-CALL boundary (which is exactly what the comprehension below does) it is
+// str()="true" / type_name()="bool". So the test is written to accept EITHER representation: any
+// non-string value whose str() is "true"/"false" is a bool and becomes "1"/"0". Excluding strings is
+// what keeps a genuine TEXT value of "true" untouched, so text columns are never corrupted into "1".
+fn _orm_pg_param1(p) -> string
+    let s = str(p)
+    if type_name(p) != "string" and (s == "true" or s == "false")
+        return "1" if s == "true" else "0"
+    s
+
 fn _orm_pg_params(params) -> list
-    [str(p) for p in params]
+    [_orm_pg_param1(p) for p in params]
 
 // ---- NULL params -----------------------------------------------------------------------------------
 // NOVA has no nullable value, so orm_null() returns a control-char-delimited sentinel string that no real
@@ -229,8 +255,18 @@ fn orm_all(db, sql: string, params) -> list
             // parking this call forever.
             return []
         let c = unwrap(acq)
-        defer send(h, c)
-        return db_query_named(c, sql, params)
+        // DOUBLE-RELEASE BUG (fixed): this was `defer send(h, c)`. pool_acquire_to REGISTERS a
+        // crash-safe release via on_exit_send, and a bare `send` does not cancel that registration --
+        // so on the normal path the connection went back to the pool TWICE: once from the defer, and
+        // again when the fiber trampoline drained the task's cleanup registry at exit. The pool then
+        // held duplicate handles, so two tasks could acquire the SAME physical sqlite connection and
+        // interleave statements on it (cross-request row mixing, and outright memory corruption when
+        // sqlite is built single-threaded). It also grew the pool without bound -- one extra duplicate
+        // per call. pool_release does send + cancel_on_exit_val, which is exactly-once on BOTH the
+        // normal and the crashed path.
+        let rows = db_query_named(c, sql, params)
+        pool_release(h, c)
+        return rows
     if kind == "postgres"
         let r = forge_pg.pg_query_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
         if is_ok(r)
@@ -273,11 +309,13 @@ fn orm_exec(db, sql: string, params) -> any
     params = _na[1]
     if kind == "sqlite"
         let c = pool_acquire_to(h, _ORM_ACQUIRE_TIMEOUT_MS)?
-        defer send(h, c)
         // db_write actually checks sqlite3_step's return code (see sqlitex.nova) -- previously this called
         // db_query (which can't report failure) and then ALWAYS returned ok(n), so a constraint violation,
         // SQLITE_BUSY, or any other write failure was reported as success to every orm_exec caller.
-        return db_write(c, sql, params)
+        // Release via pool_release, NOT `defer send` -- see the double-release note in orm_all above.
+        let wr = db_write(c, sql, params)
+        pool_release(h, c)
+        return wr
     if kind == "postgres"
         // pg_exec_params_pool returns ok(affected) from the CommandComplete tag (0 for DDL).
         return forge_pg.pg_exec_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))

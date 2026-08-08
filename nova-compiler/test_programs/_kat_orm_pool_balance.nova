@@ -1,0 +1,136 @@
+// _kat_orm_pool_balance -- KAT for the ORM pool-accounting fixes. These defects are INVISIBLE to a
+// normal functional assertion (every query still returns the right rows), so they need a test that
+// inspects the pool itself.
+//
+// KNOWN ANSWER: a pool opened with N connections must still contain EXACTLY N connections after any
+// number of ORM operations. Not N+k (double release), not N-k (leak).
+//
+// Bug 1 -- DOUBLE RELEASE (forge_orm sqlite path): orm_all/orm_exec called pool_acquire_to, which
+// REGISTERS a crash-safe release via on_exit_send, and then released with a bare `defer send(h, c)`
+// that never cancelled the registration. The connection went back to the pool TWICE -- once from the
+// defer, once from the task's cleanup registry at exit -- so the pool accumulated DUPLICATE handles.
+// Two tasks could then acquire the SAME physical sqlite connection and interleave statements on it.
+// Pre-fix this test counts MORE than N; post-fix exactly N.
+//
+// Bug 2 -- bool binding: a bool field bound as "true" instead of "1", which PostgreSQL rejects for an
+// integer column (22P02) while SQLite silently accepts it. Covered here on sqlite for the round-trip,
+// and on PostgreSQL when PGPASSWORD is set.
+
+import forge_orm
+import forge_db
+
+type KatRow
+    id: int
+    label: string
+    flag: bool
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+// Drain a pool channel with a bounded wait, counting what is actually in it.
+fn drain_count(ch) -> int
+    let n = 0
+    let going = 1
+    while going == 1
+        let r = select_timeout(ch, 300)
+        if r[0] == 0
+            n += 1
+        else
+            going = 0
+    n
+
+fn main()
+    let fails = 0
+
+    // ---------- pool accounting on sqlite ----------
+    let path = "_kat_pool_balance.db"
+    let dr = orm_open_with_pool("sqlite://" + path, 3)
+    if is_err(dr)
+        print("FAIL open: {unwrap_err(dr)}")
+        exit(1)
+    let db = unwrap(dr)
+
+    orm_exec(db, "DROP TABLE IF EXISTS kat_rows", [])
+    orm_exec(db, "CREATE TABLE kat_rows (id int, label text, flag int)", [])
+
+    // 12 operations over a pool of 3. Pre-fix each orm_all/orm_exec added one duplicate handle.
+    for i in 0..6
+        orm_exec(db, "INSERT INTO kat_rows (id, label, flag) VALUES (?, ?, ?)", [i, "row{i}", 1])
+    for i in 0..6
+        orm_all(db, "SELECT id, label, flag FROM kat_rows WHERE id = ?", [i])
+
+    let rows = orm_all(db, "SELECT id, label, flag FROM kat_rows ORDER BY id", [])
+    if len(rows) != 6
+        print("FAIL rows: expected 6 got {len(rows)}")
+        fails += 1
+
+    // the pool channel is db[2]; after 13+ operations it must hold EXACTLY the 3 it was opened with
+    let n = drain_count(db[2])
+    if n == 3
+        print("PASS pool balance: exactly 3 connections after 13 ops")
+    else
+        print("FAIL pool balance: expected 3 connections, found {n}  <-- {"DOUBLE RELEASE" if n > 3 else "LEAK"}")
+        fails += 1
+
+    // ---------- bool round-trip on sqlite ----------
+    let dr2 = orm_open_with_pool("sqlite://" + path, 2)
+    let db2 = unwrap(dr2)
+    orm_exec(db2, "DROP TABLE IF EXISTS kat_bool", [])
+    orm_exec(db2, "CREATE TABLE kat_bool (id int, label text, flag int)", [])
+    let ins = orm_insert(db2, "kat_bool", KatRow(1, "yes", true))
+    let ins2 = orm_insert(db2, "kat_bool", KatRow(2, "no", false))
+    if is_err(ins) or is_err(ins2)
+        print("FAIL sqlite bool insert")
+        fails += 1
+    let bs: list<KatRow> = orm_all(db2, "SELECT id, label, flag FROM kat_bool ORDER BY id", [])
+    if len(bs) == 2 and bs[0].flag == true and bs[1].flag == false
+        print("PASS sqlite bool round-trip")
+    else
+        print("FAIL sqlite bool round-trip: got {len(bs)} rows")
+        fails += 1
+    orm_exec(db2, "DROP TABLE IF EXISTS kat_bool", [])
+    orm_close(db2)
+
+    // ---------- bool + pool accounting on PostgreSQL ----------
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let url = "postgres://" + _envor("PGUSER", "postgres") + ":" + pw + "@" + _envor("PGHOST", "127.0.0.1") + ":" + _envor("PGPORT", "5432") + "/" + _envor("PGDATABASE", "postgres")
+        let pr = orm_open_with_pool(url, 3)
+        if is_err(pr)
+            print("FAIL pg open: {unwrap_err(pr)}")
+            fails += 1
+        else
+            let pdb = unwrap(pr)
+            orm_exec(pdb, "DROP TABLE IF EXISTS kat_bool", [])
+            orm_exec(pdb, "CREATE TABLE kat_bool (id int, label text, flag int)", [])
+            // THE regression: pre-fix this errored 22P02 invalid input syntax for type integer: "true"
+            let pi1 = orm_insert(pdb, "kat_bool", KatRow(1, "yes", true))
+            let pi2 = orm_insert(pdb, "kat_bool", KatRow(2, "no", false))
+            if is_err(pi1) or is_err(pi2)
+                print("FAIL pg bool insert: {unwrap_err(pi1)}")
+                fails += 1
+            let pbs: list<KatRow> = orm_all(pdb, "SELECT id, label, flag FROM kat_bool ORDER BY id", [])
+            if len(pbs) == 2 and pbs[0].flag == true and pbs[1].flag == false
+                print("PASS pg bool round-trip")
+            else
+                print("FAIL pg bool round-trip: got {len(pbs)} rows")
+                fails += 1
+            for i in 0..6
+                orm_all(pdb, "SELECT id, label, flag FROM kat_bool WHERE id = ?", [1])
+            let pn = drain_count(pdb[2])
+            if pn == 3
+                print("PASS pg pool balance: exactly 3 connections after 10 ops")
+            else
+                print("FAIL pg pool balance: expected 3, found {pn}")
+                fails += 1
+    else
+        print("[pg] skipped (set PGPASSWORD)")
+
+    if fails == 0
+        print("_kat_orm_pool_balance passed")
+    else
+        print("_kat_orm_pool_balance FAILED ({fails})")
+        exit(1)
