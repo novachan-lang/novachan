@@ -1,5 +1,29 @@
-// forge_htmlentities -- thin wrapper over std/encoding/htmlentities (canonical implementation).
-import std/encoding/htmlentities
+// forge_htmlentities -- decode HTML character entities back to text (the inverse of forge_html esc()): turn
+// &amp; &lt; &#169; &#x2022; into & < (copyright) (bullet). Needed when CONSUMING HTML: scraped pages, RSS/Atom
+// feed content, or values that arrived HTML-encoded. Handles the common named entities plus decimal (&#NNN;)
+// and hex (&#xHH;) numeric refs, emitting correct UTF-8 for code points beyond ASCII. LEAF -- imports NOTHING.
+//
+// DEEP RAISE 2026-08-05. Before: one function, _ent_decode_body, held THREE unrelated rules at once -- the
+// SYNTAX of an entity body (is it named / decimal / hex?), the LOOKUP for each of those shapes, and the
+// UTF-8 encoding -- fused into a nested if-ladder that collapsed every possible failure into the single
+// string "". A caller could not tell "&zzz;" (unknown name) from "&#12a;" (bad digit) from "&#0;" (code
+// point out of range); nor could the SCANNER, which had to infer "this was not an entity" from `len(x) > 0`.
+//
+// Now the shape of an entity body is an ADT (EntRef), the cause of a failure is an ADT (EntFail), the
+// lookup per shape is one `match` arm each, and everything travels as a Result. `html_entity` is a new
+// public entry point that hands the caller the actual reason. `html_decode` is unchanged in behaviour --
+// it now asks `is_ok` instead of measuring a string length.
+
+// Why an entity failed to decode. An ADT, not a bare string, so the CAUSE is a value a caller can match on:
+// an unknown NAME is "this HTML uses an entity we do not know" (recoverable, pass it through), a BAD DIGIT
+// is malformed markup, and an OUT OF RANGE code point is a document that cannot be represented. Flattening
+// all three into "" -- as before -- makes them indistinguishable at exactly the moment you need to log one.
+enum EntFail
+    NotAnEntity(string)
+    UnknownName(string)
+    BadDigits(string)
+    OutOfRange(string)
+    NoTerminator(string)
 
 fn _ent_fail_text(f) -> string
     match f
@@ -13,7 +37,14 @@ fn _ent_fail_text(f) -> string
 // plus "not one of them" -- so it is an enum, and the payload is already the part each form needs to resolve
 // (the name, the decimal digits, the hex digits). Classifying ONCE and matching means the syntax rules live
 // in one function and the lookup rules in another, instead of being interleaved in an if-ladder.
+enum EntRef
+    Named(string)
+    Decimal(string)
+    Hex(string)
+    Malformed(string)
 
+// Return type deliberately UNANNOTATED: an enum variant constructor has the VARIANT's type, not the enum's,
+// so `-> EntRef` is rejected by the checker (verified).
 fn _ent_classify(body: string)
     if len(body) == 0
         return Malformed(body)
@@ -36,7 +67,6 @@ fn _ent_classify(body: string)
 // byte, so `&#9999999;` yields three garbage bytes rather than an error. That is why EntFail has an
 // OutOfRange arm ready -- it is currently only reached for cp <= 0, and tightening the upper bound is the
 // same one-line, behaviour-changing decision.
-
 fn _ent_utf8(cp: int) -> string
     if cp < 128
         return chr(cp)
@@ -51,7 +81,34 @@ fn _ent_utf8(cp: int) -> string
 // dict or list LITERAL reads back EMPTY once the module is IMPORTED (verified: `len()` == 0 from an
 // importing program, correct when called inside its own file; module-level ints are fine). Hoisting it
 // silently disabled every named entity here -- caught by the behaviour diff, not by the compiler.
+fn _ent_named(name: string) -> Result
+    let table = {"amp": 38, "lt": 60, "gt": 62, "quot": 34, "apos": 39, "nbsp": 160, "copy": 169, "reg": 174, "trade": 8482, "mdash": 8212, "ndash": 8211, "hellip": 8230, "euro": 8364, "pound": 163, "cent": 162, "deg": 176, "bull": 8226}
+    if name not in table
+        return err(_ent_fail_text(UnknownName(name)))
+    ok(table[name])
 
+// PRIVATE: parse an unsigned integer in the given base from `s`. Returns ok(value), or err(..) on any
+// character that is not a digit of that base (previously a -1 sentinel indistinguishable from a real value).
+// Empty input is ok(0), exactly as before.
+fn _ent_digits(s: string, digits: string) -> Result
+    let base = len(digits)
+    let v = 0
+    // KEPT as a loop: it SHORT-CIRCUITS out on the first non-digit, so no all_match/comprehension form
+    // expresses it without scanning digits that cannot matter.
+    for i in 0..len(s)
+        let d = find(digits, lower(char_at(s, i)))
+        if d < 0
+            return err(_ent_fail_text(BadDigits(s)))
+        v = v * base + d
+    return ok(v)
+
+// PRIVATE: the code point an EntRef denotes. ONE arm per shape -- the two former one-line wrappers
+// (_ent_hex / _ent_dec) are gone, and their alphabets now sit at the single point of dispatch, which is
+// the only place that has to know a hex ref and a decimal ref differ at all.
+// The `match` is BOUND with `let` rather than left as the tail expression. Not style: a Result-producing
+// call in a bare match arm is reported as a discarded Result (error[E1000]) when this file is compiled
+// DIRECTLY, even though it type-checks when merely imported. Binding the match names the value, so the
+// checker sees it flow to the return. Caught by _hlcheck's direct-compile leg, not by the import leg.
 fn _ent_codepoint(ref) -> Result
     let cp = match ref
         Named(n) => _ent_named(n)
@@ -65,7 +122,6 @@ fn _ent_codepoint(ref) -> Result
 //   err("unknown entity name 'zzz'")   why it is not an entity, naming the body
 // Written as a PIPE because it IS a pipeline: a body becomes a shape, a shape becomes a code point, a code
 // point becomes UTF-8. Each stage is separately testable and none of them knows about the others.
-
 fn html_entity(body: string) -> Result
     let cp = (body |> _ent_classify() |> _ent_codepoint())?
     if cp <= 0
@@ -75,7 +131,34 @@ fn html_entity(body: string) -> Result
 // PRIVATE: does an "&" at `i` begin a decodable entity, and what does it decode to? The WINDOW rule -- a ";"
 // must follow within 12 characters and the body must be non-empty -- lives here and nowhere else, so the
 // scanner below never repeats it.
+fn _ent_span(s: string, i: int, semi: int) -> Result
+    if semi <= 1 or semi > 12
+        return err(_ent_fail_text(NoTerminator(slice(s, i, min(i + 13, len(s))))))
+    html_entity(slice(s, i + 1, i + semi))
 
+// Decode all HTML entities in `s`. An unrecognized "&...;" (or a lone &) is passed through literally.
 fn html_decode(s: string) -> string
-    return he_decode(s)
-
+    // PARTS + one join. `out = out + c` per character reallocated and recopied the ENTIRE output on every
+    // character: quadratic in the input length. Pushing pieces and joining once is linear.
+    let parts = []
+    let i = 0
+    let n = len(s)
+    // KEPT as `while`: `i` advances by a DATA-DEPENDENT amount -- 1 for a plain character, or past a whole
+    // "&entity;" when one is recognized. Not a fixed-stride range.
+    while i < n
+        let c = char_at(s, i)
+        if c == "&"
+            // is_ok, not `len(decoded) > 0`: the decoder now SAYS whether this was an entity instead of
+            // making the scanner infer it from the length of the result.
+            let semi = find(slice(s, i, n), ";")
+            let dec = _ent_span(s, i, semi)
+            if is_ok(dec)
+                push(parts, unwrap(dec))
+                i += semi + 1
+            else
+                push(parts, c)
+                i += 1
+        else
+            push(parts, c)
+            i += 1
+    parts.join("")

@@ -1,6 +1,13 @@
-// forge_bignum -- thin wrapper over std/numeric/bignum (canonical implementation).
-import std/numeric/bignum
+// forge_bignum -- arbitrary-precision (bignum) arithmetic on NON-NEGATIVE integers, represented as decimal
+// strings. NOVA's native int is 64-bit and silently WRAPS past ~9.2e18; this module lets you compute with numbers
+// of ANY size -- 100!, 2^1000, RSA-scale moduli, exact factorials/binomials/running totals that must never
+// overflow. Numbers are plain base-10 digit strings ("0", "42", "1267650600228229401496703205376"), so they are
+// trivial to read, print, store, and compare, at the cost of speed vs a limb-based representation (fine for exact
+// results up to thousands of digits). Provides add, subtract (a>=b), multiply, compare, factorial and fast
+// exponentiation -- the schoolbook algorithms, digit by digit. Division/modulo are intentionally omitted (a larger
+// algorithm; add later if needed). Inputs must be non-negative decimal strings. LEAF -- imports NOTHING.
 
+// PRIVATE: strip leading zeros; canonicalize empty/all-zero to "0".
 fn _big_norm(s: string) -> string
     let out = "0"
     if len(s) > 0
@@ -13,25 +20,115 @@ fn _big_norm(s: string) -> string
     out
 
 // Compare two bignums: -1 if a<b, 0 if equal, 1 if a>b.
-
 fn big_cmp(a0: string, b0: string) -> int
-    return sn_cmp(a0, b0)
+    let a = _big_norm(a0)
+    let b = _big_norm(b0)
+    // normalized -> the longer decimal string is the larger number
+    if len(a) < len(b)
+        return -1
+    if len(a) > len(b)
+        return 1
+    for k in 0..len(a)
+        let ca = ord(char_at(a, k))
+        let cb = ord(char_at(b, k))
+        if ca < cb
+            return -1
+        if ca > cb
+            return 1
+    0
 
+// Add two non-negative bignums.
 fn big_add(a0: string, b0: string) -> string
-    return sn_add(a0, b0)
+    let a = _big_norm(a0)
+    let b = _big_norm(b0)
+    let i = len(a) - 1
+    let j = len(b) - 1
+    let carry = 0
+    // Digits fall out least-significant first, so they are COLLECTED and reversed+joined once.
+    // `out = chr(..) + out` per digit reallocated and copied the whole running result every digit --
+    // quadratic in the number of digits. The loop itself stays a while: it runs until BOTH operands
+    // are exhausted AND the carry is spent, which is data-dependent.
+    let digits = []
+    while i >= 0 or j >= 0 or carry > 0
+        let da = 0
+        if i >= 0
+            da = ord(char_at(a, i)) - 48
+            i -= 1
+        let db = 0
+        if j >= 0
+            db = ord(char_at(b, j)) - 48
+            j -= 1
+        let s = da + db + carry
+        carry = s / 10
+        push(digits, chr(48 + (s % 10)))
+    _big_norm(join(reverse(digits), ""))
 
+// Subtract b from a, assuming a >= b (result is non-negative). Use big_cmp first if unsure.
 fn big_sub(a0: string, b0: string) -> string
-    return sn_sub(a0, b0)
+    let a = _big_norm(a0)
+    let b = _big_norm(b0)
+    let i = len(a) - 1
+    let j = len(b) - 1
+    let borrow = 0
+    // same least-significant-first collection as big_add (the prepend was quadratic); the borrow makes
+    // the step data-dependent and both cursors descend together, so the loop itself stays a while
+    let digits = []
+    while i >= 0
+        let da = ord(char_at(a, i)) - 48
+        let db = 0
+        if j >= 0
+            db = ord(char_at(b, j)) - 48
+        let d = da - db - borrow
+        if d < 0
+            d += 10
+            borrow = 1
+        else
+            borrow = 0
+        push(digits, chr(48 + d))
+        i -= 1
+        j -= 1
+    _big_norm(join(reverse(digits), ""))
 
+// Multiply two non-negative bignums (schoolbook O(n*m)).
 fn big_mul(a0: string, b0: string) -> string
-    return sn_mul(a0, b0)
+    let a = _big_norm(a0)
+    let b = _big_norm(b0)
+    let out = "0"
+    if a != "0" and b != "0"
+        let na = len(a)
+        let nb = len(b)
+        // little-endian result digits
+        let res = [0 for z in 0..(na + nb)]
+        let i = na - 1
+        while i >= 0
+            let da = ord(char_at(a, i)) - 48
+            let carry = 0
+            let j = nb - 1
+            while j >= 0
+                let db = ord(char_at(b, j)) - 48
+                let pos = (na - 1 - i) + (nb - 1 - j)
+                let cur = res[pos] + da * db + carry
+                res[pos] = cur % 10
+                carry = cur / 10
+                j -= 1
+            let pos2 = (na - 1 - i) + nb
+            while carry > 0
+                let cur2 = res[pos2] + carry
+                res[pos2] = cur2 % 10
+                carry = cur2 / 10
+                pos2 += 1
+            i -= 1
+        // build the big-endian string: the little-endian digit list read back to front, joined ONCE
+        // (`s = s + chr(..)` per digit was quadratic in the product's digit count)
+        out = _big_norm(join([chr(48 + d) for d in reverse(res)], ""))
+    out
 
+// n! as a bignum (n >= 0). big_factorial(0) = big_factorial(1) = "1".
 fn big_factorial(n: int) -> string
     // a fold of 2..n over big_mul, seeded at "1" -- n < 2 folds over an empty range and yields "1"
     reduce([str(k) for k in 2..(n + 1)], (acc, v) => big_mul(acc, v), "1")
 
 // base raised to a non-negative integer exponent, via fast (square-and-multiply) exponentiation.
-
 fn big_pow(base: string, exp: int) -> string
     let out = "1"
     let b = _big_norm(base)
@@ -44,16 +141,39 @@ fn big_pow(base: string, exp: int) -> string
     out
 
 // Divide a by b (b != "0"), returning [quotient, remainder] via schoolbook long division. Both non-negative.
-
 fn big_divmod(a0: string, b0: string) -> list
-    return sn_divmod(a0, b0)
+    let a = _big_norm(a0)
+    let b = _big_norm(b0)
+    // One quotient digit per dividend digit, collected and joined ONCE (`quotient = quotient + chr(..)`
+    // per digit was quadratic). `remainder` stays a running string: it never exceeds len(b)+1 digits.
+    // PRE-EXISTING CONTRACT (unchanged, flagged): b == "0" is undefined here -- big_mul(b, ..) is then
+    // "0", every big_cmp is <= 0, so d saturates at 9 and the result is a string of 9s rather than an
+    // error. Callers must check b != "0" (as documented above).
+    let qdigits = []
+    let remainder = "0"
+    for i in 0..len(a)
+        // bring down the next digit: remainder = remainder*10 + a[i]
+        remainder = _big_norm(remainder + char_at(a, i))
+        // largest digit d in 0..9 with d*b <= remainder -- short-circuits, so it stays a loop
+        let d = 0
+        while d < 9 and big_cmp(big_mul(b, str(d + 1)), remainder) <= 0
+            d += 1
+        push(qdigits, chr(48 + d))
+        remainder = big_sub(remainder, big_mul(b, str(d)))
+    [_big_norm(join(qdigits, "")), _big_norm(remainder)]
 
+// Integer quotient of a / b (floor, non-negative).
 fn big_div(a0: string, b0: string) -> string
-    return sn_div(a0, b0)
+    let qr = big_divmod(a0, b0)
+    qr[0]
 
+// Remainder of a mod b (non-negative).
 fn big_mod(a0: string, b0: string) -> string
-    return sn_mod(a0, b0)
+    let qr = big_divmod(a0, b0)
+    qr[1]
 
+// Modular exponentiation: (base ^ exp) mod m, via square-and-multiply with reduction each step. This is THE
+// primitive behind RSA/Diffie-Hellman and Miller-Rabin primality. `exp` is a native (64-bit) integer.
 fn big_powmod(base: string, exp: int, m: string) -> string
     let out = "1"
     let b = big_mod(_big_norm(base), m)
@@ -64,4 +184,3 @@ fn big_powmod(base: string, exp: int, m: string) -> string
         b = big_mod(big_mul(b, b), m)
         e = e / 2
     out
-

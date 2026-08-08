@@ -1,18 +1,59 @@
-// forge_align -- thin wrapper over std/bio/align (canonical implementation).
-import std/bio/align
+// forge_align -- global sequence alignment by the Needleman-Wunsch algorithm. Edit distance (forge levenshtein)
+// tells you HOW DIFFERENT two strings are as a single number; alignment tells you HOW they line up -- it produces
+// the two strings padded with gap characters so that matching symbols sit in the same column, making every match,
+// mismatch, insertion and deletion visible. That's exactly what DNA/protein aligners, file-diff tools, spelling-
+// correction explanations, and plagiarism/version comparison need. It's a dynamic program over a scoring scheme
+// you choose (reward matches, penalize mismatches and gaps): fill a table of best scores, then trace back from the
+// corner to reconstruct the alignment. Positive `matchv`, negative `mismatch` and `gap` are typical (e.g. 1, -1,
+// -1). Returns the score and the two gap-padded strings ("-" marks a gap).
+//
+// Imports std/core/collect for `frequencies` (the column tally in align_stats).
+//
+// RAISED 2026-08-05. Four problems:
+//
+//   1. THE SCORING SCHEME WAS THREE LOOSE INTEGERS threaded through every function in the order
+//      (matchv, mismatch, gap). Two of the three are normally negative and one positive, so
+//      transposing mismatch and gap produces a DIFFERENT VALID ALIGNMENT rather than an error --
+//      silently the wrong answer, with no way to notice. `type Scoring` makes that transposition a
+//      compile error, and the loose-int entry points remain as adapters.
+//   2. THE SUBSTITUTION SCORE (match or mismatch for this pair of symbols) was computed inline in
+//      BOTH the fill and the traceback, as a mutable `sub` assigned by an if. The traceback MUST use
+//      the same rule the fill used or it reconstructs a path the table never took -- so having it
+//      written twice is the one duplication in this algorithm that can silently corrupt the output.
+//      _sub_score states it once.
+//   3. THE FLAT-TABLE INDEX `i * w + j` was open-coded at TEN sites. One mistyped index reads a
+//      neighbouring cell, which yields a plausible alignment rather than a crash. _at owns it.
+//   4. BOTH TRACEBACK STRINGS WERE BUILT BY PREPENDING (`aa = char + aa`), which reallocates and
+//      recopies the whole string per column -- quadratic in the alignment length. They are lists,
+//      reversed and joined once.
+//
+//   _al_max3 is gone: it was max(max(x, y), z).
+import std/core/collect
 
+// The scoring scheme. Three loose ints in a fixed order is exactly the shape that gets transposed,
+// and two of the three are conventionally negative.
+type Scoring
+    matchv: int
+    mismatch: int
+    gap: int
+
+// The conventional scheme: +1 match, -1 mismatch, -1 gap.
+fn align_default_scoring() -> Scoring
+    Scoring(1, 0 - 1, 0 - 1)
+
+// PRIVATE: the substitution score for aligning a[i-1] against b[j-1] -- match or mismatch.
+// THE rule, stated once: the fill and the traceback must agree on it or the traceback reconstructs a
+// path the table never took.
 fn _sub_score(a: string, b: string, i: int, j: int, sc: Scoring) -> int
     sc.matchv if char_at(a, i - 1) == char_at(b, j - 1) else sc.mismatch
 
 // PRIVATE: the flat-table index of cell (i, j) in a table of row width w. Open-coded at ten sites,
 // where one mistyped index reads a neighbouring cell and yields a plausible wrong alignment.
-
 fn _at(i: int, j: int, w: int) -> int
     i * w + j
 
 // PRIVATE: the filled score table (flat, row width m+1). dp[_at(i,j,w)] is the best score aligning
 // a[0:i] with b[0:j].
-
 fn _al_fill(a: string, b: string, sc: Scoring) -> list
     let n = len(a)
     let m = len(b)
@@ -36,22 +77,6 @@ fn _al_fill(a: string, b: string, sc: Scoring) -> list
 
 // Globally align a and b under `sc`. Returns [score, aligned_a, aligned_b], where the aligned strings
 // have equal length and "-" marks a gap.
-
-fn _col_mark(x: string, y: string) -> string
-    if x == "-" or y == "-"
-        return " "
-    "|" if x == y else "."
-
-// How many columns are matches / mismatches / gaps. A caller judging alignment quality had to walk the
-// two strings itself.
-
-fn align_default_scoring() -> Scoring
-    Scoring(1, 0 - 1, 0 - 1)
-
-// PRIVATE: the substitution score for aligning a[i-1] against b[j-1] -- match or mismatch.
-// THE rule, stated once: the fill and the traceback must agree on it or the traceback reconstructs a
-// path the table never took.
-
 fn align_with(a: string, b: string, sc: Scoring) -> list
     let n = len(a)
     let m = len(b)
@@ -82,19 +107,33 @@ fn align_with(a: string, b: string, sc: Scoring) -> list
     [dp[_at(n, m, w)], join(reverse(acols), ""), join(reverse(bcols), "")]
 
 // Loose-int entry point, contract UNCHANGED.
-
 fn align_global(a: string, b: string, matchv: int, mismatch: int, gap: int) -> list
-    return nw_global(a, b, matchv, mismatch, gap)
+    align_with(a, b, Scoring(matchv, mismatch, gap))
 
+// Just the optimal global alignment score. Fills the table WITHOUT the traceback -- the old version
+// called align_global and discarded the two reconstructed strings, so asking for the score alone did
+// the whole traceback and built both output strings for nothing.
 fn align_score_with(a: string, b: string, sc: Scoring) -> int
     _al_fill(a, b, sc)[_at(len(a), len(b), len(b) + 1)]
 
 fn align_score(a: string, b: string, matchv: int, mismatch: int, gap: int) -> int
-    return nw_score(a, b, matchv, mismatch, gap)
+    align_score_with(a, b, Scoring(matchv, mismatch, gap))
 
+// --- reading an alignment ---------------------------------------------------------------------------
+
+// The per-column verdict as a string of "|" (match), "." (mismatch) and " " (gap) -- the middle line
+// every aligner prints between the two sequences, which this module produced the inputs for but not
+// the line itself.
 fn align_ruler(aligned_a: string, aligned_b: string) -> string
     join([_col_mark(char_at(aligned_a, i), char_at(aligned_b, i)) for i in 0..len(aligned_a)], "")
 
+fn _col_mark(x: string, y: string) -> string
+    if x == "-" or y == "-"
+        return " "
+    "|" if x == y else "."
+
+// How many columns are matches / mismatches / gaps. A caller judging alignment quality had to walk the
+// two strings itself.
 fn align_stats(aligned_a: string, aligned_b: string) -> dict
     // SELF-REVIEW FIX: the first version filtered `marks` three times, one pass per category. A tally
     // over the marks is exactly `frequencies`, which walks them once -- and it is the same function
@@ -110,8 +149,6 @@ fn align_stats(aligned_a: string, aligned_b: string) -> dict
 // Percent identity: matching columns over total columns, 0-100 truncated. The number a biologist or a
 // diff tool actually reports, and the reason percent identity is not just "score" -- the score mixes
 // in gap penalties.
-
 fn align_identity_pct(aligned_a: string, aligned_b: string) -> int
     let st = align_stats(aligned_a, aligned_b)
     0 if st["columns"] == 0 else st["matches"] * 100 / st["columns"]
-

@@ -1,21 +1,35 @@
-// forge_cuckoofilter -- thin wrapper over std/sketch/cuckoofilter (canonical implementation).
-import std/sketch/cuckoofilter
+// forge_cuckoofilter -- an approximate-membership filter like a Bloom filter, but one you can also DELETE from and
+// that is more space-efficient at low false-positive rates. It answers "have I probably seen this before?" with no
+// false negatives (a real member is never reported absent) and only a small, tunable false-positive rate, using far
+// less memory than storing the items themselves. Unlike a Bloom filter (which can never remove an item), a cuckoo
+// filter stores a short FINGERPRINT of each item in one of two candidate buckets and, when both are full, kicks an
+// existing fingerprint to ITS other bucket (the "cuckoo" move) to make room -- which also makes deletion trivial:
+// just erase the fingerprint from either candidate bucket. The clever part is that from either bucket you can
+// compute the other by XOR-ing in a hash of the fingerprint, so no item needs to remember which bucket it landed
+// in. Use it for dedup with expiry, membership caches you must evict from, and set reconciliation. Keys are
+// non-negative integers; the bucket count is a power of two so the XOR-relocation stays in range. LEAF.
 
+// PRIVATE: an integer scramble (xorshift, 32-bit).
+fn _cf_mix(v: int) -> int
+    let x = v & 4294967295
+    x = (x ^ (x << 13)) & 4294967295
+    x = x ^ (x >> 17)
+    x = (x ^ (x << 5)) & 4294967295
+    x
+
+// PRIVATE: the 8-bit non-zero fingerprint of a key.
 fn _cf_fp(key: int) -> int
     (_cf_mix((key + 1) * 2654435761) % 255) + 1
 
 // PRIVATE: the primary bucket index of a key.
-
 fn _cf_i1(key: int, nb: int) -> int
     _cf_mix(key + 12345) & (nb - 1)
 
 // PRIVATE: the alternate bucket, computed by XOR-ing a hash of the fingerprint (symmetric: alt(alt(i))==i).
-
 fn _cf_alt(i: int, fp: int, nb: int) -> int
     i ^ (_cf_mix(fp * 40503) & (nb - 1))
 
 // PRIVATE: place fp in the first empty slot of bucket `bi`; returns 1 on success.
-
 fn _cf_place(buckets: list, bi: int, bs: int, fp: int) -> int
     let out = 0
     let s = 0
@@ -27,10 +41,25 @@ fn _cf_place(buckets: list, bi: int, bs: int, fp: int) -> int
     out
 
 // PRIVATE: is fp present in bucket bi?
+fn _cf_has(buckets: list, bi: int, bs: int, fp: int) -> int
+    let out = 0
+    let s = 0
+    while s < bs and out == 0
+        if buckets[bi * bs + s] == fp
+            out = 1
+        s += 1
+    out
 
+// A new cuckoo filter sized to comfortably hold about `capacity` items. 4 slots per bucket; bucket count rounded up
+// to a power of two.
 fn cuckoo_new(capacity: int) -> dict
-    return cf_new(capacity)
+    let nb = 1
+    while nb * 4 < capacity * 2
+        nb = nb * 2
+    let buckets = [0 for z in 0..(nb * 4)]
+    {"nb": nb, "bs": 4, "buckets": buckets, "count": 0, "seed": 123456789}
 
+// Insert a key. Returns true on success, false if the filter is too full to place it after many relocations.
 fn cuckoo_insert(cf: dict, key: int) -> bool
     let nb = cf["nb"]
     let bs = cf["bs"]
@@ -64,13 +93,42 @@ fn cuckoo_insert(cf: dict, key: int) -> bool
     done
 
 // True if the key is (probably) present. No false negatives; a small false-positive rate.
-
 fn cuckoo_contains(cf: dict, key: int) -> bool
-    return cf_contains(cf, key)
+    let nb = cf["nb"]
+    let bs = cf["bs"]
+    let buckets = cf["buckets"]
+    let fp = _cf_fp(key)
+    let i1 = _cf_i1(key, nb)
+    let i2 = _cf_alt(i1, fp, nb)
+    _cf_has(buckets, i1, bs, fp) == 1 or _cf_has(buckets, i2, bs, fp) == 1
 
+// Delete a key (erase its fingerprint from either candidate bucket). Returns true if a matching fingerprint was
+// removed.
 fn cuckoo_delete(cf: dict, key: int) -> bool
-    return cf_delete(cf, key)
+    let nb = cf["nb"]
+    let bs = cf["bs"]
+    let buckets = cf["buckets"]
+    let fp = _cf_fp(key)
+    let i1 = _cf_i1(key, nb)
+    let i2 = _cf_alt(i1, fp, nb)
+    let out = false
+    let s = 0
+    while s < bs and not out
+        if buckets[i1 * bs + s] == fp
+            buckets[i1 * bs + s] = 0
+            out = true
+        s += 1
+    if not out
+        let s2 = 0
+        while s2 < bs and not out
+            if buckets[i2 * bs + s2] == fp
+                buckets[i2 * bs + s2] = 0
+                out = true
+            s2 += 1
+    if out
+        cf["count"] -= 1
+    out
 
+// The number of items currently stored.
 fn cuckoo_count(cf: dict) -> int
-    return cf_count(cf)
-
+    cf["count"]

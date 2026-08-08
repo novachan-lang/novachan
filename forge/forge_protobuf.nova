@@ -1,12 +1,59 @@
-// forge_protobuf -- thin wrapper over std/encoding/protobuf (canonical implementation).
-import std/encoding/protobuf
+// forge_protobuf — protobuf wire codec (varint/zigzag/tag/length-delimited);
+// the message substrate for gRPC-from-NOVA-types (no .proto — the struct IS the message).
+// LEAF module: byte-LIST based (list of ints 0-255), imports nothing.
+//
+// Wire types used here: 0 = varint, 2 = length-delimited (bytes/string/sub-message).
+// Key encoding: (field_number << 3) | wire_type  — field numbers start at 1.
+//
+// Verified vectors:
+//   pb_encode_varint([], 1)   -> [1]
+//   pb_encode_varint([], 300) -> [172, 2]   (300=0b100101100: low7=44+128=172, 300/128=2)
+//   pb_decode_varint([172,2], 0) -> [300, 2]
+//   pb_zigzag_encode(-1)->1  pb_zigzag_encode(1)->2  pb_zigzag_encode(-2)->3
+//   pb_zigzag_decode(3)->-2
+//   pb_tag(1,0)->8  pb_tag(2,2)->18
 
+// PRIVATE: 2^k by repeated doubling; avoids << for portability and the 1<<64 edge case.
+fn _pb_pow2(k: int) -> int
+    let r = 1
+    for i in 0..k
+        r = r * 2
+    r
+
+// Encode a non-negative integer as a base-128 varint, appending bytes to `out`.
+// Each 7-bit group is emitted low-bits-first; continuation bit (0x80) set on all but the last.
+// Vector: pb_encode_varint([], 300) -> [172, 2]
+//   step1: 300>=128 -> push (300%128)+128 = 44+128 = 172; v=300/128=2
+//   step2: 2<128   -> push 2
 fn pb_encode_varint(out: list, v: int) -> list
-    return pb_wire_varint(out, v)
+    while v >= 128
+        push(out, (v % 128) + 128)
+        v = v / 128
+    push(out, v)
+    out
 
+// Decode a varint from byte list `buf` starting at offset `off`.
+// Returns [value, next_offset].
+// Vector: pb_decode_varint([172,2], 0) -> [300, 2]
+//   pos=0: b=172, b&127=44, value=44*_pb_pow2(0)=44; b&128=128!=0 -> continue; shift=7
+//   pos=1: b=2,   b&127=2,  value=44+2*_pb_pow2(7)=44+256=300; b&128=0 -> stop; pos=2
 fn pb_decode_varint(buf: list, off: int) -> list
-    return pb_read_varint(buf, off)
+    let value = 0
+    let shift = 0
+    let pos = off
+    let cont = 1
+    while cont == 1
+        let b = buf[pos]
+        pos += 1
+        value += (b & 127) * _pb_pow2(shift)
+        shift += 7
+        if (b & 128) == 0
+            cont = 0
+    [value, pos]
 
+// Zigzag encode: maps signed integers to unsigned so small-magnitude negatives stay small.
+// Formula: n>=0 -> n*2 ; n<0 -> (0-n)*2 - 1
+// Vectors: encode(-1)->1, encode(1)->2, encode(-2)->3
 fn pb_zigzag_encode(n: int) -> int
     if n >= 0
         return n * 2
@@ -15,7 +62,6 @@ fn pb_zigzag_encode(n: int) -> int
 // Zigzag decode: inverse of pb_zigzag_encode.
 // Formula: z even -> z/2 ; z odd -> 0-((z+1)/2)
 // Vector: decode(3)->-2  (3 odd -> 0-((3+1)/2) = 0-2 = -2)
-
 fn pb_zigzag_decode(z: int) -> int
     if z % 2 == 0
         return z / 2
@@ -24,10 +70,11 @@ fn pb_zigzag_decode(z: int) -> int
 // Compute the wire key: (field_number << 3) | wire_type.
 // Wire types: 0=varint, 1=64-bit, 2=length-delimited, 5=32-bit.
 // Vectors: pb_tag(1,0)->8, pb_tag(2,2)->18
-
 fn pb_tag(field_number: int, wire_type: int) -> int
-    return pb_make_tag(field_number, wire_type)
+    field_number * 8 + wire_type
 
+// Encode a varint field: write the tag (wire type 0) then the value, both as varints.
+// Appends to `out`; returns `out`.
 fn pb_encode_field_varint(out: list, field_number: int, v: int) -> list
     let tag = pb_tag(field_number, 0)
     let o1 = pb_encode_varint(out, tag)
@@ -36,7 +83,6 @@ fn pb_encode_field_varint(out: list, field_number: int, v: int) -> list
 // Encode a length-delimited field (wire type 2): tag, then len(data) as varint, then raw bytes.
 // Used for bytes, strings, and embedded sub-messages.
 // Appends to `out`; returns `out`.
-
 fn pb_encode_field_bytes(out: list, field_number: int, data: list) -> list
     let tag = pb_tag(field_number, 2)
     let o1 = pb_encode_varint(out, tag)
@@ -44,4 +90,3 @@ fn pb_encode_field_bytes(out: list, field_number: int, data: list) -> list
     for i in 0..len(data)
         push(o2, data[i])
     o2
-

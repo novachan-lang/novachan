@@ -1,6 +1,207 @@
-// forge_toml -- thin wrapper over std/data/toml (canonical implementation).
-import std/data/toml
+// forge_toml -- a practical SUBSET TOML config parser (the 90% that Cargo.toml / pyproject.toml consumers
+// need). Parses TOML text into a nested NOVA dict. Supports: `#` line comments (a hash at line start or
+// preceded by a space is stripped -- a `#` glued to non-space, e.g. inside an unquoted URL fragment, is
+// kept), `key = value` pairs, `[section]` and dotted `[a.b]` table headers (nesting sub-dicts), and value
+// kinds: double/single-quoted strings (double-quote unescapes \n \t \\ \"), and single-line arrays.
+// Anything else is kept as the raw trimmed string. LEAF -- imports NOTHING.
+//
+// KNOWN SUBSET LIMITS (unchanged by the raise): multi-line arrays / inline tables are out of scope;
+// comment-stripping is the simple "space-hash or leading-hash" rule (a `#` NOT preceded by whitespace is
+// never treated as a comment, so a `#` inside an unquoted value survives but a `#` inside a quoted value
+// that follows a space would be cut); array element splitting is a plain "," split (a comma inside a
+// quoted array string, or a nested array, over-splits).
+//
+// DEEP RAISE 2026-08-05. What was wrong, concretely:
+//   * `_toml_value` fused THREE unrelated jobs -- the SYNTAX of a value (quoted? array? bare?), the
+//     DECODING of each shape, and the recursion into array elements -- into one if-ladder.
+//   * Inside it, the double-quoted and single-quoted cases were TWO COPIES of the same "find the closing
+//     delimiter, or take the rest if there is none" scan. Two copies of one rule is two places to drift.
+//   * `_toml_unescape` was a FOUR-DEEP nested if-ladder over single characters. Two of its four arms
+//     (`\\` -> `\` and `\"` -> `"`) were REDUNDANT with its own else-branch, which already yields the
+//     character itself. Verified against the pre-raise build: `\z` -> `z`, `\\` -> `\`, `\"` -> `"`.
+//   * `toml_get` returned "" for FIVE different situations -- missing key, missing intermediate, a path
+//     through a scalar, a path with an empty segment, and a value that genuinely IS "" -- so no caller
+//     could tell a typo'd config path from an empty setting.
+//   * `toml_parse` silently DROPPED any line that was neither a header nor a `k = v` pair. A `port 8080`
+//     typo produced no key and no signal.
+//
+// Now: the value shape is an ADT (TomlVal), the line kind is an ADT (TomlLine), the lookup failure cause
+// is an ADT (TomlFail), the quoted scan is ONE function parameterised by delimiter, the escape map is a
+// dict, and there is ONE path walk that every lookup entry point adapts. `toml_parse` / `toml_get` /
+// `toml_is_int` keep their exact signatures and behaviour (byte-identical behaviour diff).
+//
+// NOTE on typing (CORRECTED -- the previous header described a `box["v"]` scheme that the code did not
+// actually use): `_toml_value` must yield a string OR a list from one call site. A `match` used as a
+// single tail EXPRESSION unifies its arms to ONE type, which would mis-tag the list arm. So the arms
+// each `return` separately -- distinct return sites behind `-> any` keep each shape's tag intact. This
+// is verified, not assumed.
 
+// ---------------------------------------------------------------------------------------------------
+// Lookup failure causes
+// ---------------------------------------------------------------------------------------------------
+
+// Why a dotted-path lookup failed. An ADT rather than a bare string so the CAUSE is a value a caller can
+// match on: a missing key is a config typo (recoverable, apply a default), while descending through a
+// scalar means the config has the wrong SHAPE -- a different bug with a different fix. Flattening both
+// into "" (as before) makes them indistinguishable at exactly the moment you need to report one.
+enum TomlFail
+    NoKey(string)
+    NotATable(string)
+
+fn _toml_fail_text(f) -> string
+    match f
+        NoKey(k) => "no key '{k}'"
+        NotATable(k) => "cannot descend into a scalar at '{k}'"
+
+// ---------------------------------------------------------------------------------------------------
+// Escapes
+// ---------------------------------------------------------------------------------------------------
+
+// PRIVATE: what the character after a backslash expands to. A four-deep nested if-ladder over single
+// characters IS a dictionary -- written as one. The `\\` and `\"` arms are GONE because the default
+// "yields itself" already covers them exactly, which is also TOML's rule for an unrecognised escape.
+// NOTE: the table is deliberately NOT hoisted to a module-level `let`. A module-level `let` bound to a
+// dict or list LITERAL reads back EMPTY once the module is IMPORTED (verified elsewhere in forge, and it
+// silently disabled every entry in the analogous forge_htmlentities table).
+fn _toml_escape(nx: string) -> string
+    let table = {"n": chr(10), "t": chr(9)}
+    get(table, nx, nx)
+
+// PRIVATE: expand backslash escapes inside a double-quoted string body.
+// The `while` STAYS: the index advances by 2 over an escape pair and by 1 otherwise, so the step is
+// data-dependent and no for-range expresses it. A trailing lone backslash is copied verbatim (the
+// `i + 1 < n` guard), matching the pre-raise build.
+// PARTS + one join, not `out = out + c`: appending to a string per character reallocates and recopies
+// the whole result each time, which is quadratic in the body length.
+fn _toml_unescape(s: string) -> string
+    let out_parts = []
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = char_at(s, i)
+        if c == chr(92) and i + 1 < n
+            push(out_parts, _toml_escape(char_at(s, i + 1)))
+            i += 2
+        else
+            push(out_parts, c)
+            i += 1
+    out_parts.join("")
+
+// ---------------------------------------------------------------------------------------------------
+// Value shapes
+// ---------------------------------------------------------------------------------------------------
+
+// The SHAPE of the text to the right of `=`. A genuinely closed set in this subset -- double-quoted,
+// single-quoted, array, or bare -- so it is an enum, and each payload is already the part that form
+// needs to decode. Classifying ONCE means the SYNTAX rules live in `_toml_classify` and the DECODING
+// rules in `_toml_decode`, instead of being interleaved in one ladder where a change to either risks
+// the other.
+enum TomlVal
+    Quoted(string)
+    Literal(string)
+    Array(string)
+    Bare(string)
+
+// PRIVATE: the body of a quoted run that starts at index 0 of `s`, delimited by `quote`. ONE
+// implementation of the rule "up to the closing delimiter, or all of the rest when there is none" --
+// the double- and single-quoted cases previously each carried their own copy, differing only in the
+// delimiter character. Parameterising the DELIMITER (a value) is the right fix here; this is not a
+// generics case, because both copies operated on the same type.
+fn _toml_quoted_body(s: string, quote: string) -> string
+    let rest = slice(s, 1, len(s))
+    let close = find(rest, quote)
+    if close < 0
+        return rest
+    slice(s, 1, 1 + close)
+
+// PRIVATE: classify a TRIMMED value string. Syntax only -- decides nothing about the resulting value.
+// Return type deliberately UNANNOTATED: an enum variant constructor has the VARIANT's type, not the
+// enum's, so `-> TomlVal` is rejected by the checker.
+fn _toml_classify(s: string)
+    if len(s) == 0
+        return Bare("")
+    let first = char_at(s, 0)
+    if first == chr(34)
+        return Quoted(_toml_quoted_body(s, chr(34)))
+    if first == chr(39)
+        return Literal(_toml_quoted_body(s, chr(39)))
+    if first == "[" and ends_with(s, "]")
+        return Array(trim(slice(s, 1, len(s) - 1)))
+    Bare(s)
+
+// PRIVATE: the elements an array body denotes. A UFCS chain feeding a comprehension: split on ",",
+// trim each piece, drop the empty ones, decode what is left. The empty-body and all-commas cases need
+// no special branch -- the filter already yields [] for them, exactly as the pre-raise guard did.
+// `_toml_value` is called from the comprehension rather than from a `map` closure so the recursion
+// stays a direct call.
+fn _toml_array(inner: string) -> list
+    [_toml_value(p) for p in split(inner, ",").map((x) => trim(x)).filter((x) => len(x) > 0)]
+
+// PRIVATE: the NOVA value a classified shape denotes. ONE arm per shape.
+// Each arm `return`s rather than being a bare arm: the arms have DIFFERENT types (string vs list) and a
+// match used as one tail expression would unify them, mis-tagging the list. Separate return sites keep
+// each tag intact behind `any`. (Also: a bare arm holding a Result-producing call is reported as a
+// discarded Result when the file is compiled directly -- see forge_htmlentities.)
+fn _toml_decode(v) -> any
+    match v
+        Quoted(b) => return _toml_unescape(b)
+        Literal(b) => return b
+        Array(inner) => return _toml_array(inner)
+        Bare(b) => return b
+
+// PRIVATE: parse a single value string. A PIPE, because it IS a pipeline of three independent stages:
+// text -> shape -> value. Each stage is separately testable and none knows about the others.
+// Scalars (numbers / booleans / bare words) come back as their RAW trimmed STRING -- the same
+// convention as forge_dotenv / forge_ini. `toml_get_int` / `toml_get_bool` below do the coercion so
+// callers no longer have to.
+fn _toml_value(raw: string) -> any
+    trim(raw) |> _toml_classify() |> _toml_decode()
+
+// Is the trimmed string an integer literal (all digits, with at most one leading '-')?
+// `all_match` states the rule ONCE over every character, instead of an early-return scan. The
+// predicate is the exact negation of the pre-raise reject test (`c < "0" or c > "9"`), so the accepted
+// set is unchanged -- including the deliberate rejection of "+1", "1.5" and non-ASCII digits.
+fn toml_is_int(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let start = 0
+    if char_at(s, 0) == "-"
+        if n == 1
+            return false
+        start = 1
+    all_match([char_at(s, i) for i in start..n], (c) => c >= "0" and c <= "9")
+
+// ---------------------------------------------------------------------------------------------------
+// Lines
+// ---------------------------------------------------------------------------------------------------
+
+// PRIVATE: strip a trailing comment using the "space-hash or leading-hash" rule.
+fn _toml_strip_comment(line: string) -> string
+    let hash = chr(35)
+    if starts_with(line, hash)
+        return ""
+    let sh = find(line, " " + hash)
+    if sh >= 0
+        return slice(line, 0, sh)
+    line
+
+// The KIND of a source line once comments are stripped and it is trimmed. Closed set: blank, a table
+// header, a key/value pair, or a line we deliberately ignore. Making `Junk` a NAMED case is the point:
+// before, an ignored line was the silent fall-through of `if eq > 0`, which reads as an oversight
+// rather than a decision -- and gave callers no way to learn their config had a typo. Its payload is
+// what `toml_lint` reports.
+enum TomlLine
+    Blank()
+    Header(string)
+    Pair(string, string)
+    Junk(string)
+
+// PRIVATE: classify ONE raw line. The single place that knows the comment rule, the header brackets and
+// the `=` rule; everything below just matches on the answer.
+// A PIPE for the two ordered normalisations (strip the comment, then trim) -- that is the order the
+// rules apply in, and now the code says so.
+// `eq > 0`, not `eq >= 0`: a line starting with `=` has no key and is Junk. Preserved deliberately.
 fn _toml_line(rawline: string)
     let line = rawline |> _toml_strip_comment() |> trim()
     if len(line) == 0
@@ -18,7 +219,43 @@ fn _toml_line(rawline: string)
 // KEPT as a loop: `node` is threaded from one iteration into the next (each step descends into the dict
 // the previous step just created), so this is a fold over a moving cursor, not a map over independent
 // items. Dicts are reference values, so mutating `node` here updates `root` (verified).
+fn _toml_table(root: dict, name: string) -> dict
+    let node = root
+    for seg in split(name, ".")
+        let key = trim(seg)
+        if key in node and type_of(node[key]) == "dict"
+            node = node[key]
+        else
+            let sub = {}
+            node[key] = sub
+            node = sub
+    node
 
+// PRIVATE: store one pair and hand the table back, so `_toml_apply` has a uniform shape.
+fn _toml_set(table: dict, k: string, v: string) -> dict
+    table[k] = _toml_value(v)
+    table
+
+// PRIVATE: apply ONE classified line, returning the table that subsequent pairs land in. Every arm
+// yields a cursor, so `toml_parse`'s loop body is a single assignment and there are no no-op arms.
+fn _toml_apply(root: dict, current: dict, ln) -> dict
+    match ln
+        Header(name) => return _toml_table(root, name)
+        Pair(k, v) => return _toml_set(current, k, v)
+        _ => return current
+
+// Parse a whole TOML document into a nested dict. Top-level keys (before any `[table]`) go directly
+// into the result; keys after a `[table]` header go into that table's (possibly nested) sub-dict.
+// KEPT as a loop: `current` is THREADED -- which table a pair lands in depends on the last header seen
+// -- so this is a fold over a cursor, not a map over independent lines.
+fn toml_parse(text: string) -> dict
+    let result = {}
+    let current = result
+    for rawline in split(text, chr(10))
+        current = _toml_apply(result, current, _toml_line(rawline))
+    result
+
+// PRIVATE: the text of a line that parsing ignored, or "" for a line it used.
 fn _toml_junk_text(ln) -> string
     match ln
         Junk(j) => return j
@@ -29,7 +266,28 @@ fn _toml_junk_text(ln) -> string
 // config bug. This is why `TomlLine.Junk` carries its text.
 // A comprehension over the classified lines, keeping the Junk payloads. A Junk line is never empty
 // (an empty line classifies as Blank), so the length filter is exact.
+fn toml_lint(text: string) -> list
+    [_toml_junk_text(_toml_line(l)) for l in split(text, chr(10))].filter((t) => len(t) > 0)
 
+// ---------------------------------------------------------------------------------------------------
+// Lookup
+// ---------------------------------------------------------------------------------------------------
+
+// PRIVATE: descend ONE dotted-path segment. The single place that knows how a lookup can fail.
+fn _toml_step(node, seg: string) -> Result
+    if type_of(node) != "dict"
+        return err(_toml_fail_text(NotATable(seg)))
+    if seg not in node
+        return err(_toml_fail_text(NoKey(seg)))
+    ok(node[seg])
+
+// THE walk -- every lookup entry point below is an adapter over this one function. `?` propagates the
+// first failing step's message unchanged, so the loop body is one line and there is no error plumbing
+// to get wrong.
+// NOTE: segments are NOT trimmed, matching the pre-raise build -- `toml_get(c, " package")` misses.
+// `config` is deliberately UNANNOTATED: annotating it `dict` pins `node` to Dict<string, any>, and then
+// `unwrap_or(walk, "")` in `toml_get` is a type mismatch against the string default. The cursor is
+// genuinely `any` -- it becomes a scalar as soon as it descends onto one.
 fn _toml_walk(config, path: string) -> Result
     let node = config
     for seg in split(path, ".")
@@ -39,41 +297,10 @@ fn _toml_walk(config, path: string) -> Result
 // Resolve a dotted path against a parsed config, KEEPING the reason on failure:
 //   ok(value)             the value at that path (which may legitimately be "")
 //   err("no key 'prot'")  why it did not resolve, naming the offending segment
-
-fn toml_is_int(s: string) -> bool
-    let n = len(s)
-    if n == 0
-        return false
-    let start = 0
-    if char_at(s, 0) == "-"
-        if n == 1
-            return false
-        start = 1
-    all_match([char_at(s, i) for i in start..n], (c) => c >= "0" and c <= "9")
-
-// ---------------------------------------------------------------------------------------------------
-// Lines
-// ---------------------------------------------------------------------------------------------------
-
-// PRIVATE: strip a trailing comment using the "space-hash or leading-hash" rule.
-
-fn toml_parse(text: string) -> dict
-    return toml_parse(text)
-
-fn toml_lint(text: string) -> list
-    [_toml_junk_text(_toml_line(l)) for l in split(text, chr(10))].filter((t) => len(t) > 0)
-
-// ---------------------------------------------------------------------------------------------------
-// Lookup
-// ---------------------------------------------------------------------------------------------------
-
-// PRIVATE: descend ONE dotted-path segment. The single place that knows how a lookup can fail.
-
 fn toml_resolve(config: dict, path: string) -> Result
     _toml_walk(config, path)
 
 // True iff `path` resolves to something in `config`.
-
 fn toml_has(config: dict, path: string) -> bool
     is_ok(_toml_walk(config, path))
 
@@ -81,10 +308,12 @@ fn toml_has(config: dict, path: string) -> bool
 // NOTE: "" is ALSO a legitimate value (`k =` parses to ""), so this signature cannot distinguish
 // "resolved to empty" from "did not resolve". That ambiguity is inherent to the existing contract and
 // is PRESERVED for current callers -- reach for `toml_resolve` when the difference matters.
-
 fn toml_get(config: dict, path: string) -> any
-    return toml_get(config, path)
+    unwrap_or(_toml_walk(config, path), "")
 
+// Typed reads. Scalars are stored as raw strings, so every caller previously had to repeat
+// "look it up, check the shape, coerce, else default" by hand -- which is what `toml_is_int` was
+// exported for and what these now do once. Both are thin adapters over the ONE walk.
 fn toml_get_int(config: dict, path: string, fallback: int) -> int
     let s = str(toml_get(config, path))
     if not toml_is_int(s)
@@ -98,4 +327,3 @@ fn toml_get_bool(config: dict, path: string, fallback: bool) -> bool
     if s == "false"
         return false
     fallback
-
