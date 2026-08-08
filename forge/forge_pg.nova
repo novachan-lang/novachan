@@ -84,7 +84,15 @@ fn pg_parse_data_row(b, off: int) -> any
         if vlen > 2147483647
             push(vals, null)
         else
-            push(vals, join([chr(bytes_get(b, p + j)) for j in 0..vlen], ""))
+            // HOT PATH -- this runs for EVERY value of EVERY row. It used to be
+            //   join([chr(bytes_get(b, p + j)) for j in 0..vlen], "")
+            // which allocated one single-character NOVA string per BYTE, built an intermediate list of
+            // them, and then joined: O(vlen) allocations for a value a memcpy can copy in one. A single
+            // 1 KB text column cost ~1000 allocations, per row. bytes_slice + bytes_to_str is one slice
+            // plus one memcpy. Semantically identical here: PostgreSQL's TEXT wire format cannot contain
+            // a NUL byte (and bytea arrives hex-encoded as \x...), so there is no embedded-NUL case to
+            // preserve.
+            push(vals, bytes_to_str(bytes_slice(b, p, p + vlen)))
             p += vlen
     vals
 
@@ -447,11 +455,17 @@ fn pg_cmd_affected(tag: string) -> int
 
 // Run Parse/Bind/Describe/Execute/Sync batch -> PgBatchResult struct.
 fn _pg_run_batch(conn: PgConn, sql: string, params: list) -> PgBatchResult
-    _pg_send(conn, _pg_parse_msg(sql))
-    _pg_send(conn, _pg_bind_msg(params))
-    _pg_send(conn, _pg_describe_portal_msg())
-    _pg_send(conn, _pg_execute_msg())
-    _pg_send(conn, _pg_msg(83, bytes(0)))
+    // COALESCED WRITE: Parse + Bind + Describe + Execute + Sync go out as ONE send instead of five.
+    // Each _pg_send is a separate write() syscall, and with TCP_NODELAY semantics each tends to become
+    // its own packet -- five syscalls and up to five round-trip-exposed segments for every single query.
+    // The protocol is identical (the backend reads a byte stream, not discrete writes); only the framing
+    // of the writes changes. On a remote database this is the difference between one network write per
+    // query and five.
+    let out = bytes_concat(_pg_parse_msg(sql), _pg_bind_msg(params))
+    out = bytes_concat(out, _pg_describe_portal_msg())
+    out = bytes_concat(out, _pg_execute_msg())
+    out = bytes_concat(out, _pg_msg(83, bytes(0)))
+    _pg_send(conn, out)
     let buf = bytes(0)
     let names = []
     let rows = []
