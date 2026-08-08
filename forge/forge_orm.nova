@@ -28,6 +28,51 @@ import sqlitex
 // to a fast, catchable err()/[] instead of parking the calling task forever -- see forge_db.pool_acquire_to.
 let _ORM_ACQUIRE_TIMEOUT_MS = 5000
 
+// ---- typed handle -----------------------------------------------------------------------------------
+// The handle used to be a RAW LIST -- ["orm", kind, pool, pool_size] -- read back by position as db[1],
+// db[2], db[3] in 19 places, with the driver selected by comparing a bare `kind` STRING in if-chains that
+// had no final else. Two concrete failures came out of that shape:
+//   * the mysql branch built a THREE-element list (it had no pool), so every db[3] read on a mysql handle
+//     was an out-of-bounds access waiting to happen;
+//   * a `kind` that matched no branch fell out of the bottom and returned a wrong default -- orm_all gave
+//     [] ("no rows"), which is indistinguishable from a successful empty query.
+// Modelling the driver as an ENUM makes both impossible. Each variant CARRIES its own pool and size, so a
+// driver cannot exist without them, and `match` over it is EXHAUSTIVENESS-CHECKED: adding a fourth database
+// is a compile error (E1009 "non-exhaustive match on enum 'OrmDrv': missing ...") at every dispatch site
+// rather than a silent wrong default. Field names are prefixed because field lookup is by NAME, not by
+// (type, name) -- see the struct-field-collision hazard.
+enum OrmDrv
+    DSqlite(dsq_pool: any, dsq_size: int)
+    DPostgres(dpg_pool: any, dpg_size: int)
+    DMysql(dmy_pool: any, dmy_size: int)
+
+// The driver plus the per-handle knobs a production deployment needs to tune. Kept as a struct around the
+// enum (rather than more enum payload) because these are driver-INDEPENDENT: every driver wants an acquire
+// budget, and adding one here does not touch any variant.
+type OrmDb
+    odb_drv: OrmDrv
+    odb_timeout_ms: int
+
+fn orm_pool(db: OrmDb) -> any
+    match db.odb_drv
+        DSqlite(p, n) => p
+        DPostgres(p, n) => p
+        DMysql(p, n) => p
+
+fn orm_pool_size(db: OrmDb) -> int
+    match db.odb_drv
+        DSqlite(p, n) => n
+        DPostgres(p, n) => n
+        DMysql(p, n) => n
+
+// Dialect tag, used only for identifier quoting (_orm_qident). Deliberately derived FROM the enum rather
+// than stored, so the two can never disagree.
+fn orm_kind(db: OrmDb) -> string
+    match db.odb_drv
+        DSqlite(p, n) => "sqlite"
+        DPostgres(p, n) => "postgres"
+        DMysql(p, n) => "mysql"
+
 // ---- internal helpers -------------------------------------------------------------------------------
 
 // NOTE: the private `_orm_find(s, sub)` that used to live here was a byte-for-byte duplicate of the
@@ -194,7 +239,7 @@ fn _orm_open_impl(url: string, pool_size: int) -> any
     if starts_with(url, "sqlite://")
         let path = url[9:len(url)]
         let pool = forge_db.pool_open(path, pool_size)
-        return ok(["orm", "sqlite", pool, pool_size])
+        return ok(OrmDb(DSqlite(pool, pool_size), _ORM_ACQUIRE_TIMEOUT_MS))
     if starts_with(url, "postgresql://") or starts_with(url, "postgres://")
         let rest = url[11:len(url)]
         if starts_with(url, "postgresql://")
@@ -207,7 +252,7 @@ fn _orm_open_impl(url: string, pool_size: int) -> any
         let dsn = unwrap(pdsn)
         let r = forge_pg.pg_pool_open(dsn[2], dsn[3], dsn[0], dsn[4], dsn[1], pool_size)
         if is_ok(r)
-            return ok(["orm", "postgres", unwrap(r), pool_size])
+            return ok(OrmDb(DPostgres(unwrap(r), pool_size), _ORM_ACQUIRE_TIMEOUT_MS))
         return r
     if starts_with(url, "mysql://")
         let rest = url[8:len(url)]
@@ -215,83 +260,93 @@ fn _orm_open_impl(url: string, pool_size: int) -> any
         if is_err(mdsn)
             return mdsn
         let dsn = unwrap(mdsn)
-        let r = forge_mysql.mysql_connect(dsn[2], dsn[3], dsn[0], dsn[4], dsn[1])
+        // MySQL now opens a real POOL, like every other driver. It previously called mysql_connect and
+        // stored ONE connection, so every task in the process shared a single socket: MySQL's protocol
+        // is strictly request/response with a per-command packet SEQUENCE NUMBER, so two concurrent
+        // queries interleaved their writes and then each read the other's response packets -- silent
+        // cross-request data corruption under any real concurrency. (forge_mysql already had the whole
+        // pool API; orm_open simply never wired it up.) The handle also carried only three elements,
+        // making every pool_size read on a mysql handle an out-of-bounds access.
+        let r = forge_mysql.mysql_pool_open(dsn[2], dsn[3], dsn[0], dsn[4], dsn[1], pool_size)
         if is_ok(r)
-            return ok(["orm", "mysql", unwrap(r)])
+            return ok(OrmDb(DMysql(unwrap(r), pool_size), _ORM_ACQUIRE_TIMEOUT_MS))
         return r
     err("orm: unsupported url scheme (use sqlite://, postgres://, or mysql://)")
 
-fn orm_close(db)
-    let kind = db[1]
-    let h = db[2]
-    if kind == "sqlite"
-        // db[3] is the SAME pool_size orm_open passed to forge_db.pool_open -- must drain exactly that
-        // many connections (a hardcoded 4 here would hang forever draining a smaller pool, or leak
-        // connections it never drained from a larger one, once orm_open's pool_size became configurable).
-        forge_db.pool_close(h, db[3])
-    if kind == "postgres"
-        forge_pg.pg_pool_close(h, db[3])
-    if kind == "mysql"
-        forge_mysql.mysql_close(h)
+// Drain and close every pooled connection. The size comes from the enum variant that was built at open
+// time, so it can never disagree with how many were actually opened.
+fn orm_close(db: OrmDb)
+    let n = orm_pool_size(db)
+    match db.odb_drv
+        DSqlite(p, sz) => forge_db.pool_close(p, n)
+        DPostgres(p, sz) => forge_pg.pg_pool_close(p, n)
+        DMysql(p, sz) => forge_mysql.mysql_pool_close(p, n)
 
 // ---- queries (agnostic) -----------------------------------------------------------------------------
 
+// A driver failure that orm_all/orm_one CANNOT report (their return types are fixed by the compiler's
+// typed-let rewrite -- see orm_all) is at least made LOUD here instead of vanishing. Silence is what made
+// a database outage read as "the table is empty" for every caller.
+fn _orm_report(where: string, sql: string, msg: string)
+    print("[orm] {where} FAILED: {msg} | sql: {sql}")
+
+// ---- sound, Result-returning primitives -------------------------------------------------------------
+// PREFER THESE in new code. orm_all/orm_one below exist because the compiler's typed-let rewrite pins
+// their return types (see the note on orm_all), so they cannot report failure at all.
+
+// Per-driver row source. Each match arm is a single call, so the dispatch stays a flat, exhaustive
+// three-liner and each driver's quirks live in its own named function.
+fn _orm_sqlite_rows(pool, sql: string, params, ms: int) -> Result
+    let acq = pool_acquire_to(pool, ms)
+    if is_err(acq)
+        return acq
+    let c = unwrap(acq)
+    // Release with pool_release, NEVER a bare `send`: pool_acquire_to REGISTERS a crash-safe release via
+    // on_exit_send, and a bare send does not cancel that registration, so the connection would go back to
+    // the pool TWICE -- once here and again when the task's cleanup registry drained at exit. That put
+    // DUPLICATE handles in the pool, letting two tasks acquire the SAME physical sqlite connection and
+    // interleave statements on it, and it grew the pool by one on every single call.
+    let rows = db_query_named(c, sql, params)
+    pool_release(pool, c)
+    ok(rows)
+
+// mysql_query/_params return ok(rows_list) for a SELECT but ok(affected_int) for an exec-style statement
+// (an OK packet). This is a SELECT API, so a bare int must not escape as a "list" -- a caller would
+// dereference it as a NovaList.
+fn _orm_mysql_rows(pool, sql: string, params) -> Result
+    let r = forge_mysql.mysql_pool_query_params(pool, sql, params) if len(params) > 0 else forge_mysql.mysql_pool_query(pool, sql)
+    if is_err(r)
+        return r
+    let v = unwrap(r)
+    if type_of(v) == "list"
+        return ok(v)
+    ok([])
+
+// SELECT -> ok(list of name-keyed row dicts) / err(message). The sound counterpart of orm_all.
+fn orm_rows(db: OrmDb, sql: string, params) -> Result
+    let _na = _orm_apply_nulls(sql, params)
+    let s = _na[0]
+    let ps = _na[1]
+    match db.odb_drv
+        DSqlite(p, n) => _orm_sqlite_rows(p, s, ps, db.odb_timeout_ms)
+        DPostgres(p, n) => forge_pg.pg_query_params_pool(p, _orm_pg_sql(s), _orm_pg_params(ps))
+        DMysql(p, n) => _orm_mysql_rows(p, s, ps)
+
 // SELECT -> list of name-keyed string row dicts. The name `orm_all` is recognized by the typed-let
 // rewrite, so `let xs: list<T> = orm_all(db, sql, params)` yields a list<T> of real structs.
-fn orm_all(db, sql: string, params) -> list
-    let kind = db[1]
-    let h = db[2]
-    let _na = _orm_apply_nulls(sql, params)
-    sql = _na[0]
-    params = _na[1]
-    if kind == "sqlite"
-        let acq = pool_acquire_to(h, _ORM_ACQUIRE_TIMEOUT_MS)
-        if is_err(acq)
-            // orm_all's contract is `-> list` (the typed `list<T> = orm_all(...)` let-site rewrite depends
-            // on it), so a pool-exhaustion timeout can't be surfaced as an err() Result here without
-            // breaking that contract -- consistent with the postgres/mysql branches just below, which also
-            // degrade ANY driver failure to [] rather than changing the return type. The production win is
-            // still real: a saturated pool now returns FAST (bounded by _ORM_ACQUIRE_TIMEOUT_MS) instead of
-            // parking this call forever.
-            return []
-        let c = unwrap(acq)
-        // DOUBLE-RELEASE BUG (fixed): this was `defer send(h, c)`. pool_acquire_to REGISTERS a
-        // crash-safe release via on_exit_send, and a bare `send` does not cancel that registration --
-        // so on the normal path the connection went back to the pool TWICE: once from the defer, and
-        // again when the fiber trampoline drained the task's cleanup registry at exit. The pool then
-        // held duplicate handles, so two tasks could acquire the SAME physical sqlite connection and
-        // interleave statements on it (cross-request row mixing, and outright memory corruption when
-        // sqlite is built single-threaded). It also grew the pool without bound -- one extra duplicate
-        // per call. pool_release does send + cancel_on_exit_val, which is exactly-once on BOTH the
-        // normal and the crashed path.
-        let rows = db_query_named(c, sql, params)
-        pool_release(h, c)
-        return rows
-    if kind == "postgres"
-        let r = forge_pg.pg_query_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
-        if is_ok(r)
-            return unwrap(r)
+//
+// WHY THIS CANNOT RETURN A Result: the compiler rewrites `let xs: list<T> = orm_all(...)` into
+// `T__from_dict_list(orm_all(...))`, and the generated T__from_dict_list takes a bare `list` of dicts.
+// Changing this signature to Result would feed a Result into that generated function. The name is
+// therefore pinned by the compiler (as are orm_one/orm_get/orm_where/orm_fetch). Making the rewrite
+// Result-aware is a COMPILER change -- deliberately not attempted here. What IS fixed: the failure is
+// no longer SILENT. Use orm_rows when you need to handle the error.
+fn orm_all(db: OrmDb, sql: string, params) -> list
+    let r = orm_rows(db, sql, params)
+    if is_err(r)
+        _orm_report("orm_all", sql, str(unwrap_err(r)))
         return []
-    if kind == "mysql"
-        // mysql_query/_params return ok(rows_list) for a SELECT but ok(affected_int) for an exec-style
-        // statement (OK packet). orm_all is a SELECT API declared `-> list`; guard against a bare int
-        // slipping through as a "list" (which a caller would deref as a NovaList) if misused with non-SELECT.
-        if len(params) == 0
-            let mr = forge_mysql.mysql_query(h, sql)
-            if is_ok(mr)
-                let v = unwrap(mr)
-                if type_of(v) == "list"
-                    return v
-                return []
-            return []
-        let mr2 = forge_mysql.mysql_query_params(h, sql, params)
-        if is_ok(mr2)
-            let v2 = unwrap(mr2)
-            if type_of(v2) == "list"
-                return v2
-            return []
-        return []
-    []
+    unwrap(r)
 
 // SELECT one -> a single name-keyed dict ({} if no row). `let r: Result<T> = orm_one(...)` -> Result<T>.
 fn orm_one(db, sql: string, params) -> any
@@ -300,31 +355,68 @@ fn orm_one(db, sql: string, params) -> any
         return rows[0]
     {}
 
-// INSERT / UPDATE / DELETE / DDL. Returns ok(affected_rows) or err(message).
-fn orm_exec(db, sql: string, params) -> any
-    let kind = db[1]
-    let h = db[2]
+// db_write checks sqlite3_step's return code (see sqlitex.nova) -- an earlier version called db_query,
+// which cannot report failure, and then ALWAYS returned ok(n), so a constraint violation, SQLITE_BUSY, or
+// any other write failure was reported as success to every caller.
+fn _orm_sqlite_exec(pool, sql: string, params, ms: int) -> Result
+    let acq = pool_acquire_to(pool, ms)
+    if is_err(acq)
+        return acq
+    let c = unwrap(acq)
+    let wr = db_write(c, sql, params)
+    pool_release(pool, c)          // NOT a bare send -- see the double-release note in _orm_sqlite_rows
+    wr
+
+fn _orm_mysql_exec(pool, sql: string, params) -> Result
+    forge_mysql.mysql_pool_query_params(pool, sql, params) if len(params) > 0 else forge_mysql.mysql_pool_query(pool, sql)
+
+// INSERT / UPDATE / DELETE / DDL. Returns ok(affected_rows) or err(message). Unlike orm_all this name is
+// NOT pinned by the compiler rewrite, so it reports failure properly.
+fn orm_exec(db: OrmDb, sql: string, params) -> Result
     let _na = _orm_apply_nulls(sql, params)
-    sql = _na[0]
-    params = _na[1]
-    if kind == "sqlite"
-        let c = pool_acquire_to(h, _ORM_ACQUIRE_TIMEOUT_MS)?
-        // db_write actually checks sqlite3_step's return code (see sqlitex.nova) -- previously this called
-        // db_query (which can't report failure) and then ALWAYS returned ok(n), so a constraint violation,
-        // SQLITE_BUSY, or any other write failure was reported as success to every orm_exec caller.
-        // Release via pool_release, NOT `defer send` -- see the double-release note in orm_all above.
-        let wr = db_write(c, sql, params)
-        pool_release(h, c)
-        return wr
-    if kind == "postgres"
-        // pg_exec_params_pool returns ok(affected) from the CommandComplete tag (0 for DDL).
-        return forge_pg.pg_exec_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
-    if kind == "mysql"
-        // mysql_query / mysql_query_params return ok(affected) from the OK packet for exec-style SQL.
-        if len(params) == 0
-            return forge_mysql.mysql_query(h, sql)
-        return forge_mysql.mysql_query_params(h, sql, params)
-    err("orm: unknown db kind")
+    let s = _na[0]
+    let ps = _na[1]
+    match db.odb_drv
+        DSqlite(p, n) => _orm_sqlite_exec(p, s, ps, db.odb_timeout_ms)
+        DPostgres(p, n) => forge_pg.pg_exec_params_pool(p, _orm_pg_sql(s), _orm_pg_params(ps))
+        DMysql(p, n) => _orm_mysql_exec(p, s, ps)
+
+// ---- transactions (agnostic) ------------------------------------------------------------------------
+// Run `body(txdb)` inside ONE transaction on ONE connection, committing on ok() and rolling back on err().
+//
+// The trick that makes this usable: the acquired connection is wrapped in its OWN single-connection pool
+// and handed to the body as a normal OrmDb. So every ordinary orm_* call inside the body transparently
+// runs on THAT connection -- which is what a transaction requires, since a transaction cannot span
+// connections. Without this the body would receive a raw driver connection and none of the ORM API would
+// work inside a transaction.
+//
+// Each driver's own with_tx is used underneath, so the correct dialect is issued (START TRANSACTION on
+// MySQL, BEGIN elsewhere) and -- since the drivers were fixed -- a failed BEGIN or a failed COMMIT is
+// reported as err() instead of being discarded and reported as success.
+// Sequential operations only: two CONCURRENT operations inside one body would contend for the single
+// connection in the tx pool.
+fn _orm_tx_wrap(db: OrmDb, conn, body) -> Result
+    let txch = channel()
+    send(txch, conn)
+    let txdb = OrmDb(_orm_same_driver(db, txch, 1), db.odb_timeout_ms)
+    let r = body(txdb)
+    // drain the tx pool so the caller's driver can return the real connection to the real pool
+    let back = select_timeout(txch, db.odb_timeout_ms)
+    r
+
+// Rebuild the SAME driver variant around a different pool -- keeps orm_with_tx driver-agnostic while
+// staying exhaustive, so a fourth database cannot be forgotten here.
+fn _orm_same_driver(db: OrmDb, pool, size: int) -> OrmDrv
+    match db.odb_drv
+        DSqlite(p, n) => DSqlite(pool, size)
+        DPostgres(p, n) => DPostgres(pool, size)
+        DMysql(p, n) => DMysql(pool, size)
+
+fn orm_with_tx(db: OrmDb, body) -> Result
+    match db.odb_drv
+        DSqlite(p, n) => forge_db.with_tx(p, fn(c) _orm_tx_wrap(db, c, body))
+        DPostgres(p, n) => forge_pg.pg_with_tx(p, fn(c) _orm_tx_wrap(db, c, body))
+        DMysql(p, n) => forge_mysql.mysql_with_tx(p, fn(c) _orm_tx_wrap(db, c, body))
 
 // Quote a SQL IDENTIFIER (table or column) for the active dialect so reserved words (Order, Group, User,
 // Select, Table, Index, ...) -- and the zero-annotation, type-derived table/column names -- are always
@@ -349,7 +441,7 @@ fn _orm_qident(kind: string, name: string) -> string
 
 // COUNT rows, optional WHERE (pass "" for none). orm_count(db, "users", "age > ?", [18]).
 fn orm_count(db, table: string, where: string, params) -> int
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     let sql = "SELECT count(*) AS n FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT count(*) AS n FROM {tbl}"
     let rows = orm_all(db, sql, params)
     if len(rows) > 0
@@ -374,8 +466,8 @@ fn _orm_is_valid_agg_fn(fn_name: string) -> bool
 fn orm_agg(db, fn_name: string, col: string, table: string, where: string, params) -> string
     if not _orm_is_valid_agg_fn(fn_name)
         return ""
-    let cq = _orm_qident(db[1], col)
-    let tbl = _orm_qident(db[1], table)
+    let cq = _orm_qident(orm_kind(db), col)
+    let tbl = _orm_qident(orm_kind(db), table)
     let sql = "SELECT {fn_name}({cq}) AS a FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT {fn_name}({cq}) AS a FROM {tbl}"
     let rows = orm_all(db, sql, params)
     if len(rows) > 0
@@ -388,7 +480,7 @@ fn orm_agg(db, fn_name: string, col: string, table: string, where: string, param
 // runs INSERT INTO <table> (cols) VALUES (?,..). Portable across drivers. Set the id field explicitly (for
 // an auto/serial key, use orm_exec with custom SQL). Returns ok(affected) / err(msg).
 fn orm_insert(db, table: string, row) -> any
-    let kind = db[1]
+    let kind = orm_kind(db)
     // Skip an UNSET id (id == 0) so the DB auto-assigns the primary key (the "insert a new row, get its
     // id" hero flow). A non-zero id is inserted verbatim (explicit-id inserts still work). No id field
     // -> nothing skipped.
@@ -402,7 +494,7 @@ fn orm_insert(db, table: string, row) -> any
 // UPDATE a struct by its `id` field: SET every non-id column WHERE id = the struct's id. The struct MUST
 // have an id field. Returns ok(affected) (driver-reported where available) / err(msg).
 fn orm_update(db, table: string, row) -> any
-    let kind = db[1]
+    let kind = orm_kind(db)
     let names = field_names(row)
     let cols = [nm for nm in names if nm != "id"]
     let setclause = join([_orm_qident(kind, nm) + " = ?" for nm in cols], ", ")
@@ -415,7 +507,7 @@ fn orm_update(db, table: string, row) -> any
 
 // DELETE by id. Returns ok(affected) / err(msg).
 fn orm_delete(db, table: string, id) -> any
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     orm_exec(db, "DELETE FROM {tbl} WHERE id = ?", [id])
 
 // ── Zero-annotation, zero-table-name persistence: the struct's TYPE *is* the table ───────────────────
@@ -447,7 +539,7 @@ fn orm_fetch(db) -> list
 // rows. This is the target of the orm_fetch compiler rewrite (so reserved-word type names are legal SQL),
 // and is also usable directly: `let xs: list<Todo> = orm_fetch_all(db, "Todo")` when the table is dynamic.
 fn orm_fetch_all(db, table: string) -> list
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     orm_all(db, "SELECT * FROM {tbl}", [])
 
 // Create the struct-type's table if it doesn't already exist (columns + SQL types derived from the fields).
@@ -548,11 +640,11 @@ fn OrmQuery.run(db) -> list
 // Relations need no special API or annotations: has-many = orm_where on the child's FK column;
 // belongs-to = orm_get on the parent table by the FK value. Both are ONE typed call, no SQL ceremony.
 fn orm_get(db, table: string, id) -> any
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     orm_one(db, "SELECT * FROM {tbl} WHERE id = ?", [id])
 
 fn orm_where(db, table: string, cond: string, params) -> list
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     orm_all(db, "SELECT * FROM {tbl} WHERE {cond}", params)
 
 // ---- migrations: schema generated from a struct (JPA's ddl-auto, zero annotations) ------------------
@@ -580,7 +672,7 @@ fn _orm_sql_type(nova_type: string, kind: string, col: string) -> string
 fn orm_create_table(db, table: string, sample) -> any
     let names = field_names(sample)
     let types = field_types(sample)
-    let kind = db[1]
+    let kind = orm_kind(db)
     // quote the column identifier (keyword-safe); _orm_sql_type still sees the RAW name so its
     // `col == "id"` PRIMARY-KEY check is unaffected.
     let cols = join([_orm_qident(kind, names[i]) + " " + _orm_sql_type(types[i], kind, names[i]) for i in 0..len(names)], ", ")
@@ -588,5 +680,5 @@ fn orm_create_table(db, table: string, sample) -> any
     orm_exec(db, "CREATE TABLE IF NOT EXISTS {tbl} ({cols})", [])
 
 fn orm_drop_table(db, table: string) -> any
-    let tbl = _orm_qident(db[1], table)
+    let tbl = _orm_qident(orm_kind(db), table)
     orm_exec(db, "DROP TABLE IF EXISTS {tbl}", [])

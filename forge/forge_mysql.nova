@@ -1,28 +1,36 @@
-// forge_mysql -- pure-NOVA MySQL driver over raw TCP (no libmysqlclient), mirroring forge_pg. Speaks the
-// classic MySQL protocol: LE packet framing (3-byte length + 1-byte seq), HandshakeV10, the
-// mysql_native_password auth (SHA-1), COM_QUERY, and length-encoded result-set parsing. Rows come back as
-// name-keyed string dicts -- so forge_orm's typed mapping (orm_all<T>/orm_one<T>) works unchanged.
-// Auth token = SHA1(pw) XOR SHA1(scramble ++ SHA1(SHA1(pw))); values are always parameterized upstream.
-// Also provides: a channel-based connection POOL + transactions (mysql_pool_open/mysql_with_tx, parallel
-// to forge_db's pool_*/with_tx and forge_pg's pg_pool_open/pg_with_tx), and optional TLS (mysql_connect_tls,
-// parallel to forge_pg's pg_connect/pg_connect_tls split, via MySQL's mid-handshake SSLRequest switch).
+// forge_mysql -- pure-NOVA MySQL wire-protocol driver. Speaks HandshakeV10, mysql_native_password /
+// caching_sha2_password auth, COM_QUERY (text) and COM_STMT_PREPARE/EXECUTE (binary), connection
+// pooling, and transactions. Rows come back as name-keyed string/null dicts for forge_orm compatibility.
 import forge_crypto
-// forge_pg (not just for its own sake -- see the extern-dedup note by the TLS externs below).
 import forge_pg
-// str_pad_left(s, width, "0") -- read before delegating: it no-ops when len(s) >= width, exactly like the
-// hand-rolled zero-padders it replaces below.
-import std/core/str
 
-// ---- little-endian helpers --------------------------------------------------------------------------
-// n little-endian bytes of `v` as a plain int list -- the ONE place the LE byte order is written.
-// _my_p3/_my_p4 were the same three/four lines at two widths; they are now this at w=3 / w=4.
+// ── data types ──────────────────────────────────────────────────────────────────────────────────
+type MysqlConn
+    is_tls: int
+    handle: int
+
+type MysqlPacket
+    seq: int
+    payload: bytes
+    leftover: bytes
+
+type ColDefs
+    names: list
+    types: list
+    flags: list
+    leftover: bytes
+
+// ── little-endian helpers ───────────────────────────────────────────────────────────────────────
 fn _my_le_list(v: int, w: int) -> list
     [(v >> (i * 8)) & 255 for i in 0..w]
 
-// Read an n-byte little-endian unsigned integer. Folded most-significant byte first so the fold is the
-// same wrapping i64 arithmetic the byte*256^i sum was (verified bit-exact incl. the 8-byte/float cases).
 fn _my_u(b, off: int, n: int) -> int
     reduce([bytes_get(b, off + n - 1 - i) for i in 0..n], (acc, v) => (acc << 8) | v, 0)
+
+fn _my_i(b, off: int, n: int) -> int
+    let u = _my_u(b, off, n)
+    let sign_bit = 1 << (n * 8 - 1)
+    u - (sign_bit << 1) if u >= sign_bit else u
 
 fn _my_p3(n: int) -> any
     bytes_from_list(_my_le_list(n, 3))
@@ -36,7 +44,6 @@ fn _my_cstr(b, off: int) -> any
         endp += 1
     [bytes_to_str(bytes_slice(b, off, endp)), endp + 1]
 
-// length-encoded integer -> [value, next_off].
 fn _my_lenenc_int(b, off: int) -> any
     let f = bytes_get(b, off)
     if f < 251
@@ -49,16 +56,15 @@ fn _my_lenenc_int(b, off: int) -> any
         return [_my_u(b, off + 1, 8), off + 9]
     [0, off + 1]
 
-// length-encoded string -> [string, next_off]. 0xfb (251) = SQL NULL -> "".
+// 0xfb (251) = SQL NULL -> NOVA null (not "")
 fn _my_lenenc_str(b, off: int) -> any
     if bytes_get(b, off) == 251
-        return ["", off + 1]
+        return [null, off + 1]
     let li = _my_lenenc_int(b, off)
     let n = li[0]
     let start = li[1]
     [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
 
-// length-encoded INTEGER writer (for COM_STMT_EXECUTE param values/lengths).
 fn _my_wr_lenenc(n: int) -> any
     if n < 251
         return bytes_from_list([n])
@@ -66,44 +72,36 @@ fn _my_wr_lenenc(n: int) -> any
         return bytes_from_list([252, ..._my_le_list(n, 2)])
     bytes_from_list([253, ..._my_le_list(n, 3)])
 
-// length-encoded STRING writer (lenenc length + raw bytes).
 fn _my_wr_lenstr(sb) -> any
     bytes_concat(_my_wr_lenenc(bytes_len(sb)), sb)
 
-// ---- packet IO --------------------------------------------------------------------------------------
-// Transport-agnostic send/recv/close. `conn` = [is_tls (0/1), handle]: handle is a raw tcp_connect() fd
-// when is_tls==0, or the opaque handle nova_rt_tls_upgrade() returned when is_tls==1. Every packet read
-// and write in this file flows through _my_read_packet/_my_write_packet -> these three helpers, so
-// mysql_connect_tls can switch a connection from plaintext to TLS mid-handshake (see _my_connect_impl's
-// use_tls block) and every later query on that same conn stays transparently encrypted. Mirrors forge_pg's
-// _pg_send/_pg_recv_chunk/_pg_close_transport (conn = [kind, handle]) exactly.
-// NOT re-declared as `extern fn` here (unlike forge_pg.nova, which does declare them): the compiler
-// emits a `define @nova_ffi_<name>` FFI wrapper for every FILE containing its own `extern fn` of a
-// given name, with no cross-file dedup -- so two files each independently declaring the identical
-// extern (forge_pg.nova already does) collide at link time the moment a program imports both (as
-// forge_orm.nova, which imports forge_pg + forge_mysql, does). `import forge_pg` above makes its
-// already-declared nova_rt_tls_upgrade/nova_rt_tls_send_bytes/nova_rt_tls_recv_bytes symbols
-// directly callable here (NOVA function symbols are global across imports) with no redeclaration.
-// (tls_close is already a compiler builtin -- used directly below, NOT re-declared as extern.)
+fn _my_lenenc_str_n(b, off: int, n: int) -> any
+    let o = off
+    let s = ["", off]
+    for i in 0..n
+        s = _my_lenenc_str(b, o)
+        o = s[1]
+    s
 
-fn _my_send(conn, data)
-    if conn[0] == 1
-        unsafe nova_rt_tls_send_bytes(conn[1], data)
+// ── transport (dispatch on conn.is_tls) ─────────────────────────────────────────────────────────
+fn _my_send(conn: MysqlConn, data)
+    if conn.is_tls == 1
+        tls_send_bytes(conn.handle, data)
     else
-        tcp_send_bytes(conn[1], data)
+        tcp_send_bytes(conn.handle, data)
 
-fn _my_recv_chunk(conn) -> any
-    if conn[0] == 1
-        return unsafe nova_rt_tls_recv_bytes(conn[1])
-    tcp_recv_bytes(conn[1])
+fn _my_recv_chunk(conn: MysqlConn) -> any
+    if conn.is_tls == 1
+        return tls_recv_bytes(conn.handle)
+    tcp_recv_bytes(conn.handle)
 
-fn _my_close_transport(conn)
-    if conn[0] == 1
-        tls_close(conn[1])
+fn _my_close_transport(conn: MysqlConn)
+    if conn.is_tls == 1
+        tls_close(conn.handle)
     else
-        tcp_close(conn[1])
+        tcp_close(conn.handle)
 
-fn _my_recv_at_least(conn, buf, need: int) -> any
+fn _my_recv_at_least(conn: MysqlConn, buf, need: int) -> any
     while bytes_len(buf) < need
         let chunk = _my_recv_chunk(conn)
         if bytes_len(chunk) == 0
@@ -111,28 +109,40 @@ fn _my_recv_at_least(conn, buf, need: int) -> any
         buf = bytes_concat(buf, chunk)
     buf
 
-// Read one whole packet -> [seq, payload, leftover]. seq -1 = EOF/short read.
-fn _my_read_packet(conn, buf) -> any
+// ── packet I/O ──────────────────────────────────────────────────────────────────────────────────
+// Read one whole packet -> MysqlPacket. seq == -1 means EOF/short read. Reassembles >16MB payloads.
+fn _my_read_packet(conn: MysqlConn, buf) -> MysqlPacket
     buf = _my_recv_at_least(conn, buf, 4)
     if bytes_len(buf) < 4
-        return [-1, bytes(0), buf]
+        return MysqlPacket(-1, bytes(0), buf)
     let plen = _my_u(buf, 0, 3)
     let seq = bytes_get(buf, 3)
     let total = 4 + plen
     buf = _my_recv_at_least(conn, buf, total)
     if bytes_len(buf) < total
-        return [-1, bytes(0), buf]
-    [seq, bytes_slice(buf, 4, total), bytes_slice(buf, total, bytes_len(buf))]
+        return MysqlPacket(-1, bytes(0), buf)
+    let payload = bytes_slice(buf, 4, total)
+    buf = bytes_slice(buf, total, bytes_len(buf))
+    while plen == 16777215
+        buf = _my_recv_at_least(conn, buf, 4)
+        if bytes_len(buf) < 4
+            return MysqlPacket(-1, bytes(0), buf)
+        plen = _my_u(buf, 0, 3)
+        seq = bytes_get(buf, 3)
+        total = 4 + plen
+        buf = _my_recv_at_least(conn, buf, total)
+        if bytes_len(buf) < total
+            return MysqlPacket(-1, bytes(0), buf)
+        payload = bytes_concat(payload, bytes_slice(buf, 4, total))
+        buf = bytes_slice(buf, total, bytes_len(buf))
+    MysqlPacket(seq, payload, buf)
 
-fn _my_write_packet(conn, seq: int, payload)
+fn _my_write_packet(conn: MysqlConn, seq: int, payload)
     let hdr = bytes_from_list([..._my_le_list(bytes_len(payload), 3), seq & 255])
     _my_send(conn, bytes_concat(hdr, payload))
 
-// ---- auth (mysql_native_password / caching_sha2_password) -------------------------------------------
-// Both MySQL challenge-response plugins are the SAME shape -- h1 = H(pw); h3 = H(salted H(h1)); token =
-// h1 XOR h3, len(h1) bytes -- differing only in the hash and in which side of the concat the scramble
-// sits on. One helper, the hash passed as a closure, `h2_first` picking the concat order. The XOR width
-// is len(h1), which is exactly the 20 (SHA-1) / 32 (SHA-256) the two open-coded versions used.
+// ── auth (mysql_native_password / caching_sha2_password) ────────────────────────────────────────
+// Both plugins: h1 = H(pw); h3 = H(salted H(h1)); token = h1 XOR h3. Hash + concat order differ.
 fn _my_xor_auth_token(password: string, scramble, hashfn, h2_first: int) -> any
     if len(password) == 0
         return bytes(0)
@@ -142,104 +152,87 @@ fn _my_xor_auth_token(password: string, scramble, hashfn, h2_first: int) -> any
     let h3 = hashfn(cat)
     bytes_from_list([(h1[i] ^ h3[i]) & 255 for i in 0..len(h1)])
 
-// token = SHA1(pw) XOR SHA1( scramble(20) ++ SHA1(SHA1(pw)) ). Empty password -> empty token.
 fn _my_native_pw(password: string, scramble) -> any
     _my_xor_auth_token(password, scramble, (m) => sha1_bytes(m), 0)
 
-// caching_sha2_password fast-path token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ scramble(20) ), 32 bytes.
 fn _my_caching_sha2_pw(password: string, scramble) -> any
     _my_xor_auth_token(password, scramble, (m) => sha256_bytes(m), 1)
 
-// PRIVATE: format a MySQL ERR packet (byte0 = 0xff) -> "mysql: <code> <message>". Layout: 0xff,
-// error_code(2 LE), then a 6-byte SQL-state marker+state, then the human-readable message. This exact
-// three-line shape appeared at five call sites (connect, fast-auth, query, prepare, execute).
 fn _my_err_msg(p) -> string
     let code = _my_u(p, 1, 2)
+    let sqlstate = bytes_to_str(bytes_slice(p, 4, 9))
     let msg = bytes_to_str(bytes_slice(p, 9, bytes_len(p)))
-    "mysql: {code} {msg}"
+    "mysql: [{sqlstate}] {code} {msg}"
 
-// PRIVATE: skip n consecutive length-encoded strings starting at `off` -> [nth string, next off].
-// A column-definition packet is a run of these, and both readers below walk it the same way.
-fn _my_lenenc_str_n(b, off: int, n: int) -> any
-    let o = off
-    let s = ["", off]
-    for i in 0..n
-        s = _my_lenenc_str(b, o)
-        o = s[1]
-    s
-
-// ---- connect ----------------------------------------------------------------------------------------
-// PRIVATE: the HandshakeResponse41 header shared by both the abbreviated SSLRequest and the full
-// response: capability flags(4) + max-packet-size(4) + charset(1) + 23 reserved zero bytes.
+// ── connect ─────────────────────────────────────────────────────────────────────────────────────
 fn _my_handshake_header(flags: int) -> any
-    bytes_from_list([..._my_le_list(flags, 4), ..._my_le_list(16777215, 4), 33, ...[0 for zi in 0..23]])
+    bytes_from_list([..._my_le_list(flags, 4), ..._my_le_list(16777215, 4), 45, ...[0 for zi in 0..23]])
 
-// PRIVATE: shared by mysql_connect (use_tls=0) and mysql_connect_tls (use_tls=1) -- ok(conn) authenticated
-// + ready for queries, or err. conn = [is_tls, handle] (is_tls 0 = plaintext, handle = tcp fd; is_tls 1 =
-// TLS, handle = the nova_rt_tls_upgrade() handle) -- opaque to every other function here, which only ever
-// forwards it into _my_read_packet/_my_write_packet/_my_close_transport. Supports mysql_native_password
-// (MySQL 5.7 default; 8.0 accounts created WITH mysql_native_password) and caching_sha2_password's fast
-// path. use_tls=1 encrypts the connection (verify=1: cert chain + hostname checked, matching the other
-// secure-by-default callers of nova_rt_tls_upgrade) via MySQL's mid-handshake SSLRequest switch below.
-// (A default param on ONE public mysql_connect would be simpler, but a default parameter is not filled in
-// at a cross-module call site -- verified by compiling forge_orm_test.nova, which calls
-// forge_mysql.mysql_connect with 5 args and failed arity-checking against a 6-param signature. Two
-// distinctly-named public entry points below sidestep that gap entirely and mirror forge_pg's actual
-// pg_connect/pg_connect_tls split.)
+// Handle AuthMoreData (byte0 == 1) for caching_sha2_password fast/full paths.
+fn _my_handle_auth_more(conn: MysqlConn, rp, r2: MysqlPacket, password: string, use_tls: int) -> any
+    let status = bytes_get(rp, 1)
+    if status == 3
+        let r3 = _my_read_packet(conn, r2.leftover)
+        if r3.seq == -1
+            _my_close_transport(conn)
+            return err("mysql: connection closed after caching_sha2 fast-auth")
+        if bytes_get(r3.payload, 0) == 255
+            _my_close_transport(conn)
+            return err(_my_err_msg(r3.payload))
+        return ok(conn)
+    if use_tls == 1
+        let pw_bytes = bytes_append(str_to_bytes(password), 0)
+        _my_write_packet(conn, r2.seq + 1, pw_bytes)
+        let r4 = _my_read_packet(conn, r2.leftover)
+        if r4.seq == -1
+            _my_close_transport(conn)
+            return err("mysql: connection closed during caching_sha2 full auth")
+        if bytes_get(r4.payload, 0) == 255
+            _my_close_transport(conn)
+            return err(_my_err_msg(r4.payload))
+        return ok(conn)
+    _my_close_transport(conn)
+    err("mysql: caching_sha2 full auth requires TLS (use mysql_connect_tls) or prime the server cache")
+
 fn _my_connect_impl(host: string, port: int, user: string, db: string, password: string, use_tls: int) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
         return err("mysql: cannot connect to {host}:{port}")
-    let conn = [0, sock]
+    let conn = MysqlConn(0, sock)
     let pkt = _my_read_packet(conn, bytes(0))
-    if pkt[0] == -1
+    if pkt.seq == -1
         _my_close_transport(conn)
         return err("mysql: no handshake packet")
-    let payload = pkt[1]
+    let payload = pkt.payload
     if bytes_get(payload, 0) != 10
         _my_close_transport(conn)
         return err("mysql: unsupported protocol version")
     let svr = _my_cstr(payload, 1)
-    let off = svr[1]
-    off += 4
+    let off = svr[1] + 4
     let scr1off = off
-    off += 8 + 1
-    off += 2 + 1 + 2 + 2
+    off += 8 + 1 + 2 + 1 + 2 + 2
     let adl = bytes_get(payload, off)
     off += 1 + 10
-    let part2 = adl - 8
-    if part2 < 13
-        part2 = 13
+    let part2 = max([adl - 8, 13])
     let scr2off = off
     let scramble = [...[bytes_get(payload, scr1off + si) for si in 0..8], ...[bytes_get(payload, scr2off + si) for si in 0..12]]
     let plugin_res = _my_cstr(payload, scr2off + part2)
     let srv_plugin = plugin_res[0]
-    let token = bytes(0)
-    let resp_plugin = "mysql_native_password"
-    if srv_plugin == "caching_sha2_password"
-        token = _my_caching_sha2_pw(password, scramble)
-        resp_plugin = "caching_sha2_password"
-    else
-        token = _my_native_pw(password, scramble)
-    // HandshakeResponse41
+    let is_sha2 = srv_plugin == "caching_sha2_password"
+    let token = _my_caching_sha2_pw(password, scramble) if is_sha2 else _my_native_pw(password, scramble)
+    let resp_plugin = "caching_sha2_password" if is_sha2 else "mysql_native_password"
     let flags = 512 | 32768 | 524288 | 1
     if len(db) > 0
         flags = flags | 8
     let resp_seq = 1
     if use_tls == 1
-        // MySQL's SSL switch happens MID-handshake (unlike Postgres's pre-startup SSLRequest): send the
-        // abbreviated SSLRequest -- capability flags with CLIENT_SSL set, no username/password -- at
-        // sequence 1, upgrade the raw socket to TLS, then send the FULL HandshakeResponse41 (built below,
-        // with the credentials) at sequence 2 over the now-encrypted transport. Every read/write on
-        // `conn` from here on is transparently encrypted (_my_read_packet/_my_write_packet dispatch on
-        // conn[0]).
         flags = flags | 2048
         _my_write_packet(conn, 1, _my_handshake_header(flags))
-        let tls = unsafe nova_rt_tls_upgrade(sock, host, 1)
+        let tls = tls_upgrade(sock, host, 1)
         if tls == 0
             tcp_close(sock)
             return err("mysql: TLS handshake/verification failed")
-        conn = [1, tls]
+        conn = MysqlConn(1, tls)
         resp_seq = 2
     let resp = _my_handshake_header(flags)
     resp = bytes_concat(resp, str_to_bytes(user))
@@ -252,94 +245,74 @@ fn _my_connect_impl(host: string, port: int, user: string, db: string, password:
     resp = bytes_concat(resp, str_to_bytes(resp_plugin))
     resp = bytes_append(resp, 0)
     _my_write_packet(conn, resp_seq, resp)
-    let r2 = _my_read_packet(conn, pkt[2])
-    if r2[0] == -1
+    let r2 = _my_read_packet(conn, pkt.leftover)
+    if r2.seq == -1
         _my_close_transport(conn)
         return err("mysql: connection closed during auth")
-    let rp = r2[1]
+    let rp = r2.payload
     let first = bytes_get(rp, 0)
     if first == 255
-        let emsg = _my_err_msg(rp)
         _my_close_transport(conn)
-        return err(emsg)
+        return err(_my_err_msg(rp))
     if first == 1
-        let status = bytes_get(rp, 1)
-        if status == 3
-            let r3 = _my_read_packet(conn, r2[2])
-            if r3[0] == -1
-                _my_close_transport(conn)
-                return err("mysql: connection closed after caching_sha2 fast-auth")
-            if bytes_get(r3[1], 0) == 255
-                let e3 = _my_err_msg(r3[1])
-                _my_close_transport(conn)
-                return err(e3)
-            return ok(conn)
-        _my_close_transport(conn)
-        return err("mysql: caching_sha2 full authentication required (cold cache) -- needs TLS or RSA, not yet supported; prime the cache or use mysql_native_password")
+        return _my_handle_auth_more(conn, rp, r2, password, use_tls)
     if first == 254
         _my_close_transport(conn)
         return err("mysql: server requested an auth-switch (unsupported plugin)")
     ok(conn)
 
-// Plaintext connect (the common case) -> ok(conn) or err.
 fn mysql_connect(host: string, port: int, user: string, db: string, password: string) -> any
     _my_connect_impl(host, port, user, db, password, 0)
 
-// TLS connect: encrypts the connection via MySQL's mid-handshake SSLRequest switch (see
-// _my_connect_impl's use_tls block above for the wire-level detail); verify is always on, matching the
-// other secure-by-default nova_rt_tls_upgrade callers (forge_pg's pg_connect_tls, forge_http_client) ->
-// ok(conn) or err.
 fn mysql_connect_tls(host: string, port: int, user: string, db: string, password: string) -> any
     _my_connect_impl(host, port, user, db, password, 1)
 
-fn mysql_close(conn)
+// COM_QUIT (opcode 1) + close transport.
+fn mysql_close(conn: MysqlConn)
+    _my_write_packet(conn, 0, bytes_from_list([1]))
     _my_close_transport(conn)
 
-// ---- query ------------------------------------------------------------------------------------------
-// Run SQL (COM_QUERY). Returns ok(list of name-keyed string row dicts) for a SELECT, ok([]) for a
-// statement with no result set (INSERT/UPDATE/DDL), or err(message).
-// affected_rows from an OK packet. Layout: byte0 = 0x00 (OK marker), then affected_rows as a
-// length-encoded int, then last_insert_id (lenenc), status_flags (2), warnings (2). Caller must have
-// verified byte0 == 0x00 (an OK packet, not a result set or ERR).
+// COM_PING (opcode 14): round-trip liveness check. true = alive, false = dead.
+fn mysql_ping(conn: MysqlConn) -> bool
+    _my_write_packet(conn, 0, bytes_from_list([14]))
+    let pkt = _my_read_packet(conn, bytes(0))
+    pkt.seq != -1 and bytes_get(pkt.payload, 0) == 0
+
+// ── query (text protocol) ───────────────────────────────────────────────────────────────────────
 fn mysql_ok_affected(pkt) -> int
     (_my_lenenc_int(pkt, 1))[0]
 
-fn mysql_query(conn, sql: string) -> any
-    let q = bytes_concat(bytes_from_list([3]), str_to_bytes(sql))
-    _my_write_packet(conn, 0, q)
+// COM_QUERY -> ok(list of row dicts) for SELECT, ok(affected_rows: int) for DML, or err.
+fn mysql_query(conn: MysqlConn, sql: string) -> any
+    _my_write_packet(conn, 0, bytes_concat(bytes_from_list([3]), str_to_bytes(sql)))
     let buf = bytes(0)
     let p1 = _my_read_packet(conn, buf)
-    if p1[0] == -1
+    if p1.seq == -1
         return err("mysql: connection closed during query")
-    buf = p1[2]
-    let head = p1[1]
+    buf = p1.leftover
+    let head = p1.payload
     let fb = bytes_get(head, 0)
     if fb == 255
         return err(_my_err_msg(head))
     if fb == 0
-        // OK packet (INSERT/UPDATE/DELETE/DDL): byte0=0x00, then affected_rows as a lenenc-int.
-        // SELECT returns a result set (fb = column count) and takes the row-reading path below, so
-        // orm_all is unaffected; only exec-style statements reach here.
         return ok(mysql_ok_affected(head))
-    let ccr = _my_lenenc_int(head, 0)
-    let ncols = ccr[0]
-    // one column-definition packet per column; the 5th length-encoded string is the column NAME
+    let ncols = (_my_lenenc_int(head, 0))[0]
     let colnames = []
     for ci in 0..ncols
         let cp = _my_read_packet(conn, buf)
-        buf = cp[2]
-        push(colnames, (_my_lenenc_str_n(cp[1], 0, 5))[0])
+        buf = cp.leftover
+        push(colnames, (_my_lenenc_str_n(cp.payload, 0, 5))[0])
     let ep = _my_read_packet(conn, buf)
-    buf = ep[2]
+    buf = ep.leftover
     let rows = []
     let done = 0
     while done == 0
         let rp = _my_read_packet(conn, buf)
-        if rp[0] == -1
+        if rp.seq == -1
             done = 1
         else
-            buf = rp[2]
-            let row = rp[1]
+            buf = rp.leftover
+            let row = rp.payload
             let rfb = bytes_get(row, 0)
             if rfb == 254 and bytes_len(row) < 9
                 done = 1
@@ -350,7 +323,7 @@ fn mysql_query(conn, sql: string) -> any
                 let o = 0
                 for k in 0..ncols
                     if bytes_get(row, o) == 251
-                        d[colnames[k]] = ""
+                        d[colnames[k]] = null
                         o += 1
                     else
                         let sv = _my_lenenc_str(row, o)
@@ -359,177 +332,159 @@ fn mysql_query(conn, sql: string) -> any
                 push(rows, d)
     ok(rows)
 
-// ---- prepared statements (binary protocol) ----------------------------------------------------------
-// PRIVATE: left-pad an int to at least 2 / exactly 6 digits (temporal formatting).
+// ── binary protocol (prepared statements) ───────────────────────────────────────────────────────
 fn _my_z2(n: int) -> string
     str_pad_left(str(n), 2, "0")
 
 fn _my_z6(n: int) -> string
     str_pad_left(str(n), 6, "0")
 
-// Decode ONE binary-protocol value at `off` for column type `t` -> [string, next_off]. Integers ->
-// decimal string; string/decimal/blob/json -> lenenc string; DATE/DATETIME/TIMESTAMP/TIME decode to
-// ISO strings; FLOAT/DOUBLE decode via the float_from_bits/f32_from_bits reinterpret builtins.
-// _my_u is unsigned (fine for ids/counts).
-fn _my_bin_val(b, off: int, t: int) -> any
-    if t == 1
-        return [str(_my_u(b, off, 1)), off + 1]
-    if t == 2 or t == 13
-        return [str(_my_u(b, off, 2)), off + 2]
-    if t == 3 or t == 9
-        return [str(_my_u(b, off, 4)), off + 4]
-    if t == 8
-        return [str(_my_u(b, off, 8)), off + 8]
-    if t == 4
-        // FLOAT: 4-byte little-endian IEEE-754 single -> widen to double via f32_from_bits.
-        return [str(f32_from_bits(_my_u(b, off, 4))), off + 4]
-    if t == 5
-        // DOUBLE: 8-byte little-endian IEEE-754 double. _my_u wraps to the exact 64-bit pattern;
-        // float_from_bits reinterprets those bits as a NOVA float.
-        return [str(float_from_bits(_my_u(b, off, 8))), off + 8]
-    // binary DATE(10)/DATETIME(12)/TIMESTAMP(7): a length byte then that many payload bytes (0/4/7/11).
-    // 4 = date only; 7 = + time; 11 = + microseconds. year is 2-byte LE, the rest single bytes.
-    if t == 10 or t == 12 or t == 7
-        let dlen = _my_u(b, off, 1)
-        let dp = off + 1
-        // DATETIME(12)/TIMESTAMP(7) carry a time component even at midnight: MySQL omits an all-zero time
-        // (sends dlen 4 or 0), but the canonical value is still "... 00:00:00". DATE(10) is date-only.
-        let has_time = t == 12 or t == 7
-        if dlen == 0
-            if has_time
-                return ["0000-00-00 00:00:00", dp]
-            return ["0000-00-00", dp]
-        let yr = _my_u(b, dp, 2)
-        let mo = _my_u(b, dp + 2, 1)
-        let dy = _my_u(b, dp + 3, 1)
-        let dstr = "{yr}-{_my_z2(mo)}-{_my_z2(dy)}"
-        if dlen == 4
-            if has_time
-                return ["{dstr} 00:00:00", dp + 4]
-            return [dstr, dp + 4]
-        let hh = _my_u(b, dp + 4, 1)
-        let mi = _my_u(b, dp + 5, 1)
-        let se = _my_u(b, dp + 6, 1)
-        let tstr = "{dstr} {_my_z2(hh)}:{_my_z2(mi)}:{_my_z2(se)}"
-        if dlen == 7
-            return [tstr, dp + 7]
-        let dus = _my_u(b, dp + 7, 4)
-        return ["{tstr}.{_my_z6(dus)}", dp + 11]
-    // binary TIME(11): length byte then sign(1) days(4 LE) hour(1) min(1) sec(1) [micros(4 LE)] (0/8/12).
-    // MySQL TIME can exceed 24h (up to 838:59:59), so total hours = days*24 + hour (may be >2 digits).
-    if t == 11
-        let tlen = _my_u(b, off, 1)
-        let tp = off + 1
-        if tlen == 0
-            return ["00:00:00", tp]
-        let neg = _my_u(b, tp, 1)
-        let days = _my_u(b, tp + 1, 4)
-        let th = _my_u(b, tp + 5, 1)
-        let tmi = _my_u(b, tp + 6, 1)
-        let tse = _my_u(b, tp + 7, 1)
-        let sign = "-" if neg == 1 else ""
-        let base = "{sign}{_my_z2(days * 24 + th)}:{_my_z2(tmi)}:{_my_z2(tse)}"
-        if tlen == 8
-            return [base, tp + 8]
-        let tus = _my_u(b, tp + 8, 4)
-        return ["{base}.{_my_z6(tus)}", tp + 12]
-    let sres = _my_lenenc_str(b, off)
-    [sres[0], sres[1]]
+// Decode a signed or unsigned integer of width n at offset -> [str, next_off].
+fn _my_decode_int(b, off: int, n: int, unsigned: int) -> any
+    let v = _my_u(b, off, n) if unsigned == 1 else _my_i(b, off, n)
+    [str(v), off + n]
 
-// Public seam over _my_bin_val for offline testing: decode one binary-protocol value -> [str, next_off].
+// Decode DATE/DATETIME/TIMESTAMP at offset -> [iso_string, next_off].
+fn _my_decode_date(b, off: int, has_time: int) -> any
+    let dlen = _my_u(b, off, 1)
+    let dp = off + 1
+    if dlen == 0
+        return ["0000-00-00 00:00:00" if has_time == 1 else "0000-00-00", dp]
+    let yr = _my_u(b, dp, 2)
+    let mo = _my_u(b, dp + 2, 1)
+    let dy = _my_u(b, dp + 3, 1)
+    let dstr = "{yr}-{_my_z2(mo)}-{_my_z2(dy)}"
+    if dlen == 4
+        return ["{dstr} 00:00:00" if has_time == 1 else dstr, dp + 4]
+    let hh = _my_u(b, dp + 4, 1)
+    let mi = _my_u(b, dp + 5, 1)
+    let se = _my_u(b, dp + 6, 1)
+    let tstr = "{dstr} {_my_z2(hh)}:{_my_z2(mi)}:{_my_z2(se)}"
+    if dlen == 7
+        return [tstr, dp + 7]
+    let dus = _my_u(b, dp + 7, 4)
+    ["{tstr}.{_my_z6(dus)}", dp + 11]
+
+// Decode TIME at offset -> [hh:mm:ss string, next_off]. MySQL TIME can exceed 24h.
+fn _my_decode_time(b, off: int) -> any
+    let tlen = _my_u(b, off, 1)
+    let tp = off + 1
+    if tlen == 0
+        return ["00:00:00", tp]
+    let neg = _my_u(b, tp, 1)
+    let days = _my_u(b, tp + 1, 4)
+    let th = _my_u(b, tp + 5, 1)
+    let tmi = _my_u(b, tp + 6, 1)
+    let tse = _my_u(b, tp + 7, 1)
+    let sign = "-" if neg == 1 else ""
+    let base = "{sign}{_my_z2(days * 24 + th)}:{_my_z2(tmi)}:{_my_z2(tse)}"
+    if tlen == 8
+        return [base, tp + 8]
+    let tus = _my_u(b, tp + 8, 4)
+    ["{base}.{_my_z6(tus)}", tp + 12]
+
+// Decode one binary-protocol value by MySQL column type -> [string, next_off].
+fn _my_bin_val(b, off: int, t: int, unsigned: int) -> any
+    match t
+        1 => _my_decode_int(b, off, 1, unsigned)
+        2 => _my_decode_int(b, off, 2, unsigned)
+        13 => _my_decode_int(b, off, 2, unsigned)
+        3 => _my_decode_int(b, off, 4, unsigned)
+        9 => _my_decode_int(b, off, 4, unsigned)
+        8 => _my_decode_int(b, off, 8, unsigned)
+        4 => [str(f32_from_bits(_my_u(b, off, 4))), off + 4]
+        5 => [str(float_from_bits(_my_u(b, off, 8))), off + 8]
+        10 => _my_decode_date(b, off, 0)
+        12 => _my_decode_date(b, off, 1)
+        7 => _my_decode_date(b, off, 1)
+        11 => _my_decode_time(b, off)
+        _ => _my_lenenc_str(b, off)
+
 fn mysql_bin_val(b, off: int, t: int) -> any
-    _my_bin_val(b, off, t)
+    _my_bin_val(b, off, t, 0)
 
-// Read num_def column-definition packets -> [names, types, leftover_buf], then consume the trailing EOF.
-fn _my_read_coldefs(conn, buf, n: int) -> any
+// Read n column-definition packets -> ColDefs struct, then consume trailing EOF.
+fn _my_read_coldefs(conn: MysqlConn, buf, n: int) -> ColDefs
     let names = []
     let types = []
+    let flags = []
     for ci in 0..n
         let cp = _my_read_packet(conn, buf)
-        buf = cp[2]
-        let cdef = cp[1]
-        // catalog, schema, table, org_table, NAME -- the 5th length-encoded string is the column name
+        buf = cp.leftover
+        let cdef = cp.payload
         let st = _my_lenenc_str_n(cdef, 0, 5)
         push(names, st[0])
-        // then org_name; the column TYPE byte sits past charset(2) + column_length(4) after it
         let o = (_my_lenenc_str(cdef, st[1]))[1]
         push(types, bytes_get(cdef, o + 1 + 2 + 4))
+        push(flags, _my_u(cdef, o + 1 + 2 + 4 + 1, 2))
     if n > 0
         let e = _my_read_packet(conn, buf)
-        buf = e[2]
-    [names, types, buf]
+        buf = e.leftover
+    ColDefs(names, types, flags, buf)
 
-// PRIVATE: COM_STMT_CLOSE (opcode 25) -- opcode byte + the 4-byte statement id, same packet-framing
-// style as COM_STMT_PREPARE/EXECUTE above. The server sends NO response to this command (see
-// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_close.html), so callers must
-// only SEND it, never follow with a _my_read_packet -- doing so would block waiting for a reply that
-// never comes and desync every read after it.
-fn _my_stmt_close(conn, stmt_id: int)
+fn _my_stmt_close(conn: MysqlConn, stmt_id: int)
     _my_write_packet(conn, 0, bytes_from_list([25, ..._my_le_list(stmt_id, 4)]))
 
-// Parameterized query via a PREPARED STATEMENT (COM_STMT_PREPARE + COM_STMT_EXECUTE, binary protocol).
-// Every param is bound as MYSQL_TYPE_VAR_STRING and the server coerces it to the column type -> NO string
-// inlining/escaping, injection-safe, and numeric-correct. Returns ok(name-keyed string row dicts) /
-// ok([]) for a no-result-set statement / err.
-fn mysql_query_params(conn, sql: string, params) -> any
-    let pq = bytes_concat(bytes_from_list([22]), str_to_bytes(sql))
-    _my_write_packet(conn, 0, pq)
+// COM_STMT_PREPARE + COM_STMT_EXECUTE -> ok(row dicts) / ok(affected: int) / err.
+// All params bound as MYSQL_TYPE_VAR_STRING; null params use the null-bitmap.
+fn mysql_query_params(conn: MysqlConn, sql: string, params) -> any
+    _my_write_packet(conn, 0, bytes_concat(bytes_from_list([22]), str_to_bytes(sql)))
     let buf = bytes(0)
     let pr = _my_read_packet(conn, buf)
-    if pr[0] == -1
+    if pr.seq == -1
         return err("mysql: connection closed during prepare")
-    buf = pr[2]
-    let pp = pr[1]
+    buf = pr.leftover
+    let pp = pr.payload
     if bytes_get(pp, 0) == 255
         return err(_my_err_msg(pp))
     let stmt_id = _my_u(pp, 1, 4)
-    // The statement is now live server-side -- close it on EVERY path below (row-set, OK-packet, or an
-    // execute error) via defer, so a parameterized query never leaks a server-side prepared-statement
-    // handle for the life of the connection.
     defer _my_stmt_close(conn, stmt_id)
     let num_cols = _my_u(pp, 5, 2)
     let num_params = _my_u(pp, 7, 2)
     let pd = _my_read_coldefs(conn, buf, num_params)
-    buf = pd[2]
+    buf = pd.leftover
     let cd = _my_read_coldefs(conn, buf, num_cols)
-    buf = cd[2]
-    // COM_STMT_EXECUTE(23) || stmt_id(4 LE) || flags(0) || iteration_count(1)
+    buf = cd.leftover
     let ex = bytes_from_list([23, ..._my_le_list(stmt_id, 4), 0, ..._my_le_list(1, 4)])
     let np = len(params)
     if np > 0
-        // null bitmap (all-zero: no NULLs) || new_params_bound=1 || (type, unsigned-flag) per param,
-        // every param bound as MYSQL_TYPE_VAR_STRING (253) with the unsigned flag clear.
         let nbm = (np + 7) / 8
-        ex = bytes_concat(ex, bytes_from_list([...[0 for bi in 0..nbm], 1, ...[253 if ti % 2 == 0 else 0 for ti in 0..(np * 2)]]))
+        let null_bm = [0 for bi in 0..nbm]
+        for pi in 0..np
+            if params[pi] == null
+                let byi = pi / 8
+                let bti = pi % 8
+                null_bm[byi] = null_bm[byi] | (1 << bti)
+        ex = bytes_concat(ex, bytes_from_list([...null_bm, 1, ...[253 if ti % 2 == 0 else 0 for ti in 0..(np * 2)]]))
         for pv in params
-            ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(pv))))
+            if pv != null
+                ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(pv))))
     _my_write_packet(conn, 0, ex)
     let xr = _my_read_packet(conn, buf)
-    if xr[0] == -1
+    if xr.seq == -1
         return err("mysql: connection closed during execute")
-    buf = xr[2]
-    let xp = xr[1]
+    buf = xr.leftover
+    let xp = xr.payload
     let xf = bytes_get(xp, 0)
     if xf == 255
         return err(_my_err_msg(xp))
     if xf == 0
-        // OK packet: affected_rows is a lenenc-int right after the 0x00 marker (same as text protocol).
         return ok(mysql_ok_affected(xp))
-    let rcc = _my_lenenc_int(xp, 0)
-    let rncols = rcc[0]
+    let rncols = (_my_lenenc_int(xp, 0))[0]
     let rc = _my_read_coldefs(conn, buf, rncols)
-    let rnames = rc[0]
-    let rtypes = rc[1]
-    buf = rc[2]
+    let rnames = rc.names
+    let rtypes = rc.types
+    let rflags = rc.flags
+    buf = rc.leftover
     let rows = []
     let done = 0
     while done == 0
         let rp = _my_read_packet(conn, buf)
-        if rp[0] == -1
+        if rp.seq == -1
             done = 1
         else
-            buf = rp[2]
-            let row = rp[1]
+            buf = rp.leftover
+            let row = rp.payload
             let rfb = bytes_get(row, 0)
             if rfb == 254 and bytes_len(row) < 9
                 done = 1
@@ -543,30 +498,21 @@ fn mysql_query_params(conn, sql: string, params) -> any
                     let bytei = 1 + ((k + 2) / 8)
                     let biti = (k + 2) % 8
                     if ((bytes_get(row, bytei) >> biti) & 1) == 1
-                        d[rnames[k]] = ""
+                        d[rnames[k]] = null
                     else
-                        let dec = _my_bin_val(row, o, rtypes[k])
+                        let is_unsigned = 1 if (rflags[k] & 32) == 32 else 0
+                        let dec = _my_bin_val(row, o, rtypes[k], is_unsigned)
                         d[rnames[k]] = dec[0]
                         o = dec[1]
                 push(rows, d)
     ok(rows)
 
-// ── connection POOL + transactions (parallel to forge_db's pool_*/with_tx and forge_pg's pg_pool_open/
-// pg_with_tx) ──────────────────────────────────────────────────────────────────────────────────────────
-// A pool is a channel of authenticated connections; acquire = recv (parks until one frees), release =
-// send. Opens n plaintext connections and puts them on the channel; on ANY failure it cleanly closes
-// those already opened and returns the err, so a bad host/credential never leaves live sockets behind.
-// (Plaintext only, mirroring pg_pool_open exactly -- forge_pg has no TLS pool constructor either. A
-// pooled-TLS variant would call mysql_connect_tls per-connection; deferred as a tracked follow-up rather
-// than invented here without an established convention to mirror.)
+// ── connection pool + transactions ──────────────────────────────────────────────────────────────
 fn mysql_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
     let ch = channel()
     let opened = 0
     for i in 0..n
         let r = mysql_connect(host, port, user, db, password)
-        // is_ok/unwrap (runtime Result-tag checks) -- matches pg_pool_open's convention (a `match`
-        // Ok/Err on an any-typed connect result mis-resolves the constructor in a couple of these
-        // driver modules; the runtime tag ops are unaffected).
         if is_ok(r)
             send(ch, unwrap(r))
             opened += 1
@@ -576,44 +522,114 @@ fn mysql_pool_open(host: string, port: int, user: string, db: string, password: 
             return r
     ok(ch)
 
-fn mysql_pool_acquire(pool)
-    recv(pool)
+// Default bounded-acquire budget (module-level INT is safe; a module-level dict reads back EMPTY).
+let _MY_ACQUIRE_TIMEOUT_MS = 5000
 
-fn mysql_pool_release(pool, conn)
+// ── crash-safe, bounded pool acquire/release ────────────────────────────────────────────────────
+// Same defect class that was fixed in forge_pg: `defer send(pool, conn)` is NOT crash-safe, because
+// `defer` is a COMPILE-TIME construct inlined at a function's exit points and a panic longjmps past
+// all of them -- so a handler that crashed holding a pooled connection leaked it permanently, and
+// after N crashes (N = pool size) every later unbounded recv(pool) parked FOREVER. on_exit_send
+// registers a release the fiber trampoline drains on BOTH the normal and crashed exit path, and
+// cancel_on_exit_val cancels it on the normal path, so release happens exactly once either way.
+// NEVER pair on_exit_send with a bare `send` -- that returns the connection TWICE and puts duplicate
+// handles in the pool, which is precisely the bug that was live in forge_orm's sqlite path.
+fn _my_acq(pool, ms: int) -> any
+    let r = select_timeout(pool, ms)
+    if r[0] == 0
+        on_exit_send(pool, r[1])
+        return ok(r[1])
+    err("mysql: pool acquire timeout after {ms}ms (all connections busy)")
+
+fn _my_rel(pool, conn)
     send(pool, conn)
+    cancel_on_exit_val(pool, conn)
 
-// Acquire -> query -> release. `defer` releases the connection on EVERY path, including an error return.
-// mysql_query already returns ok(rows) for a SELECT or ok(affected_int) for an exec-style statement (OK
-// packet), so this single pooled entry point covers both -- no separate pool_exec is needed.
+// A connection-level failure means THIS connection is unusable. Returning it to the pool re-poisons
+// it for the next caller -- MySQL is especially unforgiving here because a desynced packet sequence
+// makes the NEXT query on that socket read the PREVIOUS query's response.
+fn _my_discard(pool, conn)
+    cancel_on_exit_val(pool, conn)
+    mysql_close(conn)
+
+fn mysql_pool_acquire(pool)
+    let a = _my_acq(pool, _MY_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return null
+    unwrap(a)
+
+fn mysql_pool_release(pool, conn: MysqlConn)
+    _my_rel(pool, conn)
+
+// Health-checked acquire: COM_PING the connection, replace if dead.
+fn mysql_pool_acquire_healthy(pool, host: string, port: int, user: string, db: string, password: string) -> any
+    let conn = recv(pool)
+    if mysql_ping(conn)
+        return ok(conn)
+    _my_close_transport(conn)
+    mysql_connect(host, port, user, db, password)
+
 fn mysql_pool_query(pool, sql: string) -> any
-    let conn = recv(pool)
-    defer send(pool, conn)
-    mysql_query(conn, sql)
-
-// Parameterized (injection-safe) pooled query: acquire -> mysql_query_params -> release (defer).
-fn mysql_pool_query_params(pool, sql: string, params) -> any
-    let conn = recv(pool)
-    defer send(pool, conn)
-    mysql_query_params(conn, sql, params)
-
-// Run body_fn(conn) in a transaction on ONE pooled connection: START TRANSACTION (MySQL's spelling of
-// BEGIN), then COMMIT if body returns ok(..) or ROLLBACK if it returns err(..). The connection is
-// released back to the pool either way (defer, so an early error return still releases it). Returns the
-// body's Result. NOTE: as with forge_db's with_tx, this rolls back on a returned ERROR; rolling back on a
-// PANIC would need runtime panic-recovery, which NOVA doesn't have -- a transaction signals failure via
-// err(), never a panic.
-fn mysql_with_tx(pool, body_fn) -> any
-    let conn = recv(pool)
-    defer send(pool, conn)
-    mysql_query(conn, "START TRANSACTION")
-    let r = body_fn(conn)
-    if is_ok(r)
-        mysql_query(conn, "COMMIT")
-    else
-        mysql_query(conn, "ROLLBACK")
+    let a = _my_acq(pool, _MY_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: MysqlConn = unwrap(a)
+    let r = mysql_query(conn, sql)
+    _my_rel(pool, conn)
     r
 
-// Close all n pooled connections (drain + close each).
+fn mysql_pool_query_params(pool, sql: string, params) -> any
+    let a = _my_acq(pool, _MY_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: MysqlConn = unwrap(a)
+    let r = mysql_query_params(conn, sql, params)
+    _my_rel(pool, conn)
+    r
+
+// START TRANSACTION -> body_fn(conn) -> COMMIT on ok / ROLLBACK on err, EVERY step checked.
+//
+// This previously DISCARDED the results of START TRANSACTION, COMMIT and ROLLBACK and returned the
+// BODY's Result -- the same silent data-integrity failure that was fixed in forge_pg.pg_with_tx:
+//   1. START TRANSACTION failed -> the body then ran with autocommit still on, so each statement
+//      committed individually. A "transaction" with zero atomicity, reported as a transaction.
+//   2. COMMIT failed -> returned the body's ok(...). On MySQL/InnoDB a COMMIT can fail on lock-wait
+//      timeout, deadlock rollback (1213), or a dropped connection; the caller was told data had
+//      persisted that the server had just discarded.
+fn mysql_with_tx(pool, body_fn) -> any
+    let a = _my_acq(pool, _MY_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: MysqlConn = unwrap(a)
+    let b = mysql_query(conn, "START TRANSACTION")
+    if is_err(b)
+        // No transaction was opened -- running the body would silently autocommit each statement.
+        _my_rel(pool, conn)
+        return err("mysql tx: START TRANSACTION failed: {str(unwrap_err(b))}")
+    let r = body_fn(conn)
+    if is_err(r)
+        let rb = mysql_query(conn, "ROLLBACK")
+        if is_err(rb)
+            _my_discard(pool, conn)
+        else
+            _my_rel(pool, conn)
+        return r
+    let c = mysql_query(conn, "COMMIT")
+    if is_err(c)
+        _my_discard(pool, conn)
+        return err("mysql tx: COMMIT failed, transaction did NOT persist: {str(unwrap_err(c))}")
+    _my_rel(pool, conn)
+    r
+
+// Drain and close up to n pooled connections, BOUNDED so shutdown cannot hang. The old unbounded
+// recv(pool) parked forever on the first missing connection -- and one is missing whenever a
+// connection was discarded as dead or is still checked out by an in-flight request.
 fn mysql_pool_close(pool, n: int)
+    let closed = 0
     for i in 0..n
-        mysql_close(recv(pool))
+        let r = select_timeout(pool, 2000)
+        if r[0] == 0
+            let c: MysqlConn = r[1]
+            mysql_close(c)
+            closed += 1
+    closed
