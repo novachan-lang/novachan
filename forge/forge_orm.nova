@@ -322,6 +322,32 @@ fn _orm_mysql_rows(pool, sql: string, params) -> Result
         return ok(v)
     ok([])
 
+// SILENT ROW LOSS ON TYPED READS (fixed here): PostgreSQL returns SQL NULL as a NOVA `null`, while
+// SQLite yields "". The compiler-generated <T>__from_dict FAILS to map a null onto a struct field
+// declared `int`, and <T>__from_dict_list then SILENTLY DROPS every row whose mapping failed -- no
+// error, no diagnostic, the row simply is not there. So ONE nullable int column made rows VANISH
+// from `let xs: list<T> = orm_all(...)` while orm_count and an untyped read both reported them.
+// Measured: 5 rows in the table, orm_count 5, untyped read 5, TYPED read 4.
+//
+// This is normalised HERE, in the agnostic layer, rather than in the driver, because:
+//   * the ORM's contract is name-keyed STRING dicts -- which is exactly what the typed mapping
+//     depends on -- and a null is not a string, so the driver was violating the contract the
+//     mapping assumes;
+//   * it makes PostgreSQL and SQLite agree instead of silently differing;
+//   * direct forge_pg users keep real nulls, since pg_query_params documents string/null dicts.
+// A NULL therefore reads back as "" (which maps to 0 for an int field, matching SQLite) instead of
+// deleting the row. Lossy for the null/zero distinction, but losing the DISTINCTION is vastly better
+// than losing the ROW. Use `col IS NULL` in SQL when the distinction matters.
+fn _orm_denull_row(row: dict) -> dict
+    let out = {}
+    for k in keys(row)
+        let v = row[k]
+        out[k] = "" if v == null else v
+    out
+
+fn _orm_denull(rows: list) -> list
+    [_orm_denull_row(r) for r in rows]
+
 // SELECT -> ok(list of name-keyed row dicts) / err(message). The sound counterpart of orm_all.
 fn orm_rows(db: OrmDb, sql: string, params) -> Result
     let _na = _orm_apply_nulls(sql, params)
@@ -329,8 +355,14 @@ fn orm_rows(db: OrmDb, sql: string, params) -> Result
     let ps = _na[1]
     match db.odb_drv
         DSqlite(p, n) => _orm_sqlite_rows(p, s, ps, db.odb_timeout_ms)
-        DPostgres(p, n) => forge_pg.pg_query_params_pool(p, _orm_pg_sql(s), _orm_pg_params(ps))
+        DPostgres(p, n) => _orm_pg_rows(p, _orm_pg_sql(s), _orm_pg_params(ps))
         DMysql(p, n) => _orm_mysql_rows(p, s, ps)
+
+fn _orm_pg_rows(pool, sql: string, params: list) -> Result
+    let r = forge_pg.pg_query_params_pool(pool, sql, params)
+    if is_err(r)
+        return r
+    ok(_orm_denull(unwrap(r)))
 
 // SELECT -> list of name-keyed string row dicts. The name `orm_all` is recognized by the typed-let
 // rewrite, so `let xs: list<T> = orm_all(db, sql, params)` yields a list<T> of real structs.
@@ -536,10 +568,14 @@ fn orm_insert_many(db: OrmDb, table: string, rows: list) -> Result
     if len(rows) == 0
         return ok(0)
     let kind = orm_kind(db)
-    // Column set is taken from the FIRST row and applied to all of them, so every tuple binds the
-    // same columns in the same order. An id of 0 is skipped so the database assigns the key, exactly
-    // as orm_insert does for a single row.
-    let names = [nm for nm in field_names(rows[0]) if nm != "id" or field_get(rows[0], nm) != 0]
+    // Column set must be the SAME for every tuple in one statement, so it is decided ACROSS ALL ROWS,
+    // not from rows[0]. Taking it from the first row alone was a real bug: orm_insert skips an id of 0
+    // so the database assigns the key, and applying that decision to the whole batch meant a single
+    // leading row with id 0 dropped the id column for EVERY row -- 200 rows all landed with a NULL id.
+    // The id column is therefore omitted only when EVERY row leaves it unset; if any row carries a
+    // real id, id is bound for all of them (a 0 then inserts as 0, which is what the caller wrote).
+    let all_ids_unset = "id" in field_names(rows[0]) and all([field_get(r, "id") == 0 for r in rows])
+    let names = [nm for nm in field_names(rows[0]) if nm != "id" or not all_ids_unset]
     if len(names) == 0
         return err("orm_insert_many: nothing to insert")
     let cols = join([_orm_qident(kind, nm) for nm in names], ", ")

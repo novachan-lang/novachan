@@ -1,0 +1,104 @@
+// _kat_orm_null_rows -- KAT for SILENT ROW LOSS on typed reads.
+//
+// KNOWN ANSWER: a typed read must return EVERY row the table contains, including rows with NULL
+// columns. Not fewer.
+//
+// The bug: PostgreSQL returns SQL NULL as a NOVA null, the compiler-generated <T>__from_dict fails
+// to map a null onto a field declared `int`, and <T>__from_dict_list SILENTLY DROPS any row whose
+// mapping failed -- no error, no diagnostic. ONE nullable int column made rows VANISH from
+// `let xs: list<T> = orm_all(...)` while orm_count and an untyped read both still reported them.
+// SQLite was unaffected (it yields "" for NULL), so the two drivers silently disagreed.
+// Pre-fix on PostgreSQL this reports TYPED=4 of 5; post-fix 5 of 5.
+import forge_orm
+
+type NkRow
+    id: int
+    label: string
+    bn: int
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+fn check(db, label: string) -> int
+    let bad = 0
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_nullrows", [])
+    _ = orm_exec(db, "CREATE TABLE kat_nullrows (id int, label text, bn int)", [])
+    _ = orm_exec(db, "INSERT INTO kat_nullrows (id,label,bn) VALUES (1,'a',10)", [])
+    _ = orm_exec(db, "INSERT INTO kat_nullrows (id,label,bn) VALUES (2,'b',20)", [])
+    _ = orm_exec(db, "INSERT INTO kat_nullrows (id,label,bn) VALUES (3,'c',30)", [])
+    _ = orm_exec(db, "INSERT INTO kat_nullrows (label,bn) VALUES ('nullid',40)", [])   // NULL int
+    _ = orm_exec(db, "INSERT INTO kat_nullrows (id,bn) VALUES (5,50)", [])             // NULL text
+
+    let cnt = orm_count(db, "kat_nullrows", "", [])
+    let untyped = orm_all(db, "SELECT id,label,bn FROM kat_nullrows ORDER BY bn", [])
+    let typed: list<NkRow> = orm_all(db, "SELECT id,label,bn FROM kat_nullrows ORDER BY bn", [])
+
+    if cnt != 5 or len(untyped) != 5
+        print("FAIL {label}: table itself wrong (count={cnt} untyped={len(untyped)})")
+        bad += 1
+    else if len(typed) != 5
+        print("FAIL {label}: TYPED read dropped rows -- got {len(typed)} of 5 (SILENT ROW LOSS)")
+        bad += 1
+    else
+        print("PASS {label}: typed read returned all 5 rows incl. NULL int and NULL text")
+
+    // struct-driven insert with an UNSET id (which lands as NULL) must also survive a typed read
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_nullrows", [])
+    _ = orm_exec(db, "CREATE TABLE kat_nullrows (id int, label text, bn int)", [])
+    let ir = orm_insert(db, "kat_nullrows", NkRow(0, "unset", 7))
+    if is_err(ir)
+        print("FAIL {label}: insert with unset id: {unwrap_err(ir)}")
+        bad += 1
+    let t2: list<NkRow> = orm_all(db, "SELECT id,label,bn FROM kat_nullrows", [])
+    if len(t2) != 1
+        print("FAIL {label}: unset-id row vanished from typed read ({len(t2)} of 1)")
+        bad += 1
+    else
+        print("PASS {label}: unset-id row survives a typed read")
+
+    // batch insert must not let one unset id drop the id column for the WHOLE batch
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_nullrows", [])
+    _ = orm_exec(db, "CREATE TABLE kat_nullrows (id int, label text, bn int)", [])
+    let mixed = [NkRow(0, "zero", 0), NkRow(1, "one", 1), NkRow(2, "two", 2)]
+    let mr = orm_insert_many(db, "kat_nullrows", mixed)
+    if is_err(mr)
+        print("FAIL {label}: batch: {unwrap_err(mr)}")
+        bad += 1
+    let t3: list<NkRow> = orm_all(db, "SELECT id,label,bn FROM kat_nullrows ORDER BY bn", [])
+    if len(t3) != 3
+        print("FAIL {label}: batch typed read got {len(t3)} of 3")
+        bad += 1
+    else if t3[1].id != 1 or t3[2].id != 2
+        print("FAIL {label}: batch dropped the id column (ids={t3[0].id},{t3[1].id},{t3[2].id})")
+        bad += 1
+    else
+        print("PASS {label}: mixed-id batch keeps ids for every row")
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_nullrows", [])
+    bad
+
+fn main()
+    let fails = 0
+    let dr = orm_open_with_pool("sqlite://_kat_nullrows.db", 2)
+    if is_ok(dr)
+        let db = unwrap(dr)
+        fails += check(db, "[sqlite]")
+        orm_close(db)
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let url = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+        let pr = orm_open_with_pool(url, 2)
+        if is_ok(pr)
+            let pdb = unwrap(pr)
+            fails += check(pdb, "[postgres]")
+            orm_close(pdb)
+    else
+        print("[postgres] skipped (set PGPASSWORD)")
+    if fails == 0
+        print("_kat_orm_null_rows passed")
+    else
+        print("_kat_orm_null_rows FAILED ({fails})")
+        exit(1)

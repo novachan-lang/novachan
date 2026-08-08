@@ -1,0 +1,103 @@
+// _tr_bisect -- bisect the OPEN anomaly: a TYPED `let xs: list<T> = orm_all(...)` returned 0 rows on
+// PostgreSQL while orm_count said 200 and an UNTYPED read returned all 200.
+//
+// I previously called it "sequence-dependent" but never actually tested a typed read STANDALONE on
+// this table -- the working diagnostic used an UNTYPED read. So test the axes independently:
+//   A  3 single inserts            -> typed read
+//   B  200 single inserts          -> typed read      (row COUNT axis)
+//   C  batch insert of 200         -> typed read      (INSERT PATH axis)
+//   D  200 single, DROP/CREATE, batch -> typed read   (the originally failing sequence)
+// Each case prints the UNTYPED count, orm_count, and the TYPED count side by side.
+
+import forge_orm
+
+type TRow
+    id: int
+    label: string
+    bn: int
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+fn fresh(db)
+    _ = orm_exec(db, "DROP TABLE IF EXISTS tr_bisect", [])
+    _ = orm_exec(db, "CREATE TABLE tr_bisect (id int, label text, bn int)", [])
+
+fn report(db, tag: string, want: int) -> int
+    let cnt = orm_count(db, "tr_bisect", "", [])
+    let untyped = orm_all(db, "SELECT id, label, bn FROM tr_bisect ORDER BY id", [])
+    let typed: list<TRow> = orm_all(db, "SELECT id, label, bn FROM tr_bisect ORDER BY id", [])
+    let ok_all = 1
+    if cnt != want or len(untyped) != want or len(typed) != want
+        ok_all = 0
+    print("  {tag}: want={want} orm_count={cnt} untyped={len(untyped)} TYPED={len(typed)}  {"OK" if ok_all == 1 else "<-- MISMATCH"}")
+    if ok_all == 1
+        return 0
+    1
+
+fn single_inserts(db, n: int)
+    for i in 0..n
+        let r = orm_insert(db, "tr_bisect", TRow(i, "row{i}", i * 2))
+        if is_err(r)
+            print("    insert err: {unwrap_err(r)}")
+
+fn run(db, label: string) -> int
+    print("{label}")
+    let bad = 0
+
+    // A: small, single inserts
+    fresh(db)
+    single_inserts(db, 3)
+    bad += report(db, "A  3 single inserts        ", 3)
+
+    // B: many, single inserts -- isolates the ROW COUNT axis
+    fresh(db)
+    single_inserts(db, 200)
+    bad += report(db, "B  200 single inserts      ", 200)
+
+    // C: batch insert -- isolates the INSERT PATH axis
+    fresh(db)
+    let rows = [TRow(i, "row{i}", i * 2) for i in 0..200]
+    let br = orm_insert_many(db, "tr_bisect", rows)
+    if is_err(br)
+        print("    batch err: {unwrap_err(br)}")
+    bad += report(db, "C  batch insert 200        ", 200)
+
+    // D: the originally failing sequence
+    fresh(db)
+    single_inserts(db, 200)
+    fresh(db)
+    let br2 = orm_insert_many(db, "tr_bisect", rows)
+    if is_err(br2)
+        print("    batch err: {unwrap_err(br2)}")
+    bad += report(db, "D  200 single, fresh, batch", 200)
+
+    // E: does a SECOND typed read in the same process behave differently?
+    let typed2: list<TRow> = orm_all(db, "SELECT id, label, bn FROM tr_bisect ORDER BY id", [])
+    print("  E  repeat typed read       : {len(typed2)}")
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS tr_bisect", [])
+    bad
+
+fn main()
+    let fails = 0
+    let dr = orm_open_with_pool("sqlite://_tr_bisect.db", 2)
+    if is_ok(dr)
+        let db = unwrap(dr)
+        fails += run(db, "[sqlite]")
+        orm_close(db)
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let url = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+        let pr = orm_open_with_pool(url, 2)
+        if is_ok(pr)
+            let pdb = unwrap(pr)
+            fails += run(pdb, "[postgres]")
+            orm_close(pdb)
+        else
+            print("[postgres] open failed: {unwrap_err(pr)}")
+    print("")
+    print("mismatches = {fails}")
