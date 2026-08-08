@@ -1,0 +1,121 @@
+// Database layer — now on the UNIVERSAL ORM (forge_orm) instead of raw forge_pg.
+//
+// What the ORM removes from this file: the hand-written `?` -> `$n` translation, the per-param
+// stringification, the pool open/close plumbing, and EVERY manual row -> struct conversion. Typed
+// reads are just `let ps: list<Project> = orm_all(...)` -- the compiler maps name-keyed rows onto
+// the struct with zero annotation. Swapping to sqlite:// or mysql:// is now a one-line URL change.
+
+import forge_orm
+
+fn _pool_size() -> int
+    8
+
+fn tb_open() -> any
+    orm_open_with_pool("postgres://postgres:root@localhost:5432/taskboard", _pool_size())
+
+fn tb_close(db)
+    orm_close(db)
+
+// ── schema ──
+fn db_init_schema(db)
+    _ = orm_exec(db, "CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '', status TEXT DEFAULT 'active')", [])
+    _ = orm_exec(db, "CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INT NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '', priority TEXT DEFAULT 'medium', status TEXT DEFAULT 'todo')", [])
+
+// ── projects ──
+// `?` placeholders stay portable; the ORM rewrites them to $1,$2,... for PostgreSQL.
+fn db_all_projects(db) -> any
+    let ps: list<Project> = orm_all(db, "SELECT id, name, description, status FROM projects ORDER BY id DESC", [])
+    ok(ps)
+
+// orm_one returns {} when no row matched, and T__from_dict({}) yields a ZERO-VALUED struct rather
+// than an Err -- so a missing row would come back as Ok(Project{id:0}) and the API would answer 200
+// with an empty project instead of 404. Treat a zero id as "not found".
+fn db_get_project(db, id: int) -> any
+    let r: Result<Project> = orm_one(db, "SELECT id, name, description, status FROM projects WHERE id = ?", [id])
+    if is_err(r)
+        return r
+    let p: Project = unwrap(r)
+    if p.id == 0
+        return err("not found")
+    ok(p)
+
+fn db_insert_project(db, name: string, desc: string, status: string) -> any
+    orm_exec(db, "INSERT INTO projects (name, description, status) VALUES (?, ?, ?)", [name, desc, status])
+
+fn db_update_project(db, id: int, name: string, desc: string, status: string) -> any
+    orm_exec(db, "UPDATE projects SET name = ?, description = ?, status = ? WHERE id = ?", [name, desc, status, id])
+
+// Cascade delete inside ONE transaction on ONE connection. orm_with_tx hands the body a normal
+// handle, so these are ordinary orm_exec calls -- and since the drivers were fixed, a COMMIT that
+// fails now surfaces as err() instead of being reported as success.
+fn _tx_delete_project(txdb, id: int) -> any
+    let a = orm_exec(txdb, "DELETE FROM tasks WHERE project_id = ?", [id])
+    if is_err(a)
+        return a
+    let b = orm_exec(txdb, "DELETE FROM projects WHERE id = ?", [id])
+    if is_err(b)
+        return b
+    ok("deleted")
+
+fn db_delete_project(db, id: int) -> any
+    orm_with_tx(db, fn(txdb) _tx_delete_project(txdb, id))
+
+// ── tasks ──
+fn db_project_tasks(db, project_id: int) -> any
+    let ts: list<Task> = orm_all(db, "SELECT id, project_id, title, description, priority, status FROM tasks WHERE project_id = ? ORDER BY id DESC", [project_id])
+    ok(ts)
+
+fn db_get_task(db, id: int) -> any
+    let r: Result<Task> = orm_one(db, "SELECT id, project_id, title, description, priority, status FROM tasks WHERE id = ?", [id])
+    if is_err(r)
+        return r
+    let t: Task = unwrap(r)
+    if t.id == 0
+        return err("not found")
+    ok(t)
+
+fn db_insert_task(db, project_id: int, title: string, desc: string, priority: string) -> any
+    orm_exec(db, "INSERT INTO tasks (project_id, title, description, priority, status) VALUES (?, ?, ?, ?, 'todo')", [project_id, title, desc, priority])
+
+fn db_update_task(db, id: int, title: string, desc: string, priority: string, status: string) -> any
+    orm_exec(db, "UPDATE tasks SET title = ?, description = ?, priority = ?, status = ? WHERE id = ?", [title, desc, priority, status, id])
+
+fn db_delete_task(db, id: int) -> any
+    orm_exec(db, "DELETE FROM tasks WHERE id = ?", [id])
+
+fn db_set_task_status(db, id: int, status: string) -> any
+    orm_exec(db, "UPDATE tasks SET status = ? WHERE id = ?", [status, id])
+
+// ── stats ──
+// orm_count is the ORM's own counter; orm_exists uses SELECT 1 ... LIMIT 1 rather than a full count.
+fn db_dashboard_stats(db) -> DashboardStats
+    let tp = orm_count(db, "projects", "", [])
+    let tt = orm_count(db, "tasks", "", [])
+    let dt = orm_count(db, "tasks", "status = ?", ["done"])
+    let ap = orm_count(db, "projects", "status = ?", ["active"])
+    DashboardStats(tp, tt, dt, ap)
+
+fn db_count_tasks(db, where_clause: string, params: list) -> int
+    orm_count(db, "tasks", where_clause, params)
+
+// Single GROUP BY instead of one COUNT per project (the N+1 fix), now through the ORM.
+fn db_task_counts(db) -> dict
+    let rows = orm_all(db, "SELECT project_id, count(*) AS total, count(CASE WHEN status = 'done' THEN 1 END) AS done FROM tasks GROUP BY project_id", [])
+    let counts = {}
+    for row in rows
+        counts[str(row["project_id"])] = [parse_int(str(row["total"])), parse_int(str(row["done"]))]
+    counts
+
+// ── validation ──
+fn is_valid_status(s: string) -> int
+    s in ["active", "planning", "archived", "completed"]
+
+fn is_valid_task_status(s: string) -> int
+    s in ["todo", "done", "in_progress"]
+
+fn is_valid_priority(p: string) -> int
+    p in ["low", "medium", "high", "critical"]
+
+// ── export (cross-entity JOIN, raw dicts) ──
+fn db_export_all_tasks(db) -> any
+    ok(orm_all(db, "SELECT t.id, p.name, t.title, t.priority, t.status FROM tasks t JOIN projects p ON t.project_id = p.id ORDER BY t.id", []))
