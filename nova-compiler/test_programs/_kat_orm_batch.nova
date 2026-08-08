@@ -1,0 +1,85 @@
+// _kat_orm_batch -- KAT for orm_insert_many: batch insert must be equivalent to N single inserts,
+// and dramatically faster (one round trip per CHUNK instead of one per ROW).
+import forge_orm
+
+type BRow
+    id: int
+    label: string
+    bn: int
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+fn check(db, label: string) -> int
+    let bad = 0
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_batch", [])
+    _ = orm_exec(db, "CREATE TABLE kat_batch (id int, label text, bn int)", [])
+
+    // baseline: 200 single-row inserts
+    let t0 = time_ms()
+    for i in 0..200
+        let r = orm_insert(db, "kat_batch", BRow(i, "row{i}", i * 2))
+        if is_err(r)
+            bad += 1
+    let t_single = time_ms() - t0
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_batch", [])
+    _ = orm_exec(db, "CREATE TABLE kat_batch (id int, label text, bn int)", [])
+
+    // batch: the same 200 rows in one statement
+    let rows = [BRow(i, "row{i}", i * 2) for i in 0..200]
+    let t1 = time_ms()
+    let br = orm_insert_many(db, "kat_batch", rows)
+    let t_batch = time_ms() - t1
+    if is_err(br)
+        print("FAIL {label} batch insert: {unwrap_err(br)}")
+        return bad + 1
+
+    // EQUIVALENCE: assert through orm_count and an UNTYPED read. Both are verified paths.
+    // (A TYPED `let got: list<BRow> = orm_all(...)` returns 0 rows here on PostgreSQL even though the
+    // rows are present -- sqlite returns 200. That is an OPEN typed-mapping anomaly, tracked
+    // separately; it is NOT a property of orm_insert_many, which is what this KAT covers.)
+    let cnt = orm_count(db, "kat_batch", "", [])
+    let got = orm_all(db, "SELECT id, label, bn FROM kat_batch ORDER BY id", [])
+    if cnt != 200 or len(got) != 200
+        print("FAIL {label}: expected 200 rows, count={cnt} read={len(got)}")
+        bad += 1
+    else if str(got[0]["label"]) != "row0" or str(got[199]["label"]) != "row199" or parse_int(str(got[199]["bn"])) != 398
+        print("FAIL {label}: data mismatch")
+        bad += 1
+    else
+        print("PASS {label} equivalence: 200 rows via count AND read, first=row0 last=row199 bn=398")
+    print("     {label} single-row: {t_single} ms   batch: {t_batch} ms")
+
+    // chunking: force more rows than one chunk would hold is impractical here, but verify a
+    // non-multiple-of-chunk count and an empty list behave.
+    let e = orm_insert_many(db, "kat_batch", [])
+    if is_err(e) or unwrap(e) != 0
+        print("FAIL {label}: empty batch should be ok(0)")
+        bad += 1
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_batch", [])
+    bad
+
+fn main()
+    let fails = 0
+    let dr = orm_open_with_pool("sqlite://_kat_batch.db", 2)
+    if is_ok(dr)
+        let db = unwrap(dr)
+        fails += check(db, "[sqlite]")
+        orm_close(db)
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let url = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+        let pr = orm_open_with_pool(url, 2)
+        if is_ok(pr)
+            let pdb = unwrap(pr)
+            fails += check(pdb, "[postgres]")
+            orm_close(pdb)
+    if fails == 0
+        print("_kat_orm_batch passed")
+    else
+        print("_kat_orm_batch FAILED ({fails})")
+        exit(1)

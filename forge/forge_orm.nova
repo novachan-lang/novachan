@@ -514,6 +514,57 @@ fn orm_insert(db, table: string, row) -> any
     let tbl = _orm_qident(kind, table)
     orm_exec(db, "INSERT INTO {tbl} ({cols}) VALUES ({placeholders})", params)
 
+// BATCH INSERT: one multi-row INSERT instead of one statement per row.
+//   INSERT INTO t (a, b) VALUES (?, ?), (?, ?), (?, ?) ...
+// Bulk loading was one full network ROUND TRIP per row, and a round trip is the dominant cost of a
+// write -- far larger than the insert itself. Collapsing N rows into one statement turns N round
+// trips into 1, which is the difference between seconds and milliseconds for a few hundred rows.
+//
+// CHUNKED, because the wire protocol caps bound parameters: PostgreSQL's Bind message carries the
+// parameter count as an INT16, so a statement can bind at most 65535 values -- exceeding it is a hard
+// protocol error, not a slow path. Chunks are sized from the column count so the cap holds for any
+// struct, and each chunk is one statement. Returns the total number of rows affected.
+fn _orm_batch_chunk_rows(ncols: int) -> int
+    if ncols <= 0
+        return 1
+    let n = 60000 / ncols
+    if n < 1
+        return 1
+    n
+
+fn orm_insert_many(db: OrmDb, table: string, rows: list) -> Result
+    if len(rows) == 0
+        return ok(0)
+    let kind = orm_kind(db)
+    // Column set is taken from the FIRST row and applied to all of them, so every tuple binds the
+    // same columns in the same order. An id of 0 is skipped so the database assigns the key, exactly
+    // as orm_insert does for a single row.
+    let names = [nm for nm in field_names(rows[0]) if nm != "id" or field_get(rows[0], nm) != 0]
+    if len(names) == 0
+        return err("orm_insert_many: nothing to insert")
+    let cols = join([_orm_qident(kind, nm) for nm in names], ", ")
+    let tbl = _orm_qident(kind, table)
+    let one = "(" + join(["?" for nm in names], ", ") + ")"
+    let per = _orm_batch_chunk_rows(len(names))
+    let total = 0
+    let i = 0
+    while i < len(rows)
+        let hi = i + per
+        if hi > len(rows)
+            hi = len(rows)
+        let chunk = rows[i:hi]
+        let tuples = join([one for r in chunk], ", ")
+        let params = []
+        for r in chunk
+            for nm in names
+                push(params, field_get(r, nm))
+        let res = orm_exec(db, "INSERT INTO {tbl} ({cols}) VALUES {tuples}", params)
+        if is_err(res)
+            return res
+        total += parse_int(str(unwrap(res)))
+        i = hi
+    ok(total)
+
 // UPDATE a struct by its `id` field: SET every non-id column WHERE id = the struct's id. The struct MUST
 // have an id field. Returns ok(affected) (driver-reported where available) / err(msg).
 fn orm_update(db, table: string, row) -> any
