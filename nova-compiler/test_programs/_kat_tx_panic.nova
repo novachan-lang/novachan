@@ -45,32 +45,41 @@ fn _run_tx(pool)
 
 fn main()
     let path = "_kat_tx_panic.db"
-    let pool = forge_db.pool_open(path, 2)
+    let pool = forge_db.pool_open(path, 1)
     let c0 = recv(pool)
     db_query(c0, "DROP TABLE IF EXISTS katx", [])
     db_query(c0, "CREATE TABLE katx (v int)", [])
     send(pool, c0)
 
-    print("pool at start        : {census(pool)}  (2)")
+    print("pool at start        : {census(pool)}  (1 -- so the next borrower MUST reuse the SAME conn)")
     print("running a transaction whose BODY panics between BEGIN and COMMIT...")
     spawn _run_tx(pool)
     sleep(800)
 
     let after = census(pool)
+    let fails = 0
     print("pool after the panic : {after}")
-    if after == 2
-        print("  -> the connection WAS returned to the pool.")
-        print("     Its transaction was never committed or rolled back, so the next borrower")
-        print("     inherits an ABANDONED TRANSACTION. That is the hazard this KAT records.")
+    if after != 0
+        print("FAIL: the dirty connection was RETURNED to the pool ({after} of 1).")
+        print("      The next borrower would silently join its abandoned transaction.")
+        fails += 1
     else
-        print("  -> the connection was NOT returned ({after} of 2): discarded rather than reused.")
+        print("PASS: the connection was DISCARDED, not returned -- no contamination path.")
 
-    // can the pool still be used, and is the abandoned write visible/locking?
-    let c1 = recv(pool)
-    let rows = db_query(c1, "SELECT count(*) AS n FROM katx", [])
-    print("rows visible to the next borrower: {str(rows)}")
-    let w = db_query(c1, "INSERT INTO katx (v) VALUES (2)", [])
-    print("next borrower's write went through: {str(w)}")
-    send(pool, c1)
+    // The abandoned transaction must not have committed either. Use a FRESH connection (the pool is
+    // intentionally empty now) and a bounded wait, so a leaked write lock shows up as a failure
+    // rather than hanging the test.
+    let fresh = db_open(path)
+    let rows = db_query(fresh, "SELECT count(*) AS n FROM katx", [])
+    let seen = parse_int(str(rows[0][0])) if len(rows) > 0 else 0 - 1
+    print("rows a FRESH connection sees: {seen}   (0 = the abandoned INSERT never committed)")
+    if seen != 0
+        print("FAIL: the abandoned transaction leaked data (expected 0, saw {seen})")
+        fails += 1
+    db_close(fresh)
 
-    print("DONE")
+    if fails == 0
+        print("_kat_tx_panic passed")
+    else
+        print("_kat_tx_panic FAILED ({fails})")
+        exit(1)

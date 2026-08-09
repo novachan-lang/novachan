@@ -98,6 +98,20 @@ fn pool_acquire_to(pool, ms: int) -> Result<int>
 // NOVA lacks today) -> a transaction signals failure via err(), never a panic.
 fn with_tx(pool, body_fn) -> any
     let db = pool_acquire_to(pool, _DB_ACQUIRE_TIMEOUT_MS)?
+    // A TRANSACTION CONNECTION MUST NEVER BE AUTO-RETURNED ON A PANIC.
+    // The acquire above registers a crash-safe RETURN-to-pool, which is right for an ordinary
+    // borrow but WRONG here: if body_fn panics between BEGIN and COMMIT, that registration hands
+    // the connection back with its transaction neither committed nor rolled back, and the next
+    // borrower silently JOINS it. Measured with a pool of one (_kat_tx_panic): the next borrower
+    // read the panicking transaction's uncommitted INSERT -- read-your-own-writes, i.e. it really
+    // was inside that transaction. Its own writes would then be lost when the transaction is
+    // finally discarded. That is cross-request transaction contamination.
+    // Rolling back on the fault path is not an option: the cleanup registry is restricted to
+    // primitive, non-faulting operations, and a ROLLBACK is I/O. So the registration is CANCELLED
+    // instead -- on a panic the connection is simply not returned. The pool shrinks by one, which
+    // is bounded and strictly better than serving a dirty connection (and the PostgreSQL pool
+    // replaces a discarded connection on its next discard).
+    cancel_on_exit_val(pool, db)
     defer pool_release(pool, db)
     db_query(db, "BEGIN", [])
     let r = body_fn(db)
@@ -179,6 +193,20 @@ fn pool_exec(pool, sql: string)
 // previously read as success and COMMITted.
 fn tx(pool, statements) -> any
     let db = pool_acquire_to(pool, _DB_ACQUIRE_TIMEOUT_MS)?
+    // A TRANSACTION CONNECTION MUST NEVER BE AUTO-RETURNED ON A PANIC.
+    // The acquire above registers a crash-safe RETURN-to-pool, which is right for an ordinary
+    // borrow but WRONG here: if body_fn panics between BEGIN and COMMIT, that registration hands
+    // the connection back with its transaction neither committed nor rolled back, and the next
+    // borrower silently JOINS it. Measured with a pool of one (_kat_tx_panic): the next borrower
+    // read the panicking transaction's uncommitted INSERT -- read-your-own-writes, i.e. it really
+    // was inside that transaction. Its own writes would then be lost when the transaction is
+    // finally discarded. That is cross-request transaction contamination.
+    // Rolling back on the fault path is not an option: the cleanup registry is restricted to
+    // primitive, non-faulting operations, and a ROLLBACK is I/O. So the registration is CANCELLED
+    // instead -- on a panic the connection is simply not returned. The pool shrinks by one, which
+    // is bounded and strictly better than serving a dirty connection (and the PostgreSQL pool
+    // replaces a discarded connection on its next discard).
+    cancel_on_exit_val(pool, db)
     defer pool_release(pool, db)
     db_exec(db, "BEGIN")
     let count = 0

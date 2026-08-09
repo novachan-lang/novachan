@@ -626,6 +626,18 @@ fn mysql_with_tx(pool, body_fn) -> any
     if is_err(a)
         return a
     let conn: MysqlConn = unwrap(a)
+    // A TRANSACTION CONNECTION MUST NEVER BE AUTO-RETURNED ON A PANIC.
+    // The acquire registers a crash-safe RETURN-to-pool, which is right for an ordinary borrow but
+    // WRONG here: if body_fn panics between BEGIN and COMMIT, that registration hands the connection
+    // back with its transaction neither committed nor rolled back, and the next borrower silently
+    // JOINS it. MEASURED with a pool of one (_kat_tx_panic): the next borrower read the panicking
+    // transaction's uncommitted INSERT -- read-your-own-writes, i.e. it really was inside that
+    // transaction; its own writes would then be lost when the transaction is finally discarded.
+    // Rolling back on the fault path is not an option -- the cleanup registry is restricted to
+    // primitive, non-faulting operations and a ROLLBACK is I/O -- so the registration is CANCELLED.
+    // On a panic the connection is simply not returned: the pool shrinks by one, which is bounded
+    // and strictly better than serving a dirty connection.
+    cancel_on_exit_val(pool, conn)
     let b = mysql_query(conn, "START TRANSACTION")
     if is_err(b)
         // No transaction was opened -- running the body would silently autocommit each statement.
