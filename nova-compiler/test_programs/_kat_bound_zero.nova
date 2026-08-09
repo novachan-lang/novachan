@@ -1,0 +1,89 @@
+// _kat_bound_zero -- KAT for the MySQL bound-integer-ZERO corruption.
+//
+// KNOWN ANSWER: a bound parameter of 0 must STORE 0, not NULL. On every driver.
+//
+// The bug: forge_mysql built the COM_STMT_EXECUTE NULL bitmap from `params[pi] == null`. But NOVA
+// HAS NO DISTINGUISHABLE NULL -- null is represented as 0 and the runtime predicate is literally
+// `nova_rt_is_null(p) { return p == 0; }` -- so EVERY BOUND INTEGER ZERO was flagged NULL and its
+// value omitted. MySQL stored NULL. Silent corruption of the most ordinary value in a database:
+// every zeroed count, flag, quantity, balance or bool-as-int. It also made rows VANISH from typed
+// reads, because a null cannot map onto an `int` field and from_dict_list drops unmappable rows.
+// Pre-fix on MySQL: bound 0 -> IS NULL = 1, and a 3-row typed read returned 2.
+import forge_orm
+
+type ZRow
+    id: int
+    tag: string
+    v: int
+    flag: bool
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+fn check(db, label: string) -> int
+    let bad = 0
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_bzero", [])
+    _ = orm_exec(db, "CREATE TABLE kat_bzero (id int, tag text, v int, flag int)", [])
+
+    // the exact corruption: a bound 0 in a nullable int column
+    _ = orm_exec(db, "INSERT INTO kat_bzero (id,tag,v,flag) VALUES (?,?,?,?)", [1, "zero", 0, 0])
+    _ = orm_exec(db, "INSERT INTO kat_bzero (id,tag,v,flag) VALUES (?,?,?,?)", [2, "one", 1, 1])
+    _ = orm_exec(db, "INSERT INTO kat_bzero (id,tag,v,flag) VALUES (?,?,?,?)", [3, "neg", 0 - 5, 0])
+
+    let nulls = orm_count(db, "kat_bzero", "v IS NULL", [])
+    if nulls != 0
+        print("FAIL {label}: {nulls} row(s) stored NULL for a bound value  <-- BOUND-ZERO CORRUPTION")
+        bad += 1
+    else
+        print("PASS {label}: no bound value stored as NULL")
+
+    // and the row must survive a TYPED read (a null int would make it vanish)
+    let rows: list<ZRow> = orm_all(db, "SELECT id, tag, v, flag FROM kat_bzero ORDER BY id", [])
+    if len(rows) != 3
+        print("FAIL {label}: typed read got {len(rows)} of 3 (zero-valued row dropped)")
+        bad += 1
+    else if rows[0].v != 0 or rows[1].v != 1 or rows[2].v != (0 - 5)
+        print("FAIL {label}: values wrong: {rows[0].v},{rows[1].v},{rows[2].v}")
+        bad += 1
+    else if rows[0].flag != false or rows[1].flag != true
+        print("FAIL {label}: bool round-trip wrong")
+        bad += 1
+    else
+        print("PASS {label}: 3 rows typed, v=0/1/-5 intact, bool round-trips")
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_bzero", [])
+    bad
+
+fn main()
+    let fails = 0
+    let dr = orm_open_with_pool("sqlite://_kat_bzero.db", 2)
+    if is_ok(dr)
+        let d = unwrap(dr)
+        fails += check(d, "[sqlite]")
+        orm_close(d)
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let u = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+        let r = orm_open_with_pool(u, 2)
+        if is_ok(r)
+            let d = unwrap(r)
+            fails += check(d, "[postgres]")
+            orm_close(d)
+    let mpw = env("MYSQLPASSWORD")
+    if len(mpw) > 0
+        let mu = "mysql://" + _envor("MYSQLUSER","root") + ":" + mpw + "@" + _envor("MYSQLHOST","127.0.0.1") + ":" + _envor("MYSQLPORT","3306") + "/nova_test"
+        let r2 = orm_open_with_pool(mu, 2)
+        if is_ok(r2)
+            let d = unwrap(r2)
+            fails += check(d, "[mysql]")
+            orm_close(d)
+        else
+            print("[mysql] open failed: {unwrap_err(r2)}")
+    if fails == 0
+        print("_kat_bound_zero passed")
+    else
+        print("_kat_bound_zero FAILED ({fails})")
+        exit(1)

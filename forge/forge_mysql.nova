@@ -425,6 +425,21 @@ fn _my_read_coldefs(conn: MysqlConn, buf, n: int) -> ColDefs
 fn _my_stmt_close(conn: MysqlConn, stmt_id: int)
     _my_write_packet(conn, 0, bytes_from_list([25, ..._my_le_list(stmt_id, 4)]))
 
+// Bound parameters go out in TEXT form. A NOVA bool must become "1"/"0", not str()'s
+// "true"/"false": MySQL accepts 1/0 for TINYINT(1), BOOLEAN and INT alike, whereas 'true' into an
+// INT column is coerced to 0 in a permissive sqlmode and REJECTED under STRICT_TRANS_TABLES --
+// either way the value is wrong. This mirrors the identical fix in forge_orm for PostgreSQL, where
+// 'true' into an int column is a hard 22P02 error.
+// Detecting the bool has to accept BOTH of its representations: read inline a NOVA bool is
+// str()="1"/type_name()="int", but passed across a function-call boundary (exactly what happens
+// here) it is str()="true"/type_name()="bool". Excluding strings is what keeps a genuine TEXT value
+// of "true" from being rewritten to "1".
+fn _my_param_str(p) -> string
+    let s = str(p)
+    if type_name(p) != "string" and (s == "true" or s == "false")
+        return "1" if s == "true" else "0"
+    s
+
 // COM_STMT_PREPARE + COM_STMT_EXECUTE -> ok(row dicts) / ok(affected: int) / err.
 // All params bound as MYSQL_TYPE_VAR_STRING; null params use the null-bitmap.
 fn mysql_query_params(conn: MysqlConn, sql: string, params) -> any
@@ -449,16 +464,26 @@ fn mysql_query_params(conn: MysqlConn, sql: string, params) -> any
     let np = len(params)
     if np > 0
         let nbm = (np + 7) / 8
+        // THE NULL BITMAP IS LEFT ALL-ZERO DELIBERATELY -- do not "restore" the check below.
+        //
+        // This used to set a bit whenever `params[pi] == null`. But NOVA HAS NO DISTINGUISHABLE NULL
+        // VALUE: null is represented as 0, and the runtime's own predicate is literally
+        // `nova_rt_is_null(p) { return p == 0; }`. So `0 == null` is TRUE, and EVERY BOUND INTEGER
+        // ZERO was flagged NULL and had its value omitted -- MySQL stored NULL for it.
+        // Verified against a live server: binding 0 stored NULL, while 1, -5, the string "0", and a
+        // literal 0 written into the SQL all stored correctly. Silent data corruption on the single
+        // most ordinary value in a database: every zeroed count, flag, quantity, balance or
+        // bool-as-int became NULL. It also made rows VANISH from typed reads, because a null cannot
+        // be mapped onto an `int` struct field and <T>__from_dict_list drops rows it cannot map.
+        //
+        // A real SQL NULL is expressed the way forge_orm already does it uniformly for every driver:
+        // orm_null() -> _orm_apply_nulls rewrites that placeholder into the literal NULL keyword
+        // BEFORE the driver is reached. So inferring NULL from a bound value here is both impossible
+        // (no distinguishable null) and redundant (the ORM has already handled it).
         let null_bm = [0 for bi in 0..nbm]
-        for pi in 0..np
-            if params[pi] == null
-                let byi = pi / 8
-                let bti = pi % 8
-                null_bm[byi] = null_bm[byi] | (1 << bti)
         ex = bytes_concat(ex, bytes_from_list([...null_bm, 1, ...[253 if ti % 2 == 0 else 0 for ti in 0..(np * 2)]]))
         for pv in params
-            if pv != null
-                ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(pv))))
+            ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(_my_param_str(pv))))
     _my_write_packet(conn, 0, ex)
     let xr = _my_read_packet(conn, buf)
     if xr.seq == -1
