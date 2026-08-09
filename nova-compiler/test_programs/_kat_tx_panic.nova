@@ -1,0 +1,76 @@
+// _kat_tx_panic -- what happens to a POOLED connection when a TRANSACTION BODY panics?
+//
+// KNOWN ANSWER: a connection whose transaction state is UNKNOWN must never be handed to another
+// caller. Either it is rolled back before reuse, or it is discarded and replaced. What must NOT
+// happen is the next borrower silently inheriting an open transaction.
+//
+// The concern: with_tx acquires (which REGISTERS a crash-safe RETURN-to-pool), runs BEGIN, then
+// calls body_fn(db) -- USER code. On a panic there:
+//   * `defer pool_release` does NOT run (defer is inlined at exit points; a panic longjmps past),
+//   * but the registration from the acquire DOES fire, returning the connection to the pool,
+//   * and neither COMMIT nor ROLLBACK ever ran.
+// So the pool can hand out a connection sitting inside an abandoned transaction. On SQLite that
+// holds a write lock (later writers get SQLITE_BUSY); on PostgreSQL/MySQL the next borrower's
+// statements silently join a transaction they did not open, and are lost when it is finally
+// rolled back.
+//
+// This KAT is deliberately written to REPORT rather than assume: it prints what actually happens so
+// the behaviour is on record either way.
+
+import forge_db
+import sqlitex
+
+fn census(ch) -> int
+    let taken = []
+    let going = 1
+    while going == 1
+        let r = select_timeout(ch, 300)
+        if r[0] == 0
+            push(taken, r[1])
+        else
+            going = 0
+    for t in taken
+        send(ch, t)
+    len(taken)
+
+// a transaction body that panics AFTER its write, i.e. between BEGIN and COMMIT
+fn _panicking_body(db) -> any
+    db_query(db, "INSERT INTO katx (v) VALUES (1)", [])
+    let boom = unwrap(err("panic inside the transaction body"))
+    ok(boom)
+
+fn _run_tx(pool)
+    let r = forge_db.with_tx(pool, fn(db) _panicking_body(db))
+    print("    with_tx returned (unexpected): is_err={is_err(r)}")
+
+fn main()
+    let path = "_kat_tx_panic.db"
+    let pool = forge_db.pool_open(path, 2)
+    let c0 = recv(pool)
+    db_query(c0, "DROP TABLE IF EXISTS katx", [])
+    db_query(c0, "CREATE TABLE katx (v int)", [])
+    send(pool, c0)
+
+    print("pool at start        : {census(pool)}  (2)")
+    print("running a transaction whose BODY panics between BEGIN and COMMIT...")
+    spawn _run_tx(pool)
+    sleep(800)
+
+    let after = census(pool)
+    print("pool after the panic : {after}")
+    if after == 2
+        print("  -> the connection WAS returned to the pool.")
+        print("     Its transaction was never committed or rolled back, so the next borrower")
+        print("     inherits an ABANDONED TRANSACTION. That is the hazard this KAT records.")
+    else
+        print("  -> the connection was NOT returned ({after} of 2): discarded rather than reused.")
+
+    // can the pool still be used, and is the abandoned write visible/locking?
+    let c1 = recv(pool)
+    let rows = db_query(c1, "SELECT count(*) AS n FROM katx", [])
+    print("rows visible to the next borrower: {str(rows)}")
+    let w = db_query(c1, "INSERT INTO katx (v) VALUES (2)", [])
+    print("next borrower's write went through: {str(w)}")
+    send(pool, c1)
+
+    print("DONE")

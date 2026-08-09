@@ -90,6 +90,7 @@
    crashed, which is how a cleanup mechanism turns one fault into two. These are primitive,
    non-faulting operations only. */
 #define NOVA_CLEANUP_SEND_CHAN 1   /* send(b) to channel a -- returns a pooled resource */
+#define NOVA_CLEANUP_CLOSE_FD  2   /* close socket a -- releases an fd the task still owns */
 
 typedef struct NovaCleanup {
     int64_t kind;
@@ -8109,6 +8110,7 @@ static void nova_ensure_carrier(void) {
    nova_rt_arena_free, neither of which is Windows-specific. */
 void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
 int64_t nova_rt_try_send(int64_t handle, int64_t value);
+void nova_rt_tcp_close(int64_t sock_val);   /* fwd: CLOSE_FD cleanup, defined in the socket section */
 
 /* Register a cleanup on the CURRENT task; returns a cancellation token (0 on failure, which
    callers treat as "not registered" rather than an error -- a failed registration must never
@@ -8136,6 +8138,41 @@ int64_t nova_rt_task_on_exit_send(int64_t chan, int64_t value) {
     c->kind = NOVA_CLEANUP_SEND_CHAN;
     c->a = chan;
     c->b = value;
+    c->token = ++t->cleanup_seq;
+    return c->token;
+}
+
+/* Register a crash-safe CLOSE of a socket the task owns. Without this, the only resource a task
+   could release on the fault path was a pooled value (SEND_CHAN), which is why `defer tcp_close(c)`
+   in the h2 server leaked an fd on every panic: `defer` is a COMPILE-TIME construct inlined at the
+   function's exit points, and a panic longjmps straight past all of them. Measured, not assumed --
+   see _kat_defer_panic: a defer-released resource is GONE after a panic, a registered one is not.
+   A close is a legitimate fault-path operation under the "primitive, non-faulting" rule above: it is
+   a syscall plus a waiter sweep, and the drain runs in the fiber trampoline (ordinary context, not a
+   signal handler), so taking the scheduler lock there is safe -- user code never holds it. */
+int64_t nova_rt_task_on_exit_close(int64_t fd) {
+    NovaTaskState* t = nova_cur();
+    if (!t) return 0;
+    for (int64_t i = 0; i < t->cleanup_count; i++) {
+        if (t->cleanups[i].token == 0) {
+            t->cleanups[i].kind = NOVA_CLEANUP_CLOSE_FD;
+            t->cleanups[i].a = fd;
+            t->cleanups[i].b = 0;
+            t->cleanups[i].token = ++t->cleanup_seq;
+            return t->cleanups[i].token;
+        }
+    }
+    if (t->cleanup_count >= t->cleanup_cap) {
+        int64_t ncap = t->cleanup_cap ? t->cleanup_cap * 2 : 4;
+        NovaCleanup* nc = (NovaCleanup*)realloc(t->cleanups, (size_t)ncap * sizeof(NovaCleanup));
+        if (!nc) return 0;
+        t->cleanups = nc;
+        t->cleanup_cap = ncap;
+    }
+    NovaCleanup* c = &t->cleanups[t->cleanup_count++];
+    c->kind = NOVA_CLEANUP_CLOSE_FD;
+    c->a = fd;
+    c->b = 0;
     c->token = ++t->cleanup_seq;
     return c->token;
 }
@@ -8188,6 +8225,7 @@ static void nova_task_run_cleanups(void) {
            try_send can only fail when the channel is full, which for a pool means every
            connection is already back, i.e. there was nothing to leak. */
         if (kind == NOVA_CLEANUP_SEND_CHAN) nova_rt_try_send(a, b);
+        else if (kind == NOVA_CLEANUP_CLOSE_FD) nova_rt_tcp_close(a);
     }
     t->cleanup_count = 0;
     free(t->cleanups);

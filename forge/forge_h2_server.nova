@@ -164,13 +164,26 @@ fn _h2_read_preface(recv) -> Result
         buf = bytes_concat(buf, more)
     ok(bytes_slice(buf, 24, bytes_len(buf)))
 
+// CRASH-SAFE SOCKET RELEASE. `defer tcp_close(conn)` leaked the fd on every panic: `defer` is a
+// COMPILE-TIME construct inlined at the function's exit points, and a panic longjmps straight past
+// all of them. Measured, not assumed (_kat_defer_panic): a defer-released resource is GONE after a
+// panic; a registered one is returned. For a server that means one leaked file descriptor per
+// panicking connection, and fd exhaustion takes the whole process down.
+// on_exit_close registers the close on the task's cleanup registry, which the fiber trampoline
+// drains on BOTH the normal and the crashed exit path; cancel_on_exit drops the registration once
+// the normal path has closed it, so the close happens EXACTLY ONCE either way.
+// Declared extern rather than added as a builtin so this needs no compiler change.
+extern fn nova_rt_task_on_exit_close(fd: int) -> int
+extern fn nova_rt_task_cancel_exit(token: int) -> int
+
 fn _h2c_serve_conn(a, conn: int)
-    defer tcp_close(conn)
+    let _cltok = unsafe nova_rt_task_on_exit_close(conn)
+    defer _h2_close_tcp(conn, _cltok)
     let r = _h2_read_preface(fn() tcp_recv_bytes(conn))
     if is_err(r)
         return
-    let post = bytes_to_list(unwrap(r))
-    _h2_drive_conn(a, post, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d))
+    let leftover = bytes_to_list(unwrap(r))
+    _h2_drive_conn(a, leftover, fn() tcp_recv_bytes(conn), fn(d) tcp_send_bytes(conn, d))
 
 // ── HTTP/2 over TLS, negotiated via ALPN (D-ALPN) ──────────────────────────────────────────────────────
 // serve_h2_tls uses the NATIVE SChannel/OpenSSL TLS builtins (tls_listen/tls_listen_alpn/tls_accept/
@@ -223,7 +236,7 @@ fn _h2tls_content_length(headers: string) -> int
 // arrived / either bound was exceeded (was a bare "" sentinel, which the caller had to re-derive).
 fn _h2tls_recv_http11(conn: int) -> Result
     let acc = bytes(0)
-    let text = ""
+    let raw = ""
     let hdr_end = -1
     while hdr_end < 0
         let more = tls_recv_bytes(conn)
@@ -232,17 +245,17 @@ fn _h2tls_recv_http11(conn: int) -> Result
         acc = bytes_concat(acc, more)
         if bytes_len(acc) > _h2tls_max_header()
             return err("h2/1.1: header block exceeds the {_h2tls_max_header()}-byte bound")
-        text = bytes_to_str(acc)
-        hdr_end = find(text, "\r\n\r\n")
-    let cl = _h2tls_content_length(slice(text, 0, hdr_end))
+        raw = bytes_to_str(acc)
+        hdr_end = find(raw, "\r\n\r\n")
+    let cl = _h2tls_content_length(slice(raw, 0, hdr_end))
     if cl <= 0
-        return ok(text)
+        return ok(raw)
     if cl > _h2tls_max_body()
         return err("h2/1.1: Content-Length exceeds the {_h2tls_max_body()}-byte bound")
     let need_total = hdr_end + 4 + cl
-    // bytes_len(acc), NOT len(text): bytes_to_str tags its result NOVA_MEM_RAW, so len()/str ops on
+    // bytes_len(acc), NOT len(raw): bytes_to_str tags its result NOVA_MEM_RAW, so len()/str ops on
     // it fall through to C strlen() -- a body containing an embedded 0x00 byte before need_total
-    // would make len(text) permanently understate the true accumulated size, so the loop guard could
+    // would make len(raw) permanently understate the true accumulated size, so the loop guard could
     // never go false even once every byte has arrived, blocking forever on the next tls_recv_bytes
     // (a real client that already sent its whole body and is just waiting for the response, not
     // closing the socket). bytes_len is a true byte count and is immune to embedded NULs. Also only
@@ -282,16 +295,28 @@ fn _h2tls_serve_conn_h2(a, conn: int)
     let r = _h2_read_preface(fn() tls_recv_bytes(conn))
     if is_err(r)
         return
-    let post = bytes_to_list(unwrap(r))
-    _h2_drive_conn(a, post, fn() tls_recv_bytes(conn), fn(d) tls_send_bytes(conn, d))
+    let leftover = bytes_to_list(unwrap(r))
+    _h2_drive_conn(a, leftover, fn() tls_recv_bytes(conn), fn(d) tls_send_bytes(conn, d))
 
 // Per-connection dispatch once the TLS+ALPN handshake has picked a protocol: "h2" drives the h2 frame
 // core; anything else (including "" -- ALPN not offered/not negotiated) falls back to plain HTTP/1.1, so
 // a non-h2 client is served rather than silently dropped. `defer` guarantees the connection is closed
 // exactly once no matter which branch runs or whether it returns early (crash-in-handler included, since
 // dispatch_safe already isolates a panicking route handler and always returns a Response).
+fn _h2_close_tcp(conn: int, tok: int)
+    tcp_close(conn)
+    unsafe nova_rt_task_cancel_exit(tok)
+
+// Same crash-safe pattern for the TLS path. The registry closes the underlying socket on the fault
+// path; tls_close on the normal path also tears down the TLS context, which is NOT a fault-path-safe
+// operation (it allocates and does I/O), so only the primitive close is registered.
+fn _h2_close_tls(conn: int, tok: int)
+    tls_close(conn)
+    unsafe nova_rt_task_cancel_exit(tok)
+
 fn _h2tls_serve_conn(a, conn: int)
-    defer tls_close(conn)
+    let _tltok = unsafe nova_rt_task_on_exit_close(conn)
+    defer _h2_close_tls(conn, _tltok)
     let proto = tls_alpn(conn)
     if proto == "h2"
         _h2tls_serve_conn_h2(a, conn)
