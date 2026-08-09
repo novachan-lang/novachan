@@ -1,0 +1,110 @@
+// _kat_orm_stream -- KAT for orm_each, the BOUNDED-MEMORY read.
+//
+// KNOWN ANSWER: streaming a table in chunks must visit EVERY row EXACTLY ONCE, in order, and report
+// the same total as orm_count -- for any chunk size, including sizes that do not divide the row
+// count evenly, and including a chunk larger than the table.
+//
+// Why it exists: every driver materialises a whole result set as a list of dicts, so the row count
+// is the server's to decide and `SELECT * FROM big_table` is an unbounded allocation. orm_each walks
+// in bounded chunks: PostgreSQL via a real server-side cursor (DECLARE/FETCH/CLOSE in a
+// transaction), SQLite and MySQL via LIMIT/OFFSET over a subquery (neither has an ad-hoc cursor).
+import forge_orm
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+// accumulate what the callback sees, so we can prove exactly-once and ordering
+let _seen = []
+
+fn _collect(row)
+    push(_seen, parse_int(str(row["id"])))
+
+fn check(db, label: string) -> int
+    let bad = 0
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_stream", [])
+    _ = orm_exec(db, "CREATE TABLE kat_stream (id int, payload text)", [])
+    let rows = [KsRow(i, "p{i}") for i in 0..250]
+    let ins = orm_insert_many(db, "kat_stream", rows)
+    if is_err(ins)
+        print("FAIL {label} seed: {unwrap_err(ins)}")
+        return 1
+
+    // chunk sizes chosen so 250 is NOT evenly divisible by most of them, and one exceeds the table
+    for ch in [1, 7, 100, 250, 1000]
+        _seen = []
+        let r = orm_each(db, "SELECT id, payload FROM kat_stream ORDER BY id", [], ch, fn(row) _collect(row))
+        if is_err(r)
+            print("FAIL {label} chunk={ch}: {unwrap_err(r)}")
+            bad += 1
+        else
+            let total = unwrap(r)
+            let n = len(_seen)
+            // exactly-once: 250 rows, ids 0..249 strictly ascending with no gaps or repeats
+            let ordered = 1
+            for i in 0..n
+                if _seen[i] != i
+                    ordered = 0
+            if total != 250 or n != 250 or ordered == 0
+                print("FAIL {label} chunk={ch}: reported={total} visited={n} ordered={ordered}")
+                bad += 1
+            else
+                print("PASS {label} chunk={ch}: 250 rows, each exactly once, in order")
+
+    // a streamed WHERE must see only matching rows
+    _seen = []
+    let r2 = orm_each(db, "SELECT id, payload FROM kat_stream WHERE id < ? ORDER BY id", [10], 3, fn(row) _collect(row))
+    if is_err(r2) or unwrap(r2) != 10 or len(_seen) != 10
+        print("FAIL {label} filtered stream: {len(_seen)} rows")
+        bad += 1
+    else
+        print("PASS {label} filtered stream: 10 rows via params")
+
+    // empty result must stream cleanly, not hang or error
+    _seen = []
+    let r3 = orm_each(db, "SELECT id, payload FROM kat_stream WHERE id > ?", [99999], 10, fn(row) _collect(row))
+    if is_err(r3) or unwrap(r3) != 0 or len(_seen) != 0
+        print("FAIL {label} empty stream")
+        bad += 1
+    else
+        print("PASS {label} empty stream: 0 rows, no hang")
+
+    // the pool must be intact afterwards -- the cursor path holds a connection across many FETCHes
+    let after = orm_count(db, "kat_stream", "", [])
+    if after != 250
+        print("FAIL {label}: table count after streaming = {after}")
+        bad += 1
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_stream", [])
+    bad
+
+type KsRow
+    id: int
+    payload: string
+
+fn main()
+    let fails = 0
+    let dr = orm_open_with_pool("sqlite://_kat_stream.db", 2)
+    if is_ok(dr)
+        let db = unwrap(dr)
+        fails += check(db, "[sqlite]")
+        orm_close(db)
+    let pw = env("PGPASSWORD")
+    if len(pw) > 0
+        let url = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+        let pr = orm_open_with_pool(url, 2)
+        if is_ok(pr)
+            let pdb = unwrap(pr)
+            fails += check(pdb, "[postgres]")
+            orm_close(pdb)
+        else
+            print("[postgres] open failed: {unwrap_err(pr)}")
+    else
+        print("[postgres] skipped (set PGPASSWORD)")
+    if fails == 0
+        print("_kat_orm_stream passed")
+    else
+        print("_kat_orm_stream FAILED ({fails})")
+        exit(1)

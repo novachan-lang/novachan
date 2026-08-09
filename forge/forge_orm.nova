@@ -380,6 +380,92 @@ fn orm_all(db: OrmDb, sql: string, params) -> list
         return []
     unwrap(r)
 
+// ---- streaming reads --------------------------------------------------------------------------
+// Every driver materialises a whole result set as a list of dicts, so `SELECT * FROM big_table` is
+// an unbounded allocation -- the row count is the server's to decide, not the caller's. orm_each
+// walks the result in BOUNDED chunks and hands each row to `row_fn`, so peak memory is one chunk
+// rather than the whole table.
+//
+// PostgreSQL uses a real SERVER-SIDE CURSOR (DECLARE / FETCH / CLOSE inside a transaction), which is
+// the correct primitive: the server streams and never builds the full set either.
+// SQLite and MySQL have no equivalent for an ad-hoc statement (MySQL cursors exist only inside
+// stored programs), so they chunk with LIMIT/OFFSET over a subquery. TWO CAVEATS, stated plainly
+// because they are real and the caller cannot see them otherwise:
+//   * OFFSET is O(offset) on every driver -- the server walks and discards the skipped rows -- so
+//     deep pagination degrades. The cursor path has no such cost.
+//   * a LIMIT/OFFSET walk is NOT a snapshot: concurrent INSERT/DELETE between chunks can shift rows
+//     across page boundaries, so a row may be seen twice or missed. Pass an ORDER BY on a stable
+//     unique key to bound this. The cursor path holds one transaction and IS consistent.
+// row_fn returns nothing; stop early by having it ignore later rows. Returns ok(total_rows_seen).
+fn _orm_each_cursor(db: OrmDb, pool, sql: string, params: list, chunk: int, row_fn) -> Result
+    let a = forge_pg.pg_acquire_checked(pool, db.odb_timeout_ms, 3)
+    if is_err(a)
+        return a
+    let conn = unwrap(a)
+    let seen = 0
+    let bt = forge_pg.pg_exec(conn, "BEGIN")
+    if is_err(bt)
+        forge_pg.pg_release(pool, conn)
+        return err("orm_each: BEGIN failed: {str(unwrap_err(bt))}")
+    // The cursor query is PARAMETERISED -- values are still bound, never spliced into the DECLARE.
+    let dc = forge_pg.pg_exec_params(conn, "DECLARE _nova_cur NO SCROLL CURSOR FOR " + _orm_pg_sql(sql), _orm_pg_params(params))
+    if is_err(dc)
+        forge_pg.pg_exec(conn, "ROLLBACK")
+        forge_pg.pg_release(pool, conn)
+        return dc
+    let going = 1
+    while going == 1
+        let fr = forge_pg.pg_query_params(conn, "FETCH {chunk} FROM _nova_cur", [])
+        if is_err(fr)
+            forge_pg.pg_exec(conn, "ROLLBACK")
+            forge_pg.pg_release(pool, conn)
+            return fr
+        let rows = _orm_denull(unwrap(fr))
+        if len(rows) == 0
+            going = 0
+        else
+            for r in rows
+                row_fn(r)
+                seen += 1
+            if len(rows) < chunk
+                going = 0
+    forge_pg.pg_exec(conn, "CLOSE _nova_cur")
+    let ct = forge_pg.pg_exec(conn, "COMMIT")
+    forge_pg.pg_release(pool, conn)
+    if is_err(ct)
+        return err("orm_each: COMMIT failed: {str(unwrap_err(ct))}")
+    ok(seen)
+
+// LIMIT/OFFSET fallback for drivers without an ad-hoc cursor. The user's SQL becomes a subquery so
+// any shape (joins, unions, ORDER BY) still works.
+fn _orm_each_paged(db: OrmDb, sql: string, params: list, chunk: int, row_fn) -> Result
+    let seen = 0
+    let off = 0
+    let going = 1
+    while going == 1
+        let page = orm_rows(db, "SELECT * FROM (" + sql + ") AS _nova_page LIMIT {chunk} OFFSET {off}", params)
+        if is_err(page)
+            return page
+        let rows = unwrap(page)
+        if len(rows) == 0
+            going = 0
+        else
+            for r in rows
+                row_fn(r)
+                seen += 1
+            off += len(rows)
+            if len(rows) < chunk
+                going = 0
+    ok(seen)
+
+fn orm_each(db: OrmDb, sql: string, params, chunk: int, row_fn) -> Result
+    let n = chunk if chunk > 0 else 500
+    let _na = _orm_apply_nulls(sql, params)
+    match db.odb_drv
+        DPostgres(p, sz) => _orm_each_cursor(db, p, _na[0], _na[1], n, row_fn)
+        DSqlite(p, sz) => _orm_each_paged(db, _na[0], _na[1], n, row_fn)
+        DMysql(p, sz) => _orm_each_paged(db, _na[0], _na[1], n, row_fn)
+
 // SELECT one row -> ok(dict) / err("no rows") / err(driver message). The sound counterpart of orm_one.
 //
 // USE THIS when "did it exist?" matters. orm_one below CANNOT report absence: it returns {} for no
