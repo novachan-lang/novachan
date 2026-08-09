@@ -723,7 +723,32 @@ The concurrency gap on ARM is therefore now a MEASURED fact rather than an infer
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
-## LAND FIRST — Windows 15.6 ms timer quantum caps ALL network I/O (VERIFIED 8x, NOT committed)
+## Windows timer quantum — LANDED (8x on all network I/O)
+
+`nova_rt_init` now raises the Windows timer resolution to 1 ms. The netpoller idles on `Sleep(1)`,
+which rounds up to the 15.6 ms default tick, so every task parking on I/O waited a full tick: every
+network round trip cost a FIXED ~15.4 ms regardless of the work (measured identically across INSERT,
+SELECT and EXISTS), capping throughput at ~65 ops/sec/connection for the ORM and for Forge HTTP alike.
+
+Measured: INSERT 4643 -> 586 ms, SELECT 626 -> 124 ms, EXISTS 3084 -> 386 ms.
+
+winmm is loaded DYNAMICALLY (LoadLibrary/GetProcAddress) rather than linked, so **no link command in
+the project needs `-lwinmm`** — nova.ps1, the CI scripts and every ad-hoc test link are untouched, and
+it degrades silently to the old behaviour if winmm is unavailable.
+
+GATE: reconverge **gen4 == gen5 == gen6, byte-identical** (all three IRs hash `b0e9dca0…`) — compared
+on the `.ll` files, not exe sizes. Note `_bootstrap_check.ps1` looks for `nova_compiler.nova` in
+`test_programs/` but it lives in `compiler/`; that script is stale.
+
+ALSO LANDED alongside it: **connection replacement on death**. A dead connection was closed and
+DROPPED, shrinking the pool permanently until a run of transient failures emptied it and every request
+failed forever. Each connection now remembers its own DSN (in the `params` dict it already had, under
+control-char-prefixed keys that cannot collide with a server ParameterStatus name), so `_pg_discard`
+opens a replacement — no PgPool struct, no signature changes, zero blast radius on callers.
+
+---
+
+## (superseded, kept for history) LAND FIRST — Windows 15.6 ms timer quantum caps ALL network I/O (VERIFIED 8x, NOT committed)
 
 Every NOVA network operation on Windows costs a FIXED ~15.4 ms regardless of what it does
 (INSERT 4643ms/300 = 15.5, SELECT 617/40 = 15.4, EXISTS 3084/200 = 15.4 — three different

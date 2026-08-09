@@ -1,6 +1,3 @@
-/* Copyright 2026 Mangesh Mane. Licensed under Apache License 2.0.
-   See LICENSE and NOTICE files at the project root. */
-
 /* _GNU_SOURCE must be defined BEFORE any libc header, or <link.h> will not expose
    dl_iterate_phdr / struct dl_phdr_info — which nova_addr_in_module needs to answer
    "is this a static string literal?" EXACTLY on Linux instead of scanning for a NUL
@@ -56,8 +53,6 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <signal.h>   /* hoisted: the fiber stack-overflow guard below needs sigaction/sigaltstack,
-                         and the pre-existing include sat ~2500 lines AFTER the fiber code */
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/socket.h>
@@ -85,19 +80,6 @@
    pass flagged as fatal). The compiler now emits calls to the nova_rt_*_error helpers
    below instead of touching the TLS globals directly. Fault-boundary fields migrate in
    Stage 0b. */
-/* One registered task cleanup. `kind` is deliberately an enum rather than a closure: running
-   a NOVA closure from the fault path would re-enter user code on a task that has already
-   crashed, which is how a cleanup mechanism turns one fault into two. These are primitive,
-   non-faulting operations only. */
-#define NOVA_CLEANUP_SEND_CHAN 1   /* send(b) to channel a -- returns a pooled resource */
-
-typedef struct NovaCleanup {
-    int64_t kind;
-    int64_t a;
-    int64_t b;
-    int64_t token;   /* 0 = free slot */
-} NovaCleanup;
-
 typedef struct {
     int64_t error_flag;
     int64_t error_msg;
@@ -110,21 +92,6 @@ typedef struct {
                                trace for it (and for non-task fatal panics) but NOT for supervised spawned crashes. */
     int64_t stack_depth;    /* Stage 1.5: per-task recursion depth (was global g_stack_depth) */
     int64_t stack_max;      /* per-task overflow limit; 0 => NOVA_DEFAULT_STACK_MAX */
-    /* Forge blocker #3: cleanups that MUST run even when the task dies by a contained
-       crash. `defer` cannot serve this -- it is a COMPILE-TIME construct that inlines at a
-       function's exit points, so a panic longjmps straight past it. That is precisely why a
-       handler faulting mid-transaction permanently leaked its pooled DB connection: the
-       longjmp skipped `send(pool, db)`, and after N such crashes (N = pool size) every later
-       request parked forever. A slow-motion outage that looks like a hang, not a 500.
-
-       Drained by the fiber trampoline on EVERY exit path -- normal completion and the fault
-       landing pad alike -- so a registered release runs exactly once either way. Entries are
-       cancellable, so the normal path releases eagerly (a long-lived task must not hold a
-       connection until it exits) and simply cancels its registration. */
-    struct NovaCleanup* cleanups;
-    int64_t  cleanup_count;
-    int64_t  cleanup_cap;
-    int64_t  cleanup_seq;            /* monotonic, so a cancelled slot's token is never reused */
     struct NovaArena* active_arena;  /* iter-94: PER-TASK transparent arena. nova_heap_alloc
                                         bumps into it when set. Per-task (not per-OS-thread) so a
                                         green task that PARKS mid-scope cannot leak its arena to
@@ -920,28 +887,8 @@ typedef enum {
        kind sets bits above the low 3 except struct -> 8 is collision-free. This gives bytes
        a distinct identity WITHOUT widening the kind field (the struct slot-count encoding
        stays untouched). See nova_mem_find_tag's load-bearing pre-mask interception. */
-    NOVA_MEM_BYTES   = 8,
-    /* LOCK-4 inc3d: packed typed array (NovaTypedArray{data,size,cap,kind}). Like BYTES this
-       is a FULL 16-bit tag, not a 3-bit kind: 16&0x7==0 (RAW), so find_tag intercepts it with
-       a pre-mask check exactly as it does for 8. No struct tag can equal 16 -- structs are
-       (nslots<<3)|5, i.e. always ==5 mod 8 -- so the value is collision-free. */
-    NOVA_MEM_TARRAY  = 16
+    NOVA_MEM_BYTES   = 8
 } NovaMemTag;
-
-/* Element kinds for the packed typed array (object defined further down, beside NovaBytes).
-   Declared HERE because find_tag validates `kind` against NOVA_TA_KINDS and runs well before
-   that definition. */
-#define NOVA_TA_I8   0
-#define NOVA_TA_U8   1
-#define NOVA_TA_I16  2
-#define NOVA_TA_U16  3
-#define NOVA_TA_I32  4
-#define NOVA_TA_U32  5
-#define NOVA_TA_I64  6
-#define NOVA_TA_U64  7
-#define NOVA_TA_F32  8
-#define NOVA_TA_F64  9
-#define NOVA_TA_KINDS 10
 
 static int64_t      nova_mem_live    = 0;
 /* C2: nova_mem_live is on the alloc/free hot path; the plain ++/-- was a real (benign-count) TSAN data
@@ -1248,20 +1195,6 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
             }
             return NOVA_MEM_BYTES;
         }
-        /* Same pre-mask interception and the same structural validation as BYTES above, plus a
-           range check on `kind` -- an out-of-range kind means this is not one of ours, and the
-           width table is indexed by it further down. */
-        if (NOVA_RC_TAG(ptr) == NOVA_MEM_TARRAY) {
-            if (nova_heap_base) {
-                if ((uintptr_t)((const char*)ptr + 32) > nova_heap_top) return (NovaMemTag)-1;
-                int64_t tsz = ((const int64_t*)ptr)[1];
-                int64_t tcp = ((const int64_t*)ptr)[2];
-                int64_t tkd = ((const int64_t*)ptr)[3];
-                if (tsz < 0 || tcp < tsz || (uint64_t)tcp > (1ULL << 40)) return (NovaMemTag)-1;
-                if (tkd < 0 || tkd >= NOVA_TA_KINDS) return (NovaMemTag)-1;
-            }
-            return NOVA_MEM_TARRAY;
-        }
         /* Mask to the low 3 kind bits: structs pack a slot count above them. */
         NovaMemTag kind = (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
         /* STRUCTURAL VALIDATION — the decisive sound filter against the uniform-i64
@@ -1559,17 +1492,6 @@ static int nova_is_readable_str(const void* ptr) {
     NovaMemTag t = nova_mem_find_tag((void*)a);
     if (t == NOVA_MEM_RAW || t == NOVA_MEM_FAT_STR) return 1;  /* headered runtime string */
     if (t != (NovaMemTag)-1) return 0;                         /* list/dict/box/etc. -> not a string */
-    /* OUR OWN small-int string cache. nova_rt_int_to_str returns a pointer straight into this
-       static table for 0..9999, and find_tag deliberately reports -1 for it (it has no RC
-       header). It must be recognised HERE or it falls through to the module-range test below --
-       and on Linux that test accepts only NON-WRITABLE PT_LOAD segments, while this table lives
-       in .bss. The result was that `"n = " + str(42)` silently produced "n = " on Linux for
-       every value under 10000, while working on Windows, so the CI never saw it. The table is
-       static, always NUL-terminated by nova_int_str_cache_init, and never freed. */
-    if (nova_int_str_cache_inited &&
-        (const char*)ptr >= nova_int_str_cache[0] &&
-        (const char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
-        return 1;
 #ifdef _WIN32
     return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
 #elif defined(NOVA_FREESTANDING)
@@ -1591,12 +1513,6 @@ static int nova_is_readable_str(const void* ptr) {
 static const char* nova_str_safe(int64_t handle) {
     if (nova_is_readable_str((void*)(uintptr_t)handle)) return (const char*)(uintptr_t)handle;
     return "";
-}
-
-static inline int64_t nova_str_len_fast(const char* s) {
-    NovaMemTag tag = nova_mem_find_tag((void*)s);
-    if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN(s);
-    return (int64_t)strlen(s);
 }
 
 /* nova_rt_init is defined later (after all lock declarations) */
@@ -1904,198 +1820,6 @@ typedef struct {
     int64_t  size;
     int64_t  cap;
 } NovaBytes;
-
-/* ── LOCK-4 inc3d: PACKED TYPED ARRAYS ────────────────────────────────────────
-   A u8[]/i32[]/f32[] stored PACKED at its element width -- 1 MB for a million u8, not 8 MB.
-
-   WHY THIS IS A SEPARATE OBJECT RATHER THAN A WIDTH FLAG ON NovaList.
-   NovaList already has an unboxed fast path (elem_kind 0/1/2), and its soundness rests on one
-   invariant: the SLOT SIZE never changes, only its interpretation. A conflicting append just
-   flips elem_kind to 0 and every alias immediately observes the deopt, because the buffer
-   layout is identical either way. Adding a width would break exactly that -- a u8[] receiving
-   a float would have to REALLOCATE from 1-byte to 8-byte slots, and every existing alias would
-   be left pointing at the old buffer. That is not a flag flip, it is a representation change
-   under aliases, and it is where silent corruption lives.
-
-   So a packed array is homogeneous BY CONTRACT (its element type is fixed at creation and a
-   type mismatch is a compile-time error now that sized widths exist) while a NovaList is
-   heterogeneous-by-default with an optimization. Conflating them forces the runtime to support
-   a transition that cannot be made sound cheaply. Every mature system draws this same line:
-   NumPy's ndarray is not a Python list, Java's int[] is not an ArrayList<Integer>.
-
-   Shares the {data,size,cap} prefix with NovaList/NovaBytes so find_tag's structural predicate
-   applies unchanged; `kind` is appended in the tail slot, exactly as NovaList did for
-   elem_kind. */
-
-typedef struct {
-    uint8_t* data;
-    int64_t  size;
-    int64_t  cap;
-    int64_t  kind;
-} NovaTypedArray;
-
-static const int8_t nova_ta_width[NOVA_TA_KINDS] = { 1, 1, 2, 2, 4, 4, 8, 8, 4, 8 };
-
-static int nova_ta_is_float(int64_t k) { return k == NOVA_TA_F32 || k == NOVA_TA_F64; }
-
-static int64_t nova_ta_elem_size(int64_t k) {
-    if (k < 0 || k >= NOVA_TA_KINDS) return 0;
-    return (int64_t)nova_ta_width[k];
-}
-
-int64_t nova_rt_tarray_new(int64_t kind, int64_t n);
-int64_t nova_rt_tarray_get(int64_t h, int64_t i);
-int64_t nova_rt_tarray_set(int64_t h, int64_t i, int64_t v);
-
-static NovaTypedArray* nova_ta_of(int64_t h) {
-    if (!h) return NULL;
-    if (nova_mem_find_tag((void*)(uintptr_t)h) != NOVA_MEM_TARRAY) return NULL;
-    return (NovaTypedArray*)(uintptr_t)h;
-}
-
-/* Allocate a zero-filled packed array of `n` elements. Overflow in n*width is checked BEFORE
-   the multiply reaches calloc -- a 2^61-element i64 array would otherwise wrap to a small
-   allocation and every later write would be an out-of-bounds store. */
-int64_t nova_rt_tarray_new(int64_t kind, int64_t n) {
-    if (kind < 0 || kind >= NOVA_TA_KINDS || n < 0) return 0;
-    int64_t w = nova_ta_elem_size(kind);
-    if (n > 0 && n > (int64_t)((1LL << 40) / w)) return 0;
-    NovaTypedArray* a = (NovaTypedArray*)nova_heap_alloc(sizeof(NovaTypedArray), (NovaMemTag)NOVA_MEM_TARRAY);
-    if (!a) return 0;
-    a->size = n;
-    a->cap = n;
-    a->kind = kind;
-    a->data = NULL;
-    if (n > 0) {
-        a->data = (uint8_t*)calloc((size_t)n, (size_t)w);
-        if (!a->data) { a->size = 0; a->cap = 0; return (int64_t)(uintptr_t)a; }
-    }
-    return (int64_t)(uintptr_t)a;
-}
-
-int64_t nova_rt_tarray_len(int64_t h) {
-    NovaTypedArray* a = nova_ta_of(h);
-    return a ? a->size : 0;
-}
-
-int64_t nova_rt_tarray_kind(int64_t h) {
-    NovaTypedArray* a = nova_ta_of(h);
-    return a ? a->kind : -1;
-}
-
-/* Read element `i`. Integer kinds sign- or zero-extend to i64 per their signedness; float kinds
-   return the value's raw double BITS, which is NOVA's float representation in an i64 slot.
-   Out of range yields 0, matching what list indexing already does -- a new container that
-   panicked where the existing one returns 0 would make the language less coherent, not safer.
-   The checked accessor lives in the NOVA-level module and returns a Result. */
-int64_t nova_rt_tarray_get(int64_t h, int64_t i) {
-    NovaTypedArray* a = nova_ta_of(h);
-    if (!a || i < 0 || i >= a->size || !a->data) return 0;
-    switch (a->kind) {
-        case NOVA_TA_I8:  return (int64_t)((int8_t*)a->data)[i];
-        case NOVA_TA_U8:  return (int64_t)((uint8_t*)a->data)[i];
-        case NOVA_TA_I16: return (int64_t)((int16_t*)a->data)[i];
-        case NOVA_TA_U16: return (int64_t)((uint16_t*)a->data)[i];
-        case NOVA_TA_I32: return (int64_t)((int32_t*)a->data)[i];
-        case NOVA_TA_U32: return (int64_t)((uint32_t*)a->data)[i];
-        case NOVA_TA_I64: return ((int64_t*)a->data)[i];
-        case NOVA_TA_U64: return (int64_t)((uint64_t*)a->data)[i];
-        case NOVA_TA_F32: { float f; memcpy(&f, a->data + (size_t)i * 4, 4); double d = (double)f;
-                            int64_t o; memcpy(&o, &d, 8); return o; }
-        case NOVA_TA_F64: { double d; memcpy(&d, a->data + (size_t)i * 8, 8);
-                            int64_t o; memcpy(&o, &d, 8); return o; }
-    }
-    return 0;
-}
-
-/* Write element `i`. Integer kinds TRUNCATE to the element width with defined wrapping -- the
-   same semantics the sized-integer arithmetic uses, so `u8[] = 300` stores 44 rather than
-   silently corrupting the neighbouring element. Float kinds take raw double bits and narrow. */
-int64_t nova_rt_tarray_set(int64_t h, int64_t i, int64_t v) {
-    NovaTypedArray* a = nova_ta_of(h);
-    if (!a || i < 0 || i >= a->size || !a->data) return 0;
-    /* UNBOX FIRST. A float argument crossing into an i64-typed builtin slot is WIDENED TO A BOX
-       by the compiler (the emitted call passes %wbox, not the raw bits), so interpreting `v`
-       directly as double bits stores a pointer. The f64 kind hid this beautifully: it round-
-       tripped the pointer byte-for-byte and str() unboxed it on the way out, so the value
-       printed correctly while nothing had actually been stored as a double. The f32 kind, which
-       narrows through `float`, is what exposed it. Integer kinds are unaffected -- unbox is the
-       identity on a non-box. */
-    v = nova_rt_unbox(v);
-    switch (a->kind) {
-        case NOVA_TA_I8:  ((int8_t*)a->data)[i]   = (int8_t)v; break;
-        case NOVA_TA_U8:  ((uint8_t*)a->data)[i]  = (uint8_t)v; break;
-        case NOVA_TA_I16: ((int16_t*)a->data)[i]  = (int16_t)v; break;
-        case NOVA_TA_U16: ((uint16_t*)a->data)[i] = (uint16_t)v; break;
-        case NOVA_TA_I32: ((int32_t*)a->data)[i]  = (int32_t)v; break;
-        case NOVA_TA_U32: ((uint32_t*)a->data)[i] = (uint32_t)v; break;
-        case NOVA_TA_I64: ((int64_t*)a->data)[i]  = v; break;
-        case NOVA_TA_U64: ((uint64_t*)a->data)[i] = (uint64_t)v; break;
-        case NOVA_TA_F32: { double d; memcpy(&d, &v, 8); float f = (float)d;
-                            memcpy(a->data + (size_t)i * 4, &f, 4); break; }
-        case NOVA_TA_F64: { memcpy(a->data + (size_t)i * 8, &v, 8); break; }
-    }
-    return 0;
-}
-
-/* Append, growing geometrically. Returns the new length, or the old one if the growth failed --
-   never a partial write. */
-int64_t nova_rt_tarray_push(int64_t h, int64_t v) {
-    NovaTypedArray* a = nova_ta_of(h);
-    if (!a) return 0;
-    int64_t w = nova_ta_elem_size(a->kind);
-    if (a->size >= a->cap) {
-        int64_t ncap = a->cap ? a->cap * 2 : 8;
-        if (ncap > (int64_t)((1LL << 40) / w)) return a->size;
-        uint8_t* nd = (uint8_t*)realloc(a->data, (size_t)ncap * (size_t)w);
-        if (!nd) return a->size;
-        memset(nd + (size_t)a->cap * (size_t)w, 0, (size_t)(ncap - a->cap) * (size_t)w);
-        a->data = nd;
-        a->cap = ncap;
-    }
-    a->size++;
-    nova_rt_tarray_set(h, a->size - 1, v);
-    return a->size;
-}
-
-/* FLOAT-typed views of the same three primitives. They exist as DISTINCT SYMBOLS, not just
-   distinct NOVA type schemes over one symbol, because the register type that decides whether
-   str() lowers to int_to_str or float_to_str is assigned per CALLEE NAME in ir_infer_one -- one
-   shared symbol cannot be typed two ways. Bodies are trivial forwarders; the whole content is
-   the name. */
-int64_t nova_rt_tarray_getf(int64_t h, int64_t i) { return nova_rt_tarray_get(h, i); }
-int64_t nova_rt_tarray_setf(int64_t h, int64_t i, int64_t v) { return nova_rt_tarray_set(h, i, v); }
-int64_t nova_rt_tarray_pushf(int64_t h, int64_t v) { return nova_rt_tarray_push(h, v); }
-
-/* `let xs: u8[] = [1,2,3]` desugars to this: build a packed array of `kind` from an existing
-   list. Elements are unboxed on the way in (a float list holds boxed doubles), so the same call
-   serves both integer and float element kinds. A non-list argument yields an empty array rather
-   than reading it as one. */
-int64_t nova_rt_tarray_of_list(int64_t kind, int64_t lst) {
-    NovaList* l = (NovaList*)(uintptr_t)lst;
-    if (!lst || nova_mem_find_tag((void*)(uintptr_t)lst) != NOVA_MEM_LIST)
-        return nova_rt_tarray_new(kind, 0);
-    int64_t h = nova_rt_tarray_new(kind, l->size);
-    if (!h) return 0;
-    for (int64_t i = 0; i < l->size; i++)
-        nova_rt_tarray_set(h, i, l->data[i]);
-    return h;
-}
-
-int64_t nova_rt_tarray_fill(int64_t h, int64_t v) {
-    NovaTypedArray* a = nova_ta_of(h);
-    if (!a) return 0;
-    for (int64_t i = 0; i < a->size; i++) nova_rt_tarray_set(h, i, v);
-    return a->size;
-}
-
-/* Bytes actually occupied by the elements -- the whole point of the type, and what a test
-   asserts against the equivalent boxed list to prove the packing is real. */
-int64_t nova_rt_tarray_bytes(int64_t h) {
-    NovaTypedArray* a = nova_ta_of(h);
-    if (!a) return 0;
-    return a->size * nova_ta_elem_size(a->kind);
-}
 int64_t nova_rt_bytes_create(int64_t size_val);  /* fwd: deep_copy(BYTES) calls it above its definition */
 
 /* ── Arena-aware backing storage for containers (iter-91) ──────────────────────
@@ -2514,7 +2238,6 @@ int64_t nova_rt_len_any(int64_t handle) {
     if (tag == NOVA_MEM_LIST) return ((NovaList*)ptr)->size;
     if (tag == NOVA_MEM_DICT) return ((NovaDict*)ptr)->size;
     if (tag == NOVA_MEM_BYTES) return ((NovaBytes*)ptr)->size;  /* true binary length, not strlen on the struct */
-    if (tag == NOVA_MEM_TARRAY) return ((NovaTypedArray*)ptr)->size;  /* ELEMENT count, not bytes */
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN((const char*)ptr);
     /* SOUNDNESS: only a genuine string may be strlen'd. A non-measurable scalar (int/float/bool -- e.g.
        len(json_decode("5")), or for-in over a non-list which lowers to len + index_get) would otherwise be
@@ -4644,13 +4367,6 @@ int64_t nova_rt_contains(int64_t container, int64_t item) {
     /* Bytes containment is not supported in Stage 0; never strstr the {data,size,cap}
        struct (wild read). A bytes container, or a bytes item against a string container
        (needle would be the struct), returns 0 safely. */
-    if (tag == NOVA_MEM_TARRAY) {
-        /* ELEMENT membership. Falling through to the string path would strstr the struct. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        for (int64_t i = 0; i < ta->size; i++)
-            if (nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i) == item) return 1;
-        return 0;
-    }
     if (tag == NOVA_MEM_BYTES) return 0;
     if (nova_mem_find_tag((void*)(uintptr_t)item) == NOVA_MEM_BYTES) return 0;
     /* SOUNDNESS: string containment requires BOTH operands to be genuine strings; a non-string container or
@@ -5052,18 +4768,6 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
             dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
         return (int64_t)(uintptr_t)dst;
     }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Mutable, exactly like bytes -- a spawned task or channel receiver must own an
-           independent buffer or a set on one side corrupts the other. Absent this case the tag
-           falls through to the bare `return v` below with NO rc_inc, which is a use-after-free
-           the moment the sender drops it. */
-        NovaTypedArray* src = (NovaTypedArray*)(uintptr_t)v;
-        int64_t dst = nova_rt_tarray_new(src->kind, src->size);
-        NovaTypedArray* d = (NovaTypedArray*)(uintptr_t)dst;
-        if (d && d->data && src->data)
-            memcpy(d->data, src->data, (size_t)src->size * (size_t)nova_ta_elem_size(src->kind));
-        return dst;
-    }
     if (tag == NOVA_MEM_BYTES) {
         /* Bytes are MUTABLE, so deep-copy (NOT rc_inc-share like immutable strings):
            process isolation requires the spawned/channel-sent process own an independent
@@ -5186,15 +4890,6 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_keys(obj);
     }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Materialize the elements as a list, same reason as bytes below: the generic iterator
-           would otherwise read the packed buffer at 8 bytes per element. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        int64_t result = nova_rt_list_create();
-        for (int64_t i = 0; i < ta->size; i++)
-            nova_rt_list_append(result, nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i));
-        return result;
-    }
     if (tag == NOVA_MEM_BYTES) {
         /* Materialize the byte values as an int64 list (0..255) so iteration is safe. Else the iterator
            treats the NovaBytes as a NovaList and reads data[i] as int64 (8 bytes/elem) -> heap overread. */
@@ -5245,18 +4940,6 @@ int64_t nova_rt_for_kv_init(int64_t obj) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_items(obj);
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* (index, element) pairs, read at the true element width. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        int64_t tresult = nova_rt_list_create();
-        for (int64_t i = 0; i < ta->size; i++) {
-            int64_t pair = nova_rt_list_create();
-            nova_rt_list_append(pair, i);
-            nova_rt_list_append(pair, nova_rt_tarray_get((int64_t)(uintptr_t)ptr, i));
-            nova_rt_list_append(tresult, pair);
-        }
-        return tresult;
     }
     if (tag == NOVA_MEM_BYTES) {
         /* (index, byteValue) pairs -- read data[i] as a 0..255 int, NOT as int64 (which would overread). */
@@ -5710,7 +5393,8 @@ int64_t nova_rt_read_file(int64_t path) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "cannot open file '%s': %s", p, strerror(errno));
         nova_set_error(errbuf);
-        return nova_str_take(NULL);
+        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
+        return (int64_t)(uintptr_t)e;
     }
 #ifdef _WIN32
     _fseeki64(f, 0, SEEK_END);
@@ -5725,18 +5409,10 @@ int64_t nova_rt_read_file(int64_t path) {
         fclose(f);
         nova_set_error(sz < 0 ? "read_file: cannot determine size"
                                : "read_file: file exceeds 512MB limit");
-        return nova_str_take(NULL);
+        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
+        return (int64_t)(uintptr_t)e;
     }
-    /* PERF: return a proper FAT string (cached length via nova_str_take, which itself
-       wraps nova_fat_str_create) instead of a bare NOVA_MEM_RAW allocation. RAW strings
-       have no cached length at all -- every downstream len()/indexing/slice call on
-       them falls back to strlen(), and a tokenizer indexing this content character by
-       character turned that into an O(n^2) full-file rescan on EVERY character. A
-       235KB file took 5.9s to index for exactly this reason even after fixing
-       nova_rt_str_char_at itself, because read_file's own output was never fat-tagged
-       in the first place. malloc (not nova_heap_alloc) here since nova_str_take frees
-       its input with plain free(). */
-    char* buf = (char*)malloc((size_t)sz + 1);
+    char* buf = (char*)nova_heap_alloc((size_t)sz + 1, NOVA_MEM_RAW);
     if (!buf) {
         fclose(f);
         nova_set_error("read_file: out of memory");
@@ -5745,7 +5421,7 @@ int64_t nova_rt_read_file(int64_t path) {
     size_t nr = fread(buf, 1, (size_t)sz, f);
     buf[nr] = '\0';
     fclose(f);
-    return nova_str_take(buf);
+    return (int64_t)(uintptr_t)buf;
 }
 
 #ifdef _WIN32
@@ -5867,14 +5543,11 @@ static int json_at_end(JsonParser* p) { return p->pos >= p->len; }
 static int64_t json_parse_value(JsonParser* p);
 
 static int64_t json_make_str(const char* s, int64_t len) {
-    /* PERF: a FAT string (cached length), not a bare RAW allocation -- this is the
-       no-escape fast path for every JSON string VALUE, including an LSP didOpen/
-       didChange message's entire "text" field (the whole open file, as one JSON
-       string). A RAW string has no cached length, so every len()/index/slice on it
-       falls back to strlen(); a tokenizer indexing that content character by
-       character turned into an O(n^2) full-string rescan per character. See
-       nova_rt_read_file for the same fix and fuller rationale. */
-    return (int64_t)(uintptr_t)nova_fat_str_create(s, (size_t)len);
+    char* buf = (char*)nova_heap_alloc((size_t)len + 1, NOVA_MEM_RAW);
+    if (!buf) return 0;
+    memcpy(buf, s, (size_t)len);
+    buf[len] = '\0';
+    return (int64_t)(uintptr_t)buf;
 }
 
 static int64_t json_parse_string(JsonParser* p) {
@@ -5895,11 +5568,7 @@ static int64_t json_parse_string(JsonParser* p) {
     if (!has_escape) {
         return json_make_str(p->src + start, raw_len);
     }
-    /* PERF: malloc (not nova_heap_alloc) -- this buffer is handed to nova_str_take
-       below, which frees it with plain free() and returns a proper FAT string (see
-       json_make_str for the fuller rationale: this is the escaped-string path, hit
-       by every LSP didOpen/didChange "text" field since JSON escapes newlines). */
-    char* buf = (char*)malloc((size_t)raw_len + 1);
+    char* buf = (char*)nova_heap_alloc((size_t)raw_len + 1, NOVA_MEM_RAW);
     if (!buf) return 0;
     int64_t out = 0;
     for (int64_t i = start; i < start + raw_len; ) {
@@ -5973,7 +5642,7 @@ static int64_t json_parse_string(JsonParser* p) {
         }
     }
     buf[out] = '\0';
-    return nova_str_take(buf);
+    return (int64_t)(uintptr_t)buf;
 }
 
 static int64_t json_parse_number(JsonParser* p) {
@@ -6221,29 +5890,6 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
             json_stringify_value(b, l->data[i], depth + 1);
         }
         jbuf_char(b, ']');
-        return;
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Unlike bytes, a typed array HAS a canonical JSON form -- it is an array of numbers --
-           so emit the real thing rather than a diagnostic placeholder. Float kinds print through
-           the float formatter; integer kinds as integers. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        int64_t h = (int64_t)(uintptr_t)ptr;
-        jbuf_append(b, "[", 1);
-        for (int64_t i = 0; i < ta->size; i++) {
-            if (i > 0) jbuf_append(b, ",", 1);
-            char tmp[64];
-            int n;
-            if (nova_ta_is_float(ta->kind)) {
-                int64_t bits = nova_rt_tarray_get(h, i);
-                double d; memcpy(&d, &bits, 8);
-                n = snprintf(tmp, sizeof(tmp), "%.17g", d);
-            } else {
-                n = snprintf(tmp, sizeof(tmp), "%lld", (long long)nova_rt_tarray_get(h, i));
-            }
-            jbuf_append(b, tmp, (int64_t)n);
-        }
-        jbuf_append(b, "]", 1);
         return;
     }
     if (tag == NOVA_MEM_BYTES) {
@@ -6546,18 +6192,6 @@ static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
         return;
     }
     if (tag == NOVA_MEM_RAW) { ntb_str(b, (const char*)ptr); return; }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Encode as a LIST term of its elements: values survive the wire, which a pointer-valued
-           INT term would not. The receiving side gets an ordinary list -- kind is not carried, so
-           this is a lossy-but-correct encoding rather than a wrong one. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        int64_t h = (int64_t)(uintptr_t)ptr;
-        int64_t lst = nova_rt_list_create();
-        for (int64_t i = 0; i < ta->size; i++)
-            nova_rt_list_append(lst, nova_rt_tarray_get(h, i));
-        term_encode_value(b, lst, depth + 1);
-        return;
-    }
     if (tag == NOVA_MEM_BYTES) {
         /* Stage 0: encode bytes as a LENGTH-PREFIXED STR term (binary-safe on the wire,
            content preserved) -- never NOVA_TT_INT (which would corrupt bytes -> the pointer
@@ -6718,13 +6352,6 @@ int64_t nova_rt_elem_to_str(int64_t val) {
     if (tag == NOVA_MEM_BYTES) {
         NovaBytes* bb = (NovaBytes*)ptr;
         char tmp[48]; snprintf(tmp, sizeof(tmp), "<bytes:%lld>", (long long)bb->size);
-        return nova_rt_create_string((void*)tmp);
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        static const char* kn[NOVA_TA_KINDS] = { "i8","u8","i16","u16","i32","u32","i64","u64","f32","f64" };
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        const char* k = (ta->kind >= 0 && ta->kind < NOVA_TA_KINDS) ? kn[ta->kind] : "?";
-        char tmp[64]; snprintf(tmp, sizeof(tmp), "<%s[%lld]>", k, (long long)ta->size);
         return nova_rt_create_string((void*)tmp);
     }
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
@@ -8019,11 +7646,6 @@ typedef struct NovaFiber {
     uint64_t          saved_sp;
     uint8_t*          stack_mem;
     size_t            stack_alloc;
-    /* POSIX hardware stack-overflow containment. `ovf_buf` is the landing point the SIGSEGV
-       handler siglongjmps to; `ovf_active` is what tells the handler this fiber is inside its
-       body and therefore that a fault in its guard page is recoverable rather than a real bug. */
-    sigjmp_buf        ovf_buf;
-    volatile int      ovf_active;
 #endif
 } NovaFiber;
 
@@ -8108,93 +7730,6 @@ static void nova_ensure_carrier(void) {
    at all (undefined reference). Moved out of the guard -- it only touches nova_cur() and
    nova_rt_arena_free, neither of which is Windows-specific. */
 void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
-int64_t nova_rt_try_send(int64_t handle, int64_t value);
-
-/* Register a cleanup on the CURRENT task; returns a cancellation token (0 on failure, which
-   callers treat as "not registered" rather than an error -- a failed registration must never
-   break the acquire it is protecting). */
-int64_t nova_rt_task_on_exit_send(int64_t chan, int64_t value) {
-    NovaTaskState* t = nova_cur();
-    if (!t) return 0;
-    for (int64_t i = 0; i < t->cleanup_count; i++) {
-        if (t->cleanups[i].token == 0) {
-            t->cleanups[i].kind = NOVA_CLEANUP_SEND_CHAN;
-            t->cleanups[i].a = chan;
-            t->cleanups[i].b = value;
-            t->cleanups[i].token = ++t->cleanup_seq;
-            return t->cleanups[i].token;
-        }
-    }
-    if (t->cleanup_count >= t->cleanup_cap) {
-        int64_t ncap = t->cleanup_cap ? t->cleanup_cap * 2 : 4;
-        NovaCleanup* nc = (NovaCleanup*)realloc(t->cleanups, (size_t)ncap * sizeof(NovaCleanup));
-        if (!nc) return 0;
-        t->cleanups = nc;
-        t->cleanup_cap = ncap;
-    }
-    NovaCleanup* c = &t->cleanups[t->cleanup_count++];
-    c->kind = NOVA_CLEANUP_SEND_CHAN;
-    c->a = chan;
-    c->b = value;
-    c->token = ++t->cleanup_seq;
-    return c->token;
-}
-
-/* Cancel a registered cleanup -- the normal path releases the resource itself and calls this,
-   so the cleanup fires only when the task did NOT get that far. Unknown/stale tokens are a
-   no-op, which keeps double-release harmless. */
-int64_t nova_rt_task_cancel_exit(int64_t token) {
-    NovaTaskState* t = nova_cur();
-    if (!t || token == 0) return 0;
-    for (int64_t i = 0; i < t->cleanup_count; i++) {
-        if (t->cleanups[i].token == token) {
-            t->cleanups[i].token = 0;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Cancel by (channel, value) rather than by token. The pool helpers release inside functions
-   that do not return the token, and threading one through would change every pool_* signature;
-   looking the entry up by what it holds keeps the API additive. Cancels the MOST RECENT match,
-   which is the right one when a task borrows the same pool more than once. */
-int64_t nova_rt_task_cancel_exit_val(int64_t chan, int64_t value) {
-    NovaTaskState* t = nova_cur();
-    if (!t) return 0;
-    for (int64_t i = t->cleanup_count - 1; i >= 0; i--) {
-        if (t->cleanups[i].token != 0 && t->cleanups[i].a == chan && t->cleanups[i].b == value) {
-            t->cleanups[i].token = 0;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Drain every still-registered cleanup. Called on BOTH the normal and the crashed exit path.
-   Runs in reverse registration order (innermost resource first), and clears each slot BEFORE
-   acting so a fault inside the drain cannot re-run it. */
-static void nova_task_run_cleanups(void) {
-    NovaTaskState* t = nova_cur();
-    if (!t || !t->cleanups) return;
-    for (int64_t i = t->cleanup_count - 1; i >= 0; i--) {
-        if (t->cleanups[i].token == 0) continue;
-        int64_t kind = t->cleanups[i].kind;
-        int64_t a = t->cleanups[i].a;
-        int64_t b = t->cleanups[i].b;
-        t->cleanups[i].token = 0;
-        /* NON-blocking on purpose. A blocking send would PARK a task that is already dying,
-           on the fault path, with no one guaranteed to drain it -- turning a leak into a hang.
-           try_send can only fail when the channel is full, which for a pool means every
-           connection is already back, i.e. there was nothing to leak. */
-        if (kind == NOVA_CLEANUP_SEND_CHAN) nova_rt_try_send(a, b);
-    }
-    t->cleanup_count = 0;
-    free(t->cleanups);
-    t->cleanups = NULL;
-    t->cleanup_cap = 0;
-}
-
 static void nova_task_arena_cleanup(void) {
     NovaTaskState* t = nova_cur();
     NovaArena* a = t->active_arena;
@@ -8270,7 +7805,6 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         fflush(stderr);
     }
     f->task.fault_active = 0;
-    nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
@@ -8467,162 +8001,21 @@ void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
 }
 #endif
 
-/* ── POSIX hardware stack-overflow containment (Forge blocker #8) ─────────────
-   Windows already contains a fiber stack overflow: the __except in nova_fiber_entry turns
-   EXCEPTION_STACK_OVERFLOW into the same "contained crash" the software fault path produces,
-   so the carrier survives and keeps serving. POSIX had NOTHING. A fiber that recurses past
-   its 1MB stack hits the 64KB PROT_NONE guard, raises SIGSEGV, and the DEFAULT disposition
-   kills the entire process -- so unbounded recursion over attacker-controlled nested input
-   (a JSON body, a route tree) takes down the whole server on Linux, the dominant deploy
-   target. That contradicts Forge's "one poisoned request cannot take down others" claim, and
-   it defeated serve_safe_req too, since its spawn resolves to this same fiber machinery.
-
-   Three things make this correct rather than merely plausible:
-
-   1. SA_ONSTACK + a per-thread sigaltstack. The handler CANNOT run on the faulting stack --
-      that stack is exactly what is exhausted -- so without an alternate stack the handler
-      itself faults and the process dies anyway. The alt stack is per-THREAD (every carrier
-      and pool worker installs its own); the disposition is per-process and installed once.
-
-   2. The fault is only claimed when si_addr lands inside THIS fiber's guard region. Anything
-      else is a genuine memory bug and must keep crashing: swallowing it would convert a
-      loud, debuggable segfault into silent corruption, which is far worse than the gap being
-      closed. A frame large enough to leap the whole 64KB guard faults BELOW the region and is
-      therefore (correctly) not claimed.
-
-   3. A non-matching fault CHAINS to whatever handler was there before rather than resetting
-      to SIG_DFL. ASAN installs its own SIGSEGV handler and the CI runs ASAN builds; clobbering
-      it would silently destroy every ASAN report.
-
-   siglongjmp out of a signal handler is async-signal-safe and is the standard mechanism here;
-   the landing frame is the trampoline's, which sits at the TOP of the fiber stack and is
-   therefore always mapped, so there is stack to run on after the jump. Unlike Windows there is
-   no _resetstkoflw equivalent to call: the guard is a separate PROT_NONE mapping, not a moving
-   guard page, so it is still armed for the next use of this fiber. */
-
-/* ASAN detection. GCC has no __has_feature at all, so it cannot appear in the same #if as
-   __SANITIZE_ADDRESS__ (the preprocessor still parses the whole expression and errors out on
-   the call). Nested #ifs are the portable idiom for this. */
-#if defined(__SANITIZE_ADDRESS__)
-#  define NOVA_ASAN_BUILD 1
-#elif defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-#    define NOVA_ASAN_BUILD 1
-#  endif
-#endif
-
-#define NOVA_ALTSTACK_SIZE (64 * 1024)   /* fixed, not SIGSTKSZ: on modern glibc SIGSTKSZ is a
-                                            runtime sysconf value and not usable for a static */
-/* 64-byte aligned: ASAN's PlatformUnpoisonStacks queries the installed sigaltstack and CHECKs
-   that its address is shadow-granularity aligned. An unaligned __thread buffer aborted the
-   sanitizer runtime outright ("CHECK failed: asan_poisoning.cpp AddrIsAlignedByGranularity"). */
-static __thread uint8_t nova_altstack[NOVA_ALTSTACK_SIZE] __attribute__((aligned(64)));
-static __thread int     nova_altstack_ready = 0;
-static struct sigaction nova_prev_segv;
-static struct sigaction nova_prev_bus;
-static pthread_once_t   nova_segv_once = PTHREAD_ONCE_INIT;
-
-static void nova_chain_previous(int sig, siginfo_t* si, void* uctx) {
-    struct sigaction* prev = (sig == SIGBUS) ? &nova_prev_bus : &nova_prev_segv;
-    if ((prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
-        prev->sa_sigaction(sig, si, uctx);
-        return;
-    }
-    if (prev->sa_handler && prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
-        prev->sa_handler(sig);
-        return;
-    }
-    /* No prior handler: restore the default and re-raise so the process still dies with the
-       usual signal + core dump. sigaction/raise are both async-signal-safe. */
-    struct sigaction dfl;
-    memset(&dfl, 0, sizeof(dfl));
-    dfl.sa_handler = SIG_DFL;
-    sigaction(sig, &dfl, NULL);
-    raise(sig);
-}
-
-static void nova_stack_guard_handler(int sig, siginfo_t* si, void* uctx) {
-    NovaFiber* f = nova_current_fiber;
-    if (f && f != &nova_carrier_fiber && f->ovf_active && f->stack_mem && si) {
-        uintptr_t addr = (uintptr_t)si->si_addr;
-        uintptr_t lo   = (uintptr_t)f->stack_mem;
-        uintptr_t hi   = lo + (uintptr_t)NOVA_POSIX_GUARD_SIZE;
-        if (addr >= lo && addr < hi) {
-            f->ovf_active = 0;              /* one shot: a fault while unwinding is a real bug */
-            siglongjmp(f->ovf_buf, 1);
-        }
-    }
-    nova_chain_previous(sig, si, uctx);
-}
-
-static void nova_install_stack_guard_once(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = nova_stack_guard_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &nova_prev_segv);
-    /* Some platforms (macOS notably) report a guard-page hit as SIGBUS rather than SIGSEGV. */
-    sigaction(SIGBUS, &sa, &nova_prev_bus);
-}
-
-/* Per-THREAD half: every carrier/pool thread needs its own alternate stack, or the handler has
-   nowhere to run when THAT thread overflows. Cheap and idempotent, so it is safe to call on
-   every fiber entry. */
-static void nova_ensure_stack_guard(void) {
-#ifdef NOVA_ASAN_BUILD
-    /* Under AddressSanitizer, STAND DOWN. ASAN installs its own SIGSEGV handler and produces a
-       precise "stack-overflow" report with the full recursion backtrace, which is strictly more
-       useful in a debugging build than silently containing the fault -- containment would MASK
-       the very diagnostic the build exists to produce. Measured: with our handler installed,
-       ASAN aborted inside PlatformUnpoisonStacks instead of reporting, so this is also what
-       keeps the CI's ASAN output intact. Production (non-sanitized) builds get containment.
-       Verified: an ASAN build with this guard reports exactly what the pre-change runtime did. */
-    return;
-#else
-    if (!nova_altstack_ready) {
-        stack_t ss;
-        ss.ss_sp = nova_altstack;
-        ss.ss_size = NOVA_ALTSTACK_SIZE;
-        ss.ss_flags = 0;
-        if (sigaltstack(&ss, NULL) == 0)
-            nova_altstack_ready = 1;
-    }
-    pthread_once(&nova_segv_once, nova_install_stack_guard_once);
-#endif
-}
-
 static void nova_posix_fiber_trampoline(void) {
     NovaFiber* f = nova_current_fiber;
     nova_current_task = &f->task;
     f->status = 1;
 
     nova_fiber_limit_stack();
-    nova_ensure_stack_guard();
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
-    /* Mirror of the Windows __try/__except. sigsetjmp lands here when the SIGSEGV handler
-       claims a guard-page fault; the inner setjmp keeps handling SOFTWARE faults (panic,
-       unwrap-on-Err, failed assert) exactly as before. Reported identically to nova_panic so
-       callers cannot tell which fault class occurred, then falls through to the normal fiber
-       exit so the carrier survives and runs the remaining tasks. */
-    f->ovf_active = 1;
-    if (sigsetjmp(f->ovf_buf, 1) == 0) {
-        if (setjmp(f->task.fault_buf) == 0) {
-            int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
-            nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
-            fn(f->entry_fn, 0);
-        }
-    } else {
-        f->task.crashed = 1;
-        nova_set_error("stack overflow");
-        fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\"\n");
-        fflush(stderr);
+    if (setjmp(f->task.fault_buf) == 0) {
+        int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
+        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+        fn(f->entry_fn, 0);
     }
-    f->ovf_active = 0;
     f->task.fault_active = 0;
-    nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
@@ -10464,35 +9857,20 @@ static void* nova_watchdog_thread(void* arg) {
 #endif
 }
 
-int64_t nova_rt_cpu_count(void);  /* fwd: defined further down (Auto-Parallelization Primitives) */
-
 void nova_rt_main_dispatch(int64_t main_fn) {
     if (nova_green_enabled()) {
         int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
         if (rec) {
             rec[0] = main_fn;
             nova_sched_root_exit = 0;
-            /* M:N carrier count: NOVA_CARRIERS overrides. When unset (or empty), auto-detect the
-               host's CPU count via nova_rt_cpu_count() (GetSystemInfo on Windows / sysconf on
-               Linux+macOS — see its definition below) and use that, capped at 16 — matching the
-               existing nova_pmap_thread_count() convention elsewhere in this file, and well under
-               the NOVA_WS_MAX_WORKERS=64 hard ceiling reserved for an explicit override. This
-               changed 2026-08: N>1 multi-carrier is now validated (full-arc + N>1 regression green),
-               so auto-parallelism is the right default rather than a silent single-core fallback.
-               An explicit NOVA_CARRIERS still always wins — including NOVA_CARRIERS=1, which forces
-               the single-carrier hot path (byte-identical to the pre-M:N code path) for anyone who
-               needs deterministic single-threaded behavior. */
+            /* M:N carrier count: NOVA_CARRIERS overrides; default 1 = single-carrier
+               (byte-identical to the pre-M:N hot path — M:N is opt-in until validated). */
             int ncar = 1;
             const char* cenv = getenv("NOVA_CARRIERS");
             if (cenv && cenv[0]) {
                 ncar = atoi(cenv);
                 if (ncar < 1) ncar = 1;
                 if (ncar > 64) ncar = 64;   /* hard cap (matches NOVA_WS_MAX_WORKERS, #defined later) */
-            } else {
-                int64_t detected = nova_rt_cpu_count();
-                ncar = (detected > 0) ? (int)detected : 1;
-                if (ncar > 16) ncar = 16;
-                if (ncar < 1) ncar = 1;
             }
             if (ncar > 1) {
                 /* Engage the locks/atomics/F1-spins BEFORE any task can run. */
@@ -11183,16 +10561,9 @@ int64_t nova_rt_reload_requested(void) {
 
 void nova_rt_init(void) {
 #ifdef _WIN32
-    /* TIMER RESOLUTION. Windows' default timer granularity is 15.6 ms, and the netpoller thread
-       idles on Sleep(1) (see the poller loop below), which ROUNDS UP to a full tick. A green task
-       parking on I/O therefore waits for the poller's next tick, so every network round trip cost a
-       fixed ~15.4 ms regardless of the work involved -- measured identically across INSERT, SELECT
-       and EXISTS -- capping throughput at ~65 ops/sec/connection for the ORM and for Forge's HTTP
-       server alike. Raising the resolution to 1 ms measured 8x on the ORM benchmark.
-       winmm is loaded DYNAMICALLY rather than linked: -lwinmm would have to be added to every link
-       command in the project (nova.ps1, the CI scripts, and every ad-hoc test link), and a single
-       missed one becomes an undefined-reference build failure. This keeps the change self-contained
-       to the runtime, and degrades silently to the old behaviour if winmm is unavailable. */
+    /* Raise Windows timer resolution to 1ms -- the netpoller idles on Sleep(1), which rounds up to
+       the 15.6ms default tick, costing every I/O park a full tick. winmm is loaded DYNAMICALLY so no
+       link command in the project needs -lwinmm. See the matching note in compiler/nova_runtime.c. */
     {
         HMODULE nova_winmm = LoadLibraryA("winmm.dll");
         if (nova_winmm) {
@@ -12976,26 +12347,6 @@ int64_t nova_rt_to_i16(int64_t val) { return (int64_t)(int16_t)(nova_rt_to_int(v
 int64_t nova_rt_to_i32(int64_t val) { return (int64_t)(int32_t)(nova_rt_to_int(val) & 0xFFFFFFFFLL); }
 int64_t nova_rt_to_i64(int64_t val) { return nova_rt_to_int(val); }
 
-/* LOCK-4 inc3c: explicit FLOAT-width conversions, the float twins of nova_rt_to_u8 et al.
-   NOVA floats live as raw double BITS in an i64 slot, so these take and return bits. f32()
-   rounds through binary32 -- the same rounding the compiler emits inline for f32 arithmetic,
-   so an explicit conversion and an inferred one cannot disagree. f64() is a widening, i.e.
-   the identity on the bit pattern; it exists so the width-mismatch error's suggested fix
-   ("convert explicitly, e.g. f64(x)") names something that actually exists. Both unbox first
-   because the argument may arrive boxed through an `any`-typed path. */
-int64_t nova_rt_to_f32(int64_t val) {
-    int64_t raw = nova_rt_unbox(val);
-    double d;
-    memcpy(&d, &raw, sizeof(double));
-    float f = (float)d;
-    double back = (double)f;
-    int64_t out;
-    memcpy(&out, &back, sizeof(double));
-    return out;
-}
-
-int64_t nova_rt_to_f64(int64_t val) { return nova_rt_unbox(val); }
-
 int64_t nova_rt_to_float(int64_t val) {
     if (val == 0) return f2i(0.0);
     /* An Any-typed float/bool arrives BOXED (json_decode, generic containers); unbox
@@ -13098,17 +12449,6 @@ static void nova_rc_free(void* ptr) {
         return;
     }
     switch (tag) {
-        case NOVA_MEM_TARRAY: {
-            /* Free the packed element buffer. Elements are RAW SCALARS by construction -- a
-               typed array can never hold a heap handle -- so unlike a list there is nothing to
-               rc_dec, only the one malloc'd buffer. Without this case the buffer leaks on every
-               array death, which for a million-element array is a megabyte a time. */
-            NovaTypedArray* ta = (NovaTypedArray*)ptr;
-            if (ta->data) { free(ta->data); ta->data = NULL; }
-            ta->size = 0;
-            ta->cap = 0;
-            break;
-        }
         case NOVA_MEM_LIST: {
             NovaList* l = (NovaList*)ptr;
             /* S4 Stage-0: kind=2 (raw inline doubles) elements are scalars, NEVER heap refs.
@@ -14773,46 +14113,6 @@ int64_t nova_rt_tcp_listen(int64_t port_val) {
     return (int64_t)sock;
 }
 
-/* F-1 (Forge production gaps, BLOCKER): the real TCP peer address was exposed NOWHERE.
-   tcp_accept fills a sockaddr_in and DISCARDS it, so mw_rate_limit could only key on the
-   client-supplied X-Forwarded-For header — a fresh random XFF per request gets a fresh
-   bucket, so the limiter never engages AND the attacker forces unlimited PBKDF2 work
-   (CPU-exhaustion DoS from a one-line curl loop).
-
-   getpeername() recovers it from the ACCEPTED socket, so no accept-path signature has to
-   change and every existing caller keeps working. Returns the dotted-quad as a NOVA string,
-   or "" when unavailable — never an error, so a caller can always fall back to XFF. */
-int64_t nova_rt_tcp_peer_addr(int64_t sock_val) {
-    NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
-    struct sockaddr_in pa;
-    memset(&pa, 0, sizeof(pa));
-#ifdef _WIN32
-    int pl = (int)sizeof(pa);
-#else
-    socklen_t pl = (socklen_t)sizeof(pa);
-#endif
-    if (getpeername(s, (struct sockaddr*)&pa, &pl) != 0)
-        return nova_rt_create_string((void*)"");
-    char host[64];
-    host[0] = 0;
-    if (!inet_ntop(AF_INET, &pa.sin_addr, host, sizeof(host)))
-        host[0] = 0;
-    return nova_rt_create_string((void*)host);
-}
-
-int64_t nova_rt_tcp_peer_port(int64_t sock_val) {
-    NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
-    struct sockaddr_in pa;
-    memset(&pa, 0, sizeof(pa));
-#ifdef _WIN32
-    int pl = (int)sizeof(pa);
-#else
-    socklen_t pl = (socklen_t)sizeof(pa);
-#endif
-    if (getpeername(s, (struct sockaddr*)&pa, &pl) != 0) return 0;
-    return (int64_t)ntohs(pa.sin_port);
-}
-
 int64_t nova_rt_tcp_accept(int64_t server_val) {
     NOVA_SOCKET server = (NOVA_SOCKET)server_val;
     if (nova_sched_in_task()) {
@@ -16349,15 +15649,6 @@ int64_t nova_rt_hash(int64_t val) {
         }
         return (int64_t)h;
     }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Content hash over the RAW BYTES, plus the kind so a u8[] and an i8[] holding the same
-           bytes do not collide. Consistent with the element-wise equality below. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        uint64_t h = 14695981039346656037ULL ^ (uint64_t)ta->kind;
-        int64_t nb = ta->size * nova_ta_elem_size(ta->kind);
-        for (int64_t i = 0; i < nb && ta->data; i++) { h ^= (uint64_t)ta->data[i]; h *= 1099511628211ULL; }
-        return (int64_t)h;
-    }
     if (tag == NOVA_MEM_BYTES) {
         /* Content hash (FNV-1a over the bytes) so equal-content bytes hash equal --
            consistent with nova_rt_eq's memcmp, required for bytes-as-dict-key correctness. */
@@ -17618,7 +16909,7 @@ int64_t nova_rt_file_read_bytes(int64_t h, int64_t n) {
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = nova_str_safe(str_val);
     if (!s) return (int64_t)(uintptr_t)"";
-    int64_t len = nova_str_len_fast(s);
+    int64_t len = (int64_t)strlen(s);
     int64_t idx = index;
     if (idx < 0) idx += len;
     if (idx < 0 || idx >= len) return (int64_t)(uintptr_t)"";
@@ -17640,12 +16931,6 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     }
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_get(obj, index);  /* size-bounded; else str_char_at would strlen the struct (wild read) */
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* Element-width aware. Without this case a packed array reaching the dynamic index path
-           would be read as a NovaList -- 8 bytes per element against a possibly 1-byte-per-element
-           buffer, i.e. a heap over-read. */
-        return nova_rt_tarray_get(obj, index);
     }
     if (tag == NOVA_MEM_STRUCT) {
         /* L8: a struct reached the dynamic index path -> the compiler could not statically resolve its
@@ -17674,22 +16959,6 @@ int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
     }
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_slice(obj, start, end);  /* size-bounded; else nova_rt_slice would strlen the struct */
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* A slice of a typed array is a NEW typed array of the SAME kind -- not a list, and not a
-           view. Clamped to bounds like the other slice paths, so a wide range yields a short
-           array rather than an over-read. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        int64_t n = ta->size;
-        if (start < 0) start += n;
-        if (end < 0) end += n;
-        if (start < 0) start = 0;
-        if (end > n) end = n;
-        if (end < start) end = start;
-        int64_t out = nova_rt_tarray_new(ta->kind, end - start);
-        for (int64_t i = start; i < end; i++)
-            nova_rt_tarray_set(out, i - start, nova_rt_tarray_get(obj, i));
-        return out;
     }
     /* SOUNDNESS: only a genuine string may reach nova_rt_slice; a non-sliceable value (bare int/float/bool)
        would otherwise be dereferenced as a char* -> wild read. Return 0 (null) for a non-sliceable value. */
@@ -17748,10 +17017,6 @@ int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
     }
     if (tag == NOVA_MEM_BYTES) {
         nova_rt_bytes_set(obj, index, value);  /* else silent no-op = data loss on any-typed bytes */
-        return 0;
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        nova_rt_tarray_set(obj, index, value);
         return 0;
     }
     if (tag == NOVA_MEM_STRUCT) {
@@ -17963,43 +17228,8 @@ int64_t nova_rt_unwrap_err(int64_t handle) {
     return r->value;
 }
 
-/* Is `handle` REALLY a Result/Option cell? nova_result_pack builds one as an
-   UNHASHED 2-slot struct whose slot 0 is the tag (0 or 1). Everything else is
-   distinguishable: a normal user struct carries the HASHED bit (slot 0 = type
-   hash), lists/dicts/strings/bytes/boxes have their own kinds, and a plain
-   integer or a foreign pointer is not owned by the object space at all, so
-   find_tag rejects it without a dereference.
-
-   This exists because the accessors below used to cast ANY i64 straight to
-   NovaResult* and read r->tag -- a wild dereference for every non-Result value
-   that reaches them. That is only safe while the caller is statically known to
-   hold a Result, which stops being true the moment a value-level fallback
-   operator (`x else d`) can be applied to an arbitrary expression.
-
-   Residual imprecision: a 2-field @repr(C) struct whose first field happens to
-   be 0 or 1 probes as a Result. @repr(C) is FFI-only and never flows into these
-   accessors from NOVA code; accepting that is far better than the unconditional
-   out-of-bounds read it replaces. */
-static int nova_result_probe(int64_t handle, NovaResult** out) {
-    if (handle == 0) return 0;
-    void* p = (void*)(uintptr_t)handle;
-    NovaMemTag t = nova_mem_find_tag(p);
-    if ((int32_t)t < 0) return 0;
-    if (((int32_t)t & 0x7) != NOVA_MEM_STRUCT) return 0;
-    if (NOVA_STRUCT_NSLOTS(p) != 2) return 0;
-    if (NOVA_STRUCT_HASHED(p)) return 0;
-    NovaResult* r = (NovaResult*)p;
-    if (r->tag != 0 && r->tag != 1) return 0;
-    *out = r;
-    return 1;
-}
-
-/* `x else d` and unwrap_or(x, d). A NON-Result x is not an error, so it is its
-   own answer -- that totality is what lets `else` be applied to any expression
-   without the caller having to know whether the callee returns a Result. */
 int64_t nova_rt_unwrap_or(int64_t handle, int64_t default_val) {
-    NovaResult* r = NULL;
-    if (!nova_result_probe(handle, &r)) return handle;
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
     if (r->tag == 0) return r->value;
     return default_val;
 }
@@ -19419,16 +18649,6 @@ static int nova_secret_span(int64_t h, unsigned char** out, size_t* len, int wri
         NovaBytes* b = (NovaBytes*)ptr;
         if (!b->data && b->size) return 0;
         *out = b->data; *len = (size_t)b->size; return 1;
-    }
-    if (tag == NOVA_MEM_TARRAY) {
-        /* LOCK-7 @redact: expose the raw element bytes so key material held in a typed array
-           (the natural home for a byte/word key schedule) can actually be zeroed. Without this
-           a @redact-marked typed array would be silently skipped -- the secret would survive. */
-        NovaTypedArray* ta = (NovaTypedArray*)ptr;
-        if (!ta->data && ta->size) return 0;
-        *out = ta->data;
-        *len = (size_t)(ta->size * nova_ta_elem_size(ta->kind));
-        return 1;
     }
     if (tag == NOVA_MEM_FAT_STR) {
         int64_t n = NOVA_FAT_LEN((const char*)ptr);
@@ -22467,23 +21687,17 @@ int64_t nova_rt_target_current(void) {
 #endif
 }
 
-/* nova_rt_target_list: Return list of supported compilation targets.
-   MUST stay in sync with resolve_target()/target_datalayout() in nova_compiler.nova --
-   this list is what `nova targets` shows a user to copy from, so advertising a triple the
-   compiler cannot actually lower is worse than not listing it.
-   - riscv64 and armv7 were removed 2026-08-07: neither resolve_target() nor
-     target_datalayout() has a path for them, so they silently fell through to the generic
-     ELF datalayout and miscompiled.
-   - the macOS entries were "*-apple-macosx", but resolve_target() emits "*-apple-darwin";
-     the advertised list and the accepted list disagreed. Aligned to darwin. */
+/* nova_rt_target_list: Return list of supported compilation targets. */
 int64_t nova_rt_target_list(void) {
     static const char* targets[] = {
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
+        "aarch64-apple-macosx",
+        "x86_64-apple-macosx",
         "wasm32-unknown-unknown",
+        "riscv64-unknown-linux-gnu",
+        "armv7-unknown-linux-gnueabihf",
         NULL
     };
     int64_t list = nova_rt_list_create();
@@ -25521,8 +24735,7 @@ int64_t c_test_set42(int64_t* out) {
    timestamp; nova_rt_prof_exit("fn_name") accumulates (now - entry) into
    that function's bucket and increments the call count. On program exit,
    atexit-registered nova_rt_prof_dump() prints sorted by total time.
-   These calls are MANUAL instrumentation only -- there is no --profile flag in the CLI, so
-   nothing injects them automatically (the previous claim here was stale). Names live
+   The compiler injects these calls when --profile is passed. Names live
    for the duration of the binary (string literals in .rodata), so we can
    key by pointer + use a tiny linear-probe table without allocation.
    Up to 1024 distinct functions; that covers any realistic NOVA program. */

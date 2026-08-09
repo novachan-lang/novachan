@@ -292,11 +292,45 @@ fn _pg_handshake(conn: PgConn, user: string, db: string, password: string) -> an
             done = 1
     ok(conn)
 
+// ── connection self-description (enables pool replacement) ──────────────────────────────────────
+// A dead connection used to be closed and DROPPED, which shrank the pool by one -- permanently. A
+// run of transient failures (a server restart, an idle reaper, a brief network partition) therefore
+// emptied the pool for the life of the process, after which every request failed with "pool acquire
+// timeout" forever. Replacing it requires knowing how to reconnect, and a pool that is a bare
+// channel cannot carry a DSN.
+// Rather than change every pooled signature to take a PgPool struct -- which would break forge_orm
+// and every caller -- each CONNECTION remembers how to recreate itself, in the params dict it
+// already has. The keys are prefixed with a control character, which cannot appear in a PostgreSQL
+// ParameterStatus name, so they can never collide with a real server parameter.
+// NOTE: this keeps the password in process memory. It already was (pg_connect received it, and any
+// pool must be able to reconnect), but it is worth knowing it now lives on the connection.
+fn _pg_dsn_key(name: string) -> string
+    chr(1) + "dsn_" + name
+
+fn _pg_remember_dsn(conn: PgConn, host: string, port: int, user: string, db: string, password: string)
+    conn.params[_pg_dsn_key("host")] = host
+    conn.params[_pg_dsn_key("port")] = str(port)
+    conn.params[_pg_dsn_key("user")] = user
+    conn.params[_pg_dsn_key("db")] = db
+    conn.params[_pg_dsn_key("pw")] = password
+
+// Open a NEW connection equivalent to `conn`. Returns err when the connection was not created
+// through pg_connect (so it carries no DSN) or the server is still unreachable.
+fn _pg_reconnect_like(conn: PgConn) -> any
+    if not (_pg_dsn_key("host") in conn.params)
+        return err("pg: connection carries no DSN; cannot replace it")
+    pg_connect(str(conn.params[_pg_dsn_key("host")]), parse_int(str(conn.params[_pg_dsn_key("port")])), str(conn.params[_pg_dsn_key("user")]), str(conn.params[_pg_dsn_key("db")]), str(conn.params[_pg_dsn_key("pw")]))
+
 fn pg_connect(host: string, port: int, user: string, db: string, password: string) -> any
     let sock = tcp_connect(host, port)
     if sock < 0
         return err("pg: cannot connect to {host}:{port}")
-    _pg_handshake(_pg_conn_new(0, sock), user, db, password)
+    let r = _pg_handshake(_pg_conn_new(0, sock), user, db, password)
+    if is_err(r)
+        return r
+    let c: PgConn = unwrap(r)
+    _pg_remember_dsn(c, host, port, user, db, password)
+    ok(c)
 
 fn pg_connect_tls(host: string, port: int, user: string, db: string, password: string, sslmode: string) -> any
     let sock = tcp_connect(host, port)
@@ -631,6 +665,15 @@ fn _pg_rel(pool, conn)
 fn _pg_discard(pool, conn)
     cancel_on_exit_val(pool, conn)
     pg_close(conn)
+    // REPLACE, do not merely shrink. Dropping the connection kept the pool one smaller for the rest
+    // of the process, so repeated transient failures eventually emptied it and every later request
+    // failed with "pool acquire timeout" permanently. Open a fresh equivalent connection and return
+    // it to the pool so the pool holds its configured size again.
+    // If the server is still unreachable the replacement fails and the pool shrinks exactly as
+    // before -- degraded, never worse, and the next discard will try again.
+    let r = _pg_reconnect_like(conn)
+    if is_ok(r)
+        send(pool, unwrap(r))
 
 fn _pg_is_conn_err(msg: string) -> bool
     find(msg, "connection closed mid-query") >= 0 or find(msg, "EOF") >= 0

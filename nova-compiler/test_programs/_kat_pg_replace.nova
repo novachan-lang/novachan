@@ -1,0 +1,94 @@
+// _kat_pg_replace -- KAT for connection REPLACEMENT on death.
+//
+// KNOWN ANSWER: killing a pooled connection must not permanently shrink the pool. After the dead
+// connection is used and discarded, the pool must be back to its configured size and queries must
+// keep working.
+//
+// Pre-fix a dead connection was closed and DROPPED, so the pool shrank by one for the rest of the
+// process; a run of transient failures (server restart, idle reaper, brief partition) emptied it and
+// every later request failed with "pool acquire timeout" forever.
+import forge_pg
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+// Non-destructive pool census: take everything, put it all back.
+fn census(ch) -> int
+    let taken = []
+    let going = 1
+    while going == 1
+        let r = select_timeout(ch, 400)
+        if r[0] == 0
+            push(taken, r[1])
+        else
+            going = 0
+    for t in taken
+        send(ch, t)
+    len(taken)
+
+fn main()
+    let pw = env("PGPASSWORD")
+    if len(pw) == 0
+        print("[pg] skipped (set PGPASSWORD)")
+        return
+    let host = _envor("PGHOST","127.0.0.1")
+    let port = parse_int(_envor("PGPORT","5432"))
+    let user = _envor("PGUSER","postgres")
+    let dbn  = _envor("PGDATABASE","postgres")
+
+    let pr = forge_pg.pg_pool_open(host, port, user, dbn, pw, 2)
+    if is_err(pr)
+        print("FAIL open: {unwrap_err(pr)}")
+        exit(1)
+    let pool = unwrap(pr)
+    let fails = 0
+
+    print("pool census at open      : {census(pool)}  (expect 2)")
+    if census(pool) != 2
+        fails += 1
+
+    // sanity: queries work
+    let q0 = forge_pg.pg_query_params_pool(pool, "SELECT 1 AS x", [])
+    if is_err(q0)
+        print("FAIL baseline query: {unwrap_err(q0)}")
+        fails += 1
+
+    // KILL one pooled connection: take it out, close its socket, put the corpse back.
+    let victim = recv(pool)
+    forge_pg.pg_close(victim)
+    send(pool, victim)
+    print("pool census after kill   : {census(pool)}  (2, but one is DEAD)")
+
+    // Drive queries. One will land on the corpse, fail with EOF, and trigger discard+replace.
+    let errs = 0
+    for i in 0..6
+        let q = forge_pg.pg_query_params_pool(pool, "SELECT 1 AS x", [])
+        if is_err(q)
+            errs += 1
+    print("queries erroring on the corpse: {errs} of 6  (>=1 expected -- the dead one is detected)")
+
+    let after = census(pool)
+    print("pool census after replace: {after}  (expect 2 -- REPLACED, not shrunk)")
+    if after != 2
+        print("FAIL: pool shrank to {after}")
+        fails += 1
+
+    // and the pool must be fully usable again
+    let good = 0
+    for i in 0..6
+        let q = forge_pg.pg_query_params_pool(pool, "SELECT 1 AS x", [])
+        if is_ok(q)
+            good += 1
+    print("queries succeeding after : {good} of 6  (expect 6)")
+    if good != 6
+        fails += 1
+
+    forge_pg.pg_pool_close(pool, 2)
+    if fails == 0
+        print("_kat_pg_replace passed")
+    else
+        print("_kat_pg_replace FAILED ({fails})")
+        exit(1)
