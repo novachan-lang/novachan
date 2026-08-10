@@ -1,0 +1,134 @@
+// _kat_pg_copy -- KAT for COPY FROM STDIN bulk load.
+//
+// KNOWN ANSWER: a COPY-loaded table must be byte-for-byte identical to the same rows loaded by
+// INSERT -- INCLUDING values containing tabs, newlines, carriage returns, backslashes, and the
+// literal two-character sequence \N.
+//
+// Why that is the whole test: COPY text format is TAB-separated and NEWLINE-terminated, so an
+// unescaped tab or newline inside a value silently splits the row into the wrong number of columns.
+// \N is the NULL marker, so a literal backslash must be escaped FIRST or a value of "\N" reads back
+// as NULL. These are the failures a naive COPY implementation ships and only discovers in
+// production, because ordinary ASCII data works fine.
+//
+// The driver previously REFUSED COPY outright ("not supported by this driver").
+import forge_orm
+import forge_pg
+
+type CpRow
+    id: int
+    payload: string
+
+fn _envor(name: string, dflt: string) -> string
+    let v = env(name)
+    if len(v) > 0
+        return v
+    dflt
+
+// values chosen to break a naive escaper
+fn nasty() -> list
+    ["plain", "with\ttab", "with\nnewline", "back\\slash", "\\N", "cr\rhere", "", "trail\\", "a\tb\nc\\d"]
+
+fn main()
+    let pw = env("PGPASSWORD")
+    if len(pw) == 0
+        print("[pg] skipped (set PGPASSWORD)")
+        return
+    let url = "postgres://" + _envor("PGUSER","postgres") + ":" + pw + "@" + _envor("PGHOST","127.0.0.1") + ":" + _envor("PGPORT","5432") + "/" + _envor("PGDATABASE","postgres")
+    let db = unwrap(orm_open_with_pool(url, 2))
+    let fails = 0
+
+    // ---------- 1. ESCAPING: COPY must round-trip hostile values exactly ----------
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_esc", [])
+    _ = orm_exec(db, "CREATE TABLE kat_copy_esc (id int, payload text)", [])
+    let vals = nasty()
+    let esc_rows = [[i, vals[i]] for i in 0..len(vals)]
+    let cr = forge_pg.pg_copy_in_pool(orm_pool(db), "kat_copy_esc", ["id", "payload"], esc_rows)
+    if is_err(cr)
+        print("FAIL copy(escaping): {unwrap_err(cr)}")
+        fails += 1
+    else
+        let back = orm_all(db, "SELECT id, payload FROM kat_copy_esc ORDER BY id", [])
+        if len(back) != len(vals)
+            print("FAIL escaping: got {len(back)} rows, expected {len(vals)} -- a value split the row")
+            fails += 1
+        else
+            let bad = 0
+            for i in 0..len(vals)
+                let got = str(back[i]["payload"])
+                if got != vals[i]
+                    print("  MISMATCH row {i}: expected len={len(vals[i])} got len={len(got)}")
+                    bad += 1
+            if bad == 0
+                print("PASS escaping: all {len(vals)} hostile values round-tripped exactly")
+            else
+                print("FAIL escaping: {bad} value(s) corrupted")
+                fails += 1
+
+    // ---------- 2. EQUIVALENCE at scale: COPY vs INSERT ----------
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_a", [])
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_b", [])
+    _ = orm_exec(db, "CREATE TABLE kat_copy_a (id int, payload text)", [])
+    _ = orm_exec(db, "CREATE TABLE kat_copy_b (id int, payload text)", [])
+    let n = 2000
+    let rows = [CpRow(i, "row-{i}") for i in 0..n]
+
+    // A: force the multi-row INSERT path (below the COPY threshold is not enough at n=2000, so
+    // call the driver-agnostic exec path directly in chunks would be slow -- instead compare against
+    // a straight INSERT..SELECT generated server-side, which is an independent source of truth).
+    let t0 = time_ms()
+    let ci = orm_insert_many(db, "kat_copy_a", rows)     // >= threshold -> takes the COPY path
+    let t_copy = time_ms() - t0
+    if is_err(ci)
+        print("FAIL bulk load: {unwrap_err(ci)}")
+        fails += 1
+
+    let t1 = time_ms()
+    _ = orm_exec(db, "INSERT INTO kat_copy_b (id, payload) SELECT g, 'row-' || g FROM generate_series(0, ?) AS g", [n - 1])
+    let t_srv = time_ms() - t1
+
+    let ca = orm_count(db, "kat_copy_a", "", [])
+    let cb = orm_count(db, "kat_copy_b", "", [])
+    // set-difference both ways: proves the CONTENTS match, not just the counts
+    // NB: orm_count quotes the table name, so an alias cannot be smuggled through it -- an earlier
+    // version passed "kat_copy_a a" and the query errored, and since orm_count returns 0 on error the
+    // assertion PASSED VACUOUSLY. Run the set-difference as a real query instead.
+    let dr = orm_all(db, "SELECT count(*) AS n FROM kat_copy_a a WHERE NOT EXISTS (SELECT 1 FROM kat_copy_b b WHERE b.id = a.id AND b.payload = a.payload)", [])
+    let diff = parse_int(str(dr[0]["n"])) if len(dr) > 0 else 0 - 1
+    if ca != n or cb != n or diff != 0
+        print("FAIL equivalence: copy={ca} server={cb} mismatched_rows={diff}")
+        fails += 1
+    else
+        print("PASS equivalence: {n} rows via COPY identical to a server-side INSERT..SELECT")
+    print("     COPY {n} rows: {t_copy} ms   (server-side INSERT..SELECT: {t_srv} ms)")
+
+    // ---------- 3. empty input must be a clean no-op ----------
+    let ce = forge_pg.pg_copy_in_pool(orm_pool(db), "kat_copy_a", ["id", "payload"], [])
+    if is_err(ce) or unwrap(ce) != 0
+        print("FAIL empty copy should be ok(0)")
+        fails += 1
+    else
+        print("PASS empty copy: ok(0)")
+
+    // ---------- 4. a failed COPY must leave the connection USABLE ----------
+    let cf = forge_pg.pg_copy_in_pool(orm_pool(db), "kat_copy_nonexistent", ["id"], [[1]])
+    if is_ok(cf)
+        print("FAIL copy into a missing table should error")
+        fails += 1
+    else
+        let still = orm_count(db, "kat_copy_a", "", [])
+        if still != n
+            print("FAIL connection unusable after a failed COPY (count={still})")
+            fails += 1
+        else
+            print("PASS failed COPY left the connection usable")
+
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_esc", [])
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_a", [])
+    _ = orm_exec(db, "DROP TABLE IF EXISTS kat_copy_b", [])
+    orm_close(db)
+
+    if fails == 0
+        print("_kat_pg_copy passed")
+    else
+        print("_kat_pg_copy FAILED ({fails})")
+        exit(1)

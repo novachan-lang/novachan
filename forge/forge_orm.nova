@@ -653,6 +653,25 @@ fn _orm_batch_chunk_rows(ncols: int) -> int
         return 1
     n
 
+fn _orm_copy_threshold() -> int
+    500
+
+// COPY is PostgreSQL-only; every other driver returns err so the caller falls back to multi-row
+// INSERT. Values are bound positionally in the same column order the INSERT path uses.
+fn _orm_try_copy(db: OrmDb, table: string, names: list, rows: list) -> Result
+    // COPY text format cannot express a NULL that the driver is able to detect (NOVA has no
+    // distinguishable null -- 0 == null), so if ANY value is the ORM's NULL sentinel, refuse and let
+    // the caller fall back to the INSERT path, where _orm_apply_nulls rewrites the placeholder into
+    // a literal SQL NULL keyword.
+    for r in rows
+        for nm in names
+            if _orm_is_null_val(field_get(r, nm))
+                return err("copy: batch contains orm_null(); use the INSERT path")
+    match db.odb_drv
+        DPostgres(p, n) => forge_pg.pg_copy_in_pool(p, _orm_qident("postgres", table), [_orm_qident("postgres", nm) for nm in names], [[field_get(r, nm) for nm in names] for r in rows])
+        DSqlite(p, n) => err("copy: postgres only")
+        DMysql(p, n) => err("copy: postgres only")
+
 fn orm_insert_many(db: OrmDb, table: string, rows: list) -> Result
     if len(rows) == 0
         return ok(0)
@@ -669,6 +688,19 @@ fn orm_insert_many(db: OrmDb, table: string, rows: list) -> Result
         return err("orm_insert_many: nothing to insert")
     let cols = join([_orm_qident(kind, nm) for nm in names], ", ")
     let tbl = _orm_qident(kind, table)
+    // POSTGRESQL LARGE BATCH -> COPY. A multi-row INSERT still parses and plans a statement whose
+    // size grows with the batch, and the Bind message caps bound values at 65535 (an INT16), so a
+    // wide table hits the ceiling after a few thousand rows. COPY streams rows in with no per-row
+    // parse and no parameter ceiling. Only for a batch big enough to pay back the extra round trip;
+    // below the threshold the multi-row INSERT is already fast and keeps one code path for the
+    // common case.
+    if len(rows) >= _orm_copy_threshold()
+        let copied = _orm_try_copy(db, table, names, rows)
+        if is_ok(copied)
+            return copied
+        // COPY failed for a reason that may be specific to it (a permission, a trigger, an
+        // unsupported column type) -- fall through to the portable multi-row INSERT rather than
+        // failing the whole load.
     let one = "(" + join(["?" for nm in names], ", ") + ")"
     let per = _orm_batch_chunk_rows(len(names))
     let total = 0

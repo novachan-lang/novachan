@@ -413,10 +413,14 @@ fn pg_exec(conn: PgConn, sql: string) -> any
         else if m.tag == 65
             _ = 0
         else if m.tag == 71
-            let fail_msg = _cstr("COPY FROM STDIN not supported by this driver")
+            // A simple query is not the COPY entry point -- pg_copy_in drives that protocol itself.
+            // Reaching CopyInResponse here means someone ran a bare "COPY ... FROM STDIN" through
+            // pg_exec, so refuse cleanly (CopyFail, 'f' = 102) and point at the right API rather
+            // than leaving the connection stuck in COPY mode.
+            let fail_msg = _cstr("use pg_copy_in for COPY FROM STDIN")
             _pg_send(conn, _pg_msg(102, fail_msg))
             had_err = 1
-            errmsg = "COPY FROM STDIN is not supported by this driver"
+            errmsg = "COPY FROM STDIN must go through pg_copy_in, not a simple query"
         else if m.tag == 72
             had_err = 1
             errmsg = "COPY TO STDOUT is not supported by this driver; use pg_query_params with a SELECT instead"
@@ -613,6 +617,122 @@ fn pg_exec_params(conn: PgConn, sql: string, params: list) -> any
     if r.had_err == 1
         return err("pg: {r.errmsg}")
     ok(r.affected)
+
+// ── COPY FROM STDIN (bulk load) ─────────────────────────────────────────────────────────────────
+// The fastest way to get rows into PostgreSQL. A multi-row INSERT still parses and plans a statement
+// whose size grows with the batch, and it is capped by the Bind message's INT16 parameter count
+// (65535 bound values, so ~13k rows at 5 columns). COPY streams rows straight into the table with no
+// per-row parse and NO parameter ceiling, so it is the right primitive for a large load.
+// This driver previously REFUSED it outright: on CopyInResponse it replied CopyFail and reported
+// "COPY FROM STDIN is not supported by this driver".
+//
+// TEXT-FORMAT ESCAPING IS THE WHOLE CORRECTNESS STORY. COPY text is tab-separated and
+// newline-terminated, so any tab, newline, carriage return or backslash INSIDE a value must be
+// escaped or the row silently splits into the wrong number of columns -- data corruption that a
+// naive implementation only discovers in production. \N is the NULL marker, which is why a literal
+// backslash must be escaped FIRST (otherwise a value of "\N" would be read back as NULL).
+// NO NULL INFERENCE HERE -- and that is deliberate, not an omission. NOVA has no distinguishable
+// null value: null is represented as 0 and the runtime predicate is literally
+// `nova_rt_is_null(p) { return p == 0; }`, so `v == null` is TRUE for the INTEGER ZERO. The first
+// draft of this function opened with `if v == null: return "\N"`, which wrote every zero as SQL
+// NULL. This file's own KAT caught it, and the symptom was instructive: a row with id 0 became id
+// NULL, and because PostgreSQL sorts NULLs LAST the read-back looked like a one-position ROTATION
+// rather than obvious corruption. Same defect as the MySQL bound-parameter NULL bitmap -- see
+// reference_nova_null_is_zero_indistinguishable.
+// Every value is therefore written as text. A caller needing real NULLs in a bulk load uses the
+// INSERT path; orm_insert_many falls back to it automatically when a NULL sentinel is present.
+fn _pg_copy_esc(v) -> string
+    let s = str(v)
+    let out = []
+    for i in 0..len(s)
+        let ch = s[i:i + 1]
+        if ch == "\\"
+            push(out, "\\\\")
+        else if ch == "\t"
+            push(out, "\\t")
+        else if ch == "\n"
+            push(out, "\\n")
+        else if ch == "\r"
+            push(out, "\\r")
+        else
+            push(out, ch)
+    join(out, "")
+
+// Stream `rows` (a list of value-lists, one per row) into `table`. `cols` names the target columns.
+// Returns ok(rows_copied) / err(message).
+fn pg_copy_in(conn: PgConn, table: string, cols: list, rows: list) -> any
+    if len(rows) == 0
+        return ok(0)
+    let collist = join(cols, ", ")
+    _pg_send(conn, pg_query_message("COPY " + table + " (" + collist + ") FROM STDIN"))
+    // Wait for CopyInResponse ('G' = 71). An ErrorResponse here means the table/columns are wrong.
+    let buf = bytes(0)
+    let ready = 0
+    let errmsg = ""
+    while ready == 0
+        let m = _pg_recv_msg(conn, buf)
+        buf = m.leftover
+        if m.tag == 0 - 1
+            return err("pg copy: connection closed before CopyInResponse")
+        if m.tag == 71
+            ready = 1
+        else if m.tag == 69
+            errmsg = _pg_parse_error(m.body)
+            // drain to ReadyForQuery so the connection is reusable
+            let d = 0
+            while d == 0
+                let m2 = _pg_recv_msg(conn, buf)
+                buf = m2.leftover
+                if m2.tag == 90 or m2.tag == 0 - 1
+                    d = 1
+            return err("pg copy: {errmsg}")
+        else if m.tag == 90
+            return err("pg copy: server did not enter COPY mode")
+    // CopyData ('d' = 100), one message per row. Batched into chunks so a large load is not one
+    // syscall per row (the same coalescing argument as the query path).
+    let chunk = []
+    let sent = 0
+    for r in rows
+        push(chunk, join([_pg_copy_esc(v) for v in r], "\t") + "\n")
+        if len(chunk) >= 256
+            _pg_send(conn, _pg_msg(100, str_to_bytes(join(chunk, ""))))
+            chunk = []
+        sent += 1
+    if len(chunk) > 0
+        _pg_send(conn, _pg_msg(100, str_to_bytes(join(chunk, ""))))
+    // CopyDone ('c' = 99), then drain to ReadyForQuery picking up the row count.
+    _pg_send(conn, _pg_msg(99, bytes(0)))
+    let done = 0
+    let affected = 0
+    let failed = 0
+    let fmsg = ""
+    while done == 0
+        let m3 = _pg_recv_msg(conn, buf)
+        buf = m3.leftover
+        if m3.tag == 0 - 1
+            return err("pg copy: connection closed during COPY")
+        else if m3.tag == 67
+            affected = pg_cmd_affected(_pg_cstr(m3.body, 5))
+        else if m3.tag == 69
+            failed = 1
+            fmsg = _pg_parse_error(m3.body)
+        else if m3.tag == 90
+            done = 1
+    if failed == 1
+        return err("pg copy: {fmsg}")
+    ok(affected if affected > 0 else sent)
+
+fn pg_copy_in_pool(pool, table: string, cols: list, rows: list) -> any
+    let a = _pg_acq(pool, _PG_ACQUIRE_TIMEOUT_MS)
+    if is_err(a)
+        return a
+    let conn: PgConn = unwrap(a)
+    let r = pg_copy_in(conn, table, cols, rows)
+    if is_err(r) and _pg_is_conn_err(str(unwrap_err(r)))
+        _pg_discard(pool, conn)
+        return r
+    _pg_rel(pool, conn)
+    r
 
 // ── connection pool + transactions ──────────────────────────────────────────────────────────────
 fn pg_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
