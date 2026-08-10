@@ -99,6 +99,20 @@ typedef struct NovaCleanup {
     int64_t token;   /* 0 = free slot */
 } NovaCleanup;
 
+/* ── Crash-safe defer shadow stack ───────────────────────────────────────────
+   `defer` is a COMPILE-TIME construct that inlines at a function's exit points.
+   A panic longjmps past all of them.  The shadow stack makes defer crash-safe:
+   the compiler pushes an entry at each `defer` site and pops it at each normal
+   exit.  On panic the fiber trampoline drains the stack, calling each deferred
+   function inside its own nested setjmp so a fault in one cleanup cannot cascade.
+   Normal-path cost: one append + one decrement per defer (pointer bump). */
+typedef struct NovaDeferEntry {
+    int64_t fn_ptr;     /* address of the deferred function */
+    int64_t a1;         /* first argument  (0 if unused) */
+    int64_t a2;         /* second argument (0 if unused) */
+    int     nargs;      /* 0, 1, or 2 */
+} NovaDeferEntry;
+
 typedef struct {
     int64_t error_flag;
     int64_t error_msg;
@@ -132,6 +146,12 @@ typedef struct {
                                         another task on the same carrier -- the fiber switch
                                         repoints nova_current_task, so this field follows the task
                                         automatically. Zero-init at fiber creation (calloc). */
+    /* Crash-safe defer shadow stack (see NovaDeferEntry above).  The compiler
+       pushes at each `defer` site and pops at each normal exit point; the fiber
+       trampoline drains whatever remains on BOTH the normal and crash paths. */
+    struct NovaDeferEntry* defer_stack;
+    int64_t defer_count;
+    int64_t defer_cap;
 } NovaTaskState;
 
 #define NOVA_DEFAULT_STACK_MAX 100000
@@ -8239,6 +8259,78 @@ static void nova_task_arena_cleanup(void) {
     if (a) { t->active_arena = NULL; nova_rt_arena_free((int64_t)(uintptr_t)a); }
 }
 
+/* ── Crash-safe defer: push / pop / drain ────────────────────────────────────
+   The compiler emits nova_rt_defer_push at each `defer` site (capturing the
+   function pointer and arguments at defer-declaration time) and nova_rt_defer_pop
+   at each normal exit point (after running the inlined defer code).  On panic the
+   fiber trampoline calls nova_rt_defer_drain, which walks the stack in reverse and
+   calls each deferred function inside a nested setjmp so a fault in one cleanup
+   cannot cascade — the concern that blocked the earlier "make defer crash-safe"
+   proposal is now handled by fault isolation, not by prohibition. */
+
+int64_t nova_rt_defer_push(int64_t fn_ptr, int64_t a1, int64_t a2, int64_t nargs) {
+    NovaTaskState* t = nova_cur();
+    if (!t) return 0;
+    if (t->defer_count >= t->defer_cap) {
+        int64_t new_cap = t->defer_cap ? t->defer_cap * 2 : 8;
+        NovaDeferEntry* ns = (NovaDeferEntry*)realloc(t->defer_stack,
+                              (size_t)new_cap * sizeof(NovaDeferEntry));
+        if (!ns) return 0;
+        t->defer_stack = ns;
+        t->defer_cap = new_cap;
+    }
+    NovaDeferEntry* e = &t->defer_stack[t->defer_count++];
+    e->fn_ptr = fn_ptr;
+    e->a1 = a1;
+    e->a2 = a2;
+    e->nargs = (int)nargs;
+    return 0;
+}
+
+int64_t nova_rt_defer_pop(void) {
+    NovaTaskState* t = nova_cur();
+    if (t && t->defer_count > 0) t->defer_count--;
+    return 0;
+}
+
+typedef int64_t (*nova_defer_fn0)(void);
+typedef int64_t (*nova_defer_fn1)(int64_t);
+typedef int64_t (*nova_defer_fn2)(int64_t, int64_t);
+
+static void nova_rt_defer_drain(void) {
+    NovaTaskState* t = nova_cur();
+    if (!t || !t->defer_stack || t->defer_count == 0) return;
+    for (int64_t i = t->defer_count - 1; i >= 0; i--) {
+        NovaDeferEntry e = t->defer_stack[i];
+        t->defer_stack[i].fn_ptr = 0;
+        if (!e.fn_ptr) continue;
+        /* Each deferred call runs inside its own fault boundary so a crash in
+           one cleanup does not prevent the rest from running.  setjmp is ~20
+           cycles and only fires on the fault path — zero normal-path cost. */
+        jmp_buf guard;
+        int fault_active_saved = t->fault_active;
+        jmp_buf saved_buf;
+        memcpy(saved_buf, t->fault_buf, sizeof(jmp_buf));
+        t->fault_active = 1;
+        if (setjmp(t->fault_buf) == 0) {
+            switch (e.nargs) {
+                case 0: ((nova_defer_fn0)(uintptr_t)e.fn_ptr)(); break;
+                case 1: ((nova_defer_fn1)(uintptr_t)e.fn_ptr)(e.a1); break;
+                default:((nova_defer_fn2)(uintptr_t)e.fn_ptr)(e.a1, e.a2); break;
+            }
+        } else {
+            fprintf(stderr, "level=WARN event=defer_fault_in_cleanup detail=\"deferred call faulted during drain\"\n");
+            fflush(stderr);
+        }
+        memcpy(t->fault_buf, saved_buf, sizeof(jmp_buf));
+        t->fault_active = fault_active_saved;
+    }
+    t->defer_count = 0;
+    free(t->defer_stack);
+    t->defer_stack = NULL;
+    t->defer_cap = 0;
+}
+
 #ifdef _WIN32
 
 int _resetstkoflw(void);
@@ -8308,6 +8400,7 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         fflush(stderr);
     }
     f->task.fault_active = 0;
+    nova_rt_defer_drain();       /* crash-safe defer: run pending deferred calls (fault-isolated) */
     nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
@@ -8660,6 +8753,7 @@ static void nova_posix_fiber_trampoline(void) {
     }
     f->ovf_active = 0;
     f->task.fault_active = 0;
+    nova_rt_defer_drain();       /* crash-safe defer: run pending deferred calls (fault-isolated) */
     nova_task_run_cleanups();    /* Forge #3: release pooled resources even after a contained crash */
     nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
@@ -11021,6 +11115,7 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
         pool->tasks_completed++;
         WakeAllConditionVariable(&pool->all_done);
         LeaveCriticalSection(&pool->lock);
+        nova_rt_defer_drain();       /* crash-safe defer: drain any leftover deferred calls */
         nova_task_arena_cleanup();   /* between tasks on the shared pool thread: a faulted/leaked arena must
                                         not carry into the next task (cross-task corruption) */
     }
@@ -11079,6 +11174,7 @@ static void* nova_pool_worker(void* arg) {
         pool->tasks_completed++;
         pthread_cond_broadcast(&pool->all_done);
         pthread_mutex_unlock(&pool->lock);
+        nova_rt_defer_drain();       /* crash-safe defer: drain any leftover deferred calls */
         nova_task_arena_cleanup();   /* between tasks on the shared pool thread: a faulted/leaked arena must
                                         not carry into the next task (cross-task corruption) */
     }

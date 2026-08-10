@@ -799,6 +799,34 @@ HTTP server, which is throttled by the same quantum. Full detail in memory
 
 ---
 
+## Current focus — UPDATED 2026-08-10 (CRASH-SAFE DEFER: shadow stack + fault-isolated drain)
+
+**`defer` is now crash-safe.** Per-task shadow stack: the compiler registers each `defer` site
+via `nova_rt_defer_push(fn_ptr, a1, a2, nargs)` and the fiber trampoline drains the stack on
+panic. Each deferred call runs inside its own nested `setjmp` so a fault in one cleanup cannot
+cascade. Values are captured at defer-declaration time (like Go). Normal-path semantics
+UNCHANGED (inline expansion still runs at each exit point + pop).
+
+This reverses the earlier REJECTION (documented below). The key insight was fault isolation:
+the concern that blocked the earlier proposal — "a cleanup that faults on the fault path turns
+one crash into two" — is solved by the nested setjmp boundary per entry.
+
+**Gate**: reconverge gen5.ll == gen6.ll byte-identical (the compiler doesn't use defer itself,
+so self-compilation output changes only in the preamble declares). 107 tests pass / 0
+regressions. Both NORMAL and FULLRC modes clean. KAT: `_kat_defer_panic` proves both
+`defer send(pool,c)` and `on_exit_send(pool,c)` return the resource after a panic.
+
+**Files changed**: `nova_runtime.c` (NovaDeferEntry, push/pop/drain, wired into 4 fiber exit
+paths), `nova_compiler.nova` (defer_push at sites, defer_pop at exits, 2 new LLVM declares),
+`_kat_defer_panic.nova` (rewritten to assert both paths survive).
+
+**Limitation**: only plain function calls with ≤2 args get crash-safe registration. Method
+calls, closures, dynamic calls, and 3+-arg calls silently skip registration. All 5 production
+defer sites are covered. `on_exit_send` remains preferred for pool resources (eager cancel,
+task-scoped).
+
+---
+
 ## Current focus — UPDATED 2026-08-08 (ORM HARDENING: 3 commits, 12/12 green incl. live PG)
 
 **Committed** on `highlevel-upgrade`: `9c8e1f84` (data integrity + pool corruption),

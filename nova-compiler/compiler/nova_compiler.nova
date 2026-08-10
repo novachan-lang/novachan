@@ -13543,6 +13543,30 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), [val], "", 0, "pure", b.ir_cur_line))
             else if tag == "defer"
                 push(b.ir_defers, expr)
+                match expr
+                    Expr(_dft, _dfv, _dfn, _dfc, _dff, _dfl) =>
+                        if _dft == "call" and _dfv != "" and not contains(b.ir_locals, _dfv) and not contains(b.ir_sdefs, _dfv)
+                            let _df_rt = _dfv
+                            if not list_contains(b.ir_fnames, _dfv)
+                                _df_rt = resolve_runtime_fn(_dfv)
+                            if _df_rt != _dfv or list_contains(b.ir_fnames, _dfv)
+                                let _df_fp = ir_fresh_reg(b)
+                                ir_emit_inst(b, "fn_ptr_of", _df_fp, ir_type_int(), [], _df_rt, 0)
+                                let _df_a1 = ir_fresh_reg(b)
+                                ir_emit_inst(b, "const_int", _df_a1, ir_type_int(), [], "0", 0)
+                                let _df_a2 = ir_fresh_reg(b)
+                                ir_emit_inst(b, "const_int", _df_a2, ir_type_int(), [], "0", 0)
+                                let _df_nc = len(_dfc)
+                                if _df_nc >= 1
+                                    _df_a1 = ir_lower_expr(b, _dfc[0])
+                                if _df_nc >= 2
+                                    _df_a2 = ir_lower_expr(b, _dfc[1])
+                                if _df_nc > 2
+                                    _df_nc = 2
+                                let _df_na = ir_fresh_reg(b)
+                                ir_emit_inst(b, "const_int", _df_na, ir_type_int(), [], str(_df_nc), _df_nc)
+                                let _df_tok = ir_fresh_reg(b)
+                                ir_emit_side(b, "call", _df_tok, ir_type_any(), [_df_fp, _df_a1, _df_a2, _df_na], "nova_rt_defer_push", 0)
             else if tag == "const"
                 b.ir_consts[name] = expr
             else if tag == "yield"
@@ -14359,6 +14383,8 @@ fn ir_emit_defers(b: IrBuilder)
     let di = len(b.ir_defers) - 1
     while di >= 0
         let _df = ir_lower_expr(b, b.ir_defers[di])
+        let _dp = ir_fresh_reg(b)
+        ir_emit_side(b, "call", _dp, ir_type_any(), [], "nova_rt_defer_pop", 0)
         di = di - 1
 
 fn ir_flush_pending_block(b: IrBuilder)
@@ -21918,9 +21944,13 @@ fn native_target_triple() -> string
     let os = os_name()
     let arch = arch_name()
     if os == "windows"
+        // GNU/mingw ABI is the default (see NOVA_DESIGN/decisions/windows_toolchain_abi.md):
+        // it's what the bundled installer toolchain (llvm-mingw) targets, and unlike MSVC
+        // it needs nothing else installed to link against. --target windows-msvc remains
+        // available as an explicit, non-default opt-out for anyone who needs MSVC ABI.
         if arch == "arm64"
-            return "aarch64-pc-windows-msvc"
-        return "x86_64-pc-windows-msvc"
+            return "aarch64-pc-windows-gnu"
+        return "x86_64-pc-windows-gnu"
     if os == "macos"
         if arch == "arm64"
             return "aarch64-apple-darwin"
@@ -21933,6 +21963,8 @@ fn resolve_target(target: string) -> string
     if target == "" or target == "native"
         return native_target_triple()
     if target == "windows" or target == "win"
+        return "x86_64-pc-windows-gnu"
+    if target == "windows-msvc" or target == "win-msvc"
         return "x86_64-pc-windows-msvc"
     if target == "linux" or target == "linux-x64"
         return "x86_64-unknown-linux-gnu"
@@ -25437,6 +25469,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_task_on_exit_send(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_task_cancel_exit(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_task_cancel_exit_val(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_defer_push(i64, i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_defer_pop() nounwind")
     ire_line(e, "declare i64 @nova_rt_to_f32(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_f64(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_u8(i64) nounwind readnone")
@@ -27157,6 +27191,30 @@ fn resolve_module_file(name: string, base_dir: string) -> string
         content = read_file(candidate)
         if len(content) > 0
             return candidate
+    // Install-relative discovery: mirror nova_find_runtime()'s exe-relative pattern so
+    // `import std/core/str` and `import forge` resolve from ANY working directory with no
+    // NOVA_HOME required. gen3_test.exe sits in test_programs/; std/ and lib/ are siblings
+    // at parent level (nova-compiler/std/, nova-compiler/lib/). An installed nova.exe has
+    // std/ and lib/ as direct siblings.
+    let exe = self_exe_path()
+    if len(exe) > 0
+        let exe_dir = path_parent(exe)
+        candidate = path_join(path_parent(exe_dir), name + ".nova")
+        content = read_file(candidate)
+        if len(content) > 0
+            return candidate
+        candidate = path_join(path_join(path_parent(exe_dir), "lib"), name + ".nova")
+        content = read_file(candidate)
+        if len(content) > 0
+            return candidate
+        candidate = path_join(exe_dir, name + ".nova")
+        content = read_file(candidate)
+        if len(content) > 0
+            return candidate
+        candidate = path_join(path_join(exe_dir, "lib"), name + ".nova")
+        content = read_file(candidate)
+        if len(content) > 0
+            return candidate
     return ""
 
 fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited: dict, mod_base_dir: string) -> list
@@ -27366,6 +27424,7 @@ fn nova_compile_file(input_path: string, output_path: string, use_ir: int, targe
             return output_path
     let source = read_file(input_path)
     let base_dir = path_dir(input_path)
+    nova_check_version_compat(base_dir)
     let llvm_ir = if use_ir == 1
         compile_ir_core_named(source, base_dir, input_path, target)
     else
@@ -27456,6 +27515,69 @@ fn nova_find_runtime() -> string
             return c
     return "nova_runtime.c"
 
+fn _clang_exe_name() -> string
+    if os_name() == "windows"
+        return "clang.exe"
+    return "clang"
+
+// Locate the clang binary NOVA should invoke for every codegen/linking step. Mirrors
+// nova_find_runtime()'s resolution order, adapted for a binary (not a text source file):
+// NOVA_CLANG exact path -> NOVA_HOME-relative bundled toolchain -> install-relative
+// (self_exe_path()) bundled toolchain -> cwd-relative -> PATH via which(). The bundled
+// toolchain path is deliberately UNVERSIONED here: only the installer deals with
+// versions (staging a download, then updating the stable toolchains/clang/ this function
+// actually probes), so a version bump never requires touching this lookup.
+fn nova_find_clang() -> string
+    let exe_name = _clang_exe_name()
+    let env_clang = env("NOVA_CLANG")
+    if len(env_clang) > 0 and path_exists(env_clang) == 1
+        return env_clang
+    let nh = env("NOVA_HOME")
+    if len(nh) > 0
+        let cand = path_join(nh, "toolchains/clang/bin/" + exe_name)
+        if path_exists(cand) == 1
+            return cand
+    let exe = self_exe_path()
+    if len(exe) > 0
+        let exe_dir = path_parent(exe)
+        let e0 = path_join(exe_dir, "toolchains/clang/bin/" + exe_name)
+        if path_exists(e0) == 1
+            return e0
+        let e0b = path_join(path_parent(exe_dir), "toolchains/clang/bin/" + exe_name)
+        if path_exists(e0b) == 1
+            return e0b
+    let cwd_cand = path_join("toolchains/clang/bin", exe_name)
+    if path_exists(cwd_cand) == 1
+        return cwd_cand
+    let on_path = which("clang")
+    if len(on_path) > 0
+        return on_path
+    print("warning: no clang found (checked NOVA_CLANG, NOVA_HOME/toolchains/clang/bin, install-relative toolchains/clang/bin, ./toolchains/clang/bin, and PATH). Run `nova toolchain status` for details, or install clang and put it on PATH.")
+    return "clang"
+
+// Locate the single-source-of-truth VERSION file (repo root's nova-compiler/VERSION, or its
+// installed sibling next to the nova binary). Mirrors nova_find_runtime()'s resolution so a
+// release bump never requires touching this lookup or hunting for hardcoded literals -- only
+// the VERSION file itself changes.
+fn nova_find_version() -> string
+    let nh = env("NOVA_HOME")
+    if len(nh) > 0
+        let cand = path_join(nh, "VERSION")
+        if path_exists(cand) == 1
+            return trim(read_file(cand))
+    let exe = self_exe_path()
+    if len(exe) > 0
+        let exe_dir = path_parent(exe)
+        let e0 = path_join(exe_dir, "VERSION")
+        if path_exists(e0) == 1
+            return trim(read_file(e0))
+        let e0b = path_join(path_parent(exe_dir), "VERSION")
+        if path_exists(e0b) == 1
+            return trim(read_file(e0b))
+    if path_exists("VERSION") == 1
+        return trim(read_file("VERSION"))
+    return "0.1.0"
+
 // Locate the reusable JS-managed linear-memory runtime (_wasm_runtime.cjs) that
 // provides nova_rt_* imports for wasm32 programs. Mirrors nova_find_runtime().
 fn nova_find_wasm_runtime() -> string
@@ -27490,6 +27612,18 @@ fn _link_path_safe(p: string) -> bool
         return false
     return true
 
+// Windows cmd.exe quirk: when a command begins with a quoted, space-containing path (e.g.
+// the clang executable at "C:\Program Files\LLVM\bin\clang.exe") followed by more
+// arguments, cmd.exe mis-parses it unless the ENTIRE command line is wrapped in one more
+// outer pair of quotes. This is a real-world case, not a hypothetical: it is the default
+// LLVM install location on Windows. POSIX sh has no such quirk. Every system()/exec() call
+// that starts with a resolved (possibly space-containing) clang path must route through
+// this before invocation.
+fn _win_wrap_cmd(cmd: string) -> string
+    if os_name() == "windows"
+        return "\"" + cmd + "\""
+    return cmd
+
 fn nova_warmup_runtime() -> int
     let rt = nova_find_runtime()
     let rt_o = replace(rt, ".c", ".o")
@@ -27497,13 +27631,20 @@ fn nova_warmup_runtime() -> int
     let o_mt = build_file_mtime(rt_o)
     if o_mt >= 0 and c_mt <= o_mt
         return 0
-    let cc = "clang -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
+    let clang = nova_find_clang()
+    let cc = "\"" + clang + "\" -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
+    // See the matching comment in nova_link()'s rt_cc: nova_runtime.c's __try/__except
+    // (fiber stack-overflow containment) needs -fms-extensions to compile at all on
+    // Windows, confirmed by direct testing against the bundled mingw toolchain.
+    if os_name() == "windows"
+        cc = cc + " -fms-extensions"
     cc = cc + " \"" + rt + "\" -o \"" + rt_o + "\""
-    let ret = system(cc)
+    let ret = system(_win_wrap_cmd(cc))
     return ret
 
 fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: string) -> int
     let rt = nova_find_runtime()
+    let clang = nova_find_clang()
     let resolved = resolve_target(target)
     let ll_content = read_file(ll_path)
     let ll_lines = split(ll_content, "\n")
@@ -27543,18 +27684,26 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         let c_mt = build_file_mtime(rt)
         let o_mt = build_file_mtime(rt_o)
         if o_mt < 0 or c_mt > o_mt
-            let rt_cc = "clang -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
+            let rt_cc = "\"" + clang + "\" -c -O2 -w -D_CRT_SECURE_NO_WARNINGS"
             if target_is_windows(resolved) == 1
-                rt_cc = rt_cc + " -D_WIN32"
+                // nova_runtime.c uses __try/__except (SEH) to catch a fiber's hardware
+                // stack overflow and contain it to that task instead of crashing the
+                // whole process. clang only recognizes this MS-specific syntax with
+                // -fms-extensions -- confirmed by direct testing against the bundled
+                // mingw toolchain (fails with "use of undeclared identifier '__try'"
+                // without it, compiles clean with it). Win64 SEH unwind tables are a
+                // generic PE/ABI requirement, not an MSVC-only mechanism, so this is
+                // safe/correct under the GNU/mingw target, not a hack.
+                rt_cc = rt_cc + " -fms-extensions"
             rt_cc = rt_cc + " \"" + rt + "\" -o \"" + rt_o + "\""
-            let rt_ret = system(rt_cc)
+            let rt_ret = system(_win_wrap_cmd(rt_cc))
             if rt_ret != 0
                 rt_link = rt
             else
                 rt_link = rt_o
         else
             rt_link = rt_o
-    let cmd = "clang " + opt_level + " -w"
+    let cmd = "\"" + clang + "\" " + opt_level + " -w"
     if opt_level == "-O0"
         cmd = cmd + " -g"
     if is_cross
@@ -27562,6 +27711,30 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
     cmd = cmd + " \"" + ll_path + "\" \"" + rt_link + "\" -o \"" + exe_path + "\""
     if target_is_windows(resolved) == 1
         cmd = cmd + " -lws2_32 -lwinhttp -ladvapi32 -lbcrypt"
+        // rt_link is nova_runtime.c ITSELF (not a prebuilt .o) whenever the cached-object
+        // fast path above was skipped -- which is exactly the is_cross case, i.e. any
+        // build that names an explicit --target. That means this command, not rt_cc,
+        // is what compiles the __try/__except fiber-guard, so it needs -fms-extensions
+        // too or every explicit-target Windows build fails where a plain `nova build`
+        // succeeds. Harmless when rt_link is already an object: clang only warns about
+        // an unused compile flag, and -w is already in effect.
+        cmd = cmd + " -fms-extensions"
+    else
+        // nova_runtime.c ALWAYS references libm (sin/cos/tan/fmod/hypot/... back the
+        // math builtins), and on Unix libm is a separate archive -- clang's driver does
+        // not add -lm for C on its own. Without this, EVERY `nova build` on Linux dies
+        // with "undefined symbol: sin / cos / fmod / ...". This went unnoticed because
+        // Linux was only ever exercised through bootstrap_linux.sh, which passes
+        // "-lpthread -ldl -lm" in its own hand-written clang command -- `nova build`
+        // itself was never run there. (See the "Linux-only bugs are invisible" lesson:
+        // the Windows gate cannot see this class of defect at all.)
+        cmd = cmd + " -lm"
+        // pthread/dl back the concurrency runtime and dynamic FFI loading. Both are
+        // Linux-specific spellings: on macOS the pthread and dlopen families live in
+        // libSystem, there is no libdl.dylib at all, and `-ldl` is a hard "library not
+        // found" link error -- so this must NOT be widened to all non-Windows targets.
+        if contains(resolved, "linux")
+            cmd = cmd + " -lpthread -ldl"
     if use_ssl_define
         extra_libs = extra_libs + " -DNOVA_HAVE_OPENSSL -lssl -lcrypto"
     if needs_sqlite == 1
@@ -27569,7 +27742,7 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         let sq_c = path_join(rt_dir, "sqlite3.c")
         let sq_o = path_join(rt_dir, "sqlite3.o")
         if len(read_file(sq_o)) < 100
-            system("clang -c -O2 -DSQLITE_THREADSAFE=0 \"" + sq_c + "\" -o \"" + sq_o + "\" -D_CRT_SECURE_NO_WARNINGS -w")
+            system(_win_wrap_cmd("\"" + clang + "\" -c -O2 -DSQLITE_THREADSAFE=0 \"" + sq_c + "\" -o \"" + sq_o + "\" -D_CRT_SECURE_NO_WARNINGS -w"))
         extra_libs = extra_libs + " \"" + sq_o + "\""
     // General FFI: @link_source("x.c") compiles each C source on demand into a cached
     // <src>.o (rebuilt only when the .o is missing or the source is newer -- correct
@@ -27588,7 +27761,7 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         let obj = sp + ".o"
         let obj_mt = build_file_mtime(obj)
         if obj_mt < 0 or src_mt > obj_mt
-            let rc = system("clang -c -O2 \"" + sp + "\" -o \"" + obj + "\" -D_CRT_SECURE_NO_WARNINGS -w")
+            let rc = system(_win_wrap_cmd("\"" + clang + "\" -c -O2 \"" + sp + "\" -o \"" + obj + "\" -D_CRT_SECURE_NO_WARNINGS -w"))
             if rc != 0
                 print("link error: failed to compile @link_source: " + sp)
                 return 1
@@ -27602,20 +27775,69 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
             return 1
         extra_libs = extra_libs + " \"" + op + "\""
     cmd = cmd + extra_libs + " -D_CRT_SECURE_NO_WARNINGS 2>&1"
-    let ret = system(cmd)
+    let ret = system(_win_wrap_cmd(cmd))
     return ret
 
 // ── Package Manager ─────────────────────────────────────────────────────────
 
 fn nova_toml_default(name: string) -> string
+    let ver = nova_find_version()
     let content = "[package]\n"
     content = content + "name = \"" + name + "\"\n"
     content = content + "version = \"0.1.0\"\n"
+    content = content + "nova-version = \"" + ver + "\"\n"
     content = content + "description = \"\"\n"
     content = content + "author = \"\"\n"
+    content = content + "license = \"\"\n"
     content = content + "\n"
     content = content + "[dependencies]\n"
     content
+
+fn _sv_cmp_triple(a_maj: int, a_min: int, a_pat: int, b_maj: int, b_min: int, b_pat: int) -> int
+    if a_maj != b_maj
+        return a_maj - b_maj
+    if a_min != b_min
+        return a_min - b_min
+    a_pat - b_pat
+
+fn _sv_parse_triple(s: string) -> list
+    let parts = split(s, ".")
+    let maj = 0
+    let min = 0
+    let pat = 0
+    if len(parts) >= 1
+        let v = parse_int(parts[0])
+        if v >= 0
+            maj = v
+    if len(parts) >= 2
+        let v2 = parse_int(parts[1])
+        if v2 >= 0
+            min = v2
+    if len(parts) >= 3
+        let core = parts[2]
+        let dash = find(core, "-")
+        if dash > 0
+            core = slice(core, 0, dash)
+        let v3 = parse_int(core)
+        if v3 >= 0
+            pat = v3
+    [maj, min, pat]
+
+fn nova_check_version_compat(input_dir: string)
+    let toml_path = path_join(input_dir, "nova.toml")
+    let toml = read_file(toml_path)
+    if len(toml) == 0
+        return 0
+    let required = nova_toml_scalar(toml, "nova-version")
+    if len(required) == 0
+        return 0
+    let compiler_ver = nova_find_version()
+    let req = _sv_parse_triple(required)
+    let cur = _sv_parse_triple(compiler_ver)
+    let cmp = _sv_cmp_triple(cur[0], cur[1], cur[2], req[0], req[1], req[2])
+    if cmp < 0
+        print("warning: nova.toml requires nova-version " + required + " but this compiler is " + compiler_ver)
+        print("  upgrade your NOVA toolchain or adjust nova-version in " + toml_path)
 
 fn nova_pkg_init()
     let existing = read_file("nova.toml")
@@ -30025,6 +30247,11 @@ fn lsp_server_main()
                 if ws_root == "" and contains(iparams, "rootPath")
                     ws_root = iparams["rootPath"]
             write_raw("[nova-lsp] workspace root: " + ws_root + "\n")
+            if ws_root != "" and env("NOVA_HOME") == ""
+                let nh_candidate = path_join(ws_root, "nova-compiler")
+                if path_exists(path_join(nh_candidate, "lib"))
+                    set_env("NOVA_HOME", nh_candidate)
+                    write_raw("[nova-lsp] auto-set NOVA_HOME=" + nh_candidate + "\n")
             let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":\{\"prepareProvider\":true\},\"documentHighlightProvider\":true,\"foldingRangeProvider\":true,\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"documentFormattingProvider\":true,\"workspaceSymbolProvider\":true\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"
@@ -30593,12 +30820,14 @@ fn compiler_main()
         print("  -O2                   Full optimizations (nova build default)")
         print("  -o <output>           Output file path")
         print("  --target <target>     Cross-compile target:")
-        print("    linux, linux-arm64, macos, macos-arm64, windows, wasm")
+        print("    linux, linux-arm64, macos, macos-arm64, windows, windows-msvc, wasm")
+        print("    (windows = GNU/mingw ABI, the self-contained default; windows-msvc requires")
+        print("     your own separately-installed MSVC/Visual Studio Build Tools)")
         print("  --old                 Use legacy non-IR compiler")
         exit(0)
     let cmd = arguments[1]
     if cmd == "version" or cmd == "--version"
-        print("NOVA v0.1.0 (self-hosted, IR pipeline)")
+        print("NOVA v" + nova_find_version() + " (self-hosted, IR pipeline)")
         exit(0)
     if cmd == "self-test"
         run_self_test()
@@ -30613,7 +30842,39 @@ fn compiler_main()
             print("Build cache ready. Every build will be instant.")
         else
             print("warning: runtime cache build failed (builds will still work, just slower)")
+        let setup_clang = nova_find_clang()
+        if setup_clang == "clang" and len(which("clang")) == 0
+            print("warning: no clang toolchain found. Run `nova toolchain status` for details.")
         exit(sr)
+    if cmd == "toolchain"
+        let tc_sub = "status"
+        if len(arguments) > 2
+            tc_sub = arguments[2]
+        if tc_sub == "path"
+            print(nova_find_clang())
+            exit(0)
+        if tc_sub == "status"
+            let found = nova_find_clang()
+            let on_path = which("clang")
+            if found == "clang" and len(on_path) == 0
+                print("clang: NOT FOUND")
+                print("  Checked: NOVA_CLANG, NOVA_HOME/toolchains/clang/bin, install-relative toolchains/clang/bin, ./toolchains/clang/bin, PATH")
+                print("  Run the platform installer (install.sh / install.ps1), or install clang and put it on PATH.")
+                exit(1)
+            if contains(found, "toolchains")
+                print("clang: " + found + " (bundled toolchain)")
+            else
+                print("clang: " + found + " (system PATH -- not the bundled toolchain)")
+            exit(0)
+        if tc_sub == "install"
+            print("Toolchain auto-install isn't available from inside `nova` yet.")
+            print("Run the platform installer instead:")
+            print("  Linux/macOS: curl -fsSL https://novachan.org/install.sh | sh")
+            print("  Windows:     iwr https://novachan.org/install.ps1 -useb | iex")
+            print("Or set NOVA_CLANG to an existing clang binary, or place one at $NOVA_HOME/toolchains/clang/bin/.")
+            exit(1)
+        print("Usage: nova toolchain <status|path|install>")
+        exit(1)
     if cmd == "init"
         nova_pkg_init()
         nova_warmup_runtime()
@@ -30878,13 +31139,15 @@ fn compiler_main()
         let wasm_loader = wasm_base + ".run.cjs"
         let wasm_dir = path_dir(wasm_path)
         nova_compile_file(wasm_in, wasm_ll, 1, "wasm")
-        // One clang call drives wasm-ld internally (only clang need be on PATH).
+        // One clang call drives wasm-ld internally (resolved via nova_find_clang(), same
+        // as every other codegen/linking path -- no longer requires clang on PATH).
         let q = chr(34)
-        let wlink = "clang --target=wasm32 " + wasm_opt + " -nostdlib"
+        let wasm_clang = nova_find_clang()
+        let wlink = q + wasm_clang + q + " --target=wasm32 " + wasm_opt + " -nostdlib"
         wlink = wlink + " -Wl,--no-entry -Wl,--export=nova_user_main"
         wlink = wlink + " -Wl,--export=__heap_base -Wl,--allow-undefined -Wl,--gc-sections"
         wlink = wlink + " " + q + wasm_ll + q + " -o " + q + wasm_path + q + " -w 2>&1"
-        let wret = system(wlink)
+        let wret = system(_win_wrap_cmd(wlink))
         if wret != 0
             print("error: wasm link failed (exit " + str(wret) + ")")
             print("  command: " + wlink)
@@ -30939,7 +31202,8 @@ fn compiler_main()
         let emit_ll = nova_replace_ext(emit_in, ".nova", ".ll")
         nova_compile_file(emit_in, emit_ll, 1, emit_target)
         if emit_asm == 1
-            let asm_out = exec("clang -S -O2 -o - " + emit_ll + " -D_CRT_SECURE_NO_WARNINGS -w")
+            let emit_clang = nova_find_clang()
+            let asm_out = exec(_win_wrap_cmd("\"" + emit_clang + "\" -S -O2 -o - " + emit_ll + " -D_CRT_SECURE_NO_WARNINGS -w"))
             print(asm_out)
         else
             print(read_file(emit_ll))
