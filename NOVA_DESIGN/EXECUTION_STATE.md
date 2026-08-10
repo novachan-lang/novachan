@@ -723,6 +723,33 @@ The concurrency gap on ARM is therefore now a MEASURED fact rather than an infer
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
+## defer crash-safety — INVESTIGATED AND REJECTED (do not retry as stated)
+
+`defer` genuinely does not run on a panic — it is a COMPILE-TIME construct inlined at exit points and
+a panic longjmps past all of them. MEASURED (`_kat_defer_panic`): `defer`+panic leaks the resource,
+`on_exit_send`+panic returns it.
+
+But **"make `defer` crash-safe" is the wrong fix.** The cleanup registry is deliberately restricted to
+"primitive, non-faulting operations only" — a cleanup that faults ON the fault path turns one crash
+into two — and deferred expressions are arbitrary (two of the five real sites do allocation and I/O).
+`on_exit_send` is also TASK-scoped while `defer` is FUNCTION-scoped, so they are not interchangeable;
+a genuine fix needs LLVM landingpads or a per-frame cleanup shadow stack.
+
+**Correct model: crash-safety belongs to the RESOURCE'S ACQUIRE**, as `pool_acquire` always did.
+Implemented `NOVA_CLEANUP_CLOSE_FD` + `nova_rt_task_on_exit_close` and applied it to both h2 socket
+paths (`ac7d8aea`, reconverge byte-identical + 2852/0 both modes). `_my_stmt_close` was deliberately
+NOT changed — a panic there is unreachable (zero assert/raise sites, every unwrap guarded).
+
+Also fixed the trap the registry itself creates: auto-return is right for an ordinary borrow and
+WRONG for a transaction. Measured with a pool of one, the next borrower read the crashed
+transaction's uncommitted INSERT. `with_tx`/`pg_with_tx`/`mysql_with_tx` now cancel the registration
+(`640f18c3`, gated by `_kat_tx_panic`).
+
+STILL OPEN (design, not a bug): **structured concurrency / scoped spawn** — the real "beyond Go" item.
+Full detail: memory `reference_defer_not_crash_safe_use_acquire_registers`.
+
+---
+
 ## Windows timer quantum — LANDED (8x on all network I/O)
 
 `nova_rt_init` now raises the Windows timer resolution to 1 ms. The netpoller idles on `Sleep(1)`,
