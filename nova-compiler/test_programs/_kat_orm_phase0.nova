@@ -1,0 +1,190 @@
+// KAT: Phase-0 ORM portability. Asserts the SAME assertions against ALL THREE live drivers.
+//
+// Every claim here was previously BROKEN on at least one driver:
+//   * orm_ensure + orm_save(id=0)  worked on sqlite ONLY -- postgres raised 23502 (id not-null) and
+//     mysql raised 1364 (no default for id), because an `id: int` was spelled "INTEGER PRIMARY KEY"
+//     on every dialect and that only auto-increments on sqlite.
+//   * orm_save on an EXISTING id is insert-only -> duplicate-key error, never an update (JPA's save()
+//     updates). orm_put now provides the insert-or-update semantic.
+//   * the generated key was not retrievable at all; on mysql the obvious two-call implementation
+//     returns a STALE id because LAST_INSERT_ID() is per-connection.
+//   * orm_count/orm_exists/orm_agg report a DRIVER FAILURE as 0/false/"".
+//
+// Postgres/MySQL arms are skipped (not failed) when the server is absent, so this KAT still runs in a
+// sqlite-only environment.
+
+import forge_orm
+
+type W0
+    id: int
+    name: string
+    qty: int
+
+// A CALLER-supplied string key. On MySQL "TEXT PRIMARY KEY" is a hard error ("BLOB/TEXT column used in
+// key specification without a key length"), so a struct with a string id could not create its table at
+// all -- it must be emitted as VARCHAR there.
+type W0s
+    id: string
+    label: string
+
+let _FAILS = channel()
+
+fn fail(msg: string)
+    print("    FAIL: {msg}")
+    send(_FAILS, 1)
+
+fn check(cond, msg: string)
+    if not cond
+        fail(msg)
+
+// ---- the suite, run once per driver -----------------------------------------------------------------
+fn suite(label: string, db)
+    let t = orm_table_of(db, W0(0, "", 0))
+
+    let d = orm_exec(db, "DROP TABLE IF EXISTS {t}", [])
+    if is_err(d)
+        fail("{label}: drop failed")
+
+    // 1. schema from the struct -- zero SQL, zero annotations
+    let e = orm_ensure(db, W0(0, "", 0))
+    check(not is_err(e), "{label}: orm_ensure failed")
+
+    // 2. AUTO-GENERATED KEY: two id-omitted saves must land two rows with DISTINCT non-zero ids
+    let s1 = orm_save(db, W0(0, "alpha", 10))
+    check(not is_err(s1), "{label}: orm_save #1 failed (auto-id)")
+    let s2 = orm_save(db, W0(0, "beta", 20))
+    check(not is_err(s2), "{label}: orm_save #2 failed (auto-id)")
+
+    let ws: list<W0> = orm_all(db, "SELECT id, name, qty FROM {t} ORDER BY id", [])
+    check(len(ws) == 2, "{label}: expected 2 rows after two auto-id saves, got {len(ws)}")
+    if len(ws) == 2
+        check(ws[0].id != 0, "{label}: first auto id is 0 (no key generated)")
+        check(ws[1].id != 0, "{label}: second auto id is 0 (no key generated)")
+        check(ws[0].id != ws[1].id, "{label}: auto ids collided ({ws[0].id})")
+        // typed mapping must survive too (this is the compiler-pinned orm_all rewrite)
+        check(ws[0].name == "alpha", "{label}: typed read wrong name '{ws[0].name}'")
+        check(ws[0].qty == 10, "{label}: typed read wrong qty {ws[0].qty}")
+
+    // 3. GENERATED KEY RETURNED: orm_save_id must give the key it just created.
+    //    On mysql this is the LAST_INSERT_ID()-per-connection hazard.
+    let idr = orm_save_id(db, W0(0, "gamma", 30))
+    check(not is_err(idr), "{label}: orm_save_id failed")
+    if not is_err(idr)
+        let newid = unwrap(idr)
+        check(newid != 0, "{label}: orm_save_id returned 0")
+        // the returned key must actually address the row we just wrote
+        let back: Result<W0> = orm_one(db, "SELECT id, name, qty FROM {t} WHERE id = ?", [newid])
+        check(not is_err(back), "{label}: orm_save_id key {newid} does not address a row")
+        if not is_err(back)
+            let g = unwrap(back)
+            check(g.name == "gamma", "{label}: orm_save_id key {newid} points at '{g.name}', not 'gamma'")
+
+    // 4. UPSERT: same key twice -> UPDATED IN PLACE, still exactly one row
+    let u1 = orm_upsert(db, type_name(W0(0, "", 0)), W0(9001, "delta", 40))
+    check(not is_err(u1), "{label}: upsert insert failed")
+    let u2 = orm_upsert(db, type_name(W0(0, "", 0)), W0(9001, "delta2", 41))
+    check(not is_err(u2), "{label}: upsert update failed")
+    let n9 = orm_count(db, type_name(W0(0, "", 0)), "id = ?", [9001])
+    check(n9 == 1, "{label}: upsert produced {n9} rows for one key, expected 1")
+    let got: Result<W0> = orm_one(db, "SELECT id, name, qty FROM {t} WHERE id = ?", [9001])
+    if not is_err(got)
+        let gg = unwrap(got)
+        check(gg.name == "delta2", "{label}: upsert did not update in place (name='{gg.name}')")
+        check(gg.qty == 41, "{label}: upsert did not update qty ({gg.qty})")
+
+    // 5. orm_put = JPA save(): id 0 inserts, existing id UPDATES (orm_save would duplicate-key here)
+    let p1 = orm_put(db, W0(0, "eps", 50))
+    check(not is_err(p1), "{label}: orm_put insert (id=0) failed")
+    let p2 = orm_put(db, W0(9001, "delta3", 42))
+    check(not is_err(p2), "{label}: orm_put update (existing id) failed -- JPA save() semantics")
+    let got2: Result<W0> = orm_one(db, "SELECT id, name, qty FROM {t} WHERE id = ?", [9001])
+    if not is_err(got2)
+        check(unwrap(got2).name == "delta3", "{label}: orm_put did not update the existing row")
+
+    // 6. no-silent-failure scalars agree with the swallowing ones on the HAPPY path
+    let cr = orm_try_count(db, type_name(W0(0, "", 0)), "", [])
+    check(not is_err(cr), "{label}: orm_try_count errored on a valid table")
+    if not is_err(cr)
+        check(unwrap(cr) == orm_count(db, type_name(W0(0, "", 0)), "", []), "{label}: try_count != count")
+    let er = orm_try_exists(db, type_name(W0(0, "", 0)), "id = ?", [9001])
+    check(not is_err(er), "{label}: orm_try_exists errored")
+    if not is_err(er)
+        check(unwrap(er), "{label}: orm_try_exists said id 9001 is absent")
+    let ar = orm_try_agg(db, "max", "qty", type_name(W0(0, "", 0)), "", [])
+    check(not is_err(ar), "{label}: orm_try_agg errored")
+
+    // 7. ...and they REPORT failure instead of swallowing it (a table that does not exist)
+    let bad = orm_try_count(db, "_no_such_table_xyz", "", [])
+    check(is_err(bad), "{label}: orm_try_count returned ok() for a MISSING table (silent failure)")
+    check(orm_count(db, "_no_such_table_xyz", "", []) == 0, "{label}: legacy orm_count changed behaviour")
+
+    // 8. a struct with a STRING primary key must be creatable and round-trip on every dialect
+    let ts = orm_table_of(db, W0s("", ""))
+    let ds = orm_exec(db, "DROP TABLE IF EXISTS {ts}", [])
+    if is_err(ds)
+        fail("{label}: string-id drop failed")
+    let es = orm_ensure(db, W0s("", ""))
+    check(not is_err(es), "{label}: orm_ensure with a STRING id failed -- {\"\" if not is_err(es) else unwrap_err(es)}")
+    if not is_err(es)
+        let si = orm_save(db, W0s("uuid-1", "first"))
+        check(not is_err(si), "{label}: insert with a string key failed")
+        let sb: Result<W0s> = orm_one(db, "SELECT id, label FROM {ts} WHERE id = ?", ["uuid-1"])
+        check(not is_err(sb), "{label}: string-key row not found")
+        if not is_err(sb)
+            check(unwrap(sb).label == "first", "{label}: string-key round-trip lost the value")
+        // and orm_put must UPDATE it (a non-zero string key is never "new")
+        let sp = orm_put(db, W0s("uuid-1", "second"))
+        check(not is_err(sp), "{label}: orm_put on a string key failed")
+    let ds2 = orm_exec(db, "DROP TABLE IF EXISTS {ts}", [])
+    if is_err(ds2)
+        fail("{label}: string-id drop2 failed")
+
+    // 9. a string longer than 255 bytes must survive intact -- non-key strings are TEXT precisely so
+    //    that VARCHAR(255) cannot silently truncate real data.
+    let longv = str_mul("x", 400)
+    let lw = orm_exec(db, "INSERT INTO {t} (name, qty) VALUES (?, ?)", [longv, 999])
+    check(not is_err(lw), "{label}: inserting a 400-char string failed (column too narrow?)")
+    if not is_err(lw)
+        let lr: Result<W0> = orm_one(db, "SELECT id, name, qty FROM {t} WHERE qty = ?", [999])
+        check(not is_err(lr), "{label}: 400-char row not found")
+        if not is_err(lr)
+            check(len(unwrap(lr).name) == 400, "{label}: 400-char string came back as {len(unwrap(lr).name)} chars -- TRUNCATED")
+
+    let d2 = orm_exec(db, "DROP TABLE IF EXISTS {t}", [])
+    if is_err(d2)
+        fail("{label}: drop2 failed")
+    print("    {label}: done")
+
+fn arm(label: string, dsn: string, required: int)
+    let r = orm_open(dsn)
+    if is_err(r)
+        if required == 1
+            fail("{label}: could not open ({unwrap_err(r)})")
+        else
+            print("    {label}: SKIPPED (server not reachable)")
+        return
+    let db = unwrap(r)
+    suite(label, db)
+    orm_close(db)
+
+fn main()
+    print("_kat_orm_phase0: portable auto-key + upsert + generated-key + no-silent-failure")
+    arm("sqlite  ", "sqlite://_kat_orm_phase0.db", 1)
+    arm("postgres", "postgres://postgres:root@127.0.0.1:5432/postgres", 0)
+    arm("mysql   ", "mysql://root:root@127.0.0.1:3306/nova_test", 0)
+
+    // drain the failure channel
+    let fails = 0
+    let more = 1
+    while more == 1
+        let g = select_timeout(_FAILS, 50)
+        if g[0] == 0
+            fails += 1
+        else
+            more = 0
+
+    if fails == 0
+        print("_kat_orm_phase0 passed")
+    else
+        print("_kat_orm_phase0 FAILED ({fails} assertion failures)")
+        exit(1)

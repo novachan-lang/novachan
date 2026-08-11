@@ -804,6 +804,16 @@ fn orm_remove(db, row) -> any
 //   let rows = q.run(db)
 //   JOIN: q_from("posts").join("users", "users.id = posts.user_id").where("users.active = ?", [1])
 // `?` placeholders + bound params => injection-safe and portable ($N for PG) across every driver.
+// The query is a VALUE, not a string and not a method NAME. That is a deliberate design choice with a
+// consequence beyond ergonomics: a spec built from data can be READ by tooling and, in future, by the
+// COMPILER -- which is what makes static N+1 detection, static round-trip counting and compile-time
+// column checking possible at all. JPQL/HQL strings and Spring Data's findByFirstNameAndLastNameOrderBy
+// method names are both opaque to analysis and validated no earlier than startup; a spec value is
+// inspectable at compile time. It also keeps ONE composable concept instead of the combinatorial
+// explosion of derived-name variants ("one obvious way").
+//
+// Every OrmQuery method returns a NEW OrmQuery via spread-update, so a spec is immutable and shareable:
+// branching off a base spec cannot mutate it.
 type OrmQuery
     table: string
     cols: string
@@ -813,57 +823,402 @@ type OrmQuery
     order: string
     lim: int
     off: int
+    oq_kind: string     // dialect tag, "" when unknown (see _oq_col)
+    oq_dist: int        // 1 -> SELECT DISTINCT
+    oq_grp: string      // GROUP BY list (already quoted)
+    oq_hav: string      // HAVING condition
+    oq_nhav: int        // how many of the TRAILING params belong to HAVING (see .where)
 
+// Raw builder: identifiers are passed through VERBATIM. Kept for hand-written column expressions.
 fn q_from(table: string) -> OrmQuery
-    OrmQuery { table: table, cols: "*", wheres: "", joins: "", params: [], order: "", lim: 0, off: 0 }
+    OrmQuery { table: table, cols: "*", wheres: "", joins: "", params: [], order: "", lim: 0, off: 0, oq_kind: "", oq_dist: 0, oq_grp: "", oq_hav: "", oq_nhav: 0 }
+
+// Dialect-aware builder: the table name and every column named through a typed predicate is quoted for
+// THIS database, so reserved words and CamelCase names are legal SQL on all three drivers.
+fn orm_from(db, table: string) -> OrmQuery
+    let k = orm_kind(db)
+    OrmQuery { table: _orm_qident(k, table), cols: "*", wheres: "", joins: "", params: [], order: "", lim: 0, off: 0, oq_kind: k, oq_dist: 0, oq_grp: "", oq_hav: "", oq_nhav: 0 }
+
+// Build a dialect-aware spec for a STRUCT's own table (zero SQL, zero annotations).
+fn orm_spec(db, row) -> OrmQuery
+    orm_from(db, type_name(row))
+
+// Quote a column for the spec's dialect. With no dialect (q_from) fall back to the BARE name rather
+// than guessing: an unquoted column reference is portable across all three (MEASURED), whereas guessing
+// ANSI double quotes would silently turn `"id"` into the STRING 'id' on MySQL.
+fn _oq_col(kind: string, col: string) -> string
+    col if len(kind) == 0 else _orm_qident(kind, col)
 
 fn OrmQuery.columns(cols: string) -> OrmQuery
-    OrmQuery { table: self.table, cols: cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: self.lim, off: self.off }
+    OrmQuery { ...self, cols: cols }
 
+// Project onto the columns of a struct -- the typed-projection/DTO case. Selecting only the fields the
+// target struct declares avoids SELECT * over columns the caller then throws away.
+fn OrmQuery.columns_of(sample) -> OrmQuery
+    let cs = join([_oq_col(self.oq_kind, nm) for nm in field_names(sample)], ", ")
+    OrmQuery { ...self, cols: cs }
+
+fn OrmQuery.distinct() -> OrmQuery
+    OrmQuery { ...self, oq_dist: 1 }
+
+// Raw predicate with bound params. All typed predicates below funnel through here, so there is exactly
+// ONE place where a condition is appended and parameters are kept in positional lock-step with it.
 fn OrmQuery.where(cond: string, ps) -> OrmQuery
-    let np = [...self.params, ...ps]
+    // HAVING parameters always occupy the TAIL of `params`, because sql() emits WHERE *before* HAVING.
+    // A new WHERE parameter must therefore be spliced in BEFORE that tail. Appending it instead
+    // silently REVERSES the bindings whenever having() was called first -- the SQL still has the WHERE
+    // placeholder first, so WHERE binds the having value and HAVING binds the where value. Both queries
+    // run without error and return the wrong rows, which is why it survives review.
+    let n = len(self.params)
+    let cut = n - self.oq_nhav
+    let np = [...self.params[0:cut], ...ps, ...self.params[cut:n]]
     let w = self.wheres + " AND " + cond if len(self.wheres) > 0 else cond
-    OrmQuery { table: self.table, cols: self.cols, wheres: w, joins: self.joins, params: np, order: self.order, lim: self.lim, off: self.off }
+    OrmQuery { ...self, wheres: w, params: np }
+
+// ---- typed predicates (JPA's derived-query vocabulary, as composable values) ----
+fn OrmQuery.eq(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " = ?", [v])
+
+fn OrmQuery.ne(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " <> ?", [v])
+
+fn OrmQuery.gt(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " > ?", [v])
+
+fn OrmQuery.ge(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " >= ?", [v])
+
+fn OrmQuery.lt(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " < ?", [v])
+
+fn OrmQuery.le(col: string, v) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " <= ?", [v])
+
+fn OrmQuery.between(col: string, lo, hi) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " BETWEEN ? AND ?", [lo, hi])
+
+fn OrmQuery.is_null(col: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " IS NULL", [])
+
+fn OrmQuery.not_null(col: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " IS NOT NULL", [])
+
+// Escape the LIKE metacharacters in a value that is meant LITERALLY.
+// starts/ends/contains promise substring matching, but `%` and `_` are WILDCARDS inside a LIKE pattern
+// even when the pattern is a bound parameter -- binding protects against SQL injection, NOT against
+// pattern injection. MEASURED: contains("%") matched EVERY row, and starts("user_") matched "userXadmin".
+// Since these are exactly the methods a search box feeds, an untrusted "%" would dump the whole table.
+// `!` is the escape character (declared with ESCAPE '!', verified to parse on all three dialects); it
+// must be escaped FIRST or it would double-escape the escapes it then inserts.
+fn _orm_like_escape(s: string) -> string
+    s.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+// Raw LIKE: the pattern is passed through VERBATIM, so `%`/`_` keep their wildcard meaning. Use this
+// when you WANT a pattern; use starts/ends/contains for literal matching.
+fn OrmQuery.like(col: string, pattern: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " LIKE ?", [pattern])
+
+fn OrmQuery.starts(col: string, prefix: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " LIKE ? ESCAPE '!'", [_orm_like_escape(prefix) + "%"])
+
+fn OrmQuery.ends(col: string, suffix: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " LIKE ? ESCAPE '!'", ["%" + _orm_like_escape(suffix)])
+
+fn OrmQuery.contains(col: string, needle: string) -> OrmQuery
+    self.where(_oq_col(self.oq_kind, col) + " LIKE ? ESCAPE '!'", ["%" + _orm_like_escape(needle) + "%"])
+
+// Case-INSENSITIVE literal contains. Uses LOWER(col) LIKE ? because ILIKE does not exist on MySQL
+// (MEASURED: it errors), and lower-cases the needle on this side so both sides agree.
+fn OrmQuery.icontains(col: string, needle: string) -> OrmQuery
+    self.where("LOWER(" + _oq_col(self.oq_kind, col) + ") LIKE ? ESCAPE '!'", ["%" + _orm_like_escape(lower(needle)) + "%"])
+
+// IN over a bound list. An EMPTY list is the subtle case: emitting `IN ()` is a syntax error on every
+// dialect, and dropping the predicate would silently widen the query to match EVERYTHING. `1=0` is the
+// correct degradation -- an empty set matches no rows.
+fn OrmQuery.in_(col: string, vals: list) -> OrmQuery
+    if len(vals) == 0
+        return self.where("1=0", [])
+    let ph = join(["?" for v in vals], ", ")
+    self.where(_oq_col(self.oq_kind, col) + " IN (" + ph + ")", vals)
+
+// NOT IN over a bound list. The dual: an empty exclusion set excludes nothing -> `1=1`.
+fn OrmQuery.not_in(col: string, vals: list) -> OrmQuery
+    if len(vals) == 0
+        return self.where("1=1", [])
+    let ph = join(["?" for v in vals], ", ")
+    self.where(_oq_col(self.oq_kind, col) + " NOT IN (" + ph + ")", vals)
 
 fn OrmQuery.inner_join(other: string, on: string) -> OrmQuery
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins + " JOIN " + other + " ON " + on, params: self.params, order: self.order, lim: self.lim, off: self.off }
+    OrmQuery { ...self, joins: self.joins + " JOIN " + other + " ON " + on }
 
 fn OrmQuery.left_join(other: string, on: string) -> OrmQuery
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins + " LEFT JOIN " + other + " ON " + on, params: self.params, order: self.order, lim: self.lim, off: self.off }
+    OrmQuery { ...self, joins: self.joins + " LEFT JOIN " + other + " ON " + on }
 
 fn OrmQuery.order_by(o: string) -> OrmQuery
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins, params: self.params, order: o, lim: self.lim, off: self.off }
+    OrmQuery { ...self, order: o }
+
+// Append an ORDER BY term (quoted), so .asc(a).desc(b) composes into "a ASC, b DESC".
+fn _oq_order_add(cur: string, term: string) -> string
+    cur + ", " + term if len(cur) > 0 else term
+
+fn OrmQuery.asc(col: string) -> OrmQuery
+    OrmQuery { ...self, order: _oq_order_add(self.order, _oq_col(self.oq_kind, col) + " ASC") }
+
+fn OrmQuery.desc(col: string) -> OrmQuery
+    OrmQuery { ...self, order: _oq_order_add(self.order, _oq_col(self.oq_kind, col) + " DESC") }
+
+fn OrmQuery.group_by(cols: list) -> OrmQuery
+    OrmQuery { ...self, oq_grp: join([_oq_col(self.oq_kind, c) for c in cols], ", ") }
+
+// HAVING params go to the TAIL and are COUNTED, so a later .where() knows to splice ahead of them.
+fn OrmQuery.having(cond: string, ps) -> OrmQuery
+    OrmQuery { ...self, oq_hav: cond, params: [...self.params, ...ps], oq_nhav: self.oq_nhav + len(ps) }
 
 fn OrmQuery.limit(n: int) -> OrmQuery
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: n, off: self.off }
+    OrmQuery { ...self, lim: n }
 
 fn OrmQuery.offset(n: int) -> OrmQuery
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: self.lim, off: n }
+    OrmQuery { ...self, off: n }
 
 // Pagination, 1-based page: paginate(2, 20) -> rows 21..40 (LIMIT 20 OFFSET 20).
 fn OrmQuery.paginate(page: int, per_page: int) -> OrmQuery
     let p = page
     if p < 1
         p = 1
-    OrmQuery { table: self.table, cols: self.cols, wheres: self.wheres, joins: self.joins, params: self.params, order: self.order, lim: per_page, off: (p - 1) * per_page }
+    OrmQuery { ...self, lim: per_page, off: (p - 1) * per_page }
+
+// The WHERE condition alone (no "WHERE" keyword), for the bulk-write and count paths.
+fn OrmQuery.cond() -> string
+    self.wheres
 
 fn OrmQuery.sql() -> string
-    let parts = ["SELECT " + self.cols + " FROM " + self.table]
+    let head = "SELECT DISTINCT " if self.oq_dist == 1 else "SELECT "
+    let parts = [head + self.cols + " FROM " + self.table]
     if len(self.joins) > 0
         push(parts, self.joins)
     if len(self.wheres) > 0
         push(parts, " WHERE " + self.wheres)
+    if len(self.oq_grp) > 0
+        push(parts, " GROUP BY " + self.oq_grp)
+    if len(self.oq_hav) > 0
+        push(parts, " HAVING " + self.oq_hav)
     if len(self.order) > 0
         push(parts, " ORDER BY " + self.order)
+    // An OFFSET with no LIMIT is a syntax error on MySQL and SQLite (PostgreSQL allows it), so a bare
+    // offset needs an explicit "no limit" ceiling. MySQL's own idiom for this is the UNSIGNED 64-bit max
+    // (18446744073709551615) -- but that is NOT portable: PostgreSQL parses LIMIT as bigint and rejects
+    // it outright ("22003 bigint out of range"), and SQLite overflows signed 64-bit and silently returns
+    // ZERO rows. MEASURED both. Signed-64 max is accepted by all three and is still far beyond any real
+    // table, so it truncates nothing.
     if self.lim > 0
         push(parts, " LIMIT " + str(self.lim))
+    else if self.off > 0
+        push(parts, " LIMIT 9223372036854775807")
     if self.off > 0
         push(parts, " OFFSET " + str(self.off))
     join(parts, "")
 
-// Run the built query and return untyped rows. For typed results use orm_all(db, q.sql(), q.params).
+// COUNT of the rows this spec matches, ignoring its paging. Wrapping in a subquery is required once
+// GROUP BY is present: `SELECT count(*) ... GROUP BY x` returns ONE ROW PER GROUP, so reading the first
+// row's count would report the size of the first group rather than the number of groups.
+fn OrmQuery.count_sql() -> string
+    // HAVING must ALSO force the subquery path. The flat path emits only WHERE, so a spec carrying
+    // having() params would bind MORE values than it has placeholders -- and silently drop the HAVING
+    // filter, reporting a count for a query the caller never asked for.
+    if self.oq_dist == 1
+        // DISTINCT must keep the real SELECT list -- the whole point is to count distinct VALUES of those
+        // columns, so projecting anything else would count the wrong thing.
+        let dinner = OrmQuery { ...self, order: "", lim: 0, off: 0 }
+        return "SELECT count(*) AS n FROM (" + dinner.sql() + ") AS _sub"
+    if len(self.oq_grp) > 0 or len(self.oq_hav) > 0
+        // GROUP BY / HAVING: project a CONSTANT in the subquery. Neither "*" nor the caller's column
+        // list is safe here -- an aggregate query (which is what GROUP BY, or HAVING even WITHOUT a
+        // GROUP BY, makes it) may only select grouped columns or aggregates, so PostgreSQL rejects
+        // "SELECT * FROM t GROUP BY x" outright while MySQL and SQLite accept it (ONLY_FULL_GROUP_BY
+        // off) -- the bug is invisible on two of three drivers. A constant is always legal, and
+        // count(*) over the grouped subquery still yields the NUMBER OF GROUPS, which is the answer.
+        let ginner = OrmQuery { ...self, cols: "1", order: "", lim: 0, off: 0 }
+        return "SELECT count(*) AS n FROM (" + ginner.sql() + ") AS _sub"
+    let parts = ["SELECT count(*) AS n FROM " + self.table]
+    if len(self.joins) > 0
+        push(parts, self.joins)
+    if len(self.wheres) > 0
+        push(parts, " WHERE " + self.wheres)
+    join(parts, "")
+
+// Run the built query and return untyped rows. For TYPED results use orm_all(db, q.sql(), q.params) --
+// orm_all is one of the compiler-pinned names, so `let xs: list<T> = orm_all(...)` maps rows onto T.
 fn OrmQuery.run(db) -> list
     orm_all(db, self.sql(), self.params)
+
+// Same, but surfacing a driver failure instead of returning [].
+fn OrmQuery.try_run(db) -> Result
+    orm_rows(db, self.sql(), self.params)
+
+// ---- paging with a real total (Spring Data's Page) --------------------------------------------------
+type OrmPage
+    op_total: int
+    op_page: int
+    op_per: int
+    op_pages: int
+    op_has_next: bool
+    op_has_prev: bool
+
+// Page METADATA for a spec, ignoring its own paging. The ITEMS are read separately through the
+// compiler-pinned orm_all so they stay typed:
+//     let q  = orm_spec(db, User(0,"",0)).gt("age", 18).desc("name")
+//     let pg = unwrap(orm_page_meta(db, q, 2, 20))
+//     let us: list<User> = orm_all(db, q.paginate(2,20).sql(), q.paginate(2,20).params)
+fn orm_page_meta(db, q: OrmQuery, page: int, per: int) -> any
+    let r = orm_rows(db, q.count_sql(), q.params)
+    if is_err(r)
+        return r
+    let rows = unwrap(r)
+    let total = 0
+    if len(rows) > 0
+        total = parse_int(str(rows[0]["n"]))
+    let p = page if page >= 1 else 1
+    let pp = per if per >= 1 else 1
+    let pages = (total + pp - 1) / pp
+    ok(OrmPage(total, p, pp, pages, p < pages, p > 1))
+
+// ---- bulk writes driven by a spec (JPA's bulk update/delete by criteria) ----------------------------
+
+// UPDATE <table> SET <sets> WHERE <spec condition>.
+// The SET parameters are bound BEFORE the spec's parameters because that is the order they appear in the
+// statement -- getting this backwards silently writes the filter values into the columns.
+fn orm_update_where(db, table: string, sets: dict, q: OrmQuery) -> any
+    let kind = orm_kind(db)
+    let ks = keys(sets)
+    if len(ks) == 0
+        return err("orm_update_where: no columns to set")
+    let assigns = []
+    let sp = []
+    // built in ONE pass so the placeholder order and the parameter order cannot diverge
+    for k in ks
+        push(assigns, _orm_qident(kind, k) + " = ?")
+        push(sp, sets[k])
+    let body = join(assigns, ", ")
+    let tbl = _orm_qident(kind, table)
+    let c = q.cond()
+    let params = [...sp, ...q.params]
+    if len(c) == 0
+        return orm_exec(db, "UPDATE {tbl} SET {body}", params)
+    orm_exec(db, "UPDATE {tbl} SET {body} WHERE {c}", params)
+
+// DELETE ... WHERE <spec condition>. A spec with NO condition is REFUSED: JPA's deleteAll() quietly
+// erasing a table because a criteria object came back empty is a data-loss footgun, so deleting
+// everything has to be asked for by name.
+fn orm_delete_where(db, table: string, q: OrmQuery) -> any
+    let tbl = _orm_qident(orm_kind(db), table)
+    let c = q.cond()
+    if len(c) == 0
+        return err("orm_delete_where: spec has no condition -- use orm_delete_all(db, table) to erase every row")
+    orm_exec(db, "DELETE FROM {tbl} WHERE {c}", q.params)
+
+// Deliberately-named "erase every row". DELETE, not TRUNCATE: TRUNCATE is non-transactional and/or
+// implicitly commits on some engines, so it cannot be rolled back inside orm_with_tx.
+fn orm_delete_all(db, table: string) -> any
+    let tbl = _orm_qident(orm_kind(db), table)
+    orm_exec(db, "DELETE FROM {tbl}", [])
+
+// PostgreSQL's Bind message carries the bound-parameter count as an INT16, so a single statement can
+// bind at most 65535 values -- exceeding it is a hard protocol error, not a slow path. Key sets are
+// therefore chunked, same as orm_insert_many.
+fn _orm_in_chunk() -> int
+    60000
+
+// DELETE by a set of ids, chunked under the bind cap. Returns the total affected count.
+fn orm_delete_by_ids(db, table: string, ids: list) -> any
+    if len(ids) == 0
+        return ok(0)
+    let kind = orm_kind(db)
+    let tbl = _orm_qident(kind, table)
+    let idq = _orm_qident(kind, "id")
+    let cap = _orm_in_chunk()
+    let total = 0
+    let i = 0
+    while i < len(ids)
+        let hi = i + cap
+        if hi > len(ids)
+            hi = len(ids)
+        let batch = ids[i:hi]
+        let ph = join(["?" for b in batch], ", ")
+        let r = orm_exec(db, "DELETE FROM {tbl} WHERE {idq} IN ({ph})", batch)
+        if is_err(r)
+            return r
+        total += unwrap(r)
+        i = hi
+    ok(total)
+
+// ---- N+1 avoidance that keeps the children TYPED ---------------------------------------------------
+// The N+1 fix is structural, not a cache: read the parents, pluck their keys, fetch ALL children in ONE
+// IN query, then group in memory. Two queries for any depth-1 relation regardless of parent count --
+// and unlike a JOIN-based flattening, the children remain real structs of their own type.
+//
+//   let ps: list<Project> = orm_all(db, "SELECT * FROM projects", [])
+//   let q  = orm_from(db, "tasks").in_("project_id", orm_pluck(ps, "id"))
+//   let ts: list<Task> = orm_all(db, q.sql(), q.params)
+//   let by_project = orm_group_by_field(ts, "project_id")
+//   let mine = get(by_project, str(ps[0].id), [])
+
+// One field's value from every struct in a list -- the key set to batch-load with.
+fn orm_pluck(rows: list, field: string) -> list
+    [field_get(r, field) for r in rows]
+
+// Same, with duplicates removed (a foreign key repeats across children).
+fn orm_pluck_uniq(rows: list, field: string) -> list
+    let seen = {}
+    let out = []
+    for r in rows
+        let v = field_get(r, field)
+        let k = str(v)
+        if k not in seen
+            seen[k] = true
+            push(out, v)
+    out
+
+// Group structs by a field's value -> dict keyed by the STRINGIFIED value (a dict key must be a string
+// here, and the parent's id must be stringified the same way when looking up).
+fn orm_group_by_field(rows: list, field: string) -> dict
+    let out = {}
+    for r in rows
+        let k = str(field_get(r, field))
+        if k in out
+            push(out[k], r)
+        else
+            out[k] = [r]
+    out
+
+// ---- indexes / unique constraints ------------------------------------------------------------------
+// MySQL has NO "CREATE INDEX IF NOT EXISTS", so re-running raises 1061 (duplicate key name); that ONE
+// error is tolerated to keep the call idempotent, and every other error still propagates.
+// Note also that MySQL cannot index a TEXT column without a key length -- which is why _orm_sql_type
+// emits VARCHAR(255) for a string column on MySQL (MEASURED: a unique index on TEXT fails there).
+fn _orm_ensure_idx(db, table: string, cols: list, uniq: int) -> any
+    if len(cols) == 0
+        return err("orm_ensure_index: no columns")
+    let kind = orm_kind(db)
+    let tbl = _orm_qident(kind, table)
+    let cl = join([_orm_qident(kind, c) for c in cols], ", ")
+    let nm = "ix_" + table + "_" + join(cols, "_")
+    let nq = _orm_qident(kind, nm)
+    let kw = "UNIQUE INDEX" if uniq == 1 else "INDEX"
+    if kind == "mysql"
+        let r = orm_exec(db, "CREATE {kw} {nq} ON {tbl} ({cl})", [])
+        // Match the error TEXT, not the bare code "1061": that substring also occurs inside any table
+        // or index NAME containing 1061 (e.g. `sensor1061`), so matching the number alone would swallow
+        // a genuine failure -- permission denied, disk full -- on such a table as if it were harmless.
+        if is_err(r) and find(unwrap_err(r), "Duplicate key name") >= 0
+            return ok(0)
+        return r
+    orm_exec(db, "CREATE {kw} IF NOT EXISTS {nq} ON {tbl} ({cl})", [])
+
+fn orm_ensure_index(db, table: string, cols: list) -> any
+    _orm_ensure_idx(db, table, cols, 0)
+
+fn orm_ensure_unique(db, table: string, cols: list) -> any
+    _orm_ensure_idx(db, table, cols, 1)
 
 // ---- SQL-free typed repository + relations (zero annotations; the JPA-repository win) ---------------
 // Find one row by id:        let u: Result<User>   = orm_get(db, "users", id)
@@ -892,12 +1247,42 @@ fn orm_where(db, table: string, cond: string, params) -> list
 fn _orm_sql_type_table() -> dict
     {"int": "INTEGER", "bool": "INTEGER", "string": "TEXT"}
 
+// The dialect's spelling of an AUTO-GENERATED integer primary key.
+// This exists because "INTEGER PRIMARY KEY" is a rowid ALIAS -- and therefore auto-increments -- ONLY on
+// SQLite. On PostgreSQL and MySQL the same text is a plain key with no generator attached, so the
+// zero-SQL hero flow (orm_ensure + orm_save with id == 0, where orm_insert deliberately OMITS id so the
+// database can assign it) asked for a key the database had no way to produce and failed outright:
+//     postgres -> 23502 null value in column "id" violates not-null constraint
+//     mysql    -> HY000 1364 Field 'id' doesn't have a default value
+// i.e. the flagship struct-driven flow worked on exactly ONE of three drivers. MEASURED after this fix,
+// two id-omitted inserts assign ids [1,2] on sqlite, postgres AND mysql.
+fn _orm_autopk(kind: string) -> string
+    if kind == "postgres"
+        return "BIGSERIAL PRIMARY KEY"
+    if kind == "mysql"
+        return "BIGINT AUTO_INCREMENT PRIMARY KEY"
+    "INTEGER PRIMARY KEY"
+
 fn _orm_sql_type(nova_type: string, kind: string, col: string) -> string
     let base = get(_orm_sql_type_table(), nova_type, "TEXT")
     if nova_type == "float"
         base = "DOUBLE PRECISION" if kind == "postgres" else "REAL"
     if col == "id"
+        // An INTEGER id is the generated key -> per-dialect spelling (see _orm_autopk).
+        if nova_type == "int"
+            return _orm_autopk(kind)
+        // A non-integer id (e.g. a string uuid) is a CALLER-supplied key. On MySQL it must be VARCHAR:
+        // "TEXT PRIMARY KEY" is a hard error there ("BLOB/TEXT column used in key specification without
+        // a key length"), so a struct with `id: string` could not create its table at all.
+        if kind == "mysql" and nova_type == "string"
+            return "VARCHAR(255) PRIMARY KEY"
         return "{base} PRIMARY KEY"
+    // NOTE on non-key string columns: MySQL cannot index a TEXT column without a key length, so a
+    // UNIQUE/INDEX on a string column fails there (MEASURED). It is tempting to emit VARCHAR(255) for
+    // every string column to make that possible -- but that would TRUNCATE any value over 255 bytes
+    // (silently in non-strict mode, as an error in strict mode). Losing user data to enable an index is
+    // the wrong trade, so non-key strings stay TEXT and the MySQL index limitation is accepted and
+    // documented instead.
     base
 
 fn orm_create_table(db, table: string, sample) -> any
@@ -913,3 +1298,198 @@ fn orm_create_table(db, table: string, sample) -> any
 fn orm_drop_table(db, table: string) -> any
     let tbl = _orm_qident(orm_kind(db), table)
     orm_exec(db, "DROP TABLE IF EXISTS {tbl}", [])
+
+// ---- portable identifiers + portable SQL fragments for the RAW-SQL path -----------------------------
+// Three dialect divergences were MEASURED to succeed while returning the WRONG VALUE -- the worst
+// failure class there is, because a green test suite still corrupts data:
+//   * mysql:  SELECT "id" returns the literal STRING 'id', not the column -- a double-quoted
+//             identifier is a string literal on MySQL. (sqlite/postgres return the value.)
+//   * mysql:  'a' || 'b' returns 0 -- `||` is logical OR on MySQL, not concatenation.
+//   * sqlite: NOW() returns 0 rows -- the function does not exist.
+// The struct-driven builders already route every identifier through _orm_qident, so they were never
+// exposed. These helpers give hand-written SQL the same protection.
+
+// Dialect-quoted identifier for use in raw SQL.
+fn orm_qident(db, name: string) -> string
+    _orm_qident(orm_kind(db), name)
+
+// The dialect-quoted TABLE name for a struct value. Needed because orm_ensure/orm_create_table quote the
+// type name -- and a quoted identifier is case-SENSITIVE on PostgreSQL -- so a CamelCase struct creates
+// table "Widget", while hand-written `SELECT * FROM Widget` is case-FOLDED by PostgreSQL to `widget` and
+// fails with `relation "widget" does not exist`. Since NOVA type names are CamelCase by convention this
+// trap is reachable by essentially every user of the struct-driven flow.
+//   let t = orm_table_of(db, Widget(0,"",0))
+//   let ws: list<Widget> = orm_all(db, "SELECT * FROM {t} WHERE qty > ?", [5])
+fn orm_table_of(db, row) -> string
+    _orm_qident(orm_kind(db), type_name(row))
+
+// Portable "current timestamp" -- CURRENT_TIMESTAMP is verified on all three; NOW() is NOT (sqlite).
+fn orm_now_sql() -> string
+    "CURRENT_TIMESTAMP"
+
+// Portable string concatenation -- CONCAT() is verified on all three; `||` is NOT (mysql returns 0).
+fn orm_concat_sql(a: string, b: string) -> string
+    "CONCAT({a}, {b})"
+
+// Portable case-insensitive match -- LOWER(col) LIKE ? is verified on all three; ILIKE is NOT (mysql).
+// Bind the pattern already lower-cased: orm_all(db, "... WHERE {p}", [lower(needle)])
+fn orm_ilike_sql(db, col: string) -> string
+    let c = _orm_qident(orm_kind(db), col)
+    "LOWER({c}) LIKE ?"
+
+// ---- generated keys, real UPSERT, and JPA save() semantics -----------------------------------------
+
+// The dialect's "insert, or update the row that already has this key" tail.
+// MEASURED on all three: sqlite and postgres take ON CONFLICT (<key>) DO UPDATE SET c = excluded.c;
+// mysql has NO ON CONFLICT and takes ON DUPLICATE KEY UPDATE c = VALUES(c). Both were verified to
+// update the row IN PLACE and leave exactly ONE row.
+// NOTE: MySQL's form has no conflict TARGET -- it fires on any unique-key collision, not just `key`.
+fn _orm_upsert_tail(kind: string, key: string, names: list) -> string
+    let sets = []
+    for nm in names
+        if nm != key
+            let q = _orm_qident(kind, nm)
+            push(sets, "{q} = VALUES({q})" if kind == "mysql" else "{q} = excluded.{q}")
+    let kq = _orm_qident(kind, key)
+    // A struct that is ONLY its key has nothing to SET; an empty SET list is a syntax error, so make
+    // the collision an explicit no-op instead.
+    if len(sets) == 0
+        return "ON DUPLICATE KEY UPDATE {kq} = {kq}" if kind == "mysql" else "ON CONFLICT ({kq}) DO NOTHING"
+    let body = join(sets, ", ")
+    if kind == "mysql"
+        return "ON DUPLICATE KEY UPDATE {body}"
+    "ON CONFLICT ({kq}) DO UPDATE SET {body}"
+
+// UPSERT a struct by its `id` field: one statement, one round trip, atomic.
+fn orm_upsert(db, table: string, row) -> any
+    orm_upsert_by(db, table, row, "id")
+
+// UPSERT keyed on an arbitrary unique column (e.g. "email", "sku").
+fn orm_upsert_by(db, table: string, row, key: string) -> any
+    let kind = orm_kind(db)
+    let names = field_names(row)
+    if key not in names
+        let tn = type_name(row)
+        return err("orm_upsert_by: struct '{tn}' has no '{key}' field")
+    // MySQL's ON DUPLICATE KEY UPDATE has NO conflict target -- it fires on ANY unique-key collision,
+    // including the PRIMARY KEY. So an email-keyed upsert whose row also carries an existing id would
+    // silently overwrite THAT row instead: the caller asked to key on email and got a key-on-id
+    // overwrite. Rather than honour the request incorrectly on one driver, refuse it there. Keying on
+    // the primary key ("id") is unambiguous and stays supported everywhere.
+    if kind == "mysql" and key != "id"
+        return err("orm_upsert_by: MySQL cannot target a specific conflict key ('{key}') -- ON DUPLICATE KEY UPDATE fires on ANY unique collision, so this would silently update the wrong row. Use orm_upsert (keyed on id), or do an explicit SELECT-then-update.")
+    // The KEY column is always bound -- an upsert is addressed BY its key, so omitting it would turn
+    // every call into a plain insert. But when the key is NOT the primary key, an UNSET id (0) must be
+    // omitted, for two reasons: the database has to be free to generate it on the insert path, and
+    // SQLite REFUSES a non-PK conflict target whenever the statement also binds the PK column
+    // ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" at prepare time --
+    // MEASURED: identical SQL succeeds with id omitted and fails with id bound). So `upsert_by("email")`
+    // was impossible on SQLite until id was dropped from the column list.
+    let use = [nm for nm in names if nm == key or nm != "id" or field_get(row, nm) != 0]
+    let cols = join([_orm_qident(kind, nm) for nm in use], ", ")
+    let ph = join(["?" for nm in use], ", ")
+    let params = [field_get(row, nm) for nm in use]
+    let tbl = _orm_qident(kind, table)
+    // Built from the BOUND columns, not from every field: an omitted id must not appear as
+    // "id = excluded.id" in the update tail, or the UPDATE path would overwrite the existing row's
+    // primary key with the unset proposed one.
+    let tail = _orm_upsert_tail(kind, key, use)
+    orm_exec(db, "INSERT INTO {tbl} ({cols}) VALUES ({ph}) {tail}", params)
+
+// JPA's save(): INSERT when the entity is NEW, UPDATE when it already carries a key.
+// `orm_save` is INSERT-ONLY and always has been -- calling it twice on the same entity raises a
+// duplicate-key error rather than updating (MEASURED: "UNIQUE constraint failed: Widget.id"). This is
+// the function that behaves the way a developer coming from JPA/Hibernate/ActiveRecord expects.
+fn orm_put(db, row) -> any
+    orm_put_into(db, type_name(row), row)
+
+fn orm_put_into(db, table: string, row) -> any
+    let names = field_names(row)
+    // No key field -> there is nothing to address an UPDATE by, so an insert is the only meaning.
+    if "id" not in names
+        return orm_insert(db, table, row)
+    // id == 0 is NOVA's "unset" (null IS 0) -> a new entity; let the database generate the key.
+    if field_get(row, "id") == 0
+        return orm_insert(db, table, row)
+    orm_upsert(db, table, row)
+
+// The generated primary key of a freshly INSERTed struct, as ok(int).
+// sqlite + postgres: INSERT ... RETURNING <id> -- one round trip.
+// mysql: has NO RETURNING, so the key must come from LAST_INSERT_ID(). MEASURED HAZARD: issued as two
+// POOL calls the SELECT lands on a DIFFERENT pooled connection and returns a STALE id (the probe got 2
+// where the true key was 1001) -- LAST_INSERT_ID() is per-CONNECTION state. orm_with_tx pins the INSERT
+// and the SELECT to ONE connection, which is what makes the mysql answer correct.
+fn orm_insert_id(db, table: string, row) -> any
+    let kind = orm_kind(db)
+    let use = [nm for nm in field_names(row) if nm != "id" or field_get(row, nm) != 0]
+    if len(use) == 0
+        return err("orm_insert_id: nothing to insert")
+    let cols = join([_orm_qident(kind, nm) for nm in use], ", ")
+    let ph = join(["?" for nm in use], ", ")
+    let params = [field_get(row, nm) for nm in use]
+    let tbl = _orm_qident(kind, table)
+    if kind == "mysql"
+        return orm_with_tx(db, fn(tx) _orm_mysql_insert_id(tx, tbl, cols, ph, params))
+    let idq = _orm_qident(kind, "id")
+    let r = orm_rows(db, "INSERT INTO {tbl} ({cols}) VALUES ({ph}) RETURNING {idq}", params)
+    if is_err(r)
+        return r
+    let rows = unwrap(r)
+    if len(rows) == 0
+        return err("orm_insert_id: INSERT returned no id")
+    ok(parse_int(str(rows[0]["id"])))
+
+fn _orm_mysql_insert_id(tx, tbl: string, cols: string, ph: string, params) -> any
+    let w = orm_exec(tx, "INSERT INTO {tbl} ({cols}) VALUES ({ph})", params)
+    if is_err(w)
+        return w
+    let r = orm_rows(tx, "SELECT LAST_INSERT_ID() AS id", [])
+    if is_err(r)
+        return r
+    let rows = unwrap(r)
+    if len(rows) == 0
+        return err("orm_insert_id: LAST_INSERT_ID() returned no row")
+    ok(parse_int(str(rows[0]["id"])))
+
+// Insert a struct into its own type's table and return the generated key.
+fn orm_save_id(db, row) -> any
+    orm_insert_id(db, type_name(row), row)
+
+// ---- no-silent-failure scalars ---------------------------------------------------------------------
+// orm_count / orm_exists / orm_agg return 0 / false / "" when the DRIVER FAILS, which is
+// indistinguishable from a legitimately empty result -- the same "a dead connection looks like no rows"
+// class that was already fixed once in the drivers. These variants surface the error instead. The
+// originals are kept because they are used as plain int/bool at many call sites.
+
+fn orm_try_count(db, table: string, where: string, params) -> any
+    let tbl = _orm_qident(orm_kind(db), table)
+    let sql = "SELECT count(*) AS n FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT count(*) AS n FROM {tbl}"
+    let r = orm_rows(db, sql, params)
+    if is_err(r)
+        return r
+    let rows = unwrap(r)
+    if len(rows) == 0
+        return err("orm_try_count: count query returned no row")
+    ok(parse_int(str(rows[0]["n"])))
+
+fn orm_try_exists(db, table: string, where: string, params) -> any
+    let tbl = _orm_qident(orm_kind(db), table)
+    let sql = "SELECT 1 AS one FROM {tbl} WHERE {where} LIMIT 1" if len(where) > 0 else "SELECT 1 AS one FROM {tbl} LIMIT 1"
+    let r = orm_rows(db, sql, params)
+    if is_err(r)
+        return r
+    ok(len(unwrap(r)) > 0)
+
+fn orm_try_agg(db, fn_name: string, col: string, table: string, where: string, params) -> any
+    if not _orm_is_valid_agg_fn(fn_name)
+        return err("orm_try_agg: '{fn_name}' is not one of count/sum/avg/min/max")
+    let cq = _orm_qident(orm_kind(db), col)
+    let tbl = _orm_qident(orm_kind(db), table)
+    let sql = "SELECT {fn_name}({cq}) AS a FROM {tbl} WHERE {where}" if len(where) > 0 else "SELECT {fn_name}({cq}) AS a FROM {tbl}"
+    let r = orm_rows(db, sql, params)
+    if is_err(r)
+        return r
+    let rows = unwrap(r)
+    if len(rows) == 0
+        return ok("")
+    ok(str(rows[0]["a"]))

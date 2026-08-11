@@ -1,0 +1,316 @@
+// KAT: the OrmSpec predicate builder, paging, bulk criteria writes and N+1 batch loading -- asserted
+// against ALL THREE live drivers with the SAME assertions.
+//
+// The two assertions that matter most are the EMPTY-LIST duals, because both failure modes are silent:
+//   * an empty in_()     must match NOTHING  (dropping the predicate would widen to EVERY row)
+//   * an empty not_in()  must match EVERYTHING
+// Getting either backwards returns a plausible-looking result set, which is how it survives review.
+
+import forge_orm
+
+type S1
+    id: int
+    name: string
+    qty: int
+    grp: string
+
+let _F = channel()
+
+fn fail(msg: string)
+    print("    FAIL: {msg}")
+    send(_F, 1)
+
+fn check(cond, msg: string)
+    if not cond
+        fail(msg)
+
+fn ids_of(rows: list) -> string
+    join([str(r.id) for r in rows], ",")
+
+fn suite(label: string, db)
+    let tname = type_name(S1(0, "", 0, ""))
+    let t = orm_table_of(db, S1(0, "", 0, ""))
+    let d = orm_exec(db, "DROP TABLE IF EXISTS {t}", [])
+    if is_err(d)
+        fail("{label}: drop failed")
+    let e = orm_ensure(db, S1(0, "", 0, ""))
+    check(not is_err(e), "{label}: ensure failed")
+
+    // seed: ids 1..5
+    let seed = [S1(0, "apple", 10, "fruit"), S1(0, "banana", 20, "fruit"), S1(0, "Cherry", 30, "fruit"), S1(0, "carrot", 40, "veg"), S1(0, "daikon", 50, "veg")]
+    for s in seed
+        let w = orm_save(db, s)
+        if is_err(w)
+            fail("{label}: seed insert failed: {unwrap_err(w)}")
+
+    let all: list<S1> = orm_all(db, "SELECT * FROM {t} ORDER BY id", [])
+    check(len(all) == 5, "{label}: expected 5 seeded rows, got {len(all)}")
+    if len(all) != 5
+        return
+
+    // ---- typed predicates ----
+    let q_gt = orm_spec(db, S1(0, "", 0, "")).gt("qty", 25).asc("qty")
+    let r_gt: list<S1> = orm_all(db, q_gt.sql(), q_gt.params)
+    check(len(r_gt) == 3, "{label}: gt(qty,25) -> {len(r_gt)} rows, want 3")
+
+    let q_eq = orm_spec(db, S1(0, "", 0, "")).eq("grp", "veg").asc("id")
+    let r_eq: list<S1> = orm_all(db, q_eq.sql(), q_eq.params)
+    check(len(r_eq) == 2, "{label}: eq(grp,veg) -> {len(r_eq)} rows, want 2")
+
+    let q_bt = orm_spec(db, S1(0, "", 0, "")).between("qty", 20, 40)
+    let r_bt: list<S1> = orm_all(db, q_bt.sql(), q_bt.params)
+    check(len(r_bt) == 3, "{label}: between(20,40) -> {len(r_bt)} rows, want 3")
+
+    let q_ne = orm_spec(db, S1(0, "", 0, "")).ne("grp", "veg")
+    let r_ne: list<S1> = orm_all(db, q_ne.sql(), q_ne.params)
+    check(len(r_ne) == 3, "{label}: ne(grp,veg) -> {len(r_ne)} rows, want 3")
+
+    // case-INSENSITIVE contains must find "Cherry" from "cher" on every dialect (no ILIKE on mysql)
+    let q_ic = orm_spec(db, S1(0, "", 0, "")).icontains("name", "CHER")
+    let r_ic: list<S1> = orm_all(db, q_ic.sql(), q_ic.params)
+    check(len(r_ic) == 1, "{label}: icontains(name,CHER) -> {len(r_ic)} rows, want 1 (Cherry)")
+
+    let q_st = orm_spec(db, S1(0, "", 0, "")).starts("name", "car")
+    let r_st: list<S1> = orm_all(db, q_st.sql(), q_st.params)
+    check(len(r_st) == 1, "{label}: starts(name,car) -> {len(r_st)} rows, want 1")
+
+    // ---- the empty-list duals (silent-failure guards) ----
+    let q_in0 = orm_spec(db, S1(0, "", 0, "")).in_("id", [])
+    let r_in0: list<S1> = orm_all(db, q_in0.sql(), q_in0.params)
+    check(len(r_in0) == 0, "{label}: EMPTY in_() matched {len(r_in0)} rows -- must match NOTHING")
+
+    let q_ni0 = orm_spec(db, S1(0, "", 0, "")).not_in("id", [])
+    let r_ni0: list<S1> = orm_all(db, q_ni0.sql(), q_ni0.params)
+    check(len(r_ni0) == 5, "{label}: EMPTY not_in() matched {len(r_ni0)} rows -- must match EVERYTHING")
+
+    let q_in = orm_spec(db, S1(0, "", 0, "")).in_("qty", [10, 50]).asc("qty")
+    let r_in: list<S1> = orm_all(db, q_in.sql(), q_in.params)
+    check(len(r_in) == 2, "{label}: in_(qty,[10,50]) -> {len(r_in)} rows, want 2")
+
+    // ---- ordering composes ----
+    let q_ord = orm_spec(db, S1(0, "", 0, "")).asc("grp").desc("qty")
+    let r_ord: list<S1> = orm_all(db, q_ord.sql(), q_ord.params)
+    check(len(r_ord) == 5, "{label}: composed order lost rows ({len(r_ord)})")
+    if len(r_ord) == 5
+        // fruit(10,20,30) desc -> 30,20,10 ; then veg(40,50) desc -> 50,40
+        check(r_ord[0].qty == 30, "{label}: asc(grp).desc(qty) first qty={r_ord[0].qty}, want 30")
+        check(r_ord[4].qty == 40, "{label}: asc(grp).desc(qty) last qty={r_ord[4].qty}, want 40")
+
+    // ---- distinct + group_by/having, and count_sql must wrap them ----
+    let q_dg = orm_spec(db, S1(0, "", 0, "")).columns("grp").distinct()
+    let r_dg = q_dg.run(db)
+    check(len(r_dg) == 2, "{label}: distinct grp -> {len(r_dg)}, want 2")
+
+    let q_gb = orm_spec(db, S1(0, "", 0, "")).columns("grp").group_by(["grp"]).having("count(*) > ?", [2])
+    let r_gb = q_gb.run(db)
+    check(len(r_gb) == 1, "{label}: group_by+having(count>2) -> {len(r_gb)}, want 1 (fruit=3)")
+    // the GROUP BY count must be the NUMBER OF GROUPS, not the first group's size
+    let q_gc = orm_spec(db, S1(0, "", 0, "")).columns("grp").group_by(["grp"])
+    let cg = orm_rows(db, q_gc.count_sql(), q_gc.params)
+    check(not is_err(cg), "{label}: grouped count_sql errored")
+    if not is_err(cg)
+        let cgr = unwrap(cg)
+        if len(cgr) > 0
+            check(parse_int(str(cgr[0]["n"])) == 2, "{label}: grouped count = {cgr[0][\"n\"]}, want 2 groups")
+
+    // ---- paging: metadata must reflect the FILTER, not the whole table ----
+    let q_pg = orm_spec(db, S1(0, "", 0, "")).gt("qty", 15).asc("id")
+    let pm = orm_page_meta(db, q_pg, 2, 2)
+    check(not is_err(pm), "{label}: orm_page_meta errored")
+    if not is_err(pm)
+        let pg = unwrap(pm)
+        check(pg.op_total == 4, "{label}: page total={pg.op_total}, want 4")
+        check(pg.op_pages == 2, "{label}: pages={pg.op_pages}, want 2")
+        check(pg.op_has_prev, "{label}: page 2 should have a previous page")
+        check(not pg.op_has_next, "{label}: page 2 of 2 should NOT have a next page")
+    let q_p2 = q_pg.paginate(2, 2)
+    let r_p2: list<S1> = orm_all(db, q_p2.sql(), q_p2.params)
+    check(len(r_p2) == 2, "{label}: page 2 size {len(r_p2)}, want 2")
+
+    // a bare offset with no limit is a syntax error on mysql/sqlite -- sql() must guard it
+    let q_off = orm_spec(db, S1(0, "", 0, "")).asc("id").offset(1)
+    let r_off = q_off.try_run(db)
+    check(not is_err(r_off), "{label}: bare offset failed -- {\"\" if not is_err(r_off) else unwrap_err(r_off)}")
+    if not is_err(r_off)
+        check(len(unwrap(r_off)) == 4, "{label}: offset(1) -> {len(unwrap(r_off))} rows, want 4")
+
+    // ---- bulk update by criteria: SET params must bind BEFORE spec params ----
+    let q_up = orm_spec(db, S1(0, "", 0, "")).eq("grp", "veg")
+    let ur = orm_update_where(db, tname, {"grp": "vegetable"}, q_up)
+    check(not is_err(ur), "{label}: orm_update_where failed")
+    let n_veg = orm_count(db, tname, "grp = ?", ["vegetable"])
+    check(n_veg == 2, "{label}: bulk update touched {n_veg} rows, want 2 (param order bug if 0 or 5)")
+    let n_old = orm_count(db, tname, "grp = ?", ["veg"])
+    check(n_old == 0, "{label}: {n_old} rows still have the OLD value")
+
+    // ---- delete by criteria; and an unconditioned spec must be REFUSED ----
+    let q_del = orm_spec(db, S1(0, "", 0, "")).eq("grp", "vegetable")
+    let dr = orm_delete_where(db, tname, q_del)
+    check(not is_err(dr), "{label}: orm_delete_where failed")
+    check(orm_count(db, tname, "", []) == 3, "{label}: after delete_where expected 3 rows")
+
+    let bare = orm_delete_where(db, tname, orm_spec(db, S1(0, "", 0, "")))
+    check(is_err(bare), "{label}: delete_where with NO condition was ALLOWED -- must refuse")
+
+    // ---- delete_by_ids ----
+    let remain: list<S1> = orm_all(db, "SELECT * FROM {t} ORDER BY id", [])
+    let two = [remain[0].id, remain[1].id]
+    let dbi = orm_delete_by_ids(db, tname, two)
+    check(not is_err(dbi), "{label}: orm_delete_by_ids failed")
+    check(orm_count(db, tname, "", []) == 1, "{label}: after delete_by_ids expected 1 row")
+    // empty id set must be a no-op, not a full delete
+    let dz = orm_delete_by_ids(db, tname, [])
+    check(not is_err(dz), "{label}: delete_by_ids([]) errored")
+    check(orm_count(db, tname, "", []) == 1, "{label}: delete_by_ids([]) DELETED rows -- must be a no-op")
+
+    // ---- N+1 batch loading keeps children typed ----
+    let parents: list<S1> = orm_all(db, "SELECT * FROM {t}", [])
+    let pids = orm_pluck(parents, "id")
+    check(len(pids) == len(parents), "{label}: orm_pluck lost values")
+    let grouped = orm_group_by_field(parents, "grp")
+    check(len(keys(grouped)) >= 1, "{label}: orm_group_by_field produced no groups")
+    let firstk = keys(grouped)[0]
+    check(len(grouped[firstk]) >= 1, "{label}: group '{firstk}' is empty")
+    // grouped values must still be REAL structs, not dicts
+    let kids = grouped[firstk]
+    check(kids[0].id != 0, "{label}: grouped child lost its struct identity (id=0)")
+
+    // ---- REGRESSION: having() called BEFORE where() must not reverse the bindings ----
+    // Both clauses bind params, but sql() emits WHERE before HAVING, so having-params must stay at the
+    // tail. Appending a later where-param after them swaps the bindings: both orders run without error
+    // and return DIFFERENT rows. Asserting the two call orders agree is the only way to catch it.
+    let sa = orm_spec(db, S1(0, "", 0, "")).columns("grp").eq("grp", "fruit").group_by(["grp"]).having("count(*) > ?", [0])
+    let sb = orm_spec(db, S1(0, "", 0, "")).columns("grp").group_by(["grp"]).having("count(*) > ?", [0]).eq("grp", "fruit")
+    let ra = sa.try_run(db)
+    let rb = sb.try_run(db)
+    check(not is_err(ra), "{label}: where-then-having errored")
+    check(not is_err(rb), "{label}: having-then-where errored")
+    if not is_err(ra) and not is_err(rb)
+        let na = len(unwrap(ra))
+        let nb = len(unwrap(rb))
+        check(na == nb, "{label}: PARAM ORDER BUG -- where-then-having gave {na} rows, having-then-where gave {nb}")
+
+    // ---- REGRESSION: count_sql() with having but NO group_by must not drop HAVING ----
+    // The flat count path emits only WHERE, so a having-bearing spec would bind more values than it has
+    // placeholders AND silently lose the filter.
+    let sh = orm_spec(db, S1(0, "", 0, "")).eq("grp", "fruit").having("count(*) > ?", [0])
+    let rh = orm_rows(db, sh.count_sql(), sh.params)
+    check(not is_err(rh), "{label}: count_sql with having-but-no-group_by errored (param/placeholder mismatch)")
+
+    // ---- REGRESSION: LIKE metacharacters in a LITERAL match must not act as wildcards ----
+    // Binding stops SQL injection but NOT pattern injection: an untrusted "%" in a search box would
+    // otherwise match every row.
+    let w1 = orm_exec(db, "INSERT INTO {t} (name, qty, grp) VALUES (?, ?, ?)", ["100%", 60, "sym"])
+    if is_err(w1)
+        fail("{label}: wildcard seed 1 failed")
+    let w2 = orm_exec(db, "INSERT INTO {t} (name, qty, grp) VALUES (?, ?, ?)", ["a_b", 61, "sym"])
+    if is_err(w2)
+        fail("{label}: wildcard seed 2 failed")
+    let w3 = orm_exec(db, "INSERT INTO {t} (name, qty, grp) VALUES (?, ?, ?)", ["aXb", 62, "sym"])
+    if is_err(w3)
+        fail("{label}: wildcard seed 3 failed")
+
+    let q_pc = orm_spec(db, S1(0, "", 0, "")).contains("name", "%")
+    let r_pc: list<S1> = orm_all(db, q_pc.sql(), q_pc.params)
+    check(len(r_pc) == 1, "{label}: contains('%') matched {len(r_pc)} rows -- a literal '%' must match ONLY '100%', not act as a wildcard")
+
+    let q_us = orm_spec(db, S1(0, "", 0, "")).starts("name", "a_")
+    let r_us: list<S1> = orm_all(db, q_us.sql(), q_us.params)
+    check(len(r_us) == 1, "{label}: starts('a_') matched {len(r_us)} rows -- '_' must be literal, not a single-char wildcard (would also match 'aXb')")
+
+    let q_ic2 = orm_spec(db, S1(0, "", 0, "")).icontains("name", "%")
+    let r_ic2: list<S1> = orm_all(db, q_ic2.sql(), q_ic2.params)
+    check(len(r_ic2) == 1, "{label}: icontains('%') matched {len(r_ic2)} rows -- must be literal")
+
+    // raw .like() KEEPS wildcards (that is its purpose)
+    let q_raw = orm_spec(db, S1(0, "", 0, "")).like("name", "a%b")
+    let r_raw: list<S1> = orm_all(db, q_raw.sql(), q_raw.params)
+    check(len(r_raw) == 2, "{label}: raw like('a%b') matched {len(r_raw)}, want 2 (a_b and aXb) -- raw LIKE must stay a pattern")
+
+    // clean the wildcard fixtures back out
+    let wd = orm_delete_where(db, tname, orm_spec(db, S1(0, "", 0, "")).eq("grp", "sym"))
+    if is_err(wd)
+        fail("{label}: wildcard cleanup failed")
+
+    // ---- index DDL works on all three (mysql: no IF NOT EXISTS, and TEXT cannot be indexed) ----
+    let ix = orm_ensure_index(db, tname, ["qty"])
+    check(not is_err(ix), "{label}: orm_ensure_index failed -- {\"\" if not is_err(ix) else unwrap_err(ix)}")
+    let ix2 = orm_ensure_index(db, tname, ["qty"])
+    check(not is_err(ix2), "{label}: orm_ensure_index is NOT idempotent")
+    // A unique index on a STRING column: MySQL cannot index a TEXT column without a key length, and
+    // non-key strings are deliberately kept TEXT rather than VARCHAR(255) (truncating user data to
+    // enable an index is the wrong trade). So this is expected to FAIL on mysql and succeed elsewhere --
+    // asserted per-dialect so the limitation stays honest instead of silently regressing.
+    let uq = orm_ensure_unique(db, tname, ["name"])
+    if orm_kind(db) == "mysql"
+        check(is_err(uq), "{label}: mysql unexpectedly indexed a TEXT column -- did string columns become VARCHAR again (truncation risk)?")
+    else
+        check(not is_err(uq), "{label}: orm_ensure_unique on a STRING column failed -- {\"\" if not is_err(uq) else unwrap_err(uq)}")
+
+    // ---- MySQL must REFUSE a non-id upsert key rather than silently key on the PRIMARY KEY ----
+    // Ordered AFTER the index section on purpose: ON CONFLICT (<col>) requires a real UNIQUE constraint
+    // on that column, so this can only be exercised once orm_ensure_unique("name") has succeeded.
+    // On mysql the unique index on a TEXT column cannot exist at all, and orm_upsert_by refuses a
+    // non-id key outright -- both are asserted.
+    if orm_kind(db) == "mysql"
+        let ubm = orm_upsert_by(db, tname, S1(7777, "ub", 70, "ub"), "name")
+        check(is_err(ubm), "{label}: MySQL ALLOWED orm_upsert_by on a non-id key -- ON DUPLICATE KEY UPDATE has no conflict target, so it would silently update the WRONG row")
+    else
+        // FRESH table. The rest of this suite mutates rows and indexes, and a conflict target must be
+        // backed by a unique constraint over the CURRENT data -- running this against the accumulated
+        // state made it fail for reasons unrelated to the feature.
+        let dz = orm_exec(db, "DROP TABLE IF EXISTS {t}", [])
+        if is_err(dz)
+            fail("{label}: upsert_by fixture drop failed")
+        let ez = orm_ensure(db, S1(0, "", 0, ""))
+        check(not is_err(ez), "{label}: upsert_by fixture ensure failed")
+        let uz = orm_ensure_unique(db, tname, ["name"])
+        check(not is_err(uz), "{label}: upsert_by fixture unique index failed -- {\"\" if not is_err(uz) else unwrap_err(uz)}")
+        if not is_err(uz)
+            let ub = orm_upsert_by(db, tname, S1(0, "unique-ub", 70, "ub"), "name")
+            check(not is_err(ub), "{label}: orm_upsert_by on a UNIQUE non-id key failed -- {\"\" if not is_err(ub) else unwrap_err(ub)}")
+            let ub2 = orm_upsert_by(db, tname, S1(0, "unique-ub", 71, "ub2"), "name")
+            check(not is_err(ub2), "{label}: orm_upsert_by second call (the UPDATE path) failed")
+            let nub = orm_count(db, tname, "name = ?", ["unique-ub"])
+            check(nub == 1, "{label}: upsert_by on a unique column produced {nub} rows, want 1 (it inserted twice instead of updating)")
+            let gz: Result<S1> = orm_one(db, "SELECT id, name, qty, grp FROM {t} WHERE name = ?", ["unique-ub"])
+            if not is_err(gz)
+                check(unwrap(gz).qty == 71, "{label}: upsert_by did not UPDATE (qty={unwrap(gz).qty}, want 71)")
+
+    let d2 = orm_exec(db, "DROP TABLE IF EXISTS {t}", [])
+    if is_err(d2)
+        fail("{label}: drop2 failed")
+    print("    {label}: done")
+
+fn arm(label: string, dsn: string, required: int)
+    let r = orm_open(dsn)
+    if is_err(r)
+        if required == 1
+            fail("{label}: could not open ({unwrap_err(r)})")
+        else
+            print("    {label}: SKIPPED (server not reachable)")
+        return
+    let db = unwrap(r)
+    suite(label, db)
+    orm_close(db)
+
+fn main()
+    print("_kat_orm_spec: predicate builder + paging + bulk criteria writes + N+1 batching")
+    arm("sqlite  ", "sqlite://_kat_orm_spec.db", 1)
+    arm("postgres", "postgres://postgres:root@127.0.0.1:5432/postgres", 0)
+    arm("mysql   ", "mysql://root:root@127.0.0.1:3306/nova_test", 0)
+
+    let fails = 0
+    let more = 1
+    while more == 1
+        let g = select_timeout(_F, 50)
+        if g[0] == 0
+            fails += 1
+        else
+            more = 0
+
+    if fails == 0
+        print("_kat_orm_spec passed")
+    else
+        print("_kat_orm_spec FAILED ({fails} assertion failures)")
+        exit(1)
