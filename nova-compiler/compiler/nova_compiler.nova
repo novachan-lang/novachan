@@ -18088,6 +18088,129 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
             return nt_any()
     nt_any()
 
+// ── ORM compile-time column verification (the struct IS the schema) ──────────
+// A typed ORM read carries BOTH halves of the contract at compile time: the SQL string literal and the
+// target struct. Every other ORM discovers a mistyped column at RUNTIME (JPA/Hibernate), or needs a LIVE
+// database at build time to check it (sqlx). NOVA needs neither -- the struct already IS the schema, so
+// verifying `SELECT id, nmae FROM ...` against `list<Widget>` is a pure compile-time string comparison.
+//
+// SCOPED SO FALSE POSITIVES ARE IMPOSSIBLE, because a spurious compile error on valid SQL would be worse
+// than the bug it catches:
+//   * only an explicit SELECT list is inspected -- `SELECT *` is skipped entirely
+//   * only a BARE identifier is considered. Anything containing '(', '.', a space, '*' or a quote is an
+//     aggregate, a qualified column, an alias or an expression, and is skipped
+//   * a column merely ABSENT from the struct is NOT reported. Selecting extra columns is legal and a
+//     deliberate projection must keep compiling. It is reported ONLY when it is within edit-distance 1
+//     of a real field -- i.e. almost certainly a typo.
+// Net effect: a pure typo catcher that cannot fire on correct code.
+
+// Index of the SQL argument for the ORM reads that take a full statement, or -1.
+// Deliberately NOT orm_exec/orm_each: this check only makes sense where a target STRUCT is known.
+fn _orm_sql_arg_of(fname: string) -> int
+    if fname == "orm_all" or fname == "orm_rows" or fname == "orm_row" or fname == "orm_one"
+        return 1
+    -1
+
+// The text between SELECT and FROM, or "" when this is not an inspectable SELECT.
+fn _orm_select_list(sql: string) -> string
+    let up = upper(sql)
+    let t = trim(up)
+    if not starts_with(t, "SELECT ")
+        return ""
+    let fi = find(up, " FROM ")
+    if fi < 0
+        return ""
+    let si = find(up, "SELECT")
+    if si < 0 or si + 6 >= fi
+        return ""
+    // slice the ORIGINAL (case-preserving) string over the offsets found in the upper-cased copy;
+    // upper() must not change length for this to be sound, which holds for ASCII SQL keywords.
+    trim(sql[si + 6:fi])
+
+// A SELECT-list item reduced to a plain column name, or "" when it is not checkable.
+fn _orm_plain_col(item: string) -> string
+    let t = trim(item)
+    if len(t) == 0
+        return ""
+    if find(t, "(") >= 0 or find(t, ".") >= 0 or find(t, " ") >= 0 or find(t, "*") >= 0
+        return ""
+    if find(t, "\"") >= 0 or find(t, "`") >= 0 or find(t, "'") >= 0
+        return ""
+    t
+
+// Strip one layer of `list<...>` from an annotation, so both `let x: T` and `let xs: list<T>` resolve to T.
+fn _orm_elem_of_ann(ann: string) -> string
+    if len(ann) > 6 and ann[0:5] == "list<" and ann[len(ann) - 1:len(ann)] == ">"
+        return ann[5:len(ann) - 1]
+    ann
+
+// Is `a` `b` with exactly ONE adjacent pair swapped? ("nmae" vs "name")
+// Plain Levenshtein scores a transposition as TWO edits, so an edit-distance-1 test misses the single
+// most common class of typo. Widening the threshold to 2 instead would start matching genuinely
+// different short names ("ip" vs "id"), so transposition is detected exactly rather than approximated.
+fn _orm_is_transposition(a: string, b: string) -> bool
+    if len(a) != len(b) or len(a) < 2
+        return false
+    let i = 0
+    while i < len(a) and a[i:i + 1] == b[i:i + 1]
+        i = i + 1
+    if i + 1 >= len(a)
+        return false
+    if a[i:i + 1] != b[i + 1:i + 2] or a[i + 1:i + 2] != b[i:i + 1]
+        return false
+    // everything after the swapped pair must match exactly
+    a[i + 2:len(a)] == b[i + 2:len(b)]
+
+// The struct field a mistyped column most likely meant, or "" when nothing is close enough.
+fn _orm_near_field(col: string, fields: list) -> string
+    // Very short names are the riskiest false-positive class: "ip" is one edit from "id" but may well be
+    // a real column the struct simply does not map. Below 3 characters, stay silent.
+    if len(col) < 3
+        return ""
+    for f in fields
+        if edit_distance(col, f) == 1
+            return f
+    for f2 in fields
+        if _orm_is_transposition(col, f2)
+            return f2
+    ""
+
+// Report a mistyped column in a typed ORM read. `sname` is a struct known to st.ti_structs.
+fn _orm_check_cols(st: TiState, sname: string, sql: string, line: int)
+    let sel = _orm_select_list(sql)
+    if sel == ""
+        return
+    if find(sel, "*") >= 0
+        return
+    let fields = keys(st.ti_structs[sname])
+    if len(fields) == 0
+        return
+    for item in split(sel, ",")
+        let col = _orm_plain_col(item)
+        if col != ""
+            if not list_contains(fields, col)
+                // absent-but-unlike-any-field is a legal projection -> silent. Only a NEAR MISS is a typo.
+                let best = _orm_near_field(col, fields)
+                if best != ""
+                    ti_error_full(st, "E1013", "column '" + col + "' does not exist on struct '" + sname + "'", line, "did you mean '" + best + "'? (the struct IS the schema -- verified at compile time, no database needed)")
+
+// Entry point from the typed-let path: fires only for a `let x: T = orm_*(db, "<literal sql>", ...)`.
+fn _orm_verify_typed_read(st: TiState, ann: string, e: Expr, line: int)
+    let sname = _orm_elem_of_ann(ann)
+    if not contains(st.ti_structs, sname)
+        return
+    match e
+        Expr(oet, oev, oen, oec, oef, oel) =>
+            if oet == "call"
+                let ai = _orm_sql_arg_of(oev)
+                if ai >= 0 and len(oec) > ai
+                    match oec[ai]
+                        Expr(set_, sev, sen, sec, sef, sel2) =>
+                            // only a STRING LITERAL can be checked; an interpolated or computed SQL
+                            // expression is not knowable here and is left alone.
+                            if set_ == "str"
+                                _orm_check_cols(st, sname, sev, line)
+
 // ── Statement inference ──────────────────────────────────────────────────────
 
 fn ti_infer_stmt(st: TiState, stmt: Stmt) -> NType
@@ -18337,6 +18460,10 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 let la_ann = ti_ann_to_type_g(st, la_pty, {})
                                 if expr != null_expr()
                                     ti_constrain(st, la_ann, rhs, sline)
+                                    // ORM: the annotation names the target STRUCT and the call carries the
+                                    // SQL literal, so a mistyped column is catchable HERE -- at compile
+                                    // time, with no live database. See _orm_verify_typed_read.
+                                    _orm_verify_typed_read(st, la_pty, expr, sline)
                                 rhs = la_ann
                 if name != ""
                     // A `let` inside a fn SHADOWS a top-level `let` VARIABLE (a non-fn
@@ -29389,15 +29516,23 @@ fn lsp_collect_diagnostics(source: string, filename: string) -> list
     let stmts = parse_program(tokens, parse_errors)
     for pe in parse_errors
         let pe_line = 0
-        let colon_idx = find(pe, ":")
-        if colon_idx > 0
-            let after = slice(pe, colon_idx + 1, len(pe))
-            let space_idx = find(after, " ")
-            if space_idx > 0
-                let num = slice(after, 0, space_idx)
-                pe_line = int(num) - 1
-                if pe_line < 0
-                    pe_line = 0
+        let arrow_idx = find(pe, "--> ")
+        if arrow_idx >= 0
+            let after = slice(pe, arrow_idx + 4, len(pe))
+            let num_end = find(after, "\n")
+            if num_end < 0
+                num_end = len(after)
+            let loc_part = slice(after, 0, num_end)
+            let last_colon = str_last_index_of(loc_part, ":")
+            if last_colon > 0
+                let before_col = slice(loc_part, 0, last_colon)
+                let line_colon = str_last_index_of(before_col, ":")
+                if line_colon > 0
+                    let num_str = slice(loc_part, line_colon + 1, last_colon)
+                    num_str = trim(num_str)
+                    pe_line = int(num_str) - 1
+                    if pe_line < 0
+                        pe_line = 0
         push(diags, [pe_line, 0, lsp_escape_json(pe)])
     let source_lines = split(source, "\n")
     let ti_state = ti_infer_program_named(stmts, source_lines, filename)
@@ -29406,12 +29541,13 @@ fn lsp_collect_diagnostics(source: string, filename: string) -> list
         let arrow_idx = find(te, "--> ")
         if arrow_idx >= 0
             let after = slice(te, arrow_idx + 4, len(te))
-            let colon_idx = find(after, ":")
+            let num_end = find(after, "\n")
+            if num_end < 0
+                num_end = len(after)
+            let loc_part = slice(after, 0, num_end)
+            let colon_idx = str_last_index_of(loc_part, ":")
             if colon_idx > 0
-                let num_end = find(after, "\n")
-                if num_end < 0
-                    num_end = len(after)
-                let num_str = slice(after, colon_idx + 1, num_end)
+                let num_str = slice(loc_part, colon_idx + 1, len(loc_part))
                 num_str = trim(num_str)
                 te_line = int(num_str) - 1
                 if te_line < 0
@@ -30252,6 +30388,13 @@ fn lsp_server_main()
                 if path_exists(path_join(nh_candidate, "lib"))
                     set_env("NOVA_HOME", nh_candidate)
                     write_raw("[nova-lsp] auto-set NOVA_HOME=" + nh_candidate + "\n")
+                else
+                    let parent = path_parent(ws_root)
+                    if parent != "" and parent != ws_root
+                        let nh_parent = path_join(parent, "nova-compiler")
+                        if path_exists(path_join(nh_parent, "lib"))
+                            set_env("NOVA_HOME", nh_parent)
+                            write_raw("[nova-lsp] auto-set NOVA_HOME=" + nh_parent + " (from parent)\n")
             let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":\{\"prepareProvider\":true\},\"documentHighlightProvider\":true,\"foldingRangeProvider\":true,\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"documentFormattingProvider\":true,\"workspaceSymbolProvider\":true\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"

@@ -54,6 +54,11 @@ Test-ShouldReject "_negty_width.nova"      "width mismatch"
 Test-ShouldReject "_negty_f32width.nova"   "width mismatch"
 Test-ShouldReject "_negty_f32mix.nova"     "width mismatch"
 Test-ShouldReject "_l11_dup_neg.nova"      "exported by two modules"
+# ORM compile-time column verification (E1013): the struct IS the schema, so a mistyped column in a
+# typed ORM read is caught at COMPILE time with no database. Two typo classes are covered because plain
+# edit distance scores a TRANSPOSITION as 2, so an edit-distance-1 test alone would miss the commonest one.
+Test-ShouldReject "_negty_ormcol.nova"     "does not exist on struct"
+Test-ShouldReject "_negty_ormcol2.nova"    "does not exist on struct"
 Test-ShouldReject "_negty_sizedrange.nova" "out of range"
 Test-ShouldReject "_negty_traitconf.nova"  "does not fully implement"
 
