@@ -1450,3 +1450,39 @@ soundness = DONE. Next: task 5 (float-payload codegen, empirical) then the bread
   compiler (name-map, type schemes, 2× LLVM declares, raw-double lists). gen4-tested: D11 14/14, D8 5/5
   (determinism/seed-independence/range/reproducibility). Reconverge (gen5==gen6) + full both-mode regression
   running now — validates D11 + D8 AND re-certifies the 4 breadth modules. Commit after green.
+
+---
+
+## Current focus — UPDATED 2026-08-12 (ORM: JPA-class Phase 0+1 LANDED; Phase 2 scoped)
+
+Commits: `f664bad0` (NOVA_COMMANDS.md), `e5461975` (CI gate 4 FAIL/33 SKIP/14 silent-pass -> 2850/0/0),
+`94073505` (ORM Phase 0+1). Canonical design: `NOVA_DESIGN/ORM_COMPILE_TIME_DESIGN.md`.
+
+**ALL THREE DIALECTS ARE LIVE ON THIS HOST** — including MySQL on :3306, which prior state recorded as
+never testable. The MySQL path is KAT-covered for the first time.
+
+**The headline defect fixed:** the flagship zero-SQL flow (`orm_ensure` + `orm_save` with an auto id)
+worked on **1 of 3 drivers**. `_orm_sql_type` spelled an `id: int` as `INTEGER PRIMARY KEY` on every
+dialect, but that auto-increments only on SQLite -> postgres 23502, mysql 1364.
+
+Phase 0 (correctness) and Phase 1 (the `OrmSpec` predicate builder, paging with totals, bulk criteria
+writes, N+1 batching, index DDL) both landed with **zero compiler change**, because typed reads still
+flow through the compiler-pinned `orm_all`/`orm_where`.
+
+**Phase 2 (compiler pillars) is SCOPED, NOT BUILT.** Insertion points and blockers:
+- 2.1 dialect lint -> `nova_compiler.nova:17619` (`tag == "call"` in `ti_infer_expr_inner`;
+  `static_assert` at :17620 is the precedent). BLOCKER: there is **no warning channel** — only
+  `ti_errors`, and any entry aborts the build (:24345). Needs `ti_warnings` on TiState (:14990).
+  It must **not** be a hard error: `_kat_pg_copy.nova:86` legitimately uses `||` with
+  `generate_series` (PG-only). Portability is a property of program INTENT, not of the SQL alone.
+- 2.2 SQL-vs-struct -> belongs in ti's LET handling (needs the `list<T>` annotation).
+  `edit_distance` already exists at :17157. Hard error IS correct here; keep false positives at zero
+  by only flagging a bare identifier at edit-distance 1 from a real field.
+- 2.3 N+1 compile error, 2.4 tx escape analysis, 2.5 total mapping (`from_dict_list` silently DROPS
+  unmappable rows, :~4324) — not yet investigated in depth.
+
+**Process findings worth keeping:** (a) an error-only probe LIES — three dialect forms succeeded while
+returning garbage, so KATs must assert VALUES; (b) `NOVA_NO_CACHE=1` is mandatory when testing a
+`forge_*` edit or the module cache silently tests the OLD code (this produced a false green);
+(c) the KATs found 5 bugs the adversary missed and the adversary found 6 the KATs missed — neither
+alone was sufficient.
