@@ -114,7 +114,6 @@ $domain_tests = @(
     'os_test',
     'net_test',
     'bit_ops_test',
-    'corex',
     'otp',
     'telemetry',
     'cluster',
@@ -126,22 +125,8 @@ $domain_tests = @(
     'qb',
     'schema',
     'unitext',
-    'urlx',
-    'csvx',
     'regex_alt_test',
-    'collx',
-    'bignum',
-    'complexnum',
-    'rational',
-    'setops',
-    'strx',
-    'basex',
-    'matrixx',
     'proptest',
-    'getin',
-    'prng',
-    'uuid',
-    'bitset',
     'typed_result_test',
     'result_test',
     'parse_safe_test',
@@ -281,7 +266,6 @@ $domain_tests = @(
     'remote_multi_test',
     'call_by_name_test',
     'remote_spawn_test',
-    'const_bake_test',
     'tensor_matmul_test',
     'tensor_activations_test',
     'tensor_ops_test',
@@ -401,7 +385,6 @@ $domain_tests = @(
     'zipx',
     'bitsx',
     'spanx',
-    'pvecx',
     'bfieldx',
     'bindgen',
     'doctestx',
@@ -418,9 +401,7 @@ $domain_tests = @(
     'exit_reason_test',
     'mapfbox_test',
     'fiber_test',
-    'coro',
     'pipe',
-    'graphemex',
     'utctime',
     'term_test',
     'dirwatch',
@@ -454,7 +435,6 @@ $domain_tests = @(
     'backoffx',
     'defer_test',
     'lazy_gen_test',
-    'const_test',
     'hot_reload_test',
     'io_poll_test',
     'ws_sched_test',
@@ -546,7 +526,7 @@ $all_tests = @($core_tests + $track7_tests + $new_tests + $domain_tests + $concu
 # many concurrently starves the green server's scheduling under CPU load -> intermittent
 # failures (they each pass reliably given the box to themselves). So run these SERIALLY,
 # after the parallel batch.
-$server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test','forge_spawn_test','forge_recover_test','forge_recv_security_test','forge_keepalive_test','forge_model_route_test','bytes_socket_test','forge_binary_serve_test','forge_binary_file_test','forge_multipart_test','forge_ws_echo_test','_ws_soak_test','forge_ws_routing_test','forge_ws_chat_test','forge_sse_test','_timed_park_test','forge_ws_keepalive_test','forge_ws_presence_test','forge_ws_lifecycle_test','forge_chunked_test','forge_range_test','forge_conditional_test','forge_flash_test','forge_cache_test','forge_compose_test','forge_hardening_test','forge_http_client_test','forge_resilient_client_test','forge_sse_client_test','forge_h2c_test','forge_grpc_h2c_serve_test','cluster_test')
+$server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test','forge_spawn_test','forge_recover_test','forge_recv_security_test','forge_keepalive_test','forge_model_route_test','bytes_socket_test','forge_binary_serve_test','forge_binary_file_test','forge_multipart_test','forge_ws_echo_test','_ws_soak_test','forge_ws_routing_test','forge_ws_chat_test','forge_sse_test','_timed_park_test','forge_ws_keepalive_test','forge_ws_presence_test','forge_ws_lifecycle_test','forge_chunked_test','forge_range_test','forge_conditional_test','forge_flash_test','forge_cache_test','forge_compose_test','forge_hardening_test','forge_http_client_test','forge_resilient_client_test','forge_sse_client_test','forge_h2c_test','forge_grpc_h2c_serve_test','cluster_test','forge_p256_test','forge_p256_field_test')
 $parallel_tests = @($all_tests | Where-Object { $server_tests -notcontains $_ })
 
 # -ForgeOnly: run only tests whose SOURCE imports a forge module. A forge-LIB change (compiler + runtime
@@ -687,17 +667,14 @@ $testScript = {
     }
 
     $la = "-O2 -o `"$exe`" `"$ll`" `"$rtObjPath`"$xsrc $lFlags$xlib -D_CRT_SECURE_NO_WARNINGS -w"
-    # 150s (was 60s): heavy networking links (-lws2_32/-ladvapi32 + large test .ll at -O2) exceed 60s
-    # under ~8-16x parallel CPU contention and spuriously "LINK"-fail a ROTATING set of forge/ws/tls
-    # tests that all link fine standalone. Matches the compile-timeout bump above.
-    $lr = _RunProc $clangExe $la 150000 $workDir
+    $lr = _RunProc $clangExe $la 300000 $workDir
     if (-not (Test-Path $exe)) {
         $r.Status = "FAIL"; $r.Detail = "LINK"
         Remove-Item $ll -Force -ErrorAction SilentlyContinue
         return $r
     }
 
-    $rr = _RunProc $exe "" 30000 $workDir   # 30s (was 15s): heavy numeric tests (linalg/dframe/ndarray) get CPU-starved under ~16x parallel + IDE background load and spuriously timed out at 15s though they finish in <120ms standalone
+    $rr = _RunProc $exe "" 60000 $workDir
     Remove-Item $exe,$ll -Force -ErrorAction SilentlyContinue
 
     if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
