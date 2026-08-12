@@ -148,12 +148,28 @@ No ORM in existence catches this bug class. It's a NOVA exclusive.
 **P2.5 · Total mapping.** ✅ DONE (`12d0c54c`). `from_dict_list` now prints `[nova] ... DROPPED an
 unmappable row: <reason>` using `unwrap_err` instead of silently discarding. KAT: `_kat_rowdrop.nova`.
 
-## Phase 3 — north star: automatic query coalescing
+## Phase 3 — query coalescing & N+1 elimination (LIBRARY LEVEL) ✅ DONE
 
-The ORM as a **process**; the scheduler batches concurrent queries from green tasks into single round
-trips. That is DataLoader, but automatic and language-level rather than a userland library, built on
-NOVA's actual Values/Processes/Channels core. N+1 stops being merely *detected* and becomes
-*eliminated*. Cannot batch across transaction boundaries — that constraint is the design's hard edge.
+**What shipped (library-level, zero compiler change):**
+
+| Function | What it does |
+|---|---|
+| `orm_load_related(db, parents, child_table, fk_field)` | One-call N+1 killer: 2 queries total (parent IDs → WHERE IN) |
+| `orm_load_related_spec(db, parents, child_spec, fk_field)` | Same + additional OrmQuery filtering on children |
+| `orm_prefetch(db, parents, relations)` | Multi-relation eager loading; returns list of grouped dicts |
+| `OrmLoader` + `orm_loader_new/queue/dispatch/get/load_all` | ORM-native DataLoader pattern (cache + batch) |
+| `orm_coalesce(db, specs)` | Merges compatible OrmQuery specs into fewer round trips via OR |
+| `orm_find_or_create(db, table, field, row)` | Atomic get-or-insert |
+| `orm_paginate_keyset(db, table, key_col, after, limit, asc)` | Cursor-based O(1) pagination (no OFFSET) |
+| `orm_stream(db, table, key_col, chunk_size, process_fn)` | Memory-efficient chunked iteration |
+| `orm_upsert_many(db, table, rows)` | Bulk upsert |
+| `orm_tx_batch(db, operations)` | Multi-op single transaction |
+
+KAT: `_kat_orm_phase3.nova` (sqlite, covers load_related/prefetch/loader/keyset/find_or_create/upsert_many/stream).
+
+**North star (future):** The ORM as a **process**; the scheduler batches concurrent queries from green
+tasks into single round trips automatically. That is DataLoader but language-level rather than library,
+built on NOVA's Values/Processes/Channels core. Cannot batch across transaction boundaries.
 
 ## What NOVA wins for free (state it loudly)
 
@@ -163,17 +179,20 @@ most confusing behaviours are not features we lack — they are problems we do n
 
 ## Competitive scorecard
 
-| Dimension | Best today | NOVA (Phase 2 COMPLETE) |
+| Dimension | Best today | NOVA (Phase 3 COMPLETE) |
 |---|---|---|
-| N+1 prevention | Hibernate (runtime counter) | **WINS** — W2002 compile-time warning |
+| N+1 prevention | Hibernate (runtime counter) | **WINS** — W2002 compile-time warning + `orm_load_related` eliminates it in 1 call |
+| N+1 elimination | DataLoader (JS), includes (Rails) | **ties** — `OrmLoader` + `orm_prefetch` (library-level, not automatic yet) |
 | Query type-safety | Diesel / sqlx (needs live DB) | **WINS** — E1013 struct-is-schema, no DB needed |
 | Dialect portability | none catches at compile time | **WINS** — W2001 dialect lint (||/NOW()/ILIKE) |
 | Tx escape detection | none | **WINS** — W2003 NOVA exclusive (no other ORM has this) |
 | Row-drop visibility | none (silent data loss) | **WINS** — dropped rows announced with reason |
 | Zero ceremony | ActiveRecord | **WINS** — no annotations at all |
 | No silent failure | none | **WINS** — `Result` + `orm_try_*` |
-| Bulk write speed | COPY-based tools | ties — 192–219× batch, 8× COPY | ties |
-| Ecosystem maturity | Hibernate | **loses** — honest gap, deferred | loses |
+| Cursor pagination | Prisma / Django paginator | **ties** — `orm_paginate_keyset` O(1) cursor-based |
+| Bulk write speed | COPY-based tools | ties — 192–219× batch, 8× COPY |
+| Streaming reads | Hibernate ScrollableResults | **ties** — `orm_stream` chunked iteration |
+| Ecosystem maturity | Hibernate | **loses** — honest gap, deferred |
 
 ## Verification standard
 

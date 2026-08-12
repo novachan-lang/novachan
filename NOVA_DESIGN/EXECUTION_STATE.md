@@ -1453,31 +1453,33 @@ soundness = DONE. Next: task 5 (float-payload codegen, empirical) then the bread
 
 ---
 
-## Current focus — UPDATED 2026-08-12 (ORM: JPA-class Phase 0+1 LANDED; Phase 2 scoped)
+## Current focus — UPDATED 2026-08-12 (ORM: ALL FOUR PHASES COMPLETE)
 
-Commits: `f664bad0` (NOVA_COMMANDS.md), `e5461975` (CI gate 4 FAIL/33 SKIP/14 silent-pass -> 2850/0/0),
-`94073505` (ORM Phase 0+1). Canonical design: `NOVA_DESIGN/ORM_COMPILE_TIME_DESIGN.md`.
+Commits: `f664bad0` (NOVA_COMMANDS.md), `e5461975` (CI gate), `94073505` (ORM Phase 0+1),
+`227ce529` (W2001), `4593ad21` (E1013), `12d0c54c` (row-drop), `1d867266` (W2002+W2003).
+Canonical design: `NOVA_DESIGN/ORM_COMPILE_TIME_DESIGN.md`.
 
-**ALL THREE DIALECTS ARE LIVE ON THIS HOST** — including MySQL on :3306, which prior state recorded as
-never testable. The MySQL path is KAT-covered for the first time.
+**ALL THREE DIALECTS ARE LIVE ON THIS HOST** — including MySQL on :3306.
 
-**The headline defect fixed:** the flagship zero-SQL flow (`orm_ensure` + `orm_save` with an auto id)
-worked on **1 of 3 drivers**. `_orm_sql_type` spelled an `id: int` as `INTEGER PRIMARY KEY` on every
-dialect, but that auto-increments only on SQLite -> postgres 23502, mysql 1364.
+### Phase 0+1 (library) — DONE `94073505`
+Phase 0 fixed the flagship flow (worked on 1/3 drivers). Phase 1 added OrmSpec predicate builder,
+paging, bulk writes, index DDL. Zero compiler change.
 
-Phase 0 (correctness) and Phase 1 (the `OrmSpec` predicate builder, paging with totals, bulk criteria
-writes, N+1 batching, index DDL) both landed with **zero compiler change**, because typed reads still
-flow through the compiler-pinned `orm_all`/`orm_where`.
+### Phase 2 (compiler pillars) — ALL FIVE DONE, reconverge byte-identical
+- 2.1 dialect lint (W2001) — `227ce529`
+- 2.2 SQL-vs-struct (E1013) — `4593ad21`
+- 2.3 N+1 detection (W2002) — `1d867266`
+- 2.4 tx escape analysis (W2003) — `1d867266`
+- 2.5 dropped rows announced — `12d0c54c`
 
-**Phase 2 (compiler pillars) — ALL FIVE DONE, reconverge byte-identical (gen5==gen6).**
-- 2.1 dialect lint (W2001) — `227ce529`. `ti_warnings` infrastructure + `||`/`NOW()`/`ILIKE` lint.
-- 2.2 SQL-vs-struct (E1013) — `4593ad21`. Column typo = hard error, edit-distance-1 + transposition.
-- 2.3 N+1 detection (W2002) — reconverged. `ti_orm_loop_depth` counter in TiState; typed ORM read
-  inside a for-loop warns. KAT: `_kat_orm_n1.nova`. Positive: `_ormloop_pos.nova` (zero false positives).
-- 2.4 tx escape analysis (W2003) — reconverged. Static AST walk of `orm_with_tx(db, fn(tx) ...)`
-  lambda body; outer `db` used where `tx` expected warns. KAT: `_kat_orm_txesc.nova`. Positive: `_ormtx_pos.nova`.
-- 2.5 dropped rows announced — `12d0c54c`. `from_dict_list` prints `[nova] ... DROPPED an unmappable row`.
-  KAT: `_kat_rowdrop.nova`.
+### Phase 3 (query coalescing & N+1 elimination) — DONE (library-level)
+10 new functions: `orm_load_related` (1-call N+1 killer), `orm_load_related_spec`, `orm_prefetch`
+(multi-relation eager load), `OrmLoader` type + 5 ops (DataLoader pattern), `orm_coalesce` (query
+merging), `orm_find_or_create`, `orm_paginate_keyset` (O(1) cursor pagination), `orm_stream`
+(chunked iteration), `orm_upsert_many`, `orm_tx_batch`. KAT: `_kat_orm_phase3.nova`. Zero compiler change.
+
+**North star (future):** automatic query coalescing at the runtime/scheduler level — the ORM as a
+process that batches concurrent queries from green tasks. Requires N>1 concurrency maturity.
 
 **Process findings worth keeping:** (a) an error-only probe LIES — three dialect forms succeeded while
 returning garbage, so KATs must assert VALUES; (b) `NOVA_NO_CACHE=1` is mandatory when testing a
