@@ -14998,6 +14998,7 @@ type TiState
     ti_bindings: dict
     ti_constraints: list
     ti_errors: list
+    ti_warnings: list          // non-fatal diagnostics (e.g. W2001 SQL portability lint) -- NEVER aborts the build
     ti_scope: list
     ti_structs: dict
     ti_fn_types: dict
@@ -15217,7 +15218,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     // self-compiles the compiler with 0 errors. Opt OUT with NOVA_TI_STRICT=0 (the old fail-open path).
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = not (len(_ti_strict_env) > 0 and _ti_strict_env[0] == "0")
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {}, {})
+    TiState(1, {}, [], [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -15403,6 +15404,36 @@ fn ti_error_full(st: TiState, code: string, msg: string, line: int, help: string
     if help != ""
         out = out + "  = help: " + help + "\n"
     push(st.ti_errors, out)
+
+// Same shape as ti_error_full, but non-fatal: pushed to ti_warnings, printed alongside the build
+// output, and NEVER counted toward "compilation failed" or the process exit code.
+fn ti_warn_full(st: TiState, code: string, msg: string, line: int, help: string)
+    let out = ""
+    let in_fn = ""
+    if st.ti_in_fn != ""
+        in_fn = " (in function '" + st.ti_in_fn + "')"
+    let header_code = code
+    if header_code == ""
+        header_code = "W1000"
+    out = out + "warning[" + header_code + "]: " + msg + in_fn + "\n"
+    let file_loc = st.ti_filename
+    if file_loc == ""
+        file_loc = "<source>"
+    out = out + "  --> " + file_loc + ":" + str(line) + "\n"
+    if line > 0 and len(st.ti_source_lines) >= line
+        let src = st.ti_source_lines[line - 1]
+        let lnum = str(line)
+        let pad = ""
+        let pi = 0
+        while pi < len(lnum)
+            pad = pad + " "
+            pi = pi + 1
+        out = out + " " + pad + " |\n"
+        out = out + " " + lnum + " | " + src + "\n"
+        out = out + " " + pad + " |\n"
+    if help != ""
+        out = out + "  = help: " + help + "\n"
+    push(st.ti_warnings, out)
 
 fn ti_error(st: TiState, msg: string, line: int)
     let code = "E1000"
@@ -18220,6 +18251,25 @@ fn _orm_verify_typed_read(st: TiState, ann: string, e: Expr, line: int)
                             // expression is not knowable here and is left alone.
                             if set_ == "str"
                                 _orm_check_cols(st, sname, sev, line)
+                                // NOTE: this only fires when `ann` names a known struct (the early
+                                // return above) -- inherited from the typed-read path this rides on.
+                                // A construct- or dialect-only lint would ideally run for every ORM
+                                // call regardless of annotation, but that needs its own call site
+                                // wired independently of the column-verification struct lookup;
+                                // out of scope here per the task spec.
+                                _orm_dialect_lint(st, sev, line)
+
+// Non-portable SQL constructs measured on live servers -- warn (never error), so a legitimate
+// dialect-specific query (see _kat_pg_copy.nova's PostgreSQL-only `||` + generate_series) still
+// compiles. One warning per construct found; all under code W2001.
+fn _orm_dialect_lint(st: TiState, sql: string, line: int)
+    if find(sql, "||") >= 0
+        ti_warn_full(st, "W2001", "`||` is string concatenation on sqlite/postgres but LOGICAL OR on mysql (returns 0)", line, "use CONCAT(a, b) -- portable across all three dialects")
+    let up = upper(sql)
+    if find(up, "NOW()") >= 0
+        ti_warn_full(st, "W2001", "`NOW()` does not exist on sqlite (the query returns 0 rows)", line, "use CURRENT_TIMESTAMP -- portable across all three dialects")
+    if find(up, "ILIKE") >= 0
+        ti_warn_full(st, "W2001", "`ILIKE` does not exist on mysql (the query errors)", line, "use LOWER(col) LIKE ? with a lower-cased parameter -- portable across all three")
 
 // ── Statement inference ──────────────────────────────────────────────────────
 
@@ -24479,6 +24529,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
 
     // AST-level type inference (Hindley-Milner)
     let ti_state = ti_infer_program_named(stmts, source_lines, filename)
+    // Non-fatal diagnostics (e.g. W2001 SQL portability lint) print regardless of error outcome,
+    // and never affect the exit code -- a warning must never break a build.
+    if len(ti_state.ti_warnings) > 0
+        for warn in ti_state.ti_warnings
+            print(warn)
     if len(ti_state.ti_errors) > 0
         for err in ti_state.ti_errors
             print(err)
@@ -27587,6 +27642,10 @@ fn nova_check_file(path: string) -> int
         return len(parse_errors)
     let source_lines = split(source, "\n")
     let ti_state = ti_infer_program_named(stmts, source_lines, path)
+    // Non-fatal diagnostics print regardless of error outcome and never affect the return code.
+    if len(ti_state.ti_warnings) > 0
+        for wterr in ti_state.ti_warnings
+            print(wterr)
     if len(ti_state.ti_errors) > 0
         for terr in ti_state.ti_errors
             print(terr)
