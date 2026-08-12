@@ -15022,6 +15022,7 @@ type TiState
     ti_bound_checks: list
     ti_extern_fns: dict
     ti_unsafe_depth: int
+    ti_orm_loop_depth: int      // Phase 2.3 (W2002): >0 while inferring inside a for-loop body -- flags a typed ORM read as a potential N+1
     ti_opaque_types: dict
     ti_trait_defaults: dict
     ti_aliases: dict
@@ -15218,7 +15219,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     // self-compiles the compiler with 0 errors. Opt OUT with NOVA_TI_STRICT=0 (the old fail-open path).
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = not (len(_ti_strict_env) > 0 and _ti_strict_env[0] == "0")
-    TiState(1, {}, [], [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {}, {})
+    TiState(1, {}, [], [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -17708,6 +17709,8 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                         ti_error(st, "calling extern function '" + value + "' requires an enclosing 'unsafe' expression (C code is outside NOVA's safety envelope; wrap the call: 'unsafe " + value + "(...)')", eline)
                     else if _is_unsafe_builtin(value)
                         ti_error(st, "calling raw-memory primitive '" + value + "' requires an enclosing 'unsafe' block/expression (it can read or write arbitrary memory -- outside NOVA's safety envelope; wrap it as 'unsafe " + value + "(...)' or put it inside an `unsafe` block)", eline)
+                if value == "orm_with_tx"
+                    _orm_check_tx_escape(st, children, eline)
                 let fn_t = ti_lookup(st, value, eline)
                 // NAMED ARGS: reorder to the DECLARED parameter order before inferring, so
                 // `f(b: 2, a: 1)` checks against the right parameters. Mirrors what the IR
@@ -18244,6 +18247,12 @@ fn _orm_verify_typed_read(st: TiState, ann: string, e: Expr, line: int)
         Expr(oet, oev, oen, oec, oef, oel) =>
             if oet == "call"
                 let ai = _orm_sql_arg_of(oev)
+                // Phase 2.3 (W2002): fires only once we know `e` is a genuine typed ORM read call
+                // (ai >= 0 recognizes orm_all/orm_rows/orm_row/orm_one) -- gating on that, not just
+                // on the LHS annotation naming a known struct, avoids warning on unrelated code like
+                // `let cached: list<Item> = cache.get(i)` inside a loop.
+                if st.ti_orm_loop_depth > 0 and ai >= 0
+                    ti_warn_full(st, "W2002", "ORM query inside a loop -- potential N+1 problem (each iteration runs a separate database round trip)", line, "use orm_in/batch query outside the loop, or orm_spec().in_(...) to fetch all rows in one query")
                 if ai >= 0 and len(oec) > ai
                     match oec[ai]
                         Expr(set_, sev, sen, sec, sef, sel2) =>
@@ -18258,6 +18267,44 @@ fn _orm_verify_typed_read(st: TiState, ann: string, e: Expr, line: int)
                                 // wired independently of the column-verification struct lookup;
                                 // out of scope here per the task spec.
                                 _orm_dialect_lint(st, sev, line)
+
+// Phase 2.4 (W2003): static AST walk of an `orm_with_tx(db, fn(tx) ...)` lambda body, looking for
+// ORM calls whose first argument is the OUTER `db` identifier instead of the transaction parameter.
+// Using the outer connection inside the callback bypasses the transaction entirely -- the write
+// lands on a different pooled connection and is never part of the commit/rollback. This is a
+// conservative NAME match (not a value/alias analysis): it only fires when the literal identifier
+// passed as the first argument to the ORM call is spelled the same as the outer `db` argument.
+fn _orm_check_tx_escape(st: TiState, call_children: list, line: int)
+    if len(call_children) < 2
+        return
+    let db_name = ""
+    match call_children[0]
+        Expr(dt, dv, dn, dc, df, dl) =>
+            if dt == "ident"
+                db_name = dv
+    if db_name == ""
+        return
+    match call_children[1]
+        Expr(lt, lv, ln2, lc, lf, ll) =>
+            if lt == "lambda" and len(lc) > 0
+                _orm_scan_body_for_escape(st, lc[0], db_name, line)
+
+fn _orm_scan_body_for_escape(st: TiState, body: Expr, db_name: string, line: int)
+    match body
+        Expr(bt, bv, bn, bc, bf, bl) =>
+            if bt == "call"
+                let is_orm = starts_with(bv, "orm_") or bv == "db_all" or bv == "db_exec" or bv == "db_exec_raw" or bv == "db_query" or bv == "db_row"
+                if is_orm and len(bc) > 0
+                    match bc[0]
+                        Expr(at, av, an, ac, af, al) =>
+                            if at == "ident" and av == db_name
+                                ti_warn_full(st, "W2003", "using outer connection '" + db_name + "' inside orm_with_tx -- this BYPASSES the transaction (writes go to a different connection)", bl, "use the transaction parameter instead of '" + db_name + "'")
+            // NOTE: only `children` is walked, never `fields` -- `fields` holds Stmt (not Expr)
+            // objects for a block-bodied `catch`, and Expr idents (lambda params) elsewhere; neither
+            // is a useful or type-safe thing to recurse into here. Mirrors collect_free_vars_inner's
+            // established, proven-safe walk (children only, `fields` handled per-tag if at all).
+            for child in bc
+                _orm_scan_body_for_escape(st, child, db_name, line)
 
 // Non-portable SQL constructs measured on live servers -- warn (never error), so a legitimate
 // dialect-specific query (see _kat_pg_copy.nova's PostgreSQL-only `||` + generate_series) still
@@ -18725,9 +18772,11 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                             ti_error(st, "cannot iterate over type " + ti_type_str(wi) + "; for-loop expects list, dict, string, range, or channel", sline)
                 ti_push_scope(st)
                 ti_define(st, name, ti_mono(elem_var))
+                st.ti_orm_loop_depth = st.ti_orm_loop_depth + 1
                 for s in body
                     ti_infer_stmt(st, s)
                 ti_pop_scope(st)
+                st.ti_orm_loop_depth = st.ti_orm_loop_depth - 1
                 if len(else_body) > 0
                     ti_push_scope(st)
                     for s in else_body

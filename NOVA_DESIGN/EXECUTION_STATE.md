@@ -1469,17 +1469,15 @@ Phase 0 (correctness) and Phase 1 (the `OrmSpec` predicate builder, paging with 
 writes, N+1 batching, index DDL) both landed with **zero compiler change**, because typed reads still
 flow through the compiler-pinned `orm_all`/`orm_where`.
 
-**Phase 2 (compiler pillars) is SCOPED, NOT BUILT.** Insertion points and blockers:
-- 2.1 dialect lint -> `nova_compiler.nova:17619` (`tag == "call"` in `ti_infer_expr_inner`;
-  `static_assert` at :17620 is the precedent). BLOCKER: there is **no warning channel** — only
-  `ti_errors`, and any entry aborts the build (:24345). Needs `ti_warnings` on TiState (:14990).
-  It must **not** be a hard error: `_kat_pg_copy.nova:86` legitimately uses `||` with
-  `generate_series` (PG-only). Portability is a property of program INTENT, not of the SQL alone.
-- 2.2 SQL-vs-struct -> belongs in ti's LET handling (needs the `list<T>` annotation).
-  `edit_distance` already exists at :17157. Hard error IS correct here; keep false positives at zero
-  by only flagging a bare identifier at edit-distance 1 from a real field.
-- 2.3 N+1 compile error, 2.4 tx escape analysis, 2.5 total mapping (`from_dict_list` silently DROPS
-  unmappable rows, :~4324) — not yet investigated in depth.
+**Phase 2 (compiler pillars) — ALL FIVE DONE, reconverge byte-identical (gen5==gen6).**
+- 2.1 dialect lint (W2001) — `227ce529`. `ti_warnings` infrastructure + `||`/`NOW()`/`ILIKE` lint.
+- 2.2 SQL-vs-struct (E1013) — `4593ad21`. Column typo = hard error, edit-distance-1 + transposition.
+- 2.3 N+1 detection (W2002) — reconverged. `ti_orm_loop_depth` counter in TiState; typed ORM read
+  inside a for-loop warns. KAT: `_kat_orm_n1.nova`. Positive: `_ormloop_pos.nova` (zero false positives).
+- 2.4 tx escape analysis (W2003) — reconverged. Static AST walk of `orm_with_tx(db, fn(tx) ...)`
+  lambda body; outer `db` used where `tx` expected warns. KAT: `_kat_orm_txesc.nova`. Positive: `_ormtx_pos.nova`.
+- 2.5 dropped rows announced — `12d0c54c`. `from_dict_list` prints `[nova] ... DROPPED an unmappable row`.
+  KAT: `_kat_rowdrop.nova`.
 
 **Process findings worth keeping:** (a) an error-only probe LIES — three dialect forms succeeded while
 returning garbage, so KATs must assert VALUES; (b) `NOVA_NO_CACHE=1` is mandatory when testing a

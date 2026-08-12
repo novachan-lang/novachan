@@ -128,22 +128,25 @@ error: column `nmae` does not exist on struct `Widget`
 annotations**. Scope to an explicit SELECT list with an edit-distance-1 near miss to keep false
 positives at zero (a deliberate projection must stay legal).
 
-**P2.3 · N+1 is a compile error.** A query inside a loop over another query's rows is statically
-detectable:
+**P2.3 · N+1 detection (W2002).** ✅ DONE — reconverge byte-identical. A typed ORM read inside a
+for-loop emits W2002 (warning, not error — so deliberate patterns stay legal). Implementation:
+`ti_orm_loop_depth` counter on TiState, incremented/decremented around the for-loop body walk.
 ```
-error: N+1 query — `orm_where` runs inside a loop over rows from line 12
-   = help: batch it — orm_pluck + in_() + orm_group_by_field (2 queries, not 1001)
+warning[W2002]: ORM query inside a loop -- potential N+1 problem (each iteration runs a separate database round trip)
+  = help: use orm_in/batch query outside the loop, or orm_spec().in_(...) to fetch all rows in one query
 ```
-Hibernate ships a *runtime* counter for this. NOVA would make it **unshippable**.
+Hibernate ships a *runtime* counter for this. NOVA catches it at **compile time**.
 
-**P2.4 · Transaction escape analysis.** The vicious bug no ORM catches: inside
-`orm_with_tx(db, fn(tx) …)` you use the **outer** `db`, so a "transactional" write lands outside the
-transaction and survives rollback. NOVA already has escape analysis for ownership — point it at
-connection handles: inside a tx body `tx` is the only legal handle, and letting it escape via `spawn`
-is an error.
+**P2.4 · Transaction escape analysis (W2003).** ✅ DONE — reconverge byte-identical. Static AST walk
+of `orm_with_tx(db, fn(tx) ...)` lambda body; any ORM call using the outer `db` instead of `tx` warns.
+```
+warning[W2003]: using outer connection 'db' inside orm_with_tx -- this BYPASSES the transaction
+  = help: use the transaction parameter instead of 'db'
+```
+No ORM in existence catches this bug class. It's a NOVA exclusive.
 
-**P2.5 · Total mapping.** `from_dict_list` currently **drops rows it cannot map, silently**
-(`nova_compiler.nova:~4324`) — data loss presenting as an empty result. Mapping becomes total.
+**P2.5 · Total mapping.** ✅ DONE (`12d0c54c`). `from_dict_list` now prints `[nova] ... DROPPED an
+unmappable row: <reason>` using `unwrap_err` instead of silently discarding. KAT: `_kat_rowdrop.nova`.
 
 ## Phase 3 — north star: automatic query coalescing
 
@@ -160,13 +163,15 @@ most confusing behaviours are not features we lack — they are problems we do n
 
 ## Competitive scorecard
 
-| Dimension | Best today | NOVA now (Phase 0+1) | After Phase 2 |
-|---|---|---|---|
-| N+1 prevention | Hibernate (runtime counter) | tools to fix it manually | **wins** — compile error |
-| Query type-safety | Diesel / sqlx (needs live DB) | typed reads, unchecked SQL | **wins** — struct is schema, no DB |
-| Dialect portability | none | **wins** — measured + branched | **wins** — compile lint |
-| Zero ceremony | ActiveRecord | **wins** — no annotations at all | wins |
-| No silent failure | none | **wins** — `Result` + `orm_try_*` | wins |
+| Dimension | Best today | NOVA (Phase 2 COMPLETE) |
+|---|---|---|
+| N+1 prevention | Hibernate (runtime counter) | **WINS** — W2002 compile-time warning |
+| Query type-safety | Diesel / sqlx (needs live DB) | **WINS** — E1013 struct-is-schema, no DB needed |
+| Dialect portability | none catches at compile time | **WINS** — W2001 dialect lint (||/NOW()/ILIKE) |
+| Tx escape detection | none | **WINS** — W2003 NOVA exclusive (no other ORM has this) |
+| Row-drop visibility | none (silent data loss) | **WINS** — dropped rows announced with reason |
+| Zero ceremony | ActiveRecord | **WINS** — no annotations at all |
+| No silent failure | none | **WINS** — `Result` + `orm_try_*` |
 | Bulk write speed | COPY-based tools | ties — 192–219× batch, 8× COPY | ties |
 | Ecosystem maturity | Hibernate | **loses** — honest gap, deferred | loses |
 
