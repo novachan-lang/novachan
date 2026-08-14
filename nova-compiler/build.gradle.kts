@@ -4,7 +4,9 @@ plugins {
 }
 
 group = "nova"
-version = "0.1.0"
+// Single source of truth: nova-compiler/VERSION (also read at runtime by nova_find_version()
+// in nova_compiler.nova). Bump the VERSION file, not this line.
+version = file("VERSION").readText().trim()
 
 repositories {
     mavenCentral()

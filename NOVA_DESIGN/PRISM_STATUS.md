@@ -8,6 +8,59 @@ document is indexed here with its real completeness.
 
 ---
 
+## ✅ 2026-08-14 — PRISM ALREADY EXISTS. This work is its **v1.0**, not a new framework.
+
+Verified against `FRAMEWORK_ECOSYSTEM_STRATEGY.md`. **Prism is Framework #5 of the designated 9**
+(Forge, Cortex, Pulse, Mesh, Sentinel, Ops, Reactor, **Prism**, Edge) and **v0.1 already shipped**
+(`bccc2fd`). The name was not available to invent — it was already assigned, **to exactly this job.**
+
+**Existing implementation:** `nova-compiler/test_programs/prism.nova` — **140 lines** of ANSI
+terminal helpers (`clear`/`move`/`color_fg`/`box`/`table`/`progress_bar`/`spinner`/`bold`/`link`).
+Its own header states the intent plainly:
+
+> *"v0.1 ships text-mode (ANSI escape) helpers because the target machine has no wgpu/Vulkan SDK
+> installed; **v0.2+ will add GPU-accelerated GUI rendering via FFI to wgpu.** The API SHAPE is the
+> same: build a frame string, write it to the screen."*
+
+**The strategy doc's Prism mandate already matches this design almost exactly:**
+
+| Strategy doc (pre-existing) | This design |
+|---|---|
+| *"Each window is a process. Each heavy computation is a process. The UI process sends render commands over a channel to the platform renderer."* | Bet 4 — **component = supervised process**; patches over a channel |
+| *"GPU-accelerated via wgpu from V1. Not a web view. Not a CPU-rasterized toolkit."* | The **native GPU backend** (`backend/gpu/`) |
+| *"GPU-rendered custom widgets with pixel-identical rendering across Windows/macOS/Linux"* | §9.14 deterministic rendering |
+| *"Full accessibility support (screen reader, keyboard nav, high contrast) built in from day one — not an afterthought"* | Bet 2 — **derived** a11y, spec §13 |
+| *"Replaces Electron, Tauri, Qt, GTK, SwiftUI, WPF/WinUI, JavaFX, Dear ImGui"* | the competitive frame |
+| *"Ship on ALL Tier 1 platforms from day one: Linux, macOS, Windows, WASM, iOS, Android"* | backend-swappable, §2 |
+
+**⇒ Nothing about the name or the direction needs to change.** This work adds four things the
+existing mandate did not specify: the **`face` vocabulary**, **zero-annotation reactivity**, the
+**web/DOM backend**, and **full-stack typed channels**.
+
+### ⚠️ ONE divergence that must be stated explicitly
+
+The strategy doc says **"Not a web view. Not web-in-a-box."** The F1-F6 evidence says the **web
+backend should emit real DOM elements.** These are **not** in conflict, and the distinction matters:
+
+- **What the doc rejects (correctly):** shipping a browser engine inside a desktop app — Electron/
+  Tauri, a webview wrapping HTML, "web-in-a-box." Prism still rejects that absolutely. The desktop
+  target is GPU/wgpu with no webview anywhere.
+- **What Prism now does on the *web* target:** a compiled NOVA/WASM program emitting real DOM
+  elements from a closed, typed vocabulary. There is no webview, no HTML authoring, no JS framework,
+  no npm — the developer writes `face`, never markup. Using the browser's *own* native widgets when
+  running *inside a browser* is not web-in-a-box; it is using the platform's native toolkit, exactly
+  as the desktop backend uses the platform's GPU.
+
+**Recorded as a deliberate refinement of the strategy doc, backed by F1-F6** (the interop premise is
+false, the batched protocol already lost, and browser text shaping is inaccessible — see below).
+
+### Migration note
+The existing 140-line `prism.nova` lives in `nova-compiler/test_programs/`, which is the wrong home.
+It moves to `prism/` per the structure below. Its ANSI helpers stay useful as a **terminal backend**
+(`backend/ansi/`) — a genuinely valuable fourth target for CLI/TUI tools, and already written.
+
+---
+
 ## ⛔ 2026-08-14 — THREE CORE PREMISES FALSIFIED BY EVIDENCE. ARCHITECTURE REVISED.
 
 Step-2 research (primary sources, all cited below) **destroyed the technical justification for a

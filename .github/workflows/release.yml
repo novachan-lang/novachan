@@ -1,0 +1,218 @@
+name: NOVA Release
+
+# Builds and publishes the bundled installer artifacts described in
+# NOVA_DESIGN/decisions/windows_toolchain_abi.md and site/download.html: one
+# self-contained archive per platform (compiler + runtime + stdlib + a trimmed
+# clang/lld toolchain), plus the thin install.sh/install.ps1 scripts, published to
+# a GitHub Release.
+#
+# This is intentionally a SEPARATE workflow from cross-platform.yml, which stays
+# exactly as today's push/PR regression gate -- this one only runs on a version tag.
+#
+# Version pins verified via a live fetch of both projects' GitHub Releases APIs on
+# 2026-08-08 -- re-check before assuming these are still current on a future run
+# (https://github.com/llvm/llvm-project/releases, https://github.com/mstorsjo/llvm-mingw/releases).
+# NOTE: official LLVM release asset naming changed at some point from the older
+# "clang+llvm-<ver>-<triple>.tar.xz" scheme to "LLVM-<ver>-<OS>-<arch>.tar.xz" -- the
+# download steps below use the CURRENT naming; if this workflow starts 404ing on the
+# LLVM (not llvm-mingw) download steps, check the release page for a renamed asset.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  LLVM_VERSION: '22.1.8'
+  LLVM_MINGW_VERSION: '20260616'
+
+jobs:
+  # ─── Linux: build nova from the proven bootstrap script, package the Linux
+  #     release, and emit FRESH cross-target IR for macOS + Windows so those jobs
+  #     never depend on a hand-committed .ll file (the root fix for the old
+  #     macos-selfhosted job silently reading a nova_compiler.ll that never existed).
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang (host bootstrap toolchain -- not what ships)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld
+          clang --version
+
+      - name: Build + reconverge via the proven bootstrap script
+        run: |
+          cd nova-compiler
+          chmod +x bootstrap_linux.sh
+          ./bootstrap_linux.sh --check
+          ./nova --version
+
+      - name: Emit fresh cross-target IR for macOS and Windows
+        run: |
+          cd nova-compiler
+          ./nova compile --target macos-arm64 -o compiler/nova_compiler_macos_arm64.ll compiler/nova_compiler.nova
+          ./nova compile --target windows -o compiler/nova_compiler_windows_x64.ll compiler/nova_compiler.nova
+          grep -q 'target triple = "aarch64-apple-darwin"' compiler/nova_compiler_macos_arm64.ll \
+            || { echo "FAIL: macOS cross-IR did not target aarch64-apple-darwin"; exit 1; }
+          grep -q 'target triple = "x86_64-pc-windows-gnu"' compiler/nova_compiler_windows_x64.ll \
+            || { echo "FAIL: Windows cross-IR did not target x86_64-pc-windows-gnu (mingw ABI)"; exit 1; }
+          echo "OK: cross-target IR verified for both platforms"
+
+      - name: Download official LLVM (Linux x64)
+        run: |
+          curl -fsSL -o llvm-linux.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+
+      - name: Package Linux release
+        run: |
+          chmod +x nova-compiler/scripts/package_release.sh
+          mkdir -p dist
+          nova-compiler/scripts/package_release.sh linux x64 \
+            nova-compiler/nova llvm-linux.tar.xz dist/nova-linux-x64.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-linux-x64
+          path: dist/nova-linux-x64.tar.xz
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-target-ir
+          path: |
+            nova-compiler/compiler/nova_compiler_macos_arm64.ll
+            nova-compiler/compiler/nova_compiler_windows_x64.ll
+          retention-days: 1
+
+  # ─── macOS: consume the Linux job's freshly-generated IR (never a committed
+  #     file), build natively, smoke-test, and package with a trimmed official LLVM
+  #     macOS-ARM64 archive. Apple Silicon only for v1 (see the ABI decision doc for
+  #     why x86_64 macOS is scoped out until it can be verified on real hardware).
+  build-macos:
+    runs-on: macos-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-target-ir
+          path: nova-compiler/compiler
+
+      - name: Build nova from the cross-compiled IR
+        run: |
+          cd nova-compiler/compiler
+          clang -O2 -o ../nova nova_compiler_macos_arm64.ll nova_runtime.c -lpthread -ldl -lm -D_DARWIN_C_SOURCE -Wno-everything
+          cd ..
+          ./nova --version
+
+      - name: Smoke test
+        run: |
+          cd nova-compiler
+          export NOVA_HOME="$(pwd)"
+          printf 'fn main()\n    print("macos smoke test ok")\n' > /tmp/smoke.nova
+          ./nova run /tmp/smoke.nova | grep -q "macos smoke test ok" \
+            || { echo "FAIL: macOS smoke test did not produce expected output"; exit 1; }
+
+      - name: Download official LLVM (macOS ARM64)
+        run: |
+          curl -fsSL -o llvm-macos.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-macOS-ARM64.tar.xz"
+
+      - name: Package macOS release
+        run: |
+          chmod +x nova-compiler/scripts/package_release.sh
+          mkdir -p dist
+          nova-compiler/scripts/package_release.sh macos arm64 \
+            nova-compiler/nova llvm-macos.tar.xz dist/nova-macos-arm64.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-macos-arm64
+          path: dist/nova-macos-arm64.tar.xz
+          retention-days: 7
+
+  # ─── Windows: consume the Linux job's Windows-gnu IR, build via the runner's own
+  #     preinstalled clang (an internal bootstrap step -- NOT what ships to users),
+  #     then package with a trimmed llvm-mingw archive (the actual toolchain that
+  #     ships, per the ABI decision -- self-contained, no Visual Studio/Windows SDK
+  #     needed).
+  build-windows:
+    runs-on: windows-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-target-ir
+          path: nova-compiler/compiler
+
+      - name: Build nova from the cross-compiled IR
+        shell: pwsh
+        run: |
+          cd nova-compiler/compiler
+          clang -O2 -o ../nova.exe nova_compiler_windows_x64.ll nova_runtime.c -lws2_32 -ladvapi32 -lbcrypt -w
+          cd ..
+          ./nova.exe --version
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          cd nova-compiler
+          $env:NOVA_HOME = (Get-Location).Path
+          Set-Content -Path smoke.nova -Value "fn main()`n    print(`"windows smoke test ok`")"
+          $out = ./nova.exe run smoke.nova
+          if ($out -notmatch "windows smoke test ok") { Write-Error "FAIL: Windows smoke test did not produce expected output"; exit 1 }
+
+      - name: Download llvm-mingw
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/${env:LLVM_MINGW_VERSION}/llvm-mingw-${env:LLVM_MINGW_VERSION}-ucrt-x86_64.zip" -OutFile llvm-mingw.zip -UseBasicParsing
+
+      - name: Package Windows release
+        shell: bash
+        run: |
+          mkdir -p dist
+          bash nova-compiler/scripts/package_release.sh windows x64 \
+            nova-compiler/nova.exe llvm-mingw.zip dist/nova-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-windows-x64
+          path: dist/nova-windows-x64.zip
+          retention-days: 7
+
+  # ─── Assemble checksums, publish the release with all platform archives + the
+  #     thin installer scripts attached.
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, build-windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nova-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nova-linux-x64.tar.xz
+            dist/nova-macos-arm64.tar.xz
+            dist/nova-windows-x64.zip
+            dist/checksums.txt
+            site/install.sh
+            site/install.ps1
+          generate_release_notes: true

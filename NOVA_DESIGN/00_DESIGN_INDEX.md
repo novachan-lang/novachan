@@ -65,6 +65,28 @@ These were originally "unsolved" problems. The unified model resolves them in pr
 - The developer experience bar is: simpler than Python, safer than Rust
 - NOVA beats every listed language through unified design, not feature accumulation
 
+## Toolchain & Distribution Decisions
+
+- [Windows Toolchain ABI](decisions/windows_toolchain_abi.md) — NOVA's default native Windows target moves from MSVC ABI to GNU/mingw ABI (llvm-mingw), enabling a truly self-contained, zero-dependency single-file Windows installer. `--target windows-msvc` remains available as an explicit opt-out. Part of the broader bundled-installer effort (compiler + trimmed LLVM/clang toolchain shipped together per platform).
+
+## Prism — Framework #5 (Presentation Layer) · v1.0 design
+
+Prism v0.1 shipped as ANSI terminal helpers (`bccc2fd`). These docs are its **v1.0 design** — the
+GPU/wgpu native GUI the strategy doc always intended, plus a web backend, a declarative vocabulary,
+and compiler-inferred reactivity. **Start at the status tracker; it is the entry point.**
+
+- [**PRISM_STATUS.md**](PRISM_STATUS.md) — ★ **START HERE.** Live status, task list, doc index with
+  real completeness, and the VERIFIED / UNVERIFIED / GUESS separation.
+- [PRISM_SPEC.md](PRISM_SPEC.md) — **NORMATIVE.** 7 axioms, 44 keywords, EBNF grammar, widget
+  vocabulary, typed styling, the reactivity inference algorithm + soundness obligation, full threat model.
+- [PRISM_UNIVERSAL_UI_PLAN.md](PRISM_UNIVERSAL_UI_PLAN.md) — architecture: 8 layers, the structural
+  bets, blockers, falsification criteria.
+- [PRISM_ROADMAP.md](PRISM_ROADMAP.md) — 35 milestones with verifiable exit criteria and 8 kill gates.
+- [PRISM_FEATURE_MATRIX.md](PRISM_FEATURE_MATRIX.md) — ~132 features in 3 tiers vs best-in-class,
+  16 capabilities only Prism can have, scorecard vs 12 frameworks.
+
+**Status: design only, nothing implemented. Awaiting GO/NO-GO on Phase 0-1.**
+
 ## Framework Ecosystem Strategy
 
 - [FRAMEWORK_ECOSYSTEM_STRATEGY.md](FRAMEWORK_ECOSYSTEM_STRATEGY.md) — Complete strategic architecture for 9 frameworks (Forge, Reactor, Cortex, Mesh, Prism, Pulse, Sentinel, Edge, Ops), Nova Vault package registry, cloud platform monetization, competitive positioning, 10-year horizon, and adoption strategy.
