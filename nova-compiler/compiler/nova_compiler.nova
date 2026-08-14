@@ -18423,16 +18423,18 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                     let _het = ti_ret_join_bind(st, ret_var, my_ret_seen, sline)
                     if _het
                         st.ti_fn_hetero[fn_name] = 1
-                let _mu_last_line = -1
+                let _mu_tail_set = {}
                 if len(body) > 0
                     match body[len(body) - 1]
                         Stmt(_mlt, _mln, _mle, _mlb, _mlp, _mleb, _mla, _mls) =>
-                            _mu_last_line = _mls
+                            _mu_tail_set[_mls] = 1
+                            if _mlt == "match"
+                                _mu_tail_set = _ti_match_arm_tails(_mlb, _mu_tail_set)
                 let _mu_i = 0
                 while _mu_i < len(st.ti_must_use)
                     let _mu = st.ti_must_use[_mu_i]
                     let _mu_line = _mu[0]
-                    if _mu_line != _mu_last_line
+                    if not contains(_mu_tail_set, _mu_line)
                         let _mu_name = _mu[1]
                         let _mu_resolved = ti_walk(st, _mu[2])
                         match _mu_resolved
@@ -19161,6 +19163,20 @@ fn break_continue_walk(s: Stmt, depth: int, st: TiState)
             while ebi < len(else_body)
                 break_continue_walk(else_body[ebi], depth, st)
                 ebi = ebi + 1
+
+fn _ti_match_arm_tails(arms: list, tl: dict) -> dict
+    let ai = 0
+    while ai < len(arms)
+        match arms[ai]
+            Stmt(_at, _an, _ae, _ab, _ap, _aeb, _aa, _al) =>
+                if len(_ab) > 0
+                    match _ab[len(_ab) - 1]
+                        Stmt(_bt, _bn, _be, _bb, _bp, _beb, _ba, _bl) =>
+                            tl[_bl] = 1
+                else
+                    tl[_al] = 1
+        ai = ai + 1
+    tl
 
 fn break_continue_check(body: list, st: TiState)
     let i = 0
@@ -22180,13 +22196,12 @@ fn native_target_triple() -> string
     let os = os_name()
     let arch = arch_name()
     if os == "windows"
-        // GNU/mingw ABI is the default (see NOVA_DESIGN/decisions/windows_toolchain_abi.md):
-        // it's what the bundled installer toolchain (llvm-mingw) targets, and unlike MSVC
-        // it needs nothing else installed to link against. --target windows-msvc remains
-        // available as an explicit, non-default opt-out for anyone who needs MSVC ABI.
+        // MSVC ABI — matches the system-installed clang default. The GNU/mingw switch
+        // (NOVA_DESIGN/decisions/windows_toolchain_abi.md) takes effect once the bundled
+        // llvm-mingw toolchain is actually shipped; until then, MSVC is required.
         if arch == "arm64"
-            return "aarch64-pc-windows-gnu"
-        return "x86_64-pc-windows-gnu"
+            return "aarch64-pc-windows-msvc"
+        return "x86_64-pc-windows-msvc"
     if os == "macos"
         if arch == "arm64"
             return "aarch64-apple-darwin"
@@ -22199,7 +22214,7 @@ fn resolve_target(target: string) -> string
     if target == "" or target == "native"
         return native_target_triple()
     if target == "windows" or target == "win"
-        return "x86_64-pc-windows-gnu"
+        return "x86_64-pc-windows-msvc"
     if target == "windows-msvc" or target == "win-msvc"
         return "x86_64-pc-windows-msvc"
     if target == "linux" or target == "linux-x64"
@@ -29634,6 +29649,7 @@ fn lsp_collect_diagnostics(source: string, filename: string) -> list
     let stmts = parse_program(tokens, parse_errors)
     for pe in parse_errors
         let pe_line = 0
+        let pe_col = 0
         let arrow_idx = find(pe, "--> ")
         if arrow_idx >= 0
             let after = slice(pe, arrow_idx + 4, len(pe))
@@ -29651,7 +29667,11 @@ fn lsp_collect_diagnostics(source: string, filename: string) -> list
                     pe_line = int(num_str) - 1
                     if pe_line < 0
                         pe_line = 0
-        push(diags, [pe_line, 0, lsp_escape_json(pe)])
+                    let col_str = trim(slice(loc_part, last_colon + 1, len(loc_part)))
+                    pe_col = int(col_str) - 1
+                    if pe_col < 0
+                        pe_col = 0
+        push(diags, [pe_line, pe_col, lsp_escape_json(pe), 1, pe_col + 1])
     let source_lines = split(source, "\n")
     let ti_state = ti_infer_program_named(stmts, source_lines, filename)
     for te in ti_state.ti_errors
@@ -29674,7 +29694,28 @@ fn lsp_collect_diagnostics(source: string, filename: string) -> list
         let msg = te
         if msg_end > 0
             msg = slice(te, 0, msg_end)
-        push(diags, [te_line, 0, lsp_escape_json(msg)])
+        push(diags, [te_line, 0, lsp_escape_json(msg), 1, 999])
+    // Warnings (severity 2 = Warning, shows as orange/yellow instead of red)
+    for tw in ti_state.ti_warnings
+        let tw_line = 0
+        let tw_arrow = find(tw, "--> ")
+        if tw_arrow >= 0
+            let tw_after = slice(tw, tw_arrow + 4, len(tw))
+            let tw_nend = find(tw_after, "\n")
+            if tw_nend < 0
+                tw_nend = len(tw_after)
+            let tw_loc = slice(tw_after, 0, tw_nend)
+            let tw_colon = str_last_index_of(tw_loc, ":")
+            if tw_colon > 0
+                let tw_num = trim(slice(tw_loc, tw_colon + 1, len(tw_loc)))
+                tw_line = int(tw_num) - 1
+                if tw_line < 0
+                    tw_line = 0
+        let tw_msg_end = find(tw, "\n")
+        let tw_msg = tw
+        if tw_msg_end > 0
+            tw_msg = slice(tw, 0, tw_msg_end)
+        push(diags, [tw_line, 0, lsp_escape_json(tw_msg), 2, 999])
     diags
 
 fn lsp_publish_diagnostics(uri: string, source: string, filename: string)
@@ -29685,9 +29726,11 @@ fn lsp_publish_diagnostics(uri: string, source: string, filename: string)
         let line = d[0]
         let col = d[1]
         let msg = d[2]
+        let sev = d[3]
+        let ecol = d[4]
         if di > 0
             items = items + ","
-        items = items + "\{\"range\":\{\"start\":\{\"line\":" + str(line) + ",\"character\":" + str(col) + "\},\"end\":\{\"line\":" + str(line) + ",\"character\":999\}\},\"severity\":1,\"source\":\"nova\",\"message\":\"" + msg + "\"\}"
+        items = items + "\{\"range\":\{\"start\":\{\"line\":" + str(line) + ",\"character\":" + str(col) + "\},\"end\":\{\"line\":" + str(line) + ",\"character\":" + str(ecol) + "\}\},\"severity\":" + str(sev) + ",\"source\":\"nova\",\"message\":\"" + msg + "\"\}"
         di = di + 1
     lsp_notify("textDocument/publishDiagnostics", "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"diagnostics\":[" + items + "]\}")
 
@@ -29836,30 +29879,94 @@ fn lsp_find_in_imports(docs: dict, uri: string, word: string) -> dict
             return result
     empty
 
-fn lsp_get_completions(docs: dict, uri: string) -> string
-    if not contains(docs, uri)
-        return ""
-    let source = docs[uri]
-    let lines = split(source, "\n")
+fn lsp_get_completions(docs: dict, uri: string, builtin_names: list) -> string
     let items = []
-    let i = 0
-    while i < len(lines)
-        let line = trim(lines[i])
-        if starts_with(line, "fn ")
-            let paren = find(line, "(")
-            if paren > 3
-                let fname = slice(line, 3, paren)
-                push(items, "\{\"label\":\"" + lsp_escape_json(fname) + "\",\"kind\":3\}")
-        else if starts_with(line, "type ")
-            let sp = find(line, " ")
-            if sp >= 0
-                let trest = trim(slice(line, 5, len(line)))
-                let tname = trest
+    // 1. NOVA keywords
+    let kws = ["fn", "return", "if", "else", "for", "while", "match", "break", "continue", "type", "enum", "spawn", "send", "receive", "channel", "import", "true", "false", "null", "in", "as", "select", "try", "catch", "trait", "matches", "yield", "let", "extern", "unsafe", "with", "defer", "const", "unless", "until", "loop"]
+    for kw in kws
+        push(items, "\{\"label\":\"" + kw + "\",\"kind\":14,\"sortText\":\"2_" + kw + "\"\}")
+    // 2. Builtin functions (~1335)
+    for bn in builtin_names
+        push(items, "\{\"label\":\"" + lsp_escape_json(bn) + "\",\"kind\":3,\"sortText\":\"3_" + lsp_escape_json(bn) + "\"\}")
+    // 3. Current file declarations
+    if contains(docs, uri)
+        let source = docs[uri]
+        let flines = split(source, "\n")
+        let i = 0
+        while i < len(flines)
+            let fline = trim(flines[i])
+            if starts_with(fline, "fn ")
+                let paren = find(fline, "(")
+                let langle = find(fline, "<")
+                let stop = len(fline)
+                if paren > 3 and paren < stop
+                    stop = paren
+                if langle > 3 and langle < stop
+                    stop = langle
+                let fname = trim(slice(fline, 3, stop))
+                if len(fname) > 0 and find(fname, " ") < 0 and find(fname, ".") < 0
+                    let fsig = ""
+                    if paren > 0
+                        fsig = trim(slice(fline, 3, len(fline)))
+                    push(items, "\{\"label\":\"" + lsp_escape_json(fname) + "\",\"kind\":3,\"detail\":\"" + lsp_escape_json(fsig) + "\",\"sortText\":\"0_" + lsp_escape_json(fname) + "\"\}")
+            else if starts_with(fline, "type ")
+                let trest = trim(slice(fline, 5, len(fline)))
+                let tstop = len(trest)
                 let tsp = find(trest, " ")
-                if tsp > 0
-                    tname = slice(trest, 0, tsp)
-                push(items, "\{\"label\":\"" + lsp_escape_json(tname) + "\",\"kind\":22\}")
-        i = i + 1
+                let tla = find(trest, "<")
+                if tsp > 0 and tsp < tstop
+                    tstop = tsp
+                if tla > 0 and tla < tstop
+                    tstop = tla
+                let tname = slice(trest, 0, tstop)
+                if len(tname) > 0
+                    push(items, "\{\"label\":\"" + lsp_escape_json(tname) + "\",\"kind\":22,\"sortText\":\"0_" + lsp_escape_json(tname) + "\"\}")
+            else if starts_with(fline, "enum ")
+                let erest = trim(slice(fline, 5, len(fline)))
+                let estop = len(erest)
+                let esp = find(erest, " ")
+                let ela = find(erest, "<")
+                if esp > 0 and esp < estop
+                    estop = esp
+                if ela > 0 and ela < estop
+                    estop = ela
+                let ename = slice(erest, 0, estop)
+                if len(ename) > 0
+                    push(items, "\{\"label\":\"" + lsp_escape_json(ename) + "\",\"kind\":13,\"sortText\":\"0_" + lsp_escape_json(ename) + "\"\}")
+            else if starts_with(fline, "trait ")
+                let trrest = trim(slice(fline, 6, len(fline)))
+                let trstop = len(trrest)
+                let trsp = find(trrest, " ")
+                if trsp > 0 and trsp < trstop
+                    trstop = trsp
+                let trname = slice(trrest, 0, trstop)
+                if len(trname) > 0
+                    push(items, "\{\"label\":\"" + lsp_escape_json(trname) + "\",\"kind\":8,\"sortText\":\"0_" + lsp_escape_json(trname) + "\"\}")
+            i = i + 1
+    // 4. Imported file declarations
+    if contains(docs, uri)
+        let source = docs[uri]
+        let src_path = lsp_uri_to_path(uri)
+        let src_dir = lsp_path_dir(src_path)
+        for raw_line in split(source, "\n")
+            let trimmed = trim(raw_line)
+            if not starts_with(trimmed, "import ")
+                continue
+            let rest = trim(slice(trimmed, 7, len(trimmed)))
+            let module_name = rest
+            let space_pos = find(rest, " ")
+            if space_pos >= 0
+                module_name = slice(rest, 0, space_pos)
+            if len(module_name) == 0
+                continue
+            let file_path = src_dir + module_name + ".nova"
+            if file_exists(file_path)
+                let mcontent = read_file(file_path)
+                if len(mcontent) > 0
+                    for d in _lsp_decls_in(mcontent)
+                        let nm = d[0]
+                        let kind = d[1]
+                        push(items, "\{\"label\":\"" + lsp_escape_json(nm) + "\",\"kind\":" + str(kind) + ",\"detail\":\"(" + lsp_escape_json(module_name) + ")\",\"sortText\":\"1_" + lsp_escape_json(nm) + "\"\}")
     join(items, ",")
 
 // ── Document symbols (outline) — Ctrl+O "Quick Outline" ─────────────────────
@@ -30461,9 +30568,113 @@ fn lsp_workspace_rename(docs: dict, root: string, word: string, new_name: string
         return "null"
     "\{\"changes\":\{" + join(file_entries, ",") + "\}\}"
 
+// ── Semantic tokens — IDENT classification for rich syntax highlighting ────
+// Classifies identifiers as function/type/variable/property by cross-referencing
+// against the builtin registry, file-local declarations, and positional context.
+// Token type legend (indices must match the capability advertisement):
+//   0=keyword 1=type 2=function 3=variable 4=property 5=enumMember 6=number 7=string 8=decorator
+fn lsp_semantic_tokens(docs: dict, uri: string, builtin_set: dict) -> string
+    if not contains(docs, uri)
+        return "\{\"data\":[]}"
+    let source = docs[uri]
+    let tokens = tokenize(source)
+    // Build sets of type names and function names from declarations
+    let type_set = {}
+    let fn_set = {}
+    let slines = split(source, "\n")
+    let si = 0
+    while si < len(slines)
+        let sline = trim(slines[si])
+        if starts_with(sline, "type ") or starts_with(sline, "enum ") or starts_with(sline, "trait ")
+            let skw = 5
+            if starts_with(sline, "trait ")
+                skw = 6
+            let safter = trim(slice(sline, skw, len(sline)))
+            let sstop = len(safter)
+            let ssp = find(safter, " ")
+            let sla = find(safter, "<")
+            if ssp > 0 and ssp < sstop
+                sstop = ssp
+            if sla > 0 and sla < sstop
+                sstop = sla
+            let snm = slice(safter, 0, sstop)
+            if len(snm) > 0
+                type_set[snm] = 1
+        else if starts_with(sline, "fn ")
+            let safter = slice(sline, 3, len(sline))
+            let sstop = len(safter)
+            let spa = find(safter, "(")
+            let sla = find(safter, "<")
+            if spa > 0 and spa < sstop
+                sstop = spa
+            if sla > 0 and sla < sstop
+                sstop = sla
+            let snm = trim(slice(safter, 0, sstop))
+            if len(snm) > 0 and find(snm, " ") < 0
+                // Strip the type prefix for methods like Type.method
+                let sdot = find(snm, ".")
+                if sdot < 0
+                    fn_set[snm] = 1
+                else
+                    fn_set[snm] = 1
+                    let meth_part = slice(snm, sdot + 1, len(snm))
+                    if len(meth_part) > 0
+                        fn_set[meth_part] = 1
+        si = si + 1
+    // Pass 1: collect classified tokens as [line, col, len, type] inside match (push only)
+    let raw_st = []
+    for tok in tokens
+        match tok
+            Token(tk_kind, tk_val, tk_line, tk_col) =>
+                let ttype = -1
+                if tk_kind == "KW"
+                    ttype = 0
+                else if tk_kind == "IDENT"
+                    if contains(type_set, tk_val)
+                        ttype = 1
+                    else if contains(fn_set, tk_val) or contains(builtin_set, tk_val)
+                        ttype = 2
+                    else
+                        ttype = 3
+                else if tk_kind == "INT" or tk_kind == "FLOAT"
+                    ttype = 6
+                else if tk_kind == "AT"
+                    ttype = 8
+                if ttype >= 0
+                    push(raw_st, [tk_line - 1, tk_col - 1, len(tk_val), ttype])
+    // Pass 2: delta-encode with explicit int() casts (any -> int)
+    let st_parts = []
+    let sti = 0
+    while sti < len(raw_st)
+        let cur = raw_st[sti]
+        let cl = int(cur[0])
+        let cc = int(cur[1])
+        let clen = int(cur[2])
+        let ctype = int(cur[3])
+        let p_l = 0
+        let p_c = 0
+        if sti > 0
+            let prev = raw_st[sti - 1]
+            p_l = int(prev[0])
+            p_c = int(prev[1])
+        let dl = cl - p_l
+        let dc = cc
+        if dl == 0
+            dc = cc - p_c
+        push(st_parts, str(dl) + "," + str(dc) + "," + str(clen) + "," + str(ctype) + ",0")
+        sti = sti + 1
+    "\{\"data\":[" + join(st_parts, ",") + "]\}"
+
 fn lsp_server_main()
     write_raw("NOVA LSP server started\n")
     let docs = {}
+    // Build the stdlib once at startup — used for completions and semantic tokens
+    let stdlib = ti_build_stdlib()
+    let builtin_names = keys(stdlib)
+    let builtin_set = {}
+    for bn in builtin_names
+        builtin_set[bn] = 1
+    write_raw("[nova-lsp] loaded " + str(len(builtin_names)) + " builtins for completions\n")
     // Workspace root, captured from the initialize request. Empty until then, and the
     // workspace-wide handlers degrade to "no results" rather than scanning the whole
     // filesystem if the client never sends one.
@@ -30513,7 +30724,7 @@ fn lsp_server_main()
                         if path_exists(path_join(nh_parent, "lib"))
                             set_env("NOVA_HOME", nh_parent)
                             write_raw("[nova-lsp] auto-set NOVA_HOME=" + nh_parent + " (from parent)\n")
-            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":\{\"prepareProvider\":true\},\"documentHighlightProvider\":true,\"foldingRangeProvider\":true,\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"documentFormattingProvider\":true,\"workspaceSymbolProvider\":true\}\}"
+            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[\".\"],\"resolveProvider\":false\},\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":\{\"prepareProvider\":true\},\"documentHighlightProvider\":true,\"foldingRangeProvider\":true,\"signatureHelpProvider\":\{\"triggerCharacters\":[\"(\",\",\"]\},\"documentFormattingProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":\{\"legend\":\{\"tokenTypes\":[\"keyword\",\"type\",\"function\",\"variable\",\"property\",\"enumMember\",\"number\",\"string\",\"decorator\"],\"tokenModifiers\":[\"declaration\",\"definition\"]\},\"full\":true\}\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"
             write_raw("NOVA LSP initialized\n")
@@ -30567,9 +30778,10 @@ fn lsp_server_main()
                 if hword != ""
                     let htype = lsp_infer_type_hint(docs, huri, hword)
                     if htype != ""
-                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"plaintext\",\"value\":\"" + lsp_escape_json(hword) + " : " + lsp_escape_json(htype) + "\"\}\}")
+                        let hover_md = "```nova\n" + hword + " : " + htype + "\n```"
+                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"markdown\",\"value\":\"" + lsp_escape_json(hover_md) + "\"\}\}")
                     else
-                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"plaintext\",\"value\":\"" + lsp_escape_json(hword) + "\"\}\}")
+                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"markdown\",\"value\":\"" + lsp_escape_json(hword) + "\"\}\}")
                 else
                     lsp_respond(id, "null")
         else if method == "textDocument/definition"
@@ -30599,7 +30811,7 @@ fn lsp_server_main()
                 let cparams = msg["params"]
                 let ctd = cparams["textDocument"]
                 let curi = ctd["uri"]
-                let citems = lsp_get_completions(docs, curi)
+                let citems = lsp_get_completions(docs, curi, builtin_names)
                 lsp_respond(id, "\{\"isIncomplete\":false,\"items\":[" + citems + "]\}")
         else if method == "textDocument/documentSymbol"
             if has_id
@@ -30694,6 +30906,12 @@ fn lsp_server_main()
                     lsp_respond(id, "[]")
                 else
                     lsp_respond(id, lsp_workspace_symbols(ws_root, wsq))
+        else if method == "textDocument/semanticTokens/full"
+            if has_id
+                let stparams = msg["params"]
+                let sttd = stparams["textDocument"]
+                let sturi = sttd["uri"]
+                lsp_respond(id, lsp_semantic_tokens(docs, sturi, builtin_set))
         else if has_id
             lsp_error_response(id, -32601, "Method not found: " + method)
 
