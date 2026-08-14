@@ -24,6 +24,50 @@ P0 UNBLOCK ──► P1 SLICE ──► P2 RENDER ──► P3 LANGUAGE ──�
 
 ---
 
+# ★ PHASE A — START NOW (no compiler dependency) — added 2026-08-15
+
+**The sequencing error this corrects:** P0/P1 were being read as a 3.5-month gate before Prism could
+begin. But **M0.3 (runtime split) and M0.4 (closures across WASM) are compiler/runtime work in
+`nova-compiler/` — they do not block the `prism/` folder.** A substantial part of Prism needs *no*
+compiler change, *no* WASM, and *no* closures, and can be written in pure NOVA today.
+
+**The insight:** a `face` is initially just a **NOVA function returning a node-tree value**.
+`stack(...)`, `label(...)`, `press(...)` are ordinary functions. The `face` / `->` *syntax* is sugar
+the compiler adds later (M3.1). This is exactly how Forge did it — `forge_html` is functions returning
+strings. **Library first, syntax later.** So the entire upper stack is buildable now, and it *validates
+the vocabulary before any RED work is spent on grammar for it.*
+
+| ID | Milestone | Deliverable | **Exit criterion** | Radius | Wks | Model |
+|---|---|---|---|---|---|---|
+| **MA.1** | `prism/` skeleton | `nova.toml`, `README.md`, the 14 folders; **MOVE the existing 140-line `prism.nova` out of `nova-compiler/test_programs/`** into `prism/backend/ansi/`; artifacts git-ignored | Folder exists; the moved module still compiles and its existing regression test passes unchanged | GREEN | 0.5 | Sonnet |
+| **MA.2** | `core/prism_node.nova` | The node-tree value type: node kind, attrs, children, keyed identity. Backend-agnostic | A nested tree of 5 kinds builds, round-trips, and `type_of`/`field_names` introspect it | GREEN | 1 | Sonnet |
+| **MA.3** | `widget/` as a library | All 26 primitives as **plain functions** returning nodes — `stack`, `band`, `layer`, `label`, `press`, `entry`, `each`, … | Each primitive has a KAT proving its node shape; a 3-level page composes | GREEN | 2 | Sonnet |
+| **MA.4** | `style/` as values | `look`/`palette` as typed NOVA values (dicts/structs first, `look` keyword later); merge order; 9 presets × light/dark | An invalid property is caught at the library boundary; 18 palettes resolve to flat values | GREEN | 1.5 | Sonnet |
+| **MA.5** | `render/prism_render_html.nova` | **Node tree → HTML, server-side.** No closures, no WASM, no compiler change. Runs native today via Forge | A page of 20 nodes renders byte-identical HTML across runs; **XSS-safe by construction** (values are never markup); wired into a Forge route | GREEN | 1.5 | Sonnet |
+| **MA.6** | `backend/ansi/` extended | Terminal backend from the existing v0.1 helpers — the **fourth target**, and a real one for CLI/TUI | The same node tree renders to both HTML and ANSI from one source | GREEN | 1 | Sonnet |
+| **MA.7** | `dev/prism_catalog.nova` | Generated component catalog (the Storybook equivalent, #103) over the HTML backend | Every primitive appears in a generated catalogue page with no hand-written story files | GREEN | 1 | Sonnet |
+| **MA.8** | `kat/` + gate wiring | KATs for every module, wired into the regression manifest | All Prism KATs run in the 1121-test harness, 0 FAIL, both memory modes | GREEN | 1 | Sonnet |
+
+**Phase A total: ~9-10 weeks, entirely GREEN, entirely Sonnet-written under review, zero compiler risk.**
+
+## ★ What Phase A buys, beyond a head start
+
+1. **It ships something immediately useful.** MA.5 gives Forge a **typed component system** — a real
+   upgrade over `forge_html`'s string concatenation, usable in `nova_taskboard` the day it lands.
+2. **It validates the vocabulary before RED work.** If `stack`/`band`/`each` turn out wrong, we find
+   out for the cost of a library edit — *not* after building parser and IR support for them.
+3. **It de-risks M3.1 (the `face` grammar, RED).** By the time the compiler learns `face`, the
+   semantics are already proven by a working library.
+4. **It runs in parallel with the RED critical path.** M0.3/M0.4 are compiler work; Phase A is library
+   work. **Different files, different blast radius, no contention** — and Phase A is delegable while
+   the RED work needs careful solo attention.
+5. **It is honest about the falsification.** Nothing in Phase A depends on a canvas renderer, a glyph
+   atlas, or the interop premise — the three things F1-F6 killed.
+
+**Sequencing:** Phase A starts NOW and runs alongside P0. Nothing in Phase A waits on anything.
+
+---
+
 # PHASE 0 — UNBLOCK (3.5 months)
 
 *Nothing in Prism is possible until these land. All three blockers from the plan.*

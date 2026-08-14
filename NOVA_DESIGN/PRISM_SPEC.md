@@ -60,8 +60,31 @@ BINDING        as by it self
 CAPABILITY     grant needs
 ```
 
-44 keywords total. For comparison, React's public surface requires learning ~30 hook and API names
-plus JSX plus CSS's ~500 properties plus the ARIA vocabulary.
+**39 keywords total** (7 declarations + 22 primitives + 4 behaviour + 4 binding + 2 capability).
+For comparison, React's public surface requires learning ~30 hook and API names plus JSX plus CSS's
+~500 properties plus the ARIA vocabulary.
+
+### ⚠️ Canonical counts — corrected 2026-08-15 during MA.2 implementation
+
+Two arithmetic errors were caught when the vocabulary was first built as real code. Recorded rather
+than quietly patched, because the wrong numbers had already propagated into three other documents:
+
+- **Primitives: 22, not 26.** Part III's tables enumerate exactly 22 (arrangement 7 + content 4 +
+  interaction 6 + structure 5). `PRISM_STATUS.md` and `PRISM_UNIVERSAL_UI_PLAN.md` both said "26",
+  and the plan doc listed a **Meta** group (`portal` `focus_scope` `clip` `transform` `animate`) that
+  Part III never specified. **22 is canonical.**
+- **Keywords: 39, not 44.**
+
+**The Meta group is real but DEFERRED, and deliberately so** — it is not part of the foundational
+vocabulary:
+- `portal`, `focus_scope` — modal/a11y concerns; they belong with **semantic derivation (M3.3)**,
+  where focus trapping and dismissal are already derived from `sheet`.
+- `clip`, `transform`, `animate` — paint concerns; they belong with the **backends** and with
+  `motion` (which is already a declaration form in §3).
+
+Adding them later is purely additive: `PrismNodeKind` is a closed enum matched exhaustively with no
+wildcard arm, so extending it is a **compile error until every match is updated** — which is exactly
+the safety property axiom A7 was chosen for. Do not add them speculatively.
 
 **Not keywords, deliberately:** anything for state, memoization, effects-with-dependencies,
 placement, or accessibility. Those are inferred (A2).

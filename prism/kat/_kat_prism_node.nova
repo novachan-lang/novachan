@@ -1,0 +1,172 @@
+// KAT for prism/core/prism_node.nova (PRISM_ROADMAP.md milestone MA.2).
+//
+// Proves, against concrete expected values:
+//   1. A nested tree of >=5 distinct PrismNodeKind values builds correctly.
+//   2. Children order is preserved at every level.
+//   3. Keys round-trip through Some/None correctly (keyed vs unkeyed nodes).
+//   4. Tree-depth limit (256) is enforced exactly at the boundary, not approximately.
+//   5. Node-count limit (100,000) is enforced exactly at the boundary.
+//   6. RTTI (type_of / type_name / field_names / field_get) works on PrismNode with zero
+//      hand-written support in prism_node.nova itself.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): the module resolves `import prism_node` via $NOVA_HOME/lib/prism_node.nova,
+// which _proc_util.ps1's Prism sync block installs from the canonical prism/core/prism_node.nova
+// on every harness run (mirrors the existing forge/ -> lib/ install exactly).
+//   ./gen3_test.exe _kat_prism_node.nova
+//   clang -O2 -o _kat_prism_node.exe _kat_prism_node.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_node.exe
+
+import prism_node
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn main()
+    // ── 1+2. Multi-kind tree, order-preserving ──────────────────────────────────────────
+    // root (Stack, keyed "root-1")
+    //   ├─ label_hello (Label)
+    //   ├─ label_world (Label)
+    //   └─ toolbar (Band)
+    //        ├─ press_save (Press)
+    //        ├─ entry_name (Entry)
+    //        └─ flag_active (Flag)
+    // Six PrismNode values across five DISTINCT kinds: Stack, Band, Label, Press, Entry, Flag.
+    let label_hello_r = prism_node.prism_node_leaf(prism_node.prism_kind_label(), {"text": "Hello"})
+    let label_world_r = prism_node.prism_node_leaf(prism_node.prism_kind_label(), {"text": "World"})
+    if is_err(label_hello_r) or is_err(label_world_r)
+        _fail("leaf label construction")
+    let label_hello = unwrap(label_hello_r)
+    let label_world = unwrap(label_world_r)
+
+    let press_save_r = prism_node.prism_node_leaf(prism_node.prism_kind_press(), {"text": "Save"})
+    let entry_name_r = prism_node.prism_node_leaf(prism_node.prism_kind_entry(), {"prompt": "Name"})
+    let flag_active_r = prism_node.prism_node_leaf(prism_node.prism_kind_flag(), {"state": true})
+    if is_err(press_save_r) or is_err(entry_name_r) or is_err(flag_active_r)
+        _fail("leaf interaction-widget construction")
+    let press_save = unwrap(press_save_r)
+    let entry_name = unwrap(entry_name_r)
+    let flag_active = unwrap(flag_active_r)
+
+    let toolbar_r = prism_node.prism_node_branch(prism_node.prism_kind_band(), {}, [press_save, entry_name, flag_active])
+    if is_err(toolbar_r)
+        _fail("toolbar (Band) construction: " + unwrap_err(toolbar_r))
+    let toolbar = unwrap(toolbar_r)
+
+    let root_r = prism_node.prism_node_keyed(prism_node.prism_kind_stack(), {}, [label_hello, label_world, toolbar], "root-1")
+    if is_err(root_r)
+        _fail("root (Stack) construction: " + unwrap_err(root_r))
+    let root = unwrap(root_r)
+
+    // Kind + attrs at every position, proving CHILD ORDER (not just child membership).
+    assert_eq(prism_node.prism_node_kind_str(root), "stack")
+    assert_eq(prism_node.prism_node_child_count(root), 3)
+    let root_children = prism_node.prism_node_children(root)
+
+    let c0 = root_children[0]
+    if prism_node.prism_node_kind_str(c0) != "label" or prism_node.prism_node_attr_str(c0, "text", "") != "Hello"
+        _fail("root.children[0] should be Label(\"Hello\"), got " + prism_node.prism_node_kind_str(c0) + "/" + prism_node.prism_node_attr_str(c0, "text", "<missing>"))
+
+    let c1 = root_children[1]
+    if prism_node.prism_node_kind_str(c1) != "label" or prism_node.prism_node_attr_str(c1, "text", "") != "World"
+        _fail("root.children[1] should be Label(\"World\")")
+
+    let c2 = root_children[2]
+    if prism_node.prism_node_kind_str(c2) != "band"
+        _fail("root.children[2] should be Band (toolbar)")
+    assert_eq(prism_node.prism_node_child_count(c2), 3)
+    let toolbar_children = prism_node.prism_node_children(c2)
+    if prism_node.prism_node_kind_str(toolbar_children[0]) != "press"
+        _fail("toolbar.children[0] should be Press")
+    if prism_node.prism_node_kind_str(toolbar_children[1]) != "entry" or prism_node.prism_node_attr_str(toolbar_children[1], "prompt", "") != "Name"
+        _fail("toolbar.children[1] should be Entry(prompt=\"Name\")")
+    if prism_node.prism_node_kind_str(toolbar_children[2]) != "flag" or not prism_node.prism_node_attr_bool(toolbar_children[2], "state", false)
+        _fail("toolbar.children[2] should be Flag(state=true)")
+
+    // Distinct-kind count: stack, band, label, press, entry, flag = 6 kinds >= 5 required.
+    // Exercises prism_node_walk (pre-order visit) with a single-expression lambda.
+    let visited_kinds = []
+    prism_node.prism_node_walk(root, fn(n) visited_kinds.push(prism_node.prism_node_kind_str(n)))
+    assert_eq(len(visited_kinds), 7)   // root + 2 labels + toolbar + 3 toolbar children
+    let distinct_kinds = {}
+    for k in visited_kinds
+        distinct_kinds[k] = true
+    if len(keys(distinct_kinds)) < 5
+        _fail("expected >=5 distinct kinds in the tree, saw " + str(len(keys(distinct_kinds))))
+    print("1+2. multi-kind tree (" + str(len(keys(distinct_kinds))) + " distinct kinds) + child order: OK")
+
+    // Whole-tree shape sanity via the cached depth/count.
+    assert_eq(prism_node.prism_node_depth(root), 3)   // root -> toolbar -> press/entry/flag
+    assert_eq(prism_node.prism_node_count(root), 7)   // root + 2 labels + toolbar + 3 toolbar children
+
+    // ── 3. Keyed identity round-trips; unkeyed nodes carry no key ───────────────────────
+    if not prism_node.prism_node_has_key(root)
+        _fail("root should have a key")
+    match prism_node.prism_node_key(root)
+        Some(k) => assert_eq(k, "root-1")
+        None => _fail("root key unwrapped to None")
+
+    if prism_node.prism_node_has_key(label_hello)
+        _fail("label_hello should NOT have a key (built via prism_node_leaf)")
+    match prism_node.prism_node_key(label_hello)
+        Some(_) => _fail("label_hello key should be None")
+        None => print("3. keyed identity round-trip (Some + None): OK")
+
+    // ── 4. Tree-depth limit (256), boundary-exact ───────────────────────────────────────
+    // Build a chain of single-child Stack nodes. depth(1) is the innermost leaf; each wrap
+    // adds exactly 1. Reaching depth 256 must succeed; depth 257 must fail.
+    let chain_r = prism_node.prism_node_leaf(prism_node.prism_kind_gap(), {})
+    if is_err(chain_r)
+        _fail("chain seed construction")
+    let mut chain = unwrap(chain_r)
+    let mut i = 1
+    while i < 256
+        let wrapped_r = prism_node.prism_node_branch(prism_node.prism_kind_stack(), {}, [chain])
+        if is_err(wrapped_r)
+            _fail("depth " + str(i + 1) + " should still be within the 256 limit, got: " + unwrap_err(wrapped_r))
+        chain = unwrap(wrapped_r)
+        i = i + 1
+    assert_eq(prism_node.prism_node_depth(chain), 256)
+    // One more wrap must exceed the limit.
+    let over_depth_r = prism_node.prism_node_branch(prism_node.prism_kind_stack(), {}, [chain])
+    if is_ok(over_depth_r)
+        _fail("depth 257 should be rejected, but construction succeeded")
+    print("4. tree-depth limit (256, boundary-exact): OK -- " + unwrap_err(over_depth_r))
+
+    // ── 5. Node-count limit (100,000), boundary-exact ───────────────────────────────────
+    // 99,999 leaves under one parent: total = 99,999 + 1 (parent) = 100,000 -- must succeed.
+    // 100,000 leaves under one parent: total = 100,001 -- must fail.
+    let at_limit_leaves = []
+    let mut j = 0
+    while j < 99999
+        at_limit_leaves.push(unwrap(prism_node.prism_node_leaf(prism_node.prism_kind_gap(), {})))
+        j = j + 1
+    let at_limit_r = prism_node.prism_node_branch(prism_node.prism_kind_stack(), {}, at_limit_leaves)
+    if is_err(at_limit_r)
+        _fail("99,999 leaves (total 100,000) should be exactly at the limit and succeed, got: " + unwrap_err(at_limit_r))
+    assert_eq(prism_node.prism_node_count(unwrap(at_limit_r)), 100000)
+
+    at_limit_leaves.push(unwrap(prism_node.prism_node_leaf(prism_node.prism_kind_gap(), {})))
+    let over_count_r = prism_node.prism_node_branch(prism_node.prism_kind_stack(), {}, at_limit_leaves)
+    if is_ok(over_count_r)
+        _fail("100,000 leaves (total 100,001) should be rejected, but construction succeeded")
+    print("5. node-count limit (100,000, boundary-exact): OK -- " + unwrap_err(over_count_r))
+
+    // ── 6. RTTI introspection ────────────────────────────────────────────────────────────
+    if type_of(label_hello) != "struct"
+        _fail("type_of(PrismNode) should be \"struct\", got " + type_of(label_hello))
+    if type_name(label_hello) != "PrismNode"
+        _fail("type_name(PrismNode) should be \"PrismNode\", got " + type_name(label_hello))
+    let fns = field_names(label_hello)
+    for expected_field in ["kind", "attrs", "children", "key", "depth", "count"]
+        if not (expected_field in fns)
+            _fail("field_names(PrismNode) missing \"" + expected_field + "\": " + str(fns))
+    let kind_via_rtti = field_get(label_hello, "kind")
+    if prism_node.prism_node_kind_name(kind_via_rtti) != "label"
+        _fail("field_get(node, \"kind\") did not round-trip to Label")
+    let depth_via_rtti = field_get(label_hello, "depth")
+    assert_eq(depth_via_rtti, 1)
+    print("6. RTTI introspection (type_of/type_name/field_names/field_get): OK")
+
+    print("KAT prism_node PASSED: multi-kind tree + order + keys + depth-256 + count-100000 + RTTI, all boundary-exact")

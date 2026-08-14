@@ -1,0 +1,338 @@
+// prism_node -- the backend-agnostic node-tree value type at the foundation of NOVA Prism.
+// Every widget (widget/, milestone MA.3), every backend (HTML render at render/, ANSI at
+// backend/ansi/, the eventual DOM/GPU backends), and every dev tool (catalog, inspector,
+// RTTI-driven form derivation) builds on THIS type and nothing else. Nothing in this file
+// may know about markup, ANSI escapes, or a GPU surface -- see PRISM_SPEC.md Part III
+// (the 26-primitive vocabulary) and §16 (resource bounds).
+//
+// ── DESIGN DECISION: enum tag + struct tree, not an all-enum ADT ──────────────────────────
+// The obvious ADT design -- one enum variant per widget kind, each carrying its own payload
+// shape (`Stack(children: list)`, `Label(text: string)`, `Range(min: float, max: float)`, ...)
+// -- was rejected for THIS file. Two reasons:
+//   1. This milestone (MA.2) is explicitly the generic node-tree type that MA.3's 26 widget
+//      constructors build on top of; if the widget-specific payload shapes were baked into
+//      an enum here, adding widget #27 would require editing this foundational file instead
+//      of adding a new function in widget/. A single struct with a generic `attrs: dict` is
+//      the layer that lets MA.3 stay purely additive.
+//   2. A uniform recursive tree (one struct shape, `children: list` of the same struct) is
+//      what every backend needs to walk generically -- an all-enum ADT would force every
+//      tree-walking function (RTTI, resource-bound counting, the eventual HTML/ANSI
+//      renderers) to pattern-match all 22 variants just to reach the common `children` list.
+// The ADT is not abandoned, though -- it is applied where it earns its keep: `PrismNodeKind`
+// below IS an enum, so the vocabulary stays closed (spec axiom A7) and `prism_node_kind_name`
+// is an EXHAUSTIVE match with no wildcard arm. Add a 23rd primitive to the enum without
+// updating that match, and the compiler rejects the build -- the concrete payoff of choosing
+// an ADT for the tag even though the tree itself is a struct.
+//
+// ── SELF-REFERENCE: children is a bare `list`, not `list<PrismNode>` ──────────────────────
+// `list<PrismNode>` (self-referential generic instantiation) has no verified precedent
+// anywhere in this codebase, and NOVA_LANGUAGE_FEATURES.md's own generics section flags
+// generics as "thin/edge-tested ... verify before depending on it deeply." The PROVEN idiom
+// for a self-referential tree, used by the compiler's own AST (`Expr.children: list` in
+// nova_compiler.nova) and by std/core/tree.nova (`Tree.children: list`), is an untyped
+// `list` holding elements of the struct's own type. Verified directly for this file (see the
+// design probe in this milestone's report): iterating `for c in children` and reading
+// `c.depth` / `c.kind` etc. on the loop variable resolves correctly to PrismNode's fields --
+// NOVA's `any`-from-untyped-list values narrow to the concrete struct at first typed use,
+// exactly as NOVA_LANGUAGE_FEATURES.md promises for `any`.
+//
+// ── RESOURCE BOUNDS (PRISM_SPEC.md §16) ───────────────────────────────────────────────────
+// "Face tree depth: 256" and "Nodes per frame: 100,000", both "Enforced at tree construction."
+// Every node caches its own subtree `depth` and `count` AT CONSTRUCTION, computed from its
+// (already-validated) children in O(children) time. Without this cache, checking a growing
+// tree's depth/count by re-walking the whole subtree on every node added would make building
+// an n-node tree O(n^2); with it, every construction is O(1) plus the number of direct
+// children. Exceeding a bound returns `Err(string)`, never a crash or unbounded allocation --
+// exactly what §16 mandates ("a typed error... never a crash").
+//
+// ── KEYED IDENTITY (PRISM_SPEC.md §12.6) ──────────────────────────────────────────────────
+// `key: string?` is the runtime identity NOVA's static reactivity inference cannot supply for
+// itself: static analysis can prove a lot about `items[i]`, but not which physical row a
+// runtime `i` denotes across a re-render. `prism_node_keyed` is how MA.3's `each`/`grid`
+// primitives (which spec §10 makes `by <selector>` MANDATORY on) attach that identity.
+//
+// ── CROSS-MODULE ENUM CONSTRUCTION (a verified compiler limitation, not a style choice) ────
+// A user-defined enum's variant constructors (`Stack()`, `Label()`, ...) are ONLY resolvable
+// in the same file that declares the enum -- verified directly with a two-file probe: from
+// an importing file, both `mod.Variant()` (qualified: "has no exported function 'Variant'")
+// and bare `Variant()` after `import mod` (unqualified: "unknown identifier") are rejected by
+// the compiler. Only a value of the enum type ALREADY IN HAND may be pattern-matched with
+// unqualified variant patterns cross-module (type-directed pattern lookup, a different
+// resolution path than constructor-call-position identifier lookup). Concretely, this means
+// widget/ (MA.3) and every other consumer of PrismNodeKind CANNOT write `Stack()` themselves
+// -- they need a function that returns the value. Hence `prism_kind_*()` below: one
+// zero-argument wrapper per variant, all defined here (the only file where the bare
+// constructors resolve), so every other file gets kind values through an ordinary
+// cross-module function call. Prefixed `prism_kind_*` for the usual flat-symbol-space reason.
+//
+// PUBLIC API
+//   Vocabulary
+//     PrismNodeKind                                       the closed, 22-primitive tag enum
+//     PrismNode                                            the node-tree value
+//     prism_kind_stack() / prism_kind_band() / ... (22)  -> PrismNodeKind   cross-module ctors
+//     prism_node_kind_name(kind)                    -> string   exhaustive kind -> name
+//   Constructors (all bounds-checked, never panic on a hostile tree)
+//     prism_node_new(kind, attrs, children, key)    -> Result<PrismNode>   the one real ctor
+//     prism_node_leaf(kind, attrs)                   -> Result<PrismNode>   no children, no key
+//     prism_node_branch(kind, attrs, children)       -> Result<PrismNode>   children, no key
+//     prism_node_keyed(kind, attrs, children, key)  -> Result<PrismNode>   children + identity
+//   Accessors
+//     prism_node_kind(n)               -> PrismNodeKind
+//     prism_node_kind_str(n)           -> string
+//     prism_node_children(n)           -> list          (of PrismNode)
+//     prism_node_child_count(n)        -> int
+//     prism_node_key(n)                -> string?
+//     prism_node_has_key(n)            -> bool
+//     prism_node_depth(n)              -> int           (this node's subtree depth, leaf = 1)
+//     prism_node_count(n)              -> int           (this node + every descendant)
+//     prism_node_walk(n, visit)                          pre-order visit(node) over the subtree
+//   Attributes (typed where possible; attrs itself stays a generic dict -- see design note)
+//     prism_node_has_attr(n, name)               -> bool
+//     prism_node_attr_str(n, name, default_val)  -> string
+//     prism_node_attr_int(n, name, default_val)  -> int
+//     prism_node_attr_bool(n, name, default_val) -> bool
+//
+// RTTI: PrismNode is a plain `type`, so `type_of`/`type_name`/`field_names`/`field_get`/
+// `fields` all work on it for free (NOVA_LANGUAGE_FEATURES.md "Struct reflection API") --
+// nothing in this file implements them; the KAT (_kat_prism_node.nova) proves they work.
+
+// ── The closed, owned vocabulary (PRISM_SPEC.md §7-10, Part III) ─────────────────────────
+// 22 primitives across four families, exactly as PRISM_SPEC.md Part III enumerates them.
+// (PRISM_STATUS.md / PRISM_ROADMAP.md say "26 primitives" in several places; the spec's own
+// table in Part III sums to 22. That is a genuine discrepancy between the docs -- flagged
+// here, not silently "corrected" to 26 by inventing 4 extra tags with no spec definition.)
+enum PrismNodeKind
+    // Arrangement (§7)
+    Stack()
+    Band()
+    Layer()
+    Mesh()
+    Flow()
+    Pane()
+    Gap()
+    // Content (§8)
+    Label()
+    Art()
+    Glyph()
+    Draw()
+    // Interaction (§9)
+    Press()
+    Entry()
+    Pick()
+    Flag()
+    Range()
+    Link()
+    // Structure (§10)
+    Each()
+    Grid()
+    Sheet()
+    Hint()
+    Tabs()
+
+// ── Cross-module constructors ─────────────────────────────────────────────────────────────
+// See the header note above: these exist ONLY because a user-defined enum's variant
+// constructors do not resolve from outside the file that declares the enum. Every consumer
+// of PrismNodeKind in another file (widget/, kat/, and eventually every backend) goes through
+// these instead of writing `Stack()` etc. directly, which would not compile there.
+fn prism_kind_stack() -> PrismNodeKind
+    Stack()
+fn prism_kind_band() -> PrismNodeKind
+    Band()
+fn prism_kind_layer() -> PrismNodeKind
+    Layer()
+fn prism_kind_mesh() -> PrismNodeKind
+    Mesh()
+fn prism_kind_flow() -> PrismNodeKind
+    Flow()
+fn prism_kind_pane() -> PrismNodeKind
+    Pane()
+fn prism_kind_gap() -> PrismNodeKind
+    Gap()
+fn prism_kind_label() -> PrismNodeKind
+    Label()
+fn prism_kind_art() -> PrismNodeKind
+    Art()
+fn prism_kind_glyph() -> PrismNodeKind
+    Glyph()
+fn prism_kind_draw() -> PrismNodeKind
+    Draw()
+fn prism_kind_press() -> PrismNodeKind
+    Press()
+fn prism_kind_entry() -> PrismNodeKind
+    Entry()
+fn prism_kind_pick() -> PrismNodeKind
+    Pick()
+fn prism_kind_flag() -> PrismNodeKind
+    Flag()
+fn prism_kind_range() -> PrismNodeKind
+    Range()
+fn prism_kind_link() -> PrismNodeKind
+    Link()
+fn prism_kind_each() -> PrismNodeKind
+    Each()
+fn prism_kind_grid() -> PrismNodeKind
+    Grid()
+fn prism_kind_sheet() -> PrismNodeKind
+    Sheet()
+fn prism_kind_hint() -> PrismNodeKind
+    Hint()
+fn prism_kind_tabs() -> PrismNodeKind
+    Tabs()
+
+// Human-readable kind name. EXHAUSTIVE match, no `_` wildcard arm: adding a 23rd variant to
+// PrismNodeKind without adding its case here is a COMPILE ERROR, not a silent "unknown"
+// string returned at runtime. This is the concrete payoff of the enum-tag design (see header).
+fn prism_node_kind_name(kind: PrismNodeKind) -> string
+    match kind
+        Stack() => "stack"
+        Band() => "band"
+        Layer() => "layer"
+        Mesh() => "mesh"
+        Flow() => "flow"
+        Pane() => "pane"
+        Gap() => "gap"
+        Label() => "label"
+        Art() => "art"
+        Glyph() => "glyph"
+        Draw() => "draw"
+        Press() => "press"
+        Entry() => "entry"
+        Pick() => "pick"
+        Flag() => "flag"
+        Range() => "range"
+        Link() => "link"
+        Each() => "each"
+        Grid() => "grid"
+        Sheet() => "sheet"
+        Hint() => "hint"
+        Tabs() => "tabs"
+
+// PRISM_SPEC.md §16 resource bounds. Named, not sprinkled as magic numbers, so a later
+// milestone can make them a configurable capability (spec §16: "configurable with a safe
+// default") without hunting for every comparison site.
+let PRISM_MAX_TREE_DEPTH = 256
+let PRISM_MAX_NODE_COUNT = 100000
+
+// The node-tree value. See the header for why this is a struct (not an all-enum ADT), why
+// `children` is a bare `list`, and why `depth`/`count` are cached rather than recomputed.
+type PrismNode
+    kind: PrismNodeKind
+    attrs: dict
+    children: list
+    key: string?
+    depth: int
+    count: int
+
+// ── Constructors ───────────────────────────────────────────────────────────────────────
+
+// The one real constructor -- every constructor below calls this. Computes this node's
+// subtree depth/count from its (already bounds-checked) children, then enforces
+// PRISM_MAX_TREE_DEPTH / PRISM_MAX_NODE_COUNT before the node is allowed to exist at all.
+// A hostile or accidentally-huge tree fails here with a typed error, never a crash and never
+// an unbounded allocation (PRISM_SPEC.md §16).
+fn prism_node_new(kind: PrismNodeKind, attrs: dict, children: list, key: string?) -> Result<PrismNode>
+    let max_child_depth = 0
+    let total_count = 1
+    for c in children
+        if c.depth > max_child_depth
+            max_child_depth = c.depth
+        total_count += c.count
+    let depth = max_child_depth + 1
+    if depth > PRISM_MAX_TREE_DEPTH
+        return err("prism_node: tree depth " + str(depth) + " exceeds max " + str(PRISM_MAX_TREE_DEPTH))
+    if total_count > PRISM_MAX_NODE_COUNT
+        return err("prism_node: node count " + str(total_count) + " exceeds max " + str(PRISM_MAX_NODE_COUNT))
+    ok(PrismNode(kind, attrs, children, key, depth, total_count))
+
+// A childless node (`label`, `art`, `glyph`, an empty `gap`, ...), no identity key.
+fn prism_node_leaf(kind: PrismNodeKind, attrs: dict) -> Result<PrismNode>
+    prism_node_new(kind, attrs, [], none())
+
+// A node with children and no identity key -- most container widgets (`stack`, `band`, ...).
+fn prism_node_branch(kind: PrismNodeKind, attrs: dict, children: list) -> Result<PrismNode>
+    prism_node_new(kind, attrs, children, none())
+
+// A node with a runtime identity key -- what `each`/`grid` rows attach (PRISM_SPEC.md §12.6,
+// §10: "`by` is mandatory on `each` and `grid`. A missing identity selector is a COMPILE
+// ERROR" -- MA.3's widget layer enforces the compile-time obligation; this constructor is
+// simply where the resulting runtime key value gets threaded onto the node).
+fn prism_node_keyed(kind: PrismNodeKind, attrs: dict, children: list, key: string) -> Result<PrismNode>
+    prism_node_new(kind, attrs, children, some(key))
+
+// ── Accessors ──────────────────────────────────────────────────────────────────────────
+
+fn prism_node_kind(n: PrismNode) -> PrismNodeKind
+    n.kind
+
+fn prism_node_kind_str(n: PrismNode) -> string
+    prism_node_kind_name(n.kind)
+
+fn prism_node_children(n: PrismNode) -> list
+    n.children
+
+fn prism_node_child_count(n: PrismNode) -> int
+    len(n.children)
+
+fn prism_node_key(n: PrismNode) -> string?
+    n.key
+
+fn prism_node_has_key(n: PrismNode) -> bool
+    match n.key
+        Some(_) => true
+        None => false
+
+fn prism_node_depth(n: PrismNode) -> int
+    n.depth
+
+fn prism_node_count(n: PrismNode) -> int
+    n.count
+
+// Pre-order walk: invoke `visit` on this node, then recurse into each child in source order.
+// A convenience for backends that render top-down (the HTML renderer at render/, the ANSI
+// backend) so they don't each hand-roll the same recursion over `children`.
+fn prism_node_walk(n: PrismNode, visit)
+    visit(n)
+    for c in n.children
+        prism_node_walk(c, visit)
+
+// ── Attribute accessors (typed where possible) ────────────────────────────────────────────
+// `attrs` stays a generic dict at THIS layer by design (see header, design decision #1) --
+// one node type serves 22 differently-shaped widgets. These typed getters are the boundary:
+// MA.3's widget constructors read through them with an explicit default rather than every
+// caller re-deriving its own "is this the right type, and is the key even present" check
+// inline, matching the low-level-dict-getter convention std/core and forge_html already use
+// (forge_html's `_attrs`/`_attr_pair` treat an attrs dict the same way).
+
+fn prism_node_has_attr(n: PrismNode, name: string) -> bool
+    name in n.attrs
+
+fn prism_node_attr_str(n: PrismNode, name: string, default_val: string) -> string
+    if name in n.attrs
+        let v = n.attrs[name]
+        if is_string(v)
+            return v
+    default_val
+
+fn prism_node_attr_int(n: PrismNode, name: string, default_val: int) -> int
+    if name in n.attrs
+        let v = n.attrs[name]
+        if is_int(v)
+            return v
+    default_val
+
+// A NOVA bool read INLINE (e.g. straight out of a dict index, as here) reports `type_name`
+// "int", not "bool" -- it only shows as "bool" once passed across a function-call boundary.
+// (Verified directly: `is_bool()` on a dict-literal `true` read back via `attrs["k"]` returned
+// false in this file's own KAT until this was accounted for.) So this accepts EITHER
+// representation, same fix already used for exactly this duality in forge_orm's PG bool
+// param encoding -- an int is only treated as the bool encoding when it is literally 0 or 1,
+// so a genuine int-valued attribute (a `range` bound of 0, say) is never misread as a bool.
+fn prism_node_attr_bool(n: PrismNode, name: string, default_val: bool) -> bool
+    if name in n.attrs
+        let v = n.attrs[name]
+        let tn = type_name(v)
+        if tn == "bool"
+            return v
+        if tn == "int" and (v == 0 or v == 1)
+            return v == 1
+    default_val

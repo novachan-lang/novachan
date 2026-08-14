@@ -111,6 +111,19 @@ if (Test-Path $ForgeSrcDir) {
         Copy-Item -Force $_.FullName (Join-Path $LibDir $_.Name)
     }
 }
+# Prism (framework #5, presentation layer) -- same install-time contract as forge/ -> lib/
+# above. The canonical source lives at <repo>/prism/, organized into subfolders for humans,
+# but every module keeps a globally-unique `prism_*` filename (PRISM_STATUS.md: "folders are
+# for humans, prefixes are for the linker") -- so unlike std/ below, which mirrors
+# hierarchically, prism/ is FLATTENED into $NOVA_HOME/lib alongside forge, letting
+# `import prism_ansi` (etc.) resolve from any project exactly like `import forge_html`.
+$PrismSrcDir = Join-Path $env:NOVA_HOME "..\prism"
+if (Test-Path $PrismSrcDir) {
+    New-Item -ItemType Directory -Force -Path $LibDir | Out-Null
+    Get-ChildItem -Path $PrismSrcDir -Recurse -Filter *.nova | ForEach-Object {
+        Copy-Item -Force $_.FullName (Join-Path $LibDir $_.Name)
+    }
+}
 # NOVA STANDARD LIBRARY (LOCK-1): the std/ tree (<repo>/std, organized by category) is bundled into the
 # toolchain at $NOVA_HOME/std, preserving subdirs, so `import std/<category>/<name>` resolves from any
 # project -- exactly like forge/ -> lib/, but hierarchical. forge/ is the FRAMEWORK; std/ is the LANGUAGE.
