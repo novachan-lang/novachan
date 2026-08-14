@@ -110,11 +110,15 @@ if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurre
 
 Write-Host "`n[CI 2k/3] Negative type-error gate (Tier 1.5 - wrong programs MUST be rejected)..."
 & .\_neg_type_tests.ps1
+# FIXED 2026-08-15: this check was DISPLACED below the 2l wasm probe, so `& .\_wasm_stackguard_probe.ps1`
+# overwrote $LASTEXITCODE before it was read. The Tier-1.5 negative type-error gate therefore could
+# NEVER fail the CI — a soundness gate whose exit code was silently discarded. Each stage's exit-code
+# check must immediately follow its own invocation; nothing may run in between.
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k (negative type-error soundness) ==="; exit 1 }
 
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }
-if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k (negative type-error soundness) ==="; exit 1 }
 
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
