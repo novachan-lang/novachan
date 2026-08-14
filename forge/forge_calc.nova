@@ -1,6 +1,403 @@
-// forge_calc -- thin wrapper over std/parsing/calc (canonical implementation).
-import std/parsing/calc
+// forge_calc -- standalone integer arithmetic expression evaluator.
+//
+// NOT a thin wrapper: std/parsing/calc exposes its public API under the exact
+// same names (calc/calc_ok) as this module, so importing it here would be a
+// duplicate top-level `calc` definition (link error), and delegating to it is
+// impossible without renaming the std symbol (out of scope for this module).
+// The implementation below is copied in full from std/parsing/calc.nova so
+// this module is self-contained.
+//
+// Integer arithmetic expression evaluator (recursive-descent).
+//
+// Supported:
+//   • Binary operators: + - * / % ^ (^ = integer power, right-associative)
+//   • Unary minus: -5, -(3+2)
+//   • Parentheses: (2+3)*4
+//   • Integer division truncates toward zero.
+//   • Multi-digit integer literals.
+//   • Whitespace is ignored.
+//
+// PUBLIC API
+//   calc(expr)    -> int   evaluate expression; return 0 on any parse/eval error
+//   calc_ok(expr) -> bool  true iff expr is a syntactically valid expression
 
+// ── Integer power (repeated squaring) ───────────────────────────────────────
+
+// _calc_ipow: base^exp for exp >= 0. Returns 1 for base^0. Returns 0 for
+// negative exp (not meaningful for integer arithmetic).
+fn _calc_ipow(base, exp)
+    let result = 1
+    if exp < 0
+        result = 0
+    else
+        let b = base
+        let e = exp
+        while e > 0
+            if e % 2 == 1
+                result *= b
+            b *= b
+            e /= 2
+    return result
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+
+// _calc_is_digit: return 1 if character code is 0-9.
+fn _calc_is_digit(o)
+    let result = 0
+    if o >= 48
+        if o <= 57
+            result = 1
+    return result
+
+// _calc_is_space: return 1 if character code is whitespace.
+fn _calc_is_space(o)
+    let result = 0
+    if o == 32
+        result = 1
+    else
+        if o == 9
+            result = 1
+        else
+            if o == 10
+                result = 1
+            else
+                if o == 13
+                    result = 1
+    return result
+
+// _calc_tokenize: scan s into a token list.
+// Returns list of token dicts. Appends an "eof" token at the end.
+// On unknown character appends an "err" token.
+fn _calc_tokenize(s)
+    let toks = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        let ch = char_at(s, i)
+        let o = ord(ch)
+        if _calc_is_space(o) == 1
+            i += 1
+        else
+            if _calc_is_digit(o) == 1
+                // Read full integer literal.
+                let v = 0
+                let go = 1
+                while go == 1
+                    if i >= n
+                        go = 0
+                    else
+                        let c2 = char_at(s, i)
+                        let o2 = ord(c2)
+                        if _calc_is_digit(o2) == 1
+                            v = v * 10 + (o2 - 48)
+                            i += 1
+                        else
+                            go = 0
+                let tok = {}
+                tok["kind"] = "num"
+                tok["val"] = v
+                push(toks, tok)
+            else
+                if ch == "+"
+                    let tok = {}
+                    tok["kind"] = "plus"
+                    tok["val"] = 0
+                    push(toks, tok)
+                    i += 1
+                else
+                    if ch == "-"
+                        let tok = {}
+                        tok["kind"] = "minus"
+                        tok["val"] = 0
+                        push(toks, tok)
+                        i += 1
+                    else
+                        if ch == "*"
+                            let tok = {}
+                            tok["kind"] = "star"
+                            tok["val"] = 0
+                            push(toks, tok)
+                            i += 1
+                        else
+                            if ch == "/"
+                                let tok = {}
+                                tok["kind"] = "slash"
+                                tok["val"] = 0
+                                push(toks, tok)
+                                i += 1
+                            else
+                                if ch == "%"
+                                    let tok = {}
+                                    tok["kind"] = "pct"
+                                    tok["val"] = 0
+                                    push(toks, tok)
+                                    i += 1
+                                else
+                                    if ch == "^"
+                                        let tok = {}
+                                        tok["kind"] = "caret"
+                                        tok["val"] = 0
+                                        push(toks, tok)
+                                        i += 1
+                                    else
+                                        if ch == "("
+                                            let tok = {}
+                                            tok["kind"] = "lparen"
+                                            tok["val"] = 0
+                                            push(toks, tok)
+                                            i += 1
+                                        else
+                                            if ch == ")"
+                                                let tok = {}
+                                                tok["kind"] = "rparen"
+                                                tok["val"] = 0
+                                                push(toks, tok)
+                                                i += 1
+                                            else
+                                                // Unknown character → error token.
+                                                let tok = {}
+                                                tok["kind"] = "err"
+                                                tok["val"] = 0
+                                                push(toks, tok)
+                                                i += 1
+    // Append EOF.
+    let eof = {}
+    eof["kind"] = "eof"
+    eof["val"] = 0
+    push(toks, eof)
+    return toks
+
+// ── Parser helpers ───────────────────────────────────────────────────────────
+
+// _calc_cur_kind: return the kind string of the current token.
+fn _calc_cur_kind(st)
+    let toks = st["tokens"]
+    let p = st["pos"]
+    let ntoks = len(toks)
+    let result = "eof"
+    if p < ntoks
+        result = toks[p]["kind"]
+    return result
+
+// _calc_cur_val: return the integer value of the current token.
+fn _calc_cur_val(st)
+    let toks = st["tokens"]
+    let p = st["pos"]
+    let ntoks = len(toks)
+    let result = 0
+    if p < ntoks
+        result = toks[p]["val"]
+    return result
+
+// _calc_advance: move to next token.
+fn _calc_advance(st)
+    st["pos"] += 1
+
+// _calc_set_err: mark parse state as error.
+fn _calc_set_err(st)
+    st["err"] = 1
+
+// ── Recursive-descent parse functions ────────────────────────────────────────
+// Each returns an int value. On error, sets st["err"]=1 and returns 0.
+
+// Forward declarations via mutual recursion are not needed in NOVA because
+// the compiler resolves names across the file.  We define from deepest
+// precedence upward.
+
+// _calc_parse_atom: INTEGER | '(' expr ')'
+fn _calc_parse_atom(st)
+    let result = 0
+    if st["err"] == 1
+        result = 0
+    else
+        let k = _calc_cur_kind(st)
+        if k == "num"
+            result = _calc_cur_val(st)
+            _calc_advance(st)
+        else
+            if k == "lparen"
+                _calc_advance(st)
+                result = _calc_parse_expr(st)
+                if st["err"] == 0
+                    let k2 = _calc_cur_kind(st)
+                    if k2 == "rparen"
+                        _calc_advance(st)
+                    else
+                        _calc_set_err(st)
+            else
+                _calc_set_err(st)
+    return result
+
+// _calc_parse_unary: '-' unary | atom
+fn _calc_parse_unary(st)
+    let result = 0
+    if st["err"] == 1
+        result = 0
+    else
+        let k = _calc_cur_kind(st)
+        if k == "minus"
+            _calc_advance(st)
+            let inner = _calc_parse_unary(st)
+            result = -inner
+        else
+            result = _calc_parse_atom(st)
+    return result
+
+// _calc_parse_power: unary ['^' power]   (right-associative)
+fn _calc_parse_power(st)
+    let result = 0
+    if st["err"] == 1
+        result = 0
+    else
+        let base = _calc_parse_unary(st)
+        if st["err"] == 1
+            result = 0
+        else
+            let k = _calc_cur_kind(st)
+            if k == "caret"
+                _calc_advance(st)
+                let exp = _calc_parse_power(st)
+                if st["err"] == 0
+                    result = _calc_ipow(base, exp)
+            else
+                result = base
+    return result
+
+// _calc_parse_term: power { ('*' | '/' | '%') power }
+fn _calc_parse_term(st)
+    let result = 0
+    if st["err"] == 1
+        result = 0
+    else
+        result = _calc_parse_power(st)
+        let go = 1
+        while go == 1
+            if st["err"] == 1
+                go = 0
+            else
+                let k = _calc_cur_kind(st)
+                if k == "star"
+                    _calc_advance(st)
+                    let rhs = _calc_parse_power(st)
+                    result *= rhs
+                else
+                    if k == "slash"
+                        _calc_advance(st)
+                        let rhs = _calc_parse_power(st)
+                        if rhs == 0
+                            _calc_set_err(st)
+                        else
+                            result /= rhs
+                    else
+                        if k == "pct"
+                            _calc_advance(st)
+                            let rhs = _calc_parse_power(st)
+                            if rhs == 0
+                                _calc_set_err(st)
+                            else
+                                result = result % rhs
+                        else
+                            go = 0
+    return result
+
+// _calc_parse_expr: term { ('+' | '-') term }
+fn _calc_parse_expr(st)
+    let result = 0
+    if st["err"] == 1
+        result = 0
+    else
+        result = _calc_parse_term(st)
+        let go = 1
+        while go == 1
+            if st["err"] == 1
+                go = 0
+            else
+                let k = _calc_cur_kind(st)
+                if k == "plus"
+                    _calc_advance(st)
+                    let rhs = _calc_parse_term(st)
+                    result += rhs
+                else
+                    if k == "minus"
+                        _calc_advance(st)
+                        let rhs = _calc_parse_term(st)
+                        result -= rhs
+                    else
+                        go = 0
+    return result
+
+// ── Shared evaluation core ───────────────────────────────────────────────────
+
+// _calc_eval: tokenize + parse s; return dict {"val":int, "ok":int}.
+// ok=1 on success, ok=0 on any error (unknown char, syntax error, div-by-zero).
+fn _calc_eval(s)
+    let out = {}
+    out["val"] = 0
+    out["ok"] = 0
+    let n = len(s)
+    if n == 0
+        out["ok"] = 0
+    else
+        let toks = _calc_tokenize(s)
+        // Check for any err tokens from the tokenizer.
+        let has_tok_err = 0
+        let ti = 0
+        let ntoks = len(toks)
+        while ti < ntoks
+            if toks[ti]["kind"] == "err"
+                has_tok_err = 1
+            ti += 1
+        if has_tok_err == 1
+            out["ok"] = 0
+        else
+            let st = {}
+            st["tokens"] = toks
+            st["pos"] = 0
+            st["err"] = 0
+            let v = _calc_parse_expr(st)
+            // After parsing, must be at EOF with no error.
+            if st["err"] == 1
+                out["ok"] = 0
+            else
+                let k = _calc_cur_kind(st)
+                if k == "eof"
+                    out["val"] = v
+                    out["ok"] = 1
+                else
+                    out["ok"] = 0
+    return out
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// calc: evaluate integer arithmetic expression string.
+// Returns the integer result, or 0 on any error (parse error, div-by-zero, etc.).
+//
+// Examples:
+//   calc("2+3*4")      -> 14
+//   calc("(2+3)*4")    -> 20
+//   calc("2^10")       -> 1024
+//   calc("-5+3")       -> -2
+//   calc("17%5")       -> 2
+//   calc("100/7")      -> 14
+//   calc("2^3^2")      -> 512   (right-associative: 2^(3^2) = 2^9)
+//   calc("((1+2)*(3+4))") -> 21
+//   calc("2+")         -> 0     (error)
+//   calc("")           -> 0     (error)
 fn calc(expr: string) -> int
-    return calc(expr)
+    let r = _calc_eval(expr)
+    return r["val"]
+
+// calc_ok: return true iff expr is a syntactically valid expression
+// (no unknown characters, no syntax errors, no division by zero).
+//
+// Examples:
+//   calc_ok("2+3")   -> true
+//   calc_ok("2+")    -> false
+//   calc_ok("")      -> false
+fn calc_ok(expr: string) -> bool
+    let r = _calc_eval(expr)
+    let result = false
+    if r["ok"] == 1
+        result = true
+    return result
 
