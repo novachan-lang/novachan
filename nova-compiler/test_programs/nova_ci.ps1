@@ -130,6 +130,17 @@ Write-Host "`n[CI 2m/3] Prism KAT gate (node tree, 22 widgets, style, HTML + ANS
 & .\_prism_kat_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m (Prism KATs) ==="; exit 1 }
 
+# WASM EXECUTION gate -- Prism roadmap M0.1. Stage 2l above is a stack-guard probe: it asserts a
+# failure MODE, not arithmetic, so nothing here had ever RUN a wasm module and compared its answer
+# to native. The first such comparison found the wasm target silently computing wrong answers
+# (`i % 2` == 0, because nova_rt_mod was an unresolved import that a host stub filled with zero).
+# The gate checks the module's IMPORT LIST as well as its value: a value comparison only catches
+# functions a test happens to exercise, an import assertion catches every missing one.
+# Both failure paths verified by deliberate sabotage. Check sits immediately below its invocation.
+Write-Host "`n[CI 2n/3] WASM execution gate (native vs wasm32 agree; no unresolved runtime imports)..."
+& .\_wasm_exec_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2n (wasm execution) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1

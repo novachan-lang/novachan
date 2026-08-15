@@ -55,6 +55,34 @@ int64_t nova_rt_stack_limit(int64_t n) {
     return nova_wasm_depth_max;
 }
 
+/* ── REAL implementations, NOT stubs ──────────────────────────────────────────────
+   Found 2026-08-15 by the first cross-target comparison ever run: `i % 2` returned 0 on
+   wasm while native returned the right answer, so a Collatz loop took the even branch
+   every time (16 steps native, 8 on wasm) and an odd-counter returned 0 instead of 5.
+
+   The mechanism is worse than a wrong stub, and it is the reason this file must define
+   every pure-scalar runtime function explicitly:
+     1. nova_rt_mod was not defined here at all;
+     2. `-Wl,--allow-undefined` makes the linker emit an undefined symbol as a wasm
+        IMPORT rather than failing the link;
+     3. the JS harness fills EVERY unresolved import with `() => 0n`.
+   Net effect: any runtime function this file forgets silently becomes "returns 0" at
+   instantiation, with no link error, no trap, and no test failure. Verified directly --
+   the module's import list was exactly [env.nova_rt_mod].
+
+   The permanent guard against the whole class is the import-count assertion in
+   _wasm_exec_gate.ps1, not this one definition: a value comparison only catches the
+   functions a test happens to exercise, whereas an unexpected import is caught for
+   every function whether exercised or not.
+
+   Semantics mirror nova_runtime.c:6976 exactly, INCLUDING the b == -1 special case,
+   which exists to avoid the INT64_MIN % -1 undefined behaviour rather than for maths. */
+int64_t nova_rt_mod(int64_t a, int64_t b) {
+    if (b == 0) return 0;
+    if (b == -1) return 0;
+    return a % b;
+}
+
 #define STUB(name, sig) int64_t nova_rt_##name sig { return 0; }
 #define STUB_VOID(name, sig) void nova_rt_##name sig { }
 
