@@ -171,7 +171,7 @@ Smallest orthogonal core. Everything else composes.
 **Structure:** `list` (keyed/virtualized) `table` `tabs` `dialog` `sheet` `tooltip`
 **Meta:** `portal` `focus_scope` `clip` `transform` `animate`
 
-~26 primitives. The ~50 Ant-Design-class components in the target app are **compositions**, not
+~22 primitives. The ~50 Ant-Design-class components in the target app are **compositions**, not
 new primitives — `DatePicker` = `field` + `dialog` + `grid` + `button`.
 
 Every primitive carries its semantics **in its type**, which is what makes Bet 2 work.

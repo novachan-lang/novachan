@@ -1,0 +1,320 @@
+// prism_interact -- the six INTERACTION primitives (PRISM_SPEC.md Part III §9): press, entry,
+// pick, flag, range, link. Milestone MA.3 (part B). Plain functions returning `Result<PrismNode>`
+// over prism_node.nova's smart constructors -- no `face`/`->` syntax yet, exactly how forge_html's
+// div()/p()/el() are plain functions returning strings (see prism/widget/README.md).
+//
+// ── DESIGN DECISION: typed parameters over a free-form attrs dict ────────────────────────
+// prism_node.nova deliberately keeps `attrs` a generic dict (one node shape serving 22 widgets).
+// THIS file is the boundary the header of prism_node.nova points to: "the layer where each
+// kind's attrs get validated and typed." Every primitive below therefore takes typed, validated
+// parameters -- never a raw dict the caller could put anything into -- and the ONLY place a
+// dict literal appears is the last step, building the validated attrs to hand to
+// prism_node_leaf/branch. Enumerated vocabularies (`entry`'s input kind, `link`'s destination)
+// are real NOVA enums, not strings the caller could misspell; PRISM_SPEC.md §15.1's injection
+// argument extends naturally here -- an unvalidated string is exactly the shape of bug that
+// argument warns about.
+//
+// ── DESIGN DECISION: accessible name is a required parameter, not inferred ────────────────
+// PRISM_SPEC.md §13 derives a11y **label** from "a `label` child, `prompt` arg, or `art` alt" --
+// that derivation happens once `face` composition exists (M3.3+). At this library layer there is
+// no enclosing face to derive from, so `press`/`flag`/`range`/`link` require their accessible text
+// as an explicit parameter and REJECT construction when it is missing (empty string with no
+// children/content to fall back on). Rejecting a nameless interactive control at construction is
+// cheaper to fix than shipping a screen-reader-invisible button, and costs nothing here since the
+// caller already has the text in hand.
+//
+// ── DESIGN DECISION: `press`'s spec signature `press(text | child)` becomes (text, children) ──
+// NOVA has no anonymous union types, and callback/HOF-style "any" is reserved for genuinely
+// dynamic values (CLAUDE.md), which this is not -- the two spec forms are "just a label" and
+// "a label plus a visual composition" (icon + label), not two unrelated shapes. `children: list`
+// (possibly empty) covers the composition case without inventing a second entry point; the
+// accessible-name rule above still requires SOMETHING to name the control.
+//
+// ── DESIGN DECISION: `link`'s destination is a closed 2-variant enum, not a string ───────────
+// PRISM_SPEC.md §15.1: "injection is unrepresentable" and the destination must be an allowlist,
+// never a denylist. `PrismLinkTarget` has exactly two constructors -- `prism_link_target_url`
+// (external, scheme-checked against {http, https}) and `prism_link_target_route` (in-app, must
+// start with a single `/`, no scheme, no protocol-relative `//`). There is no third constructor
+// that accepts a raw string with no validation, so a caller cannot smuggle a `javascript:` URL
+// past the type by picking the "wrong" constructor -- both paths validate.
+// Scheme extraction reuses std/validation/url.nova's `vurl_scheme` (already a hardened parser
+// for exactly this — CLAUDE.md's "does this already exist?" rule) rather than re-deriving one.
+// NOTE (found while wiring this up): `_vurl_valid_scheme` there compares the scheme
+// case-SENSITIVELY ("HTTP" fails where "http" passes) -- a pre-existing gap in that shared
+// module, out of scope to patch here. Worked around locally by lower-casing a COPY of the
+// destination before handing it to `vurl_scheme`; the original-cased string is still what gets
+// stored as the node's `href` attr.
+//
+// ── DESIGN DECISION: `entry`'s input kind is a closed enum ────────────────────────────────
+// PRISM_SPEC.md's Part III table gives `entry`'s signature as just `entry(prompt: string)`; it
+// does not enumerate input kinds anywhere in the sections read for this milestone. Modelled here
+// as the smallest useful closed vocabulary (text/password/email/number/search/multiline) so the
+// stored attr is always one of six known strings, never a free-form one -- flagged as a judgment
+// call in the absence of a normative list, not a spec quote.
+//
+// PUBLIC API
+//   press(text: string, children: list) -> Result<PrismNode>
+//   PrismEntryKind + prism_entry_kind_text/_password/_email/_number/_search/_multiline()
+//   entry(prompt: string, kind: PrismEntryKind, value: string) -> Result<PrismNode>
+//   entry_kind_of(node) -> string                         accessor (round-trips through attr_str)
+//   PrismPickOption { value: string, label: string } + prism_pick_option(value, label)
+//   pick(options: list, selected_value: string) -> Result<PrismNode>
+//     options: list<PrismPickOption>   a non-PrismPickOption element is rejected with a typed
+//                                      error (found during MA.3 hardening: this loop read
+//                                      `o.value` before checking `o`'s type -- same class of
+//                                      wild-pointer-read bug as prism_node_new's `children`).
+//   pick_options(node) -> list                            accessor (raw attrs read -- see below)
+//   pick_selected_value(node) -> string                   accessor (attr_str)
+//   flag(label: string, state: bool) -> Result<PrismNode>
+//   range(label: string, min_val/max_val/step_val/value: int) -> Result<PrismNode>
+//   PrismLinkTarget + prism_link_target_url(url) / prism_link_target_route(path)
+//   link(text: string, target: PrismLinkTarget) -> Result<PrismNode>
+//
+// All 11 (across this file and prism_structure.nova) are prefixed `prism_` -- NOVA's flat LLVM
+// symbol space means an unprefixed `link` would collide with forge_html's `link`.
+
+import prism_node
+import std/validation/url as vurl
+
+// ── entry: input kind (closed vocabulary, see header) ────────────────────────────────────
+enum PrismEntryKind
+    EntryText()
+    EntryPassword()
+    EntryEmail()
+    EntryNumber()
+    EntrySearch()
+    EntryMultiline()
+
+// Cross-module constructors -- enum variant constructors are file-local (verified in
+// prism_node.nova's own header note), so every OTHER file reaches these kinds through here.
+fn prism_entry_kind_text() -> PrismEntryKind
+    EntryText()
+fn prism_entry_kind_password() -> PrismEntryKind
+    EntryPassword()
+fn prism_entry_kind_email() -> PrismEntryKind
+    EntryEmail()
+fn prism_entry_kind_number() -> PrismEntryKind
+    EntryNumber()
+fn prism_entry_kind_search() -> PrismEntryKind
+    EntrySearch()
+fn prism_entry_kind_multiline() -> PrismEntryKind
+    EntryMultiline()
+
+// Exhaustive match, no wildcard -- adding a 7th kind without a case here is a compile error,
+// same payoff prism_node.nova's prism_node_kind_name gets from the same shape.
+fn _prism_entry_kind_str(kind: PrismEntryKind) -> string
+    match kind
+        EntryText() => "text"
+        EntryPassword() => "password"
+        EntryEmail() => "email"
+        EntryNumber() => "number"
+        EntrySearch() => "search"
+        EntryMultiline() => "multiline"
+
+// ── link: destination (closed 2-variant enum, see header) ────────────────────────────────
+enum PrismLinkTarget
+    ExternalUrl(url: string)
+    AppRoute(path: string)
+
+fn prism_link_target_url(url: string) -> PrismLinkTarget
+    ExternalUrl(url)
+fn prism_link_target_route(path: string) -> PrismLinkTarget
+    AppRoute(path)
+
+// Allowlist, never a denylist (PRISM_SPEC.md §15.1): only these two schemes are ever accepted.
+fn _prism_link_allowed_scheme(scheme: string) -> bool
+    scheme == "http" or scheme == "https"
+
+// An in-app route must be a single-leading-slash path: no scheme, and no leading "//" (the
+// protocol-relative bypass a browser would resolve as an absolute cross-origin URL) and no
+// leading "/\" either -- browsers normalize a backslash in the authority position to a forward
+// slash, so "/\evil.com" resolves to the SAME cross-origin navigation as "//evil.com" wearing a
+// different byte (a well-known open-redirect bypass class; found in the 2026-08-15 adversarial
+// pass on the ACCEPTED set -- the rejected set was already airtight). Both leading bytes get the
+// identical treatment: path[1] must be neither "/" nor "\".
+fn _prism_link_valid_route(path: string) -> bool
+    let n = len(path)
+    if n == 0
+        return false
+    if path[0] != "/"
+        return false
+    if n >= 2 and (path[1] == "/" or path[1] == chr(92))
+        return false
+    true
+
+// A control character (any byte < 0x20, plus DEL 0x7F) anywhere in a stored destination is an
+// HTTP response-splitting / header-injection vector the instant that href is later emitted into
+// markup or a `Location:` response header (MA.5's renderer, or any HTTP layer built on top of
+// Prism). A browser's address bar silently strips a pasted CR/LF; prism_link must not even store
+// one, since nothing downstream can be trusted to re-derive that a byte is unsafe. Callers check
+// this BEFORE scheme/route validation (below) because a stray CR/LF can also corrupt scheme
+// extraction (e.g. hide a second token inside what looks like one) -- reject the raw shape first
+// rather than parse an already-corrupted string. Returns the index of the first offending byte,
+// or -1 if the string is clean.
+fn _prism_link_first_control_char(s: string) -> int
+    let n = len(s)
+    let mut i = 0
+    while i < n
+        let b = ord(s[i])
+        if b < 32 or b == 127
+            return i
+        i += 1
+    -1
+
+// A `user@host` or `user:pass@host` authority is legal per RFC 3986, but the browser navigates to
+// HOST -- everything up to and including the LAST unencoded '@' is an ignored, deprecated
+// userinfo component. So "https://example.com@evil.com/" navigates to evil.com; "example.com" is
+// just a username the user never sees rendered as the destination. A scheme allowlist structurally
+// cannot catch this -- the scheme genuinely IS "https" -- which is exactly why this needs its own
+// check rather than a smarter scheme rule. Scoped strictly to the AUTHORITY: the span between
+// "://" and the next '/', '?', or '#'. A '@' anywhere else -- a path segment like "/users/@handle"
+// or a query value like "?to=a@b.com" -- is a legitimate, unrelated use and must stay accepted.
+fn _prism_link_authority_has_userinfo(url: string) -> bool
+    let sep = find(url, "://")
+    if sep < 0
+        return false
+    let after = slice(url, sep + 3, len(url))
+    let n = len(after)
+    let mut i = 0
+    while i < n
+        let c = after[i]
+        if c == "/" or c == "?" or c == "#"
+            return false
+        if c == "@"
+            return true
+        i += 1
+    false
+
+// ── pick: option set ──────────────────────────────────────────────────────────────────────
+// A plain struct. CORRECTION (verified while wiring the KAT, 2026-08-15): unlike what
+// prism_node.nova's header implies for enums specifically, a plain struct's positional
+// constructor call is ALSO resolved as constructor-call-position identifier lookup and is
+// THEREFORE ALSO file-local cross-module -- `prism_interact.PrismPickOption(...)` fails
+// (E1000: "has no exported function 'PrismPickOption'"), same failure mode the memory notes
+// record for enum variants, just not previously confirmed for structs. Hence the ordinary
+// wrapper function below, same shape as prism_node.nova's `prism_kind_*`.
+type PrismPickOption
+    value: string
+    label: string
+
+fn prism_pick_option(value: string, label: string) -> PrismPickOption
+    PrismPickOption(value, label)
+
+// ────────────────────────────────────────────────────────────────────────────────────────
+// press -- activatable control (a11y role `button`, PRISM_SPEC.md §9).
+// text is the accessible name; children is the (possibly empty) visual composition (e.g. an
+// icon plus the label). At least one of the two must be present -- a control with neither has
+// no accessible name and nothing to click on.
+fn prism_press(text: string, children: list) -> Result<PrismNode>
+    if text == "" and len(children) == 0
+        return err("prism_press: needs a text label or at least one child (accessible name required)")
+    prism_node.prism_node_branch(prism_node.prism_kind_press(), {"text": text}, children)
+
+// entry -- text input (a11y role `textbox`, PRISM_SPEC.md §9).
+fn prism_entry(prompt: string, kind: PrismEntryKind, value: string) -> Result<PrismNode>
+    if prompt == ""
+        return err("prism_entry: needs a non-empty prompt (accessible name required)")
+    let attrs = {"prompt": prompt, "kind": _prism_entry_kind_str(kind), "value": value}
+    prism_node.prism_node_leaf(prism_node.prism_kind_entry(), attrs)
+
+// Accessor: the validated kind string ("text"/"password"/...), round-tripped through the
+// generic prism_node_attr_str getter -- proves the enum-derived value survives storage intact.
+fn prism_entry_kind_of(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "kind", "text")
+
+// pick -- choice among options (a11y role `combobox`/`radiogroup`, PRISM_SPEC.md §9).
+// Rejects an empty option set (nothing to choose among), a duplicate option value (ambiguous
+// selection target), and a selected_value that names no option. selected_value == "" means "no
+// current selection" and is always allowed.
+// `options` is a bare `list` (same untyped-caller-value caution as prism_node.nova's `children`
+// and prism_structure.nova's `key_fn`/`columns`) -- found during MA.3 hardening: this loop read
+// `o.value` before checking `o` was actually a PrismPickOption, the identical wild-pointer-read
+// class as the prism_node_new crash this milestone fixes. Guarded the same way: a type_name
+// check naming the offending index/type before the first field read.
+fn prism_pick(options: list, selected_value: string) -> Result<PrismNode>
+    if len(options) == 0
+        return err("prism_pick: needs at least one option")
+    let seen = {}
+    let mut opt_idx = 0
+    for o in options
+        if type_name(o) != "PrismPickOption"
+            return err("prism_pick: option " + str(opt_idx) + " is not a PrismPickOption (got " + type_name(o) + ")")
+        if o.value in seen
+            return err("prism_pick: duplicate option value '" + o.value + "'")
+        seen[o.value] = true
+        opt_idx += 1
+    if selected_value != "" and selected_value not in seen
+        return err("prism_pick: selected_value '" + selected_value + "' is not one of the option values")
+    let attrs = {"selected_value": selected_value, "options": options}
+    prism_node.prism_node_leaf(prism_node.prism_kind_pick(), attrs)
+
+// Accessor: the raw option list. prism_node.nova's typed getters (attr_str/_int/_bool) only
+// cover scalar attrs by design (see its header) -- a list-valued attr is read directly off the
+// struct's own `attrs` field, exactly the boundary that design note anticipates.
+fn prism_pick_options(node: PrismNode) -> list
+    node.attrs["options"]
+
+fn prism_pick_selected_value(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "selected_value", "")
+
+// flag -- boolean control (a11y role `checkbox`/`switch`, PRISM_SPEC.md §9).
+fn prism_flag(label: string, state: bool) -> Result<PrismNode>
+    if label == ""
+        return err("prism_flag: needs a non-empty label (accessible name required)")
+    prism_node.prism_node_leaf(prism_node.prism_kind_flag(), {"label": label, "state": state})
+
+// range -- bounded numeric control (a11y role `slider`, PRISM_SPEC.md §9). Validates the real
+// ordering semantics the spec's min/max/step language implies: min must not exceed max, step
+// must be positive (a zero or negative step can never advance), and the current value must lie
+// within [min_val, max_val]. (int-only for this milestone -- the spec allows "int or float" for
+// range's settled-value payload; a float variant is left for when a concrete use case needs it.)
+fn prism_range(label: string, min_val: int, max_val: int, step_val: int, value: int) -> Result<PrismNode>
+    if label == ""
+        return err("prism_range: needs a non-empty label (accessible name required)")
+    if min_val > max_val
+        return err("prism_range: min (" + str(min_val) + ") must be <= max (" + str(max_val) + ")")
+    if step_val <= 0
+        return err("prism_range: step (" + str(step_val) + ") must be > 0")
+    if value < min_val or value > max_val
+        return err("prism_range: value (" + str(value) + ") must be within [" + str(min_val) + ", " + str(max_val) + "]")
+    let attrs = {"label": label, "min": min_val, "max": max_val, "step": step_val, "value": value}
+    prism_node.prism_node_leaf(prism_node.prism_kind_range(), attrs)
+
+// link -- navigation (a11y role `link`, PRISM_SPEC.md §9). text is the visible/accessible label;
+// target is validated per its variant (see the header design note and §15.1).
+fn prism_link(text: string, target: PrismLinkTarget) -> Result<PrismNode>
+    if text == ""
+        return err("prism_link: needs a non-empty visible/accessible text label")
+    match target
+        ExternalUrl(url) =>
+            let bad_idx = _prism_link_first_control_char(url)
+            if bad_idx >= 0
+                return err("prism_link: destination has a control character (code " + str(ord(url[bad_idx])) + ") at index " + str(bad_idx) + " -- rejected (HTTP response-splitting / header-injection risk)")
+            // vurl_scheme only recognizes hierarchical `scheme://...` URLs (std/validation/
+            // url.nova's `_vurl_parse` requires a literal "://" and returns "" if none is found).
+            // "javascript:alert(1)" has no "://", so this call returns "" -- NOT "javascript" --
+            // and "" then fails the {http,https} allowlist below for the same reason any other
+            // garbage scheme would. The rejection is correct and the allowlist is sound either
+            // way (an empty scheme fails, and a correctly-extracted "javascript" would also fail
+            // this allowlist) -- but don't read the next two lines as "javascript: was extracted
+            // and denied by name". It is never extracted at all; it is denied by accident of
+            // shape. Documented here so the next reader doesn't mistake accident for design.
+            let scheme = vurl.vurl_scheme(lower(url))
+            if not _prism_link_allowed_scheme(scheme)
+                return err("prism_link: scheme '" + scheme + "' is not allowed (only http, https, or an in-app route)")
+            if _prism_link_authority_has_userinfo(url)
+                return err("prism_link: destination's authority contains '@' (userinfo) -- the browser navigates to whatever host follows '@', not the text before it; this is an open-redirect/phishing vector and userinfo-in-URL is deprecated in browsers")
+            prism_node.prism_node_leaf(prism_node.prism_kind_link(), {"text": text, "href": url, "kind": "external"})
+        AppRoute(path) =>
+            let bad_idx = _prism_link_first_control_char(path)
+            if bad_idx >= 0
+                return err("prism_link: destination has a control character (code " + str(ord(path[bad_idx])) + ") at index " + str(bad_idx) + " -- rejected (HTTP response-splitting / header-injection risk)")
+            if not _prism_link_valid_route(path)
+                return err("prism_link: '" + path + "' is not a valid in-app route (must start with a single '/', no scheme, no leading '//' or '/\\')")
+            prism_node.prism_node_leaf(prism_node.prism_kind_link(), {"text": text, "href": path, "kind": "route"})
+
+fn prism_link_href(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "href", "")
+
+fn prism_link_kind_of(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "kind", "")

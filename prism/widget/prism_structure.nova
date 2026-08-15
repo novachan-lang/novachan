@@ -1,0 +1,206 @@
+// prism_structure -- the five STRUCTURE primitives (PRISM_SPEC.md Part III §10): each, grid,
+// sheet, hint, tabs. Milestone MA.3 (part B). Plain functions returning `Result<PrismNode>` over
+// prism_node.nova's smart constructors, following the same convention as prism_interact.nova.
+//
+// ── DESIGN DECISION: `by` (identity selector) is a REQUIRED parameter, not optional ────────
+// PRISM_SPEC.md §10 is explicit: "`by` is mandatory on `each` and `grid`. A missing identity
+// selector is a compile error, not a runtime warning." There is no face/DSL layer yet to make
+// that a literal parse-time error, so the equivalent enforced here is: `key_fn` has no default
+// and no zero-arg overload -- there is no way to call prism_each/prism_grid without supplying
+// one. A duplicate key within one call is rejected with a typed error naming the key (§12.6:
+// `by` is what supplies runtime row identity for the reactivity engine's ROW-granularity
+// invalidation; a silent last-write-wins duplicate would corrupt that identity map).
+//
+// ── DESIGN DECISION: `each`'s row re-keying reads PrismNode fields directly ────────────────
+// `each`'s row shape is caller-defined (the render callback can return ANY already-built node --
+// `band.row` in the spec's worked example, but nothing requires that). To attach the row's key
+// AFTER the callback already built the node, this file reads `rendered.kind`/`.attrs`/`.children`
+// directly and re-constructs via `prism_node.prism_node_new(..., some(key))`. This is legitimate,
+// not a workaround: NOVA has no field-privacy concept (confirmed against
+// NOVA_LANGUAGE_FEATURES.md -- struct fields are always `obj.field` accessible), and
+// prism_node.nova's own header lists no accessor for the raw `attrs` dict precisely because
+// widget-layer code is expected to read through the struct directly when the typed getters
+// don't fit (its own words: "MA.3's widget constructors read through them ... rather than every
+// caller re-deriving its own check inline" -- for a non-scalar need like this, reading the
+// field directly IS that boundary). A `prism_node_attrs(n) -> dict` accessor would make this
+// one line shorter; noted as a small upstream gap, not a blocker.
+// `grid`'s rows do NOT need this: a grid row's shape is fixed (one cell per column), so
+// `prism_grid` builds the keyed row node itself in one step and never needs to re-key
+// something already built.
+//
+// ── HARDENING: `key_fn` / `columns` are typed by CONTRACT ("string"), not by the compiler ────
+// `key_fn` is a caller-supplied closure and `columns` a bare `list` (matching the untyped-
+// `children` caution prism_node.nova's header explains) -- nothing stops a caller writing
+// `fn(t) t.id` (returning an int) or passing a non-string column name. Before either value is
+// used in a dict-membership test or concatenated into an error string, both `prism_each` and
+// `prism_grid` now check `is_string(...)` and return a typed error naming the offending
+// `type_name` -- the same memory-safety-adjacent boundary prism_node_new enforces for
+// `children`, applied here for the other place this module trusts an untyped caller value.
+//
+// ── HARDENING (found in the same audit, same class): `render_fn`'s return, `panels`' elements ──
+// Two more field reads on untyped caller-supplied values, both discovered while closing the
+// `prism_node_new` children hole above: `prism_each` read `rendered.kind` (render_fn's return
+// value -- documented `Result<PrismNode>`, but that is a doc comment, not a compiler-checked
+// callback signature) and `prism_tabs` read `p.content`/`p.label` (an element of the bare
+// `panels: list`) BEFORE either was confirmed to actually be the expected struct type. Both are
+// now guarded with the identical `type_name(...) != "ExpectedType"` check, before the first
+// field access, naming the offending index and actual type on rejection.
+//
+// PUBLIC API
+//   each(items: list, key_fn, render_fn) -> Result<PrismNode>
+//     key_fn(item) -> string        REQUIRED. must return the same string type as every other
+//                                   item's key (caller writes `fn(t) str(t.id)` for an int id).
+//                                   A non-string return is rejected with a typed error, not UB.
+//     render_fn(item) -> Result<PrismNode>   builds ONE row's node (any kind/shape). A non-node
+//                                   Ok(...) return is rejected with a typed error, not UB.
+//   grid(rows: list, key_fn, columns: list, cell_fn) -> Result<PrismNode>
+//     columns: list<string>         column names; must be non-empty, duplicate-free, and
+//                                   actually strings (non-string elements are rejected).
+//     cell_fn(row_item, column) -> Result<PrismNode>   builds ONE cell.
+//   sheet(child: PrismNode, exclusive: bool) -> Result<PrismNode>
+//   hint(text: string, child: PrismNode) -> Result<PrismNode>
+//   PrismTabPanel { label: string, content: PrismNode } + prism_tab_panel(label, content)
+//   tabs(panels: list, selected: int) -> Result<PrismNode>
+//     panels: list<PrismTabPanel>   a non-PrismTabPanel element is rejected with a typed error.
+//   tabs_panel_label(panel_node) -> string        accessor (attr_str)
+//
+// All 11 (across this file and prism_interact.nova) are prefixed `prism_`.
+
+import prism_node
+
+// ────────────────────────────────────────────────────────────────────────────────────────
+// each -- keyed repetition (PRISM_SPEC.md §10). Builds one row per item via render_fn, keyed by
+// key_fn(item), then wraps all rows in an Each container. Rejects a duplicate key by name rather
+// than silently keeping the last row with that key (§10: a missing/broken identity selector is
+// a correctness bug, not a warning).
+fn prism_each(items: list, key_fn, render_fn) -> Result<PrismNode>
+    let seen = {}
+    let rows = []
+    for item in items
+        let k = key_fn(item)
+        // `key_fn` is caller-supplied and untyped (PRISM_SPEC.md §10 only mandates that a
+        // selector EXISTS, not what it returns) -- a very natural caller mistake is
+        // `fn(t) t.id` returning an int. Guarded BEFORE `k` is used in `k in seen` or the
+        // string concatenation below, which would otherwise fail on a non-string key (same
+        // memory-safety class of bug as an untyped `children` element -- see prism_node.nova's
+        // prism_node_new header note).
+        if not is_string(k)
+            return err("prism_each: key_fn must return a string, got " + type_name(k))
+        if k in seen
+            return err("prism_each: duplicate key '" + k + "'")
+        seen[k] = true
+        let rendered_r = render_fn(item)
+        if is_err(rendered_r)
+            return rendered_r
+        let rendered = unwrap(rendered_r)
+        // `render_fn`'s documented return type is `Result<PrismNode>`, but that is a doc
+        // comment, not a compiler-checked signature -- `render_fn` is an untyped callback
+        // parameter, so a caller whose render_fn returns `ok(something-not-a-node)` would
+        // otherwise reach `rendered.kind` next: the same wild-pointer-read class the
+        // prism_node_new fix closes for `children`, just one level up the call chain. Guarded
+        // here before any field of `rendered` is touched.
+        if type_name(rendered) != "PrismNode"
+            return err("prism_each: render_fn must return a PrismNode, got " + type_name(rendered))
+        let keyed_r = prism_node.prism_node_new(rendered.kind, rendered.attrs, rendered.children, some(k))
+        if is_err(keyed_r)
+            return keyed_r
+        rows.push(unwrap(keyed_r))
+    prism_node.prism_node_branch(prism_node.prism_kind_each(), {}, rows)
+
+// grid -- tabular data (PRISM_SPEC.md §10). Each row is a fixed shape (one cell per column, in
+// column order), so this builds the keyed row node in one step -- no re-keying needed (see
+// header). Rejects: an empty column set, a duplicate column name, and a duplicate row key.
+fn prism_grid(rows: list, key_fn, columns: list, cell_fn) -> Result<PrismNode>
+    if len(columns) == 0
+        return err("prism_grid: needs at least one column")
+    let seen_cols = {}
+    for c in columns
+        // Same untyped-callback/untyped-element trap prism_each guards against: `columns` is
+        // documented as `list<string>` but the parameter itself is a bare `list`, so a hostile
+        // or mistaken non-string column name must be caught before it reaches `c in seen_cols`
+        // / the string concatenation below.
+        if not is_string(c)
+            return err("prism_grid: column name must be a string, got " + type_name(c))
+        if c in seen_cols
+            return err("prism_grid: duplicate column name '" + c + "'")
+        seen_cols[c] = true
+
+    let seen_keys = {}
+    let out_rows = []
+    for row_item in rows
+        let k = key_fn(row_item)
+        // See prism_each's identical guard above -- key_fn is caller-supplied and untyped.
+        if not is_string(k)
+            return err("prism_grid: key_fn must return a string, got " + type_name(k))
+        if k in seen_keys
+            return err("prism_grid: duplicate row key '" + k + "'")
+        seen_keys[k] = true
+        let cells = []
+        for col in columns
+            let cell_r = cell_fn(row_item, col)
+            if is_err(cell_r)
+                return cell_r
+            cells.push(unwrap(cell_r))
+        // A grid row is a horizontal band of its cells -- reuses the existing arrangement kind
+        // (Band) rather than inventing a "Row" tag; PrismNodeKind's 22-primitive vocabulary is
+        // closed (PRISM_SPEC.md A7), so composing from it is the intended way to add shape here.
+        let row_r = prism_node.prism_node_new(prism_node.prism_kind_band(), {}, cells, some(k))
+        if is_err(row_r)
+            return row_r
+        out_rows.push(unwrap(row_r))
+    prism_node.prism_node_branch(prism_node.prism_kind_grid(), {"columns": len(columns)}, out_rows)
+
+// sheet -- modal surface: dialog/drawer/popover (PRISM_SPEC.md §10). `exclusive` records the
+// spec's `needs exclusive` grant (§15.8: compositor-enforced input exclusivity) as a validated
+// attr; the capability system itself is a `face`-level concern (§5's `needs` modifier) not yet
+// wired to this plain-function layer.
+fn prism_sheet(child: PrismNode, exclusive: bool) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_sheet(), {"exclusive": exclusive}, [child])
+
+// hint -- transient overlay: tooltip (PRISM_SPEC.md §10). text is the tooltip's own message;
+// child is the anchor element it is attached to.
+fn prism_hint(text: string, child: PrismNode) -> Result<PrismNode>
+    if text == ""
+        return err("prism_hint: needs non-empty tooltip text")
+    prism_node.prism_node_branch(prism_node.prism_kind_hint(), {"text": text}, [child])
+
+// tabs -- mutually exclusive panels (PRISM_SPEC.md §10). A plain struct. As with
+// prism_interact.nova's PrismPickOption, a struct's positional constructor is ALSO file-local
+// cross-module (verified directly: `prism_structure.PrismTabPanel(...)` from another file fails
+// E1000, exactly like an enum variant would) -- so prism_tab_panel() below is the cross-module
+// constructor callers actually use.
+type PrismTabPanel
+    label: string
+    content: PrismNode
+
+fn prism_tab_panel(label: string, content: PrismNode) -> PrismTabPanel
+    PrismTabPanel(label, content)
+
+// Rejects an empty panel set and an out-of-bounds `selected` index (the real semantics the
+// spec's "mutually exclusive panels" implies: there must always be exactly one panel selected,
+// and it must exist). Each panel's label is carried onto its content node as a "tab_label" attr
+// so a later renderer can read the tab header text off the same node that holds the panel body.
+fn prism_tabs(panels: list, selected: int) -> Result<PrismNode>
+    if len(panels) == 0
+        return err("prism_tabs: needs at least one panel")
+    if selected < 0 or selected >= len(panels)
+        return err("prism_tabs: selected index " + str(selected) + " is out of bounds for " + str(len(panels)) + " panel(s)")
+    let labeled = []
+    let mut panel_idx = 0
+    for p in panels
+        // `panels` is a bare `list` -- a caller passing anything other than a real
+        // PrismTabPanel (built via prism_tab_panel()) would otherwise hit `p.content` next,
+        // the same wild-pointer-read class prism_node_new's `children` guard closes. Guarded
+        // before `p.content`/`p.label` are ever read.
+        if type_name(p) != "PrismTabPanel"
+            return err("prism_tabs: panel " + str(panel_idx) + " is not a PrismTabPanel (got " + type_name(p) + ")")
+        let merged = dict_merge(p.content.attrs, {"tab_label": p.label})
+        let labeled_r = prism_node.prism_node_new(p.content.kind, merged, p.content.children, p.content.key)
+        if is_err(labeled_r)
+            return labeled_r
+        labeled.push(unwrap(labeled_r))
+        panel_idx += 1
+    prism_node.prism_node_branch(prism_node.prism_kind_tabs(), {"selected": selected}, labeled)
+
+fn prism_tabs_panel_label(panel_node: PrismNode) -> string
+    prism_node.prism_node_attr_str(panel_node, "tab_label", "")

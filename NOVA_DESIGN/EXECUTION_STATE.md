@@ -799,6 +799,64 @@ HTTP server, which is throttled by the same quantum. Full detail in memory
 
 ---
 
+## Current focus — UPDATED 2026-08-15 (PRISM PHASE A: the presentation layer becomes real code)
+
+**Where we are:** Prism — Framework #5, v0.1 shipped long ago as 140 lines of ANSI helpers — is now
+being built to v1.0. The live tracker for this campaign is
+[`PRISM_STATUS.md`](PRISM_STATUS.md); the execution path is [`PRISM_ROADMAP.md`](PRISM_ROADMAP.md)
+and the normative contract is [`PRISM_SPEC.md`](PRISM_SPEC.md). **This section is the pointer;
+do not fork a competing tracker.**
+
+**The sequencing insight that unblocked everything.** Prism's hard blockers (M0.3 runtime
+core/host split, M0.4 closures across the WASM boundary) are RED compiler work in
+`nova-compiler/`, 10-18 weeks combined. The earlier reading was that Prism could not start until
+they landed. That was wrong: **a `face` is initially just a NOVA function returning a node tree.**
+The `face`/`->` syntax is sugar the compiler adds at M3.1. So the entire library layer —
+**Phase A, milestones MA.1-MA.8, ~9-10 weeks, every one GREEN with zero compiler risk** — can be
+built now, in `prism/`, touching no compiler or runtime file. Library first, syntax later; exactly
+how `forge_html` was built. Phase A runs in parallel with the compiler work with no file contention.
+
+**Landed (commit `c55c8153`):**
+- **MA.1** — `prism/` exists: 14 subfolders, `nova.toml`, per-folder READMEs. The old
+  `nova-compiler/test_programs/prism.nova` moved to `prism/backend/ansi/prism_ansi.nova` with all
+  17 functions re-prefixed `prism_ansi_*`. Three demo tests referenced it (not one, as briefed);
+  all three updated and re-verified passing identically. Module resolution came free by extending
+  `_proc_util.ps1`'s existing forge→`lib/` sync with a recursive `prism/` block — `nova_ci.ps1`
+  untouched.
+- **MA.2** — `prism/core/prism_node.nova` (338 lines) + KAT (172 lines, **6/6 green**): the
+  backend-agnostic node-tree value type every widget, backend and dev tool builds on.
+
+**Two findings from MA.2 that outlive Prism:**
+1. ★ **Enum variant constructors are FILE-LOCAL in NOVA.** From an importing file, bare `Variant()`
+   gives `E1002 unknown identifier` and qualified `mod.Variant()` gives `E1000 no exported
+   function`. Independently re-verified with a two-file probe. **This blocks ANY multi-module ADT
+   design** — typed errors, message/event enums, state machines, protocol tags — not just Prism.
+   The workaround is a zero-arg wrapper function per variant in the declaring file; `prism_node.nova`
+   ships 22 of them. Plan that wrapper layer up front or keep the enum and its constructors in one file.
+2. **Doc counts were wrong.** "26 primitives" is really **22** (the spec's own Part III tables sum to
+   7+4+6+5) and "44 keywords" is really **39**. Corrected across the spec, roadmap, status and plan;
+   the unspecified **Meta** group (`portal`/`focus_scope`/`clip`/`transform`/`animate`) is explicitly
+   deferred rather than invented to make a number match.
+
+**In flight:** **MA.3** — all 22 primitives as plain `prism_*`-prefixed functions returning
+`Result<PrismNode>`, split into an arrangement+content half and an interaction+structure half, each
+KAT-proven. Two spec obligations are enforced at the library layer rather than deferred to the
+compiler: §10's mandatory identity selector on `each`/`grid` (duplicate keys are an error, not
+last-write-wins) and §15.1's injection-unrepresentable guarantee (`prism_link` allowlists schemes;
+`javascript:`/`data:`/`vbscript:` are rejected, never escaped).
+
+**Also closed this session (`a2e7aaa1`):** a live CI bug — the `[CI 2k/3]` negative-type-error gate's
+`$LASTEXITCODE` check had been displaced below the `2l` wasm stack-guard probe, which overwrote it.
+**The Tier-1.5 type-soundness gate could never fail the build.** Check moved adjacent to its own
+invocation; every other stage audited for the same displacement.
+
+**Next after MA.3:** MA.4 typed `look`/`palette` → **MA.5 the server-side HTML renderer, which makes
+Prism immediately useful to Forge** → MA.6 ANSI backend → MA.7 generated catalog → MA.8 gate wiring.
+The RED compiler path (M0.3, M0.4) remains the true critical path to a browser and needs a separate
+go-ahead.
+
+---
+
 ## Current focus — UPDATED 2026-08-10 (CRASH-SAFE DEFER: shadow stack + fault-isolated drain)
 
 **`defer` is now crash-safe.** Per-task shadow stack: the compiler registers each `defer` site

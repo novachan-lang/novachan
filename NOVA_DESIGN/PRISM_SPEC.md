@@ -580,6 +580,35 @@ code path from data to executable content or to structural markup.
 fails when one sink is missed — the recurring root cause of XSS. Prism has **no sink**. XSS, template
 injection, and DOM-clobbering are not "prevented"; they are **not expressible**.
 
+#### 15.1.1 The one exception, and its rules (NORMATIVE — added 2026-08-15 after adversarial testing)
+
+`link` is the **single primitive whose payload a platform will interpret rather than display.** A
+URL is not glyphs; the browser executes its scheme. So `link` is the one place the "no sink"
+argument does not carry itself, and it needs explicit rules. These were derived by probing the
+**accepted** set — an allowlist is only as strong as what it admits, and testing only the obvious
+rejections is how this class of bug survives.
+
+`link` takes a **typed destination** (`ExternalUrl` | `AppRoute`), never a bare string, so there is
+no constructor a caller can pick to skip validation. Both variants MUST enforce:
+
+| Rule | Rejects | Why |
+|---|---|---|
+| **Scheme allowlist** — `{http, https}` only, never a denylist of bad schemes | `javascript:` (any casing, with or without `//`, with leading whitespace or embedded control chars), `data:`, `vbscript:`, `file:` | A denylist is a list of the attacks you thought of. |
+| **No control characters** — reject any byte `< 0x20` or `== 0x7F`, checked **before** scheme extraction | `https://example.com/` + CRLF + `X: 1` | A stored CR/LF is HTTP **response splitting** the moment a renderer or `Location:` header emits it. Browsers strip these; storing them verbatim is worse than rejecting. Checking first also stops a control char from corrupting scheme extraction. |
+| **No userinfo in the authority** — reject `@` between `://` and the next `/`, `?`, or `#` | `https://example.com@evil.com/` | The browser navigates to **evil.com**; `example.com` is a username. A scheme allowlist structurally cannot catch this — the scheme really is `https`. Scope to the authority: `@` in a path (`/users/@handle`) or query (`?to=a@b.com`) is legitimate and MUST still be accepted. |
+| **Route authority-escape** — an `AppRoute` must begin with exactly one `/`, where neither `/` **nor `\`** may follow | `//evil.com`, `/\evil.com` | Browsers normalize backslash to forward-slash in the authority position, so `/\` is `//` — a well-known open-redirect bypass that defeats a `//`-only check. |
+
+**Explicitly NOT rejected:** `/redirect?next=javascript:alert(1)`. That is an in-app route whose
+*query parameter* contains a string. What an application does with its own query params is not
+`link`'s concern, and rejecting it would break legitimate return-URL patterns.
+
+**Implementation note (soundness of the current check).** Prism's URL scheme extraction recognizes
+only hierarchical `scheme://` forms, so an opaque scheme like `javascript:alert(1)` extracts as `""`
+rather than `"javascript"`. The rejection is still sound — the allowlist denies **both** `""` and
+`"javascript"` — but the code reads as though the scheme were extracted and denied, which it was
+not. Recorded here so the next reader does not "fix" the extractor and assume the allowlist was
+depending on it.
+
 ### 15.2 Capability-gated host access (T1, T3)
 Every host power is a value that must be threaded from `main`:
 

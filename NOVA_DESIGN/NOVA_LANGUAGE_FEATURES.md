@@ -1501,6 +1501,67 @@ BEHAVIOUR DIFF caught it. **Compiling is not passing.**
 10. **Enum variant constructors return the VARIANT type, not the enum type** — a function that
    `match`es over an enum usually leaves its parameter unannotated (`fn area(s)`).
 
+11. ★ **CONSTRUCTORS ARE FILE-LOCAL — enums AND plain structs alike** (verified 2026-08-15 with
+   two-file probes, while building `prism/core/prism_node.nova`). A type's constructor resolves
+   ONLY inside the file that declares the type:
+
+   | From an importing file | Result |
+   |---|---|
+   | `mod.wrapper_fn()` — an ordinary fn that returns the value | ✅ `ok` |
+   | `Ctor(...)` — bare | ❌ `error[E1002]: unknown identifier` |
+   | `mod.Ctor(...)` — qualified | ❌ `error[E1000]: module has no exported function` |
+
+   One root cause, not two: **constructor-call-position identifier lookup does not cross the module
+   boundary**, and both enum variants and struct names resolve by that path. *Pattern-matching* a
+   value you already hold DOES work cross-module (unqualified variant patterns resolve by
+   type-directed lookup — a different path), so you can **consume** an ADT anywhere; you just cannot
+   **construct** one outside its declaring file.
+
+   **This blocks any design where module A declares a type and module B builds values of it** —
+   typed errors, message/event enums, state machines, protocol tags, config records, DTOs. Ship one
+   wrapper fn per constructor in the declaring file, `prefix_`-named (flat LLVM symbol space):
+
+   ```nova
+   fn prism_kind_stack() -> PrismNodeKind          // enum variant
+       Stack()
+   fn prism_pick_option(v: string, l: string) -> PrismPickOption   // struct
+       PrismPickOption(v, l)
+   ```
+
+12. ★ **DEFAULT PARAMETER VALUES DIE AT THE MODULE BOUNDARY** (verified 2026-08-15, same probe).
+   A default is **not part of the exported signature** — cross-module the function is simply
+   full-arity:
+
+   ```nova
+   // mod.nova
+   fn f(a: int, b: int = 5) -> int
+       a + b
+   fn same_file() -> int
+       f(10)              // ✅ ok — 15, resolved inside the declaring file
+   ```
+   ```nova
+   // caller.nova
+   mod.f(10, 5)   // ✅ ok
+   mod.f(10)      // ❌ error[E1003]: function expects 2 arguments, but got 1
+   ```
+
+   The trap: **the API's shape silently differs depending on which file calls it.** You test it
+   same-file, it works, and it breaks for every real consumer. Compile-time caught, never a runtime
+   surprise — but it makes defaults a *same-file convenience only*.
+
+   **And NOVA has no arity overloading** — `fn f()` + `fn f(x)` in one file is
+   `E1012 duplicate function definition`. So "two call shapes" cannot be spelled that way either.
+   For any function another module will call — every public API in `std/`, `forge/`, `prism/` —
+   write the full arity, or take `T?` and match on it (also the more honest typing: "may or may not
+   have a value" IS `Option<T>`, not a sentinel):
+
+   ```nova
+   fn prism_gap(size: int?) -> Result<PrismNode>
+       match size
+           None    => ...flexible...
+           Some(n) => ...fixed n...
+   ```
+
 ---
 
 ## 8. Builtin Data Structures

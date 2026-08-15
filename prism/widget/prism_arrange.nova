@@ -1,0 +1,178 @@
+// prism_arrange -- the 7 ARRANGEMENT primitives (PRISM_SPEC.md §7): stack, band, layer, mesh,
+// flow, pane, gap. Milestone MA.3 part A. Every constructor here is a smart constructor over
+// prism_node.nova's `prism_node_leaf`/`prism_node_branch` -- this file owns NOTHING about the
+// node-tree shape itself (that is prism_node.nova's job) and everything about what each
+// arrangement widget's `attrs` legally contain (this file's job, per widget/README.md).
+//
+// ── WHAT HAS REAL ATTRS, AND WHAT DOESN'T (verified against PRISM_SPEC.md §7's own table,
+//    not assumed) ─────────────────────────────────────────────────────────────────────────
+// The spec's "Notes" column is the ground truth for what each primitive actually carries:
+//   stack/band/layer/flow -- the table gives EXACTLY `stack(children)` / `band(children)` /
+//     `layer(children)` / `flow(children)`, no additional param anywhere in Part III. Axis
+//     (block/inline), overlay order, and wrap behaviour are properties of the KIND tag itself
+//     (Stack vs Band vs Layer vs Flow in PrismNodeKind) -- there is nothing left to validate.
+//     A thin pass-through to `prism_node_branch` is therefore not a shortcut, it is the
+//     correct, complete implementation of what the spec defines (CLAUDE.md's own carve-out:
+//     "a thin wrapper... is fine ONLY where the spec says the primitive is that simple").
+//   mesh -- `cols` genuinely carries typed per-column semantics ("cols accepts fixed, fill, or
+//     fit tracks"). See PrismMeshTrack below.
+//   gap -- `gap()` vs `gap(n)` is a real two-shape primitive (flexible vs fixed), see below.
+//   pane -- the spec signature is `pane(child)`, SINGULAR, not `pane(children)`. That singular
+//     is itself the real semantic content, and it is enforced by the Nova type system (the
+//     parameter is typed `PrismNode`, not `list`) rather than by a runtime length check --
+//     a stronger guarantee than validating `len(children) == 1` at runtime would be, since a
+//     caller literally cannot construct the wrong shape. Scroll axis / clip mode are NOT in
+//     PRISM_SPEC.md's pane row or anywhere else in Part III -- they are `look`-layer paint/
+//     behaviour properties (§11's `clip` property, deferred whole-cloth to MA.4), and
+//     automatic virtualization-when-child-is-`each` is a backend rendering optimization for
+//     when `each` exists as a widget (MA.3 part B / structure primitives) -- neither belongs
+//     on this constructor. Documented here rather than silently guessed at.
+//
+// ── DESIGN DECISION: PrismMeshTrack is its own tiny closed enum, not a string or a dict ──────
+// "cols accepts fixed, fill, or fit tracks" is exactly the kind of enumerated-set constraint
+// CLAUDE.md requires be typed and validated rather than accepted as a free-form string. A
+// plain string ("fixed:120" and hope nobody typos it) would fail that bar. Instead this file
+// declares a THIRD tiny closed enum (after PrismNodeKind and content's PrismIcon) and follows
+// the exact convention prism_node.nova itself established for PrismNodeKind: enum variant
+// constructors only resolve in the file that declares them, so cross-module callers (the KAT)
+// get `prism_track_fixed(px)` / `prism_track_fill()` / `prism_track_fit()` wrappers, and an
+// EXHAUSTIVE `prism_mesh_track_kind` match with no wildcard arm (adding a 4th track kind without
+// updating it is a compile error, matching PrismNodeKind's own exhaustiveness discipline).
+// Verified directly (throwaway probe, not guessed): a NOVA enum declared in one file, wrapped
+// in the same file's zero-arg constructors, passed into an untyped `list` AND into a typed
+// `list<PrismMeshTrack>` parameter, both compile and both `match` correctly after round-tripping
+// through a `dict` value slot (`attrs["cols"]`) -- so `list<PrismMeshTrack>` is used directly
+// below (this is NOT the self-referential `list<PrismNode>` case prism_node.nova's header flags
+// as unverified; PrismMeshTrack does not contain a list of itself).
+//
+// ── DESIGN DECISION: gap's two call shapes are ONE function taking `int?`, not an overload ───
+// PRISM_SPEC.md writes `gap()` / `gap(n)` as the SAME name with two arities -- that literal
+// zero-arg call shape is a face-DSL surface-syntax concern for a LATER milestone (widget/README:
+// MA.3 is "plain NOVA functions ... no face/-> syntax yet"), so this file's job is to represent
+// the same two-shape semantics as faithfully as a plain function can, not to reproduce NOVA
+// call syntax that doesn't support it. Two things were verified directly (not guessed), both
+// throwaway two-file probes mirroring this file's actual cross-module shape:
+//   1. NOVA does NOT support arity-based overloading -- `fn f()` + `fn f(x)` in one file is a
+//      compile error (E1012 "duplicate function definition").
+//   2. A default parameter value does NOT survive a cross-module call -- a function with
+//      `fn f(x: int = 5)` in one file, called as `mod.f()` (omitting the arg) from an importing
+//      file, is REJECTED (E1003, arg-count mismatch) even though the exact same call compiles
+//      fine from within the declaring file. This is a genuine, previously-undocumented NOVA
+//      limitation (worth its own entry in NOVA_LANGUAGE_FEATURES.md's TRAPS section) and rules
+//      out a default-value approach here, since every real caller of this widget layer is, by
+//      construction, in a different file.
+// The one shape that DOES survive the module boundary (verified the same way) is an explicit
+// `int?` argument: `prism_gap(none())` for the flexible form, `prism_gap(some(20))` for fixed.
+// This is also the more honest typing -- "a gap may or may not have a fixed size" is exactly
+// what `Option<int>` means, not a magic sentinel int smuggled past the type system.
+//
+// PUBLIC API
+//   Mesh track vocabulary (closed, 3 kinds)
+//     PrismMeshTrack                                          Fixed(px) | Fill() | Fit()
+//     prism_track_fixed(px) / prism_track_fill() / prism_track_fit()   cross-module ctors
+//     prism_mesh_track_kind(t)  -> string    exhaustive: "fixed" | "fill" | "fit"
+//     prism_mesh_track_size(t)  -> int       px for Fixed, 0 for Fill/Fit
+//   Constructors (all `Result<PrismNode>`, all bounds-checked via prism_node.nova underneath)
+//     prism_stack(children: list)                     block axis, children in source order
+//     prism_band(children: list)                       inline axis, children in source order
+//     prism_layer(children: list)                       overlay, later children on top
+//     prism_mesh(cols: list<PrismMeshTrack>, children: list)   2D grid; cols validated non-empty,
+//                                                        Fixed tracks validated px > 0
+//     prism_flow(children: list)                        inline children that wrap
+//     prism_pane(child: PrismNode)                      scrollable viewport, exactly one child
+//     prism_gap(size: int?)                             none() = flexible; some(n), n>=0 = fixed
+//   Accessors (typed, mirroring prism_node.nova's attr getter convention)
+//     prism_mesh_cols(n)       -> list       the PrismMeshTrack list back out of attrs
+//     prism_mesh_col_count(n)  -> int
+//     prism_gap_is_flexible(n) -> bool
+//     prism_gap_size(n, default_val) -> int
+
+import prism_node
+
+// ── Mesh track vocabulary (PRISM_SPEC.md §7: "cols accepts fixed, fill, or fit tracks") ──────
+enum PrismMeshTrack
+    Fixed(px: int)
+    Fill()
+    Fit()
+
+fn prism_track_fixed(px: int) -> PrismMeshTrack
+    Fixed(px)
+fn prism_track_fill() -> PrismMeshTrack
+    Fill()
+fn prism_track_fit() -> PrismMeshTrack
+    Fit()
+
+// Exhaustive, no wildcard arm -- see header note on PrismNodeKind-style closed vocabularies.
+fn prism_mesh_track_kind(t: PrismMeshTrack) -> string
+    match t
+        Fixed(_) => "fixed"
+        Fill() => "fill"
+        Fit() => "fit"
+
+fn prism_mesh_track_size(t: PrismMeshTrack) -> int
+    match t
+        Fixed(px) => px
+        Fill() => 0
+        Fit() => 0
+
+// ── Arrangement constructors ──────────────────────────────────────────────────────────────
+
+// `children: list` stays untyped, not `list<PrismNode>` -- deliberately mirroring
+// prism_node.nova's OWN choice for its `children` field (see that file's header: a
+// self-referential generic instantiation has no verified precedent in this codebase). This
+// file builds on that node type, so it inherits the same caution rather than reintroducing
+// the risk one layer up.
+fn prism_stack(children: list) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_stack(), {}, children)
+
+fn prism_band(children: list) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_band(), {}, children)
+
+fn prism_layer(children: list) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_layer(), {}, children)
+
+// Validates BEFORE construction: an empty grid (0 columns) and a non-positive fixed track
+// width are both rejected with a typed error naming the bad value, never silently accepted
+// and never left for prism_node_new to discover indirectly.
+fn prism_mesh(cols: list<PrismMeshTrack>, children: list) -> Result<PrismNode>
+    if len(cols) == 0
+        return err("prism_mesh: cols must have at least 1 track, got 0")
+    for t in cols
+        if prism_mesh_track_kind(t) == "fixed"
+            let px = prism_mesh_track_size(t)
+            if px <= 0
+                return err("prism_mesh: fixed track width must be > 0, got " + str(px))
+    prism_node.prism_node_branch(prism_node.prism_kind_mesh(), {"cols": cols, "col_count": len(cols)}, children)
+
+fn prism_mesh_cols(n: PrismNode) -> list
+    if prism_node.prism_node_has_attr(n, "cols")
+        return n.attrs["cols"]
+    []
+
+fn prism_mesh_col_count(n: PrismNode) -> int
+    prism_node.prism_node_attr_int(n, "col_count", 0)
+
+fn prism_flow(children: list) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_flow(), {}, children)
+
+// `child: PrismNode` (singular, concrete type), not `list` -- see header note: the spec's
+// `pane(child)` singularity is enforced by the parameter's own type, not by a runtime count
+// check. A caller cannot pass zero or two children; the shape is unrepresentable.
+fn prism_pane(child: PrismNode) -> Result<PrismNode>
+    prism_node.prism_node_branch(prism_node.prism_kind_pane(), {}, [child])
+
+// `size`: `none()` = flexible (`gap()`, absorbs remaining space), `some(n)` = fixed (`gap(n)`).
+// See header note on why this is `int?` rather than a default-valued int.
+fn prism_gap(size: int?) -> Result<PrismNode>
+    match size
+        None => prism_node.prism_node_leaf(prism_node.prism_kind_gap(), {"flexible": true})
+        Some(n) =>
+            if n < 0
+                return err("prism_gap: size must be >= 0, got " + str(n))
+            prism_node.prism_node_leaf(prism_node.prism_kind_gap(), {"flexible": false, "size": n})
+
+fn prism_gap_is_flexible(n: PrismNode) -> bool
+    prism_node.prism_node_attr_bool(n, "flexible", false)
+
+fn prism_gap_size(n: PrismNode, default_val: int) -> int
+    prism_node.prism_node_attr_int(n, "size", default_val)
