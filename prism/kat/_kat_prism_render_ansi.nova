@@ -1,0 +1,145 @@
+// KAT for prism/backend/ansi/prism_render_ansi.nova (milestone MA.6).
+//
+// MA.6's exit criterion is "the same node tree renders to both HTML and ANSI from one source", so
+// this KAT builds ONE tree and renders it through BOTH backends, asserting each produces its own
+// medium's output with the widget code untouched. That is the real test of MA.2's claim to be a
+// backend-agnostic node tree: a single-backend abstraction is indistinguishable from no
+// abstraction, because every leaky assumption about the one backend stays invisible.
+//
+// Also proves the security property that is SPECIFIC to this medium:
+//   ★ ESC (0x1B) in user data is this backend's `<`. A terminal is not a passive display --
+//     escape sequences move the cursor, repaint the screen, set the window title, and on several
+//     terminals can trigger reply-injection that makes the terminal type text back on stdin. So
+//     every data path is asserted to strip ESC and the other C0 controls.
+//   ★ A password entry's value is NEVER echoed (terminals scroll back, and scrollback gets logged).
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_render_ansi.nova
+//   clang -O2 -o _kat_prism_render_ansi.exe _kat_prism_render_ansi.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_structure
+import prism_render_ansi as ra
+import prism_render_html as rh
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=[" + got + "]  want=[" + want + "]")
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_absent(label: string, hay: string, needle: string)
+    if find(hay, needle) < 0
+        print("  pass  absent: " + label)
+    else
+        print("  FAIL  absent: " + label + " -- FOUND")
+        FAILED[0] = FAILED[0] + 1
+
+fn main()
+    let ESC = chr(27)
+    let BEL = chr(7)
+
+    print("== 1. sanitization: ESC is this backend's `<` ==")
+    _check("ESC stripped", ra.prism_ansi_sanitize(ESC + "[2J"), "[2J")
+    _check("BEL stripped", ra.prism_ansi_sanitize("a" + BEL + "b"), "ab")
+    _check("NUL-adjacent C0 stripped", ra.prism_ansi_sanitize("a" + chr(1) + "b"), "ab")
+    _check("DEL stripped", ra.prism_ansi_sanitize("a" + chr(127) + "b"), "ab")
+    _check("newline stripped", ra.prism_ansi_sanitize("a" + chr(10) + "b"), "ab")
+    _check("TAB kept", ra.prism_ansi_sanitize("a" + chr(9) + "b"), "a" + chr(9) + "b")
+    _check("plain text untouched", ra.prism_ansi_sanitize("hello"), "hello")
+    _check("empty", ra.prism_ansi_sanitize(""), "")
+
+    print("== 2. ESC in user data never reaches output, at every data position ==")
+    // A full cursor-home + clear-screen + set-window-title payload.
+    let ATTACK = ESC + "[2J" + ESC + "]0;pwned" + BEL
+    let lbl = unwrap(ra.prism_ansi_render(unwrap(prism_content.prism_label(ATTACK))))
+    _check_absent("label text", lbl, ESC)
+    let btn = unwrap(ra.prism_ansi_render(unwrap(prism_interact.prism_press(ATTACK, []))))
+    _check_absent("press text", btn, ESC)
+    let ent = unwrap(ra.prism_ansi_render(unwrap(prism_interact.prism_entry("Name", prism_interact.prism_entry_kind_text(), ATTACK))))
+    _check_absent("entry value", ent, ESC)
+    let flg = unwrap(ra.prism_ansi_render(unwrap(prism_interact.prism_flag(ATTACK, true))))
+    _check_absent("flag label", flg, ESC)
+    let hnt = unwrap(ra.prism_ansi_render(unwrap(prism_structure.prism_hint(ATTACK, unwrap(prism_content.prism_label("anchor"))))))
+    _check_absent("hint text", hnt, ESC)
+    _check_absent("BEL nowhere either", lbl + btn + ent + flg + hnt, BEL)
+
+    print("== 3. a password is never echoed ==")
+    let pw = unwrap(ra.prism_ansi_render(unwrap(prism_interact.prism_entry("Password", prism_interact.prism_entry_kind_password(), "hunter2"))))
+    _check_absent("secret absent from output", pw, "hunter2")
+    _check_true("masked instead", find(pw, "*******") >= 0)
+    // The same value in a normal text entry IS shown -- proving the mask is kind-specific, not a
+    // blanket truncation that would make the assertion above vacuous.
+    let notpw = unwrap(ra.prism_ansi_render(unwrap(prism_interact.prism_entry("User", prism_interact.prism_entry_kind_text(), "hunter2"))))
+    _check_true("text entry does show its value", find(notpw, "hunter2") >= 0)
+
+    print("== 4. ONE tree, TWO backends (MA.6's exit criterion) ==")
+    let title = unwrap(prism_content.prism_label("Dashboard"))
+    let icon = unwrap(prism_content.prism_glyph(prism_content.prism_icon_check()))
+    let head = unwrap(prism_arrange.prism_band([icon, title]))
+    let save = unwrap(prism_interact.prism_press("Save", []))
+    let active = unwrap(prism_interact.prism_flag("Active", true))
+    let vol = unwrap(prism_interact.prism_range("Volume", 0, 10, 1, 5))
+    let docs = unwrap(prism_interact.prism_link("Docs", prism_interact.prism_link_target_url("https://example.com")))
+    let form = unwrap(prism_arrange.prism_stack([active, vol, docs]))
+    let page = unwrap(prism_arrange.prism_stack([head, form, save]))
+
+    let html = unwrap(rh.prism_html_render(page))
+    let ansi = unwrap(ra.prism_ansi_render(page))
+
+    // Same source tree, two genuinely different media.
+    _check_true("HTML has elements", find(html, "<button") >= 0)
+    _check_true("HTML has the label", find(html, "Dashboard") >= 0)
+    _check_true("ANSI has the label", find(ansi, "Dashboard") >= 0)
+    _check_true("ANSI has no HTML tags", find(ansi, "<button") < 0)
+    _check_true("ANSI renders press as brackets", find(ansi, "[ Save ]") >= 0)
+    _check_true("ANSI renders a checked flag", find(ansi, "[x] Active") >= 0)
+    _check_true("ANSI renders the glyph as ASCII", find(ansi, "+") >= 0)
+    _check_true("HTML output is non-trivial", len(html) > 100)
+    _check_true("ANSI output is non-trivial", len(ansi) > 20)
+    // The trees are the SAME object -- neither backend mutated it.
+    _check("tree unchanged: kind", prism_node.prism_node_kind_str(page), "stack")
+    _check("tree unchanged: count", str(prism_node.prism_node_count(page)), "9")
+    // And rendering twice is stable in this backend too.
+    _check_true("ANSI is deterministic", unwrap(ra.prism_ansi_render(page)) == ansi)
+
+    print("== 5. structure primitives degrade sensibly ==")
+    let items = ["alpha", "beta"]
+    let gr = unwrap(prism_structure.prism_grid(items, fn(i) i, ["name"], fn(i, c) prism_content.prism_label(i)))
+    let grt = unwrap(ra.prism_ansi_render(gr))
+    _check_true("grid renders rows", find(grt, "alpha") >= 0)
+    _check_true("grid renders second row", find(grt, "beta") >= 0)
+    // Only the SELECTED tab panel appears -- a terminal has no hidden-but-present concept, so
+    // emitting every panel would visibly show all of them at once.
+    let p1 = prism_structure.prism_tab_panel("One", unwrap(prism_content.prism_label("first-body")))
+    let p2 = prism_structure.prism_tab_panel("Two", unwrap(prism_content.prism_label("second-body")))
+    let tb = unwrap(ra.prism_ansi_render(unwrap(prism_structure.prism_tabs([p1, p2], 0))))
+    _check_true("selected panel body shown", find(tb, "first-body") >= 0)
+    _check_absent("unselected panel body hidden", tb, "second-body")
+    _check_true("both tab labels shown", find(tb, "Two") >= 0)
+
+    print("== 6. width guard ==")
+    _check_true("width 80 accepted", not is_err(ra.prism_ansi_render_width(page, 80)))
+    _check_true("width 19 rejected", is_err(ra.prism_ansi_render_width(page, 19)))
+    _check_true("width 20 accepted (exact boundary)", not is_err(ra.prism_ansi_render_width(page, 20)))
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_render_ansi: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_render_ansi: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)

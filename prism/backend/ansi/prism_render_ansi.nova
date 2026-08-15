@@ -1,0 +1,284 @@
+// prism_render_ansi -- node tree -> terminal text. Milestone MA.6, Prism's SECOND backend.
+//
+// ── WHY THIS MILESTONE EXISTS, AND WHAT IT ACTUALLY PROVES ────────────────────────────────────
+// The point is not "Prism can do TUIs" (though it can, and CLI/TUI is a real target). The point is
+// that **one node tree renders to two completely unrelated output media** with the widget code
+// unchanged. Until a second backend exists, "backend-agnostic node tree" is an untested claim --
+// a single-backend abstraction is indistinguishable from no abstraction at all, because every
+// leaky assumption about the one backend is invisible.
+//
+// So this file's real job is to be a FALSIFIER for MA.2's design. Anything that turns out to be
+// impossible to render here, or that needs a new field on PrismNode, is proof the node tree
+// smuggled an HTML assumption into what claims to be a neutral value type. (Result: it did not.
+// Every one of the 22 primitives maps with the attrs already present. The two genuinely
+// medium-specific things -- `draw`'s pixel callback and `art`'s raster image -- degrade to a
+// labelled placeholder, which is honest rather than pretending a terminal can show them.)
+//
+// ── THE SECURITY STORY IS DIFFERENT HERE, AND THAT IS THE INTERESTING PART ────────────────────
+// A terminal is NOT a passive display. ANSI escape sequences are commands: they move the cursor,
+// repaint arbitrary screen regions, set the window title, switch the alternate buffer, and on
+// several terminals can trigger clipboard writes or reply-injection (the notorious `CSI ... n`
+// device-status-report family, which makes the terminal *type text back* on the application's
+// stdin). So the HTML renderer's problem restated for this medium: **`\x1b` in user data is this
+// backend's `<`.**
+//
+// The mitigation is the same shape as PRISM_SPEC.md §17A but with a different character set --
+// every piece of data reaching output goes through `_sanitize`, which strips ESC (0x1B) and every
+// other C0 control character except `\t`. That is a strip, not an escape, and deliberately so:
+// there is no "display this literally" encoding for a control character the way `&lt;` exists for
+// `<`, so the only safe rendering of a control byte is not to emit it.
+//
+// PUBLIC API
+//   prism_ansi_render(node)             -> Result<string>   the node tree as terminal text
+//   prism_ansi_render_width(node, cols) -> Result<string>   same, with an explicit terminal width
+//   prism_ansi_sanitize(s)              -> string           strip ESC + C0 controls (keep \t)
+
+import prism_node
+import prism_ansi
+
+// ── Sanitization: this backend's escaping ─────────────────────────────────────────────────────
+// Strips ESC (0x1B) and all other C0 controls (0x00-0x1F) except TAB, plus DEL (0x7F). Newline is
+// stripped too: a raw newline in a label would break the caller's line accounting, and any line
+// structure this renderer wants it emits itself.
+fn prism_ansi_sanitize(s: string) -> string
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        let b = ord(c)
+        if b == 9
+            out = out + c
+        else
+            if b >= 32 and b != 127
+                out = out + c
+        i += 1
+    out
+
+fn _ansi_indent(depth: int) -> string
+    let out = ""
+    let i = 0
+    while i < depth
+        out = out + "  "
+        i += 1
+    out
+
+fn _ansi_children(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let out = ""
+    for c in prism_node.prism_node_children(n)
+        let r = _ansi_block(c, depth, cols)
+        if is_err(r)
+            return err(unwrap_err(r))
+        out = out + unwrap(r)
+    ok(out)
+
+// Inline children (a `band` lays its children out on one line rather than stacked).
+fn _ansi_children_inline(n: PrismNode, cols: int) -> Result<string>
+    let parts = []
+    for c in prism_node.prism_node_children(n)
+        let r = _ansi_inline(c, cols)
+        if is_err(r)
+            return err(unwrap_err(r))
+        parts.push(unwrap(r))
+    ok(join(parts, " "))
+
+// ── Public entry points ───────────────────────────────────────────────────────────────────────
+fn prism_ansi_render(node: PrismNode) -> Result<string>
+    _ansi_block(node, 0, 80)
+
+fn prism_ansi_render_width(node: PrismNode, cols: int) -> Result<string>
+    if cols < 20
+        return err("prism_ansi_render_width: terminal width must be >= 20 columns, got " + str(cols))
+    _ansi_block(node, 0, cols)
+
+// ── Block rendering ───────────────────────────────────────────────────────────────────────────
+// Dispatch on the STRING tag with a loud default, for the reason spec §17A.3b records: a
+// wildcard-free enum match is only exhaustiveness-checked inside the file declaring the enum, so
+// here it would be a false guarantee. prism_node_kind_str()'s own match IS checked, beside the
+// enum; this default arm turns an unknown kind into a loud error rather than silence.
+fn _ansi_block(n: PrismNode, depth: int, cols: int) -> Result<string>
+    match prism_node.prism_node_kind_str(n)
+        "stack" => _ansi_children(n, depth, cols)
+        "layer" => _ansi_children(n, depth, cols)
+        "flow" => _ansi_children(n, depth, cols)
+        "pane" => _ansi_children(n, depth, cols)
+        "each" => _ansi_children(n, depth, cols)
+        "sheet" => _ansi_sheet(n, depth, cols)
+        "band" => _ansi_band(n, depth, cols)
+        "mesh" => _ansi_band(n, depth, cols)
+        "grid" => _ansi_grid(n, depth, cols)
+        "tabs" => _ansi_tabs(n, depth, cols)
+        "hint" => _ansi_hint(n, depth, cols)
+        "gap" => _ansi_gap(n)
+        _ => _ansi_leaf_line(n, depth, cols)
+
+// A leaf (or an interaction primitive) on its own line.
+fn _ansi_leaf_line(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let r = _ansi_inline(n, cols)
+    if is_err(r)
+        return err(unwrap_err(r))
+    ok(_ansi_indent(depth) + unwrap(r) + "\n")
+
+fn _ansi_band(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let r = _ansi_children_inline(n, cols)
+    if is_err(r)
+        return err(unwrap_err(r))
+    ok(_ansi_indent(depth) + unwrap(r) + "\n")
+
+fn _ansi_gap(n: PrismNode) -> Result<string>
+    ok("\n")
+
+fn _ansi_sheet(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let kids = _ansi_children(n, depth + 1, cols)
+    if is_err(kids)
+        return err(unwrap_err(kids))
+    let bar = _ansi_indent(depth) + prism_ansi.prism_ansi_hline(cols - (depth * 2), "-") + "\n"
+    ok(bar + unwrap(kids) + bar)
+
+// A grid's children are Band row nodes (MA.3 composes rows from the closed vocabulary). Rendered
+// through the existing v0.1 `prism_ansi_table` helper -- the whole point of relocating those
+// helpers in MA.1 was that they stay useful, and re-deriving box drawing here would duplicate
+// working code.
+fn _ansi_grid(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let rows = []
+    for row in prism_node.prism_node_children(n)
+        let cells = []
+        for cell in prism_node.prism_node_children(row)
+            let r = _ansi_inline(cell, cols)
+            if is_err(r)
+                return err(unwrap_err(r))
+            cells.push(unwrap(r))
+        rows.push(cells)
+    if len(rows) == 0
+        return ok("")
+    // The first row supplies the header labels; the remainder are body rows.
+    let headers = rows[0]
+    let body = []
+    let i = 1
+    while i < len(rows)
+        body.push(rows[i])
+        i += 1
+    ok(prism_ansi.prism_ansi_table(headers, body) + "\n")
+
+fn _ansi_tabs(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let selected = prism_node.prism_node_attr_int(n, "selected", 0)
+    let heads = []
+    let i = 0
+    for panel in prism_node.prism_node_children(n)
+        let label = prism_ansi_sanitize(prism_node.prism_node_attr_str(panel, "tab_label", ""))
+        if i == selected
+            heads.push("[" + prism_ansi.prism_ansi_bold(label) + "]")
+        else
+            heads.push(" " + label + " ")
+        i += 1
+    let bar = _ansi_indent(depth) + join(heads, " ") + "\n"
+    // Only the SELECTED panel is rendered. A terminal has no hidden-but-present concept, so
+    // emitting every panel would show all of them at once -- visibly wrong, not merely unstyled.
+    let j = 0
+    for panel in prism_node.prism_node_children(n)
+        if j == selected
+            let r = _ansi_block(panel, depth + 1, cols)
+            if is_err(r)
+                return err(unwrap_err(r))
+            return ok(bar + unwrap(r))
+        j += 1
+    ok(bar)
+
+fn _ansi_hint(n: PrismNode, depth: int, cols: int) -> Result<string>
+    let text = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "text", ""))
+    let kids = _ansi_children(n, depth, cols)
+    if is_err(kids)
+        return err(unwrap_err(kids))
+    ok(unwrap(kids) + _ansi_indent(depth) + "  (" + text + ")\n")
+
+// ── Inline rendering ──────────────────────────────────────────────────────────────────────────
+// Every branch that emits data calls prism_ansi_sanitize -- see the header on why ESC is this
+// backend's `<`.
+fn _ansi_inline(n: PrismNode, cols: int) -> Result<string>
+    match prism_node.prism_node_kind_str(n)
+        "label" => ok(prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "text", "")))
+        "press" => ok("[ " + prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "text", "")) + " ]")
+        "link" => _ansi_inline_link(n)
+        "entry" => _ansi_inline_entry(n)
+        "pick" => _ansi_inline_pick(n)
+        "flag" => _ansi_inline_flag(n)
+        "range" => _ansi_inline_range(n)
+        "glyph" => ok(_ansi_glyph_char(prism_node.prism_node_attr_str(n, "icon", "")))
+        // A terminal cannot show a raster image or run a pixel callback. Degrading to a labelled
+        // placeholder is honest; pretending otherwise would be worse than admitting the limit.
+        "art" => ok("<image: " + prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "source", "")) + ">")
+        "draw" => ok("<canvas>")
+        "gap" => ok(" ")
+        _ => _ansi_inline_fallback(n, cols)
+
+// A container met in inline position: render its children inline and splice them in.
+fn _ansi_inline_fallback(n: PrismNode, cols: int) -> Result<string>
+    if prism_node.prism_node_child_count(n) == 0
+        return ok("")
+    _ansi_children_inline(n, cols)
+
+fn _ansi_inline_link(n: PrismNode) -> Result<string>
+    let text = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "text", ""))
+    let href = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "href", ""))
+    // OSC 8 hyperlink via the v0.1 helper. Both operands are sanitized first: an unsanitized href
+    // inside an OSC sequence would let data terminate the sequence and start a new one, which is
+    // this medium's exact analogue of attribute breakout.
+    ok(prism_ansi.prism_ansi_link(href, text))
+
+fn _ansi_inline_entry(n: PrismNode) -> Result<string>
+    let prompt = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "prompt", ""))
+    let kind = prism_node.prism_node_attr_str(n, "kind", "text")
+    let value = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "value", ""))
+    // A password's value must never be echoed to a terminal -- terminals scroll back, and
+    // scrollback is frequently logged.
+    if kind == "password"
+        return ok(prompt + ": " + _ansi_mask(len(value)))
+    ok(prompt + ": " + value)
+
+fn _ansi_mask(n: int) -> string
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + "*"
+        i += 1
+    out
+
+fn _ansi_inline_pick(n: PrismNode) -> Result<string>
+    let sel = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "selected_value", ""))
+    ok("< " + sel + " >")
+
+fn _ansi_inline_flag(n: PrismNode) -> Result<string>
+    let label = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "label", ""))
+    if prism_node.prism_node_attr_bool(n, "state", false)
+        return ok("[x] " + label)
+    ok("[ ] " + label)
+
+// Reuses the v0.1 progress-bar helper: a range IS a filled proportion on a terminal.
+fn _ansi_inline_range(n: PrismNode) -> Result<string>
+    let lo = prism_node.prism_node_attr_int(n, "min", 0)
+    let hi = prism_node.prism_node_attr_int(n, "max", 100)
+    let v = prism_node.prism_node_attr_int(n, "value", 0)
+    let label = prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "label", ""))
+    let span = hi - lo
+    let pct = 0
+    if span > 0
+        pct = ((v - lo) * 100) / span
+    ok(label + " " + prism_ansi.prism_ansi_progress_bar(pct, 20))
+
+// The 12 closed PrismIcon names -> a single ASCII character. ASCII rather than Unicode symbols on
+// purpose: this must be legible in a plain VT100 / CI log / Windows console with no font fallback.
+fn _ansi_glyph_char(icon: string) -> string
+    match icon
+        "check" => "+"
+        "close" => "x"
+        "search" => "?"
+        "menu" => "="
+        "plus" => "+"
+        "minus" => "-"
+        "chevron_up" => "^"
+        "chevron_down" => "v"
+        "chevron_left" => "<"
+        "chevron_right" => ">"
+        "warning" => "!"
+        "info" => "i"
+        _ => "*"
