@@ -1,0 +1,590 @@
+// prism_ui_form -- the first prism/ui/ composition module (PRISM_ROADMAP.md milestone MB.1,
+// PRISM_STATUS.md: "typed fields + validation + error display -- where Ant's value actually
+// lives"). A form is a COMPOSITION of the closed 22-primitive vocabulary (entry/pick/flag/range
+// from widget/prism_interact.nova, stack/label from widget/prism_arrange.nova + prism_content.nova)
+// -- this file invents no PrismNodeKind and emits no markup itself (axiom A7; §15.1). Everything
+// here is a NOVA value or a plain function over prism_node.nova's Result<PrismNode>, exactly the
+// layering widget/README.md establishes for MA.3 and that ui/README.md says MB.1 builds on now
+// that widget/ + style/ are frozen.
+//
+// ── DESIGN DECISION: field kind is a closed enum carrying its OWN value+config, not a dict ──────
+// Seven form-field kinds: text, email, password, number, range, choice, toggle. Each maps to
+// exactly one widget/ primitive (entry x4 kinds, range, pick, flag) -- so `PrismFormFieldKind`
+// is a 7-variant enum where EACH VARIANT carries the payload that kind actually needs (a plain
+// string for the three entry-text kinds, `value/min/max` for number, `value/min/max/step` for
+// range, `options/selected` for choice, `state` for toggle). This is the "one typed constructor
+// per kind, no stringly-typed kind parameter" rule MA.3 established (prism_interact.nova's
+// PrismEntryKind, PrismLinkTarget) applied one layer up: an invalid field kind, or a number field
+// missing its bounds, is unrepresentable rather than a runtime surprise.
+//
+// ── DESIGN DECISION: a field's constructor validates its SHAPE, not always its CURRENT VALUE ────
+// This is the one genuinely subtle call in this file, made after tracing what each underlying
+// widget can and cannot RENDER:
+//   - `prism_form_number`'s min/max is validated (min<=max is a property of the field's
+//     DEFINITION, independent of any particular value) but an out-of-range `value` is NOT
+//     rejected at construction. Why: the underlying widget is `entry` (HTML <input type=number>),
+//     which can display ANY int the user actually typed, in range or not -- that is the whole
+//     point of a form: it must be constructible WITH the user's current, possibly-wrong input, so
+//     `prism_form_render` can show that exact value next to an error message. Rejecting it at
+//     construction would make "show the user what they typed, plus why it's wrong" impossible.
+//   - `prism_form_range` and `prism_form_choice`, by contrast, delegate FULLY to
+//     `prism_interact.prism_range` / `prism_pick` at construction (value/min/max/step, or
+//     selected-must-be-a-real-option, all validated immediately). Why the asymmetry: a slider
+//     thumb must physically sit somewhere on the track, and a <select> can only ever show one of
+//     its own <option>s -- neither widget has a way to RENDER an "invalid" state the way a text
+//     box can just print whatever string it was given. There is no user-facing benefit to
+//     deferring their validation, and prism_interact's own constructors already reject bad shapes
+//     -- reusing that (CLAUDE.md: "does this already exist?") is strictly better than
+//     re-deriving the same min<=max/step>0/value-in-range logic here a second time.
+//   - Consequence for validation rules (below): Number and Range therefore accept NO rule from
+//     `PrismFormRule` (their one meaningful constraint -- the numeric bound -- is already part of
+//     their own kind payload, checked at construction for Range and at `prism_form_validate` time
+//     for Number). Choice accepts `required` (an empty `selected` is a legitimate "nothing chosen
+//     yet" state, per prism_pick's own doc) but not length rules (a select's value is a fixed
+//     internal code the caller controls via `options`, not free text -- "min length 5 on a combo
+//     box" is not a meaningful constraint and is rejected as a caller mistake rather than a
+//     silent no-op). Toggle accepts `required`, meaning "must be true" (the very common
+//     "must accept terms" pattern) -- but not length rules, which have no meaning on a bool.
+//
+// ── DESIGN DECISION: validation rules are a 3-variant closed enum, explicitly pattern-free ──────
+// `required` / `min_length(n)` / `max_length(n)`. No regex, no format validation (an "email
+// format" rule would need a pattern engine this milestone deliberately does not add -- `email`
+// only changes the entry KIND passed to `prism_entry`, i.e. the keyboard/input-mode hint, not
+// what gets validated). Rules are attached to an already-built field via `prism_form_field_with_rules`
+// (REPLACES the field's rule set; it is not additive -- call it once with the full set you want,
+// matching the immutable "returns a new value" idiom used throughout prism/widget/) rather than
+// being a constructor parameter, because every field constructor's signature is fixed by this
+// milestone's spec (`prism_form_text(name, label, value)` etc. -- 3/3/3/5/6/4/4 args, full arity,
+// no defaults per NOVA_LANGUAGE_FEATURES.md trap 12) and rules are optional, composable, and
+// orthogonal to the value/shape the constructor itself validates.
+//
+// ── DESIGN DECISION: `rules` is `list<PrismFormRule>`, a TYPED list, not bare `list` ─────────────
+// This deliberately departs from prism_interact.nova's own convention (`prism_pick`'s
+// `options: list` + a runtime `type_name(o) != "PrismPickOption"` guard) for a documented reason:
+// `PrismFormRule` is an ENUM, and NOVA_LANGUAGE_FEATURES.md trap 10 records that an enum VARIANT's
+// static type is the variant, not the enum -- which casts real doubt on whether `type_name()` at
+// RUNTIME would ever report the enum's own name for an enum value the way it reliably does for a
+// STRUCT (verified working: PrismPickOption, PrismTabPanel, PrismNode, PrismFormField below).
+// A runtime check that might silently never fire is worse than no check. `list<PrismFormRule>` is
+// declared and consumed in THIS SAME FILE, mirroring the one place a same-file, non-self-
+// referential, few-variant enum generic IS verified to work end to end: prism_arrange.nova's
+// `prism_mesh(cols: list<PrismMeshTrack>, ...)`. `PrismFormRule` matches that shape exactly
+// (same-file, not self-referential, 3 tiny variants), so the type system enforces homogeneity at
+// compile time instead of a maybe-broken runtime guard -- a caller literally cannot pass the wrong
+// shape. `PrismFormFieldKind.FormFieldChoice`'s `options` stays bare `list` on purpose: its
+// elements are `PrismPickOption`, a STRUCT declared in a DIFFERENT file (prism_interact.nova), and
+// this file already reuses `prism_interact.prism_pick`'s own (struct-based, verified-working)
+// runtime check by calling it at construction -- see above -- so no second check is needed here.
+//
+// ── DESIGN DECISION: help text and error text both render through `prism_label`, never markup ──
+// A field also carries optional help text (`prism_form_field_with_help`, "" = none, matching
+// prism_link_href/prism_pick_selected_value's own established "" -as-absence convention rather
+// than introducing `string?` for a case this codebase already has a consistent idiom for). Both
+// help and any validation error message are plain, caller/derived TEXT with no special status --
+// composed into the row via `prism_content.prism_label`, exactly like every other piece of text
+// in this file. There is no error-rendering code path that touches markup; escaping (if any target
+// needs it) is entirely `prism_render_html.nova`'s job at its one sink, per §15.1/A3 -- this file
+// never inspects, escapes, or otherwise treats error/help text differently from any other label.
+//
+// ── DESIGN DECISION: duplicate field names are rejected at `prism_form(fields)`, not per-field ──
+// A single field has no visibility into its siblings, so the check belongs at the point where the
+// full field list is known -- mirrors `prism_pick`'s duplicate-option-value and `prism_grid`'s
+// duplicate-column-name checks (same file-local "seen dict, reject the second occurrence, name it"
+// idiom throughout widget/).
+//
+// ── CROSS-MODULE CONSTRUCTION (trap 11) ──────────────────────────────────────────────────────────
+// `PrismFormFieldKind`, `PrismFormRule`, `PrismFormField`, `PrismForm`, `PrismFormError` are all
+// declared AND constructed only in this file, so no other file ever needs a bare variant/struct
+// constructor for them -- every external touch point is one of the ordinary `prism_form_*`
+// functions below, which is the wrapper-per-constructor pattern trap 11 requires, just satisfied
+// by construction rather than needing a separate `prism_field_kind_*()` shim layer.
+//
+// PUBLIC API
+//   Rules (closed, 3 kinds, pattern-free -- no regex)
+//     PrismFormRule                                    Required() | MinLength(n) | MaxLength(n)
+//     prism_form_rule_required() / _min_length(n) / _max_length(n)   cross-module ctors
+//   Field constructors (all `Result<PrismFormField>`; name/label validated non-empty on every one)
+//     prism_form_text(name, label, value)
+//     prism_form_email(name, label, value)
+//     prism_form_password(name, label, value)
+//     prism_form_number(name, label, value, min_val, max_val)      min_val<=max_val enforced;
+//                                                                    `value` may be out of range
+//                                                                    (a validate-time concern)
+//     prism_form_range(name, label, value, min_val, max_val, step_val)  delegates fully to
+//                                                                    prism_interact.prism_range
+//     prism_form_choice(name, label, options, selected)             delegates to prism_interact.prism_pick
+//     prism_form_toggle(name, label, state)
+//   Field composition (immutable "returns a new field" style)
+//     prism_form_field_with_rules(field, rules: list<PrismFormRule>) -> Result<PrismFormField>
+//       rejects: an incompatible rule for the field's kind, a duplicate rule TYPE, a negative
+//       min_length/max_length, or min_length > max_length
+//     prism_form_field_with_help(field, help: string) -> PrismFormField    "" = no help text
+//   Field accessors
+//     prism_form_field_name/_label/_help(f) -> string      prism_form_field_rules(f) -> list<PrismFormRule>
+//     prism_form_field_kind_str(f) -> string      exhaustive: text|email|password|number|range|choice|toggle
+//     prism_form_field_text_value(f, default_val) -> string        (text/email/password/choice-selected)
+//     prism_form_field_number_value/_min/_max(f, default_val) -> int
+//     prism_form_field_range_value/_min/_max/_step(f, default_val) -> int
+//     prism_form_field_bool_value(f, default_val) -> bool
+//     prism_form_field_choice_options(f) -> list        prism_form_field_choice_selected(f, default_val) -> string
+//   Form
+//     prism_form(fields: list) -> Result<PrismForm>          rejects a non-PrismFormField element
+//                                                             and a duplicate field name
+//     prism_form_fields(form) -> list      prism_form_field_count(form) -> int
+//   Validation
+//     prism_form_validate(form) -> Result<list>       list<PrismFormError>, empty = valid
+//     PrismFormError { field_name: string, message: string }
+//     prism_form_error_field(e) -> string      prism_form_error_message(e) -> string
+//   Rendering (composes ONLY from widget/prism_arrange + widget/prism_content + widget/prism_interact)
+//     prism_form_render_input(field) -> Result<PrismNode>     just the input widget, no label/row
+//     prism_form_render(form) -> Result<PrismNode>            stack of rows; each row is a stack of
+//                                                              label + input + help(if any) + error(if any)
+
+import prism_node
+import prism_interact
+import prism_content
+import prism_arrange
+
+// ── Field kind vocabulary (closed, 7 kinds -- see header) ────────────────────────────────────
+enum PrismFormFieldKind
+    FormFieldText(value: string)
+    FormFieldEmail(value: string)
+    FormFieldPassword(value: string)
+    FormFieldNumber(value: int, min_val: int, max_val: int)
+    FormFieldRange(value: int, min_val: int, max_val: int, step_val: int)
+    FormFieldChoice(options: list, selected: string)
+    FormFieldToggle(state: bool)
+
+// ── Validation rule vocabulary (closed, 3 kinds, pattern-free -- see header) ─────────────────
+enum PrismFormRule
+    FormRuleRequired()
+    FormRuleMinLength(n: int)
+    FormRuleMaxLength(n: int)
+
+fn prism_form_rule_required() -> PrismFormRule
+    FormRuleRequired()
+fn prism_form_rule_min_length(n: int) -> PrismFormRule
+    FormRuleMinLength(n)
+fn prism_form_rule_max_length(n: int) -> PrismFormRule
+    FormRuleMaxLength(n)
+
+// ── Values ────────────────────────────────────────────────────────────────────────────────────
+type PrismFormField
+    name: string
+    label: string
+    kind: PrismFormFieldKind
+    rules: list<PrismFormRule>
+    help: string
+
+type PrismForm
+    fields: list
+
+type PrismFormError
+    field_name: string
+    message: string
+
+// ── Field constructors ────────────────────────────────────────────────────────────────────────
+// Every one validates name/label non-empty first (an empty name can never round-trip a
+// submission; an empty label would later fail prism_entry/prism_flag/prism_range's OWN
+// non-empty-prompt/label requirement much further from the actual mistake -- rejecting here
+// gives the caller a message that names the actual field constructor they called).
+
+fn prism_form_text(name: string, label: string, value: string) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_text: field name must not be empty")
+    if label == ""
+        return err("prism_form_text: needs a non-empty label (accessible name required)")
+    ok(PrismFormField(name, label, FormFieldText(value), [], ""))
+
+fn prism_form_email(name: string, label: string, value: string) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_email: field name must not be empty")
+    if label == ""
+        return err("prism_form_email: needs a non-empty label (accessible name required)")
+    ok(PrismFormField(name, label, FormFieldEmail(value), [], ""))
+
+fn prism_form_password(name: string, label: string, value: string) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_password: field name must not be empty")
+    if label == ""
+        return err("prism_form_password: needs a non-empty label (accessible name required)")
+    ok(PrismFormField(name, label, FormFieldPassword(value), [], ""))
+
+// min_val<=max_val is a property of the field's DEFINITION and is validated now; `value` being
+// outside [min_val, max_val] is NOT rejected here -- see header design decision. That is what
+// `prism_form_validate` catches.
+fn prism_form_number(name: string, label: string, value: int, min_val: int, max_val: int) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_number: field name must not be empty")
+    if label == ""
+        return err("prism_form_number: needs a non-empty label (accessible name required)")
+    if min_val > max_val
+        return err("prism_form_number: min (" + str(min_val) + ") must be <= max (" + str(max_val) + ")")
+    ok(PrismFormField(name, label, FormFieldNumber(value, min_val, max_val), [], ""))
+
+// Delegates entirely to prism_interact.prism_range (min<=max, step>0, value-in-range all
+// enforced there) -- see header for why range's current value cannot be "constructed but
+// invalid" the way a number entry's can.
+fn prism_form_range(name: string, label: string, value: int, min_val: int, max_val: int, step_val: int) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_range: field name must not be empty")
+    if label == ""
+        return err("prism_form_range: needs a non-empty label (accessible name required)")
+    let check_r = prism_interact.prism_range(label, min_val, max_val, step_val, value)
+    if is_err(check_r)
+        return err("prism_form_range: " + unwrap_err(check_r))
+    ok(PrismFormField(name, label, FormFieldRange(value, min_val, max_val, step_val), [], ""))
+
+// Delegates entirely to prism_interact.prism_pick (option-list well-formedness, duplicate-value
+// rejection, and selected-must-name-a-real-option all reused from there -- CLAUDE.md "does this
+// already exist?"). `selected == ""` ("nothing chosen yet") is legitimate and passes through.
+fn prism_form_choice(name: string, label: string, options: list, selected: string) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_choice: field name must not be empty")
+    if label == ""
+        return err("prism_form_choice: needs a non-empty label (accessible name required)")
+    let check_r = prism_interact.prism_pick(options, selected)
+    if is_err(check_r)
+        return err("prism_form_choice: " + unwrap_err(check_r))
+    ok(PrismFormField(name, label, FormFieldChoice(options, selected), [], ""))
+
+fn prism_form_toggle(name: string, label: string, state: bool) -> Result<PrismFormField>
+    if name == ""
+        return err("prism_form_toggle: field name must not be empty")
+    if label == ""
+        return err("prism_form_toggle: needs a non-empty label (accessible name required)")
+    ok(PrismFormField(name, label, FormFieldToggle(state), [], ""))
+
+// ── Rule <-> kind compatibility (private) ─────────────────────────────────────────────────────
+// Exhaustive both ways (3 rules x 7 kinds = 21 arms, no wildcard): adding an 8th field kind or a
+// 4th rule forces every arm here to be reconsidered, the same closed-vocabulary discipline
+// PrismNodeKind/PrismMeshTrack/PrismIcon use elsewhere in prism/.
+
+fn _prism_form_rule_compatible(kind: PrismFormFieldKind, rule: PrismFormRule) -> bool
+    match rule
+        FormRuleRequired() =>
+            match kind
+                FormFieldText(_) => true
+                FormFieldEmail(_) => true
+                FormFieldPassword(_) => true
+                FormFieldChoice(_, _) => true
+                FormFieldToggle(_) => true
+                FormFieldNumber(_, _, _) => false
+                FormFieldRange(_, _, _, _) => false
+        FormRuleMinLength(_) =>
+            match kind
+                FormFieldText(_) => true
+                FormFieldEmail(_) => true
+                FormFieldPassword(_) => true
+                FormFieldChoice(_, _) => false
+                FormFieldToggle(_) => false
+                FormFieldNumber(_, _, _) => false
+                FormFieldRange(_, _, _, _) => false
+        FormRuleMaxLength(_) =>
+            match kind
+                FormFieldText(_) => true
+                FormFieldEmail(_) => true
+                FormFieldPassword(_) => true
+                FormFieldChoice(_, _) => false
+                FormFieldToggle(_) => false
+                FormFieldNumber(_, _, _) => false
+                FormFieldRange(_, _, _, _) => false
+
+fn _prism_form_rule_tag(r: PrismFormRule) -> string
+    match r
+        FormRuleRequired() => "required"
+        FormRuleMinLength(_) => "min_length"
+        FormRuleMaxLength(_) => "max_length"
+
+fn _prism_form_rule_str(r: PrismFormRule) -> string
+    match r
+        FormRuleRequired() => "required"
+        FormRuleMinLength(n) => "min_length(" + str(n) + ")"
+        FormRuleMaxLength(n) => "max_length(" + str(n) + ")"
+
+// ── Field composition ─────────────────────────────────────────────────────────────────────────
+// REPLACES `field.rules` wholesale (not additive) -- call once with the full rule set. Rejects,
+// in order: a rule incompatible with this field's kind, a duplicate rule TYPE (ambiguous --
+// "which min_length applies?"), a negative min_length/max_length, and min_length > max_length.
+fn prism_form_field_with_rules(field: PrismFormField, rules: list<PrismFormRule>) -> Result<PrismFormField>
+    let seen_tags = {}
+    let mut min_len_seen = -1
+    let mut max_len_seen = -1
+    let mut idx = 0
+    for r in rules
+        let tag = _prism_form_rule_tag(r)
+        if tag in seen_tags
+            return err("prism_form_field_with_rules: duplicate rule type '" + tag + "' (rule " + str(idx) + ")")
+        seen_tags[tag] = true
+        if not _prism_form_rule_compatible(field.kind, r)
+            return err("prism_form_field_with_rules: rule " + str(idx) + " (" + _prism_form_rule_str(r) + ") is not applicable to field '" + field.name + "' (kind " + prism_form_field_kind_str(field) + ")")
+        match r
+            FormRuleMinLength(n) =>
+                if n < 0
+                    return err("prism_form_field_with_rules: min_length must be >= 0, got " + str(n))
+                min_len_seen = n
+            FormRuleMaxLength(n) =>
+                if n < 0
+                    return err("prism_form_field_with_rules: max_length must be >= 0, got " + str(n))
+                max_len_seen = n
+            FormRuleRequired() => 0
+        idx += 1
+    if min_len_seen >= 0 and max_len_seen >= 0 and min_len_seen > max_len_seen
+        return err("prism_form_field_with_rules: min_length (" + str(min_len_seen) + ") must be <= max_length (" + str(max_len_seen) + ")")
+    ok(PrismFormField(field.name, field.label, field.kind, rules, field.help))
+
+// Any string, including "", is a legitimate help text (same "any string is legitimate" stance
+// prism_content.prism_label itself takes) -- infallible.
+fn prism_form_field_with_help(field: PrismFormField, help: string) -> PrismFormField
+    PrismFormField(field.name, field.label, field.kind, field.rules, help)
+
+// ── Field accessors ───────────────────────────────────────────────────────────────────────────
+
+fn prism_form_field_name(f: PrismFormField) -> string
+    f.name
+
+fn prism_form_field_label(f: PrismFormField) -> string
+    f.label
+
+fn prism_form_field_help(f: PrismFormField) -> string
+    f.help
+
+fn prism_form_field_rules(f: PrismFormField) -> list<PrismFormRule>
+    f.rules
+
+// Exhaustive, no wildcard -- see the closed-vocabulary discipline note above.
+fn prism_form_field_kind_str(f: PrismFormField) -> string
+    match f.kind
+        FormFieldText(_) => "text"
+        FormFieldEmail(_) => "email"
+        FormFieldPassword(_) => "password"
+        FormFieldNumber(_, _, _) => "number"
+        FormFieldRange(_, _, _, _) => "range"
+        FormFieldChoice(_, _) => "choice"
+        FormFieldToggle(_) => "toggle"
+
+// Value accessors mirror prism_node.nova's typed-getter-with-default convention: a caller-
+// supplied default covers "this field is not that kind," never a crash or a magic sentinel.
+fn prism_form_field_text_value(f: PrismFormField, default_val: string) -> string
+    match f.kind
+        FormFieldText(v) => v
+        FormFieldEmail(v) => v
+        FormFieldPassword(v) => v
+        FormFieldChoice(_, sel) => sel
+        FormFieldNumber(_, _, _) => default_val
+        FormFieldRange(_, _, _, _) => default_val
+        FormFieldToggle(_) => default_val
+
+fn prism_form_field_number_value(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldNumber(v, _, _) => v
+        _ => default_val
+
+fn prism_form_field_number_min(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldNumber(_, lo, _) => lo
+        _ => default_val
+
+fn prism_form_field_number_max(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldNumber(_, _, hi) => hi
+        _ => default_val
+
+fn prism_form_field_range_value(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldRange(v, _, _, _) => v
+        _ => default_val
+
+fn prism_form_field_range_min(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldRange(_, lo, _, _) => lo
+        _ => default_val
+
+fn prism_form_field_range_max(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldRange(_, _, hi, _) => hi
+        _ => default_val
+
+fn prism_form_field_range_step(f: PrismFormField, default_val: int) -> int
+    match f.kind
+        FormFieldRange(_, _, _, s) => s
+        _ => default_val
+
+fn prism_form_field_bool_value(f: PrismFormField, default_val: bool) -> bool
+    match f.kind
+        FormFieldToggle(state) => state
+        _ => default_val
+
+fn prism_form_field_choice_options(f: PrismFormField) -> list
+    match f.kind
+        FormFieldChoice(options, _) => options
+        _ => []
+
+fn prism_form_field_choice_selected(f: PrismFormField, default_val: string) -> string
+    match f.kind
+        FormFieldChoice(_, sel) => sel
+        _ => default_val
+
+// ── Form ──────────────────────────────────────────────────────────────────────────────────────
+// `fields` stays bare `list` (matching prism_pick/prism_tabs/prism_each's own convention for a
+// "list of a same-file struct") with a runtime type_name guard, since PrismFormField is a STRUCT
+// (type_name is verified reliable for structs throughout prism/widget/, unlike the enum case
+// `rules` above is deliberately typed to avoid).
+fn prism_form(fields: list) -> Result<PrismForm>
+    let seen = {}
+    let mut idx = 0
+    for f in fields
+        if type_name(f) != "PrismFormField"
+            return err("prism_form: field " + str(idx) + " is not a PrismFormField (got " + type_name(f) + ")")
+        if f.name in seen
+            return err("prism_form: duplicate field name '" + f.name + "'")
+        seen[f.name] = true
+        idx += 1
+    ok(PrismForm(fields))
+
+fn prism_form_fields(form: PrismForm) -> list
+    form.fields
+
+fn prism_form_field_count(form: PrismForm) -> int
+    len(form.fields)
+
+// ── Per-kind rule checkers (private) ──────────────────────────────────────────────────────────
+// Each builds and returns its OWN local list of violations for one field (never mutates a list
+// across a function boundary) -- the caller (prism_form_validate) folds these into its own
+// accumulator with a plain for-loop + push, avoiding any assumption about list-argument aliasing.
+
+fn _prism_form_check_stringy(field: PrismFormField, value: string) -> list
+    let errs = []
+    for r in field.rules
+        match r
+            FormRuleRequired() =>
+                if value == ""
+                    errs.push(PrismFormError(field.name, field.label + " is required"))
+            FormRuleMinLength(n) =>
+                if len(value) < n
+                    errs.push(PrismFormError(field.name, field.label + " must be at least " + str(n) + " characters"))
+            FormRuleMaxLength(n) =>
+                if len(value) > n
+                    errs.push(PrismFormError(field.name, field.label + " must be at most " + str(n) + " characters"))
+    errs
+
+fn _prism_form_check_choice(field: PrismFormField, selected: string) -> list
+    let errs = []
+    for r in field.rules
+        match r
+            FormRuleRequired() =>
+                if selected == ""
+                    errs.push(PrismFormError(field.name, field.label + " requires a selection"))
+            FormRuleMinLength(_) => 0
+            FormRuleMaxLength(_) => 0
+    errs
+
+// Required on a toggle means "must be true" -- the common "must accept terms" pattern.
+fn _prism_form_check_toggle(field: PrismFormField, state: bool) -> list
+    let errs = []
+    for r in field.rules
+        match r
+            FormRuleRequired() =>
+                if not state
+                    errs.push(PrismFormError(field.name, field.label + " must be accepted"))
+            FormRuleMinLength(_) => 0
+            FormRuleMaxLength(_) => 0
+    errs
+
+// ── Validation ────────────────────────────────────────────────────────────────────────────────
+// Number's inherent [min_val, max_val] is checked here (not at construction -- see header); Range
+// is never checked here because prism_form_range already guarantees its value is in-bounds at
+// construction time, and (per the compatibility table) Range accepts none of the 3 rule kinds.
+fn prism_form_validate(form: PrismForm) -> Result<list>
+    let errors = []
+    for field in form.fields
+        match field.kind
+            FormFieldText(v) =>
+                for e in _prism_form_check_stringy(field, v)
+                    errors.push(e)
+            FormFieldEmail(v) =>
+                for e in _prism_form_check_stringy(field, v)
+                    errors.push(e)
+            FormFieldPassword(v) =>
+                for e in _prism_form_check_stringy(field, v)
+                    errors.push(e)
+            FormFieldChoice(_, sel) =>
+                for e in _prism_form_check_choice(field, sel)
+                    errors.push(e)
+            FormFieldToggle(state) =>
+                for e in _prism_form_check_toggle(field, state)
+                    errors.push(e)
+            FormFieldNumber(v, lo, hi) =>
+                if v < lo or v > hi
+                    errors.push(PrismFormError(field.name, field.label + " must be between " + str(lo) + " and " + str(hi)))
+            FormFieldRange(_, _, _, _) => 0
+    ok(errors)
+
+fn prism_form_error_field(e: PrismFormError) -> string
+    e.field_name
+
+fn prism_form_error_message(e: PrismFormError) -> string
+    e.message
+
+// ── Rendering ─────────────────────────────────────────────────────────────────────────────────
+// Composes ONLY from widget/prism_interact (entry/pick/flag/range) + widget/prism_arrange (stack)
+// + widget/prism_content (label) -- no new PrismNodeKind, no markup, per axiom A7 / §15.1.
+
+// Just the input widget for one field -- no label/help/error wrapping. Exposed publicly (not
+// `_prism_form_*`) because it is a genuinely useful, independently composable building block for
+// a caller assembling a custom layout, not merely an internal step.
+fn prism_form_render_input(field: PrismFormField) -> Result<PrismNode>
+    match field.kind
+        FormFieldText(v) => prism_interact.prism_entry(field.label, prism_interact.prism_entry_kind_text(), v)
+        FormFieldEmail(v) => prism_interact.prism_entry(field.label, prism_interact.prism_entry_kind_email(), v)
+        FormFieldPassword(v) => prism_interact.prism_entry(field.label, prism_interact.prism_entry_kind_password(), v)
+        FormFieldNumber(v, _, _) => prism_interact.prism_entry(field.label, prism_interact.prism_entry_kind_number(), str(v))
+        FormFieldRange(v, lo, hi, step) => prism_interact.prism_range(field.label, lo, hi, step, v)
+        FormFieldChoice(options, selected) => prism_interact.prism_pick(options, selected)
+        FormFieldToggle(state) => prism_interact.prism_flag(field.label, state)
+
+// One row: label + input + help (if any) + error (if any), in that order. error_msg == "" means
+// no error to show for this field.
+fn _prism_form_render_row(field: PrismFormField, error_msg: string) -> Result<PrismNode>
+    let label_r = prism_content.prism_label(field.label)
+    if is_err(label_r)
+        return label_r
+    let input_r = prism_form_render_input(field)
+    if is_err(input_r)
+        return input_r
+    let parts = [unwrap(label_r), unwrap(input_r)]
+    if field.help != ""
+        let help_r = prism_content.prism_label(field.help)
+        if is_err(help_r)
+            return help_r
+        parts.push(unwrap(help_r))
+    if error_msg != ""
+        let error_r = prism_content.prism_label(error_msg)
+        if is_err(error_r)
+            return error_r
+        parts.push(unwrap(error_r))
+    prism_arrange.prism_stack(parts)
+
+// Validates first, then renders every field's row with its own first violated-rule message (if
+// any) attached. A field can have multiple violations (prism_form_validate reports all of them);
+// only the first, in rule-declaration order, is shown per row -- ordinary form UX, and NOVA dicts
+// preserve insertion order (§15.9) so "first seen" is deterministic.
+fn prism_form_render(form: PrismForm) -> Result<PrismNode>
+    let errs_r = prism_form_validate(form)
+    if is_err(errs_r)
+        return err(unwrap_err(errs_r))
+    let errs = unwrap(errs_r)
+    let first_error = {}
+    for e in errs
+        if e.field_name not in first_error
+            first_error[e.field_name] = e.message
+    let rows = []
+    for field in form.fields
+        let msg = ""
+        if field.name in first_error
+            msg = first_error[field.name]
+        let row_r = _prism_form_render_row(field, msg)
+        if is_err(row_r)
+            return row_r
+        rows.push(unwrap(row_r))
+    prism_arrange.prism_stack(rows)

@@ -1562,6 +1562,39 @@ BEHAVIOUR DIFF caught it. **Compiling is not passing.**
            Some(n) => ...fixed n...
    ```
 
+13. ★★ **`obj.field(args)` ON AN UN-INFERRED RECEIVER EMITS AN UNDEFINED `@nova_rt_<field>`**
+   (verified 2026-08-15 with an A/B probe; this is the root cause of the long-standing
+   `@nova_rt_sql` ORM link failures). Calling a closure held in a struct **field** with direct
+   dot-call syntax resolves through **method dispatch** — struct method → module function →
+   builtin → *guess the runtime symbol name* — rather than "read the field, then invoke it".
+   Whether it works depends on whether the compiler statically knows the receiver's type:
+
+   ```nova
+   type Col
+       name: string
+       extract: any
+   fn find_col(cols: list, k: string) -> Result<Col>
+       ...
+   let direct = cols[0]
+   direct.extract(41)                      // ✅ receiver type known -> field access, links
+   let viaresult = unwrap(find_col(cols, "a"))
+   viaresult.extract(41)                    // ❌ type NOT known -> emits @nova_rt_extract
+   ```
+
+   **The failure is a LINK error, not a compile error** — `error: use of undefined value
+   '@nova_rt_extract'` — so it surfaces late, and only if something actually links that path.
+   It is silent at type-check time.
+
+   **Workaround: bind the field to a local first, then call the local.**
+   ```nova
+   let f = obj.field
+   f(args)                                  // ✅ always a plain closure call
+   ```
+
+   This bites any callback-in-a-struct design — table column extractors, form validators, event
+   handlers, strategy objects — and it is exactly why `OrmQuery.sql()` fails to link. Prefer the
+   local-binding form unconditionally; it costs one line and does not depend on inference.
+
 ---
 
 ## 8. Builtin Data Structures

@@ -1,0 +1,411 @@
+// prism_ui_table -- the table component (prism/ui/ composition layer, milestone MB.1).
+// Typed columns over a row set, with header, sorting, and honest empty/loading states.
+//
+// ── THIS IS A COMPOSITION, NOT A NEW PRIMITIVE (PRISM_SPEC.md axiom A7) ──────────────────────
+// A table invents NOTHING at the PrismNodeKind level. It is built entirely from the 22-primitive
+// vocabulary widget/ already exposes: `prism_grid` (the tabular body -- PRISM_SPEC.md §10),
+// `prism_band` (the header row), `prism_stack` (header-above-body), `prism_label` (every piece of
+// display text), and `prism_glyph` (the sort-direction indicator, from the closed icon set). This
+// file's entire job is validated TYPED ASSEMBLY of those primitives -- exactly the same relationship
+// prism_arrange.nova/prism_content.nova have to prism_node.nova, one layer up.
+//
+// ── WHY A TABLE NEEDS A MANDATORY ROW-IDENTITY SELECTOR, JUST LIKE `grid` ────────────────────
+// `prism_grid(rows, key_fn, columns, cell_fn)` (prism_structure.nova) makes `key_fn` a REQUIRED
+// parameter with no default and no zero-arg overload -- PRISM_SPEC.md §10: "`by` is mandatory on
+// `each` and `grid`. A missing identity selector is a compile error, not a runtime warning," because
+// §12.6's reactivity engine needs ROW-granularity identity that survives a re-render, and a table's
+// rows get REORDERED by sorting -- exactly the scenario where identity-by-position (row index) would
+// silently corrupt that identity map (index 0 is a DIFFERENT physical row before and after a sort).
+// `prism_table_render` below composes its body via `prism_grid`, so `prism_table` (the constructor)
+// takes the SAME mandatory `row_key_fn: fn(row) -> string` PRISM_SPEC.md requires of grid itself --
+// there is no way to build a PrismTable without supplying one, and it is threaded straight through
+// to `prism_grid` unmodified at render time (that call site is where duplicate-key rejection and
+// non-string-key rejection already happen, correctly, so this file does not re-implement either).
+//
+// ── WHY SORTING IS A CLOSED 3-VALUE ENUM, NOT A STRING OR A BOOL ─────────────────────────────
+// "ascending" / "descending" toggle-off is conventionally a BOOLEAN in a naive design, but a table
+// needs a third state -- "no active sort, whatever order the data is in" -- and a bool has no room
+// for it (a caller would have to smuggle it in as a sentinel, exactly the "silently does nothing"
+// failure class PRISM_SPEC.md's own axiom on styles (§11) warns against, applied here to sort
+// direction instead of a paint property). `PrismSortDirection` is a real 3-variant closed enum for
+// the same reason `PrismMeshTrack`/`PrismIcon` are (prism_arrange.nova / prism_content.nova):
+// an invalid direction is a COMPILE error (wrong constructor call), never a runtime string typo.
+// The third variant is named `Unsorted()`, not `None()` -- deliberately avoiding the token NOVA's
+// builtin `Option` type already owns (`Some`/`None`), to keep this enum's unqualified match patterns
+// unambiguous rather than relying on unverified type-directed disambiguation between two different
+// enums that both declare a `None` variant. Its STORED/PRINTED name is still "none" (`
+// prism_sort_direction_name`), matching the task's own vocabulary -- only the Nova-level identifier
+// differs from the string.
+//
+// ── WHY `prism_table_sorted` REJECTS AN UNKNOWN COLUMN KEY (never silently no-ops) ───────────
+// Same principle as the direction enum: PRISM_SPEC.md §11's "no way to write a style that silently
+// does nothing" applies with equal force to a sort request that misspells a column key. Silently
+// returning the table unchanged would look, to the caller, exactly like "the sort ran and there was
+// nothing to reorder" -- an invisible bug. `_prism_table_find_column` is the one chokepoint every
+// column-key lookup in this file funnels through (mirroring prism_node_new's single-chokepoint
+// discipline), so the rejection happens once, correctly, everywhere a key is resolved.
+//
+// ── HOW SORTING IS PROVEN STABLE AND NON-MUTATING (read before touching the algorithm) ───────
+// The builtin `xs.sort_by(keyfn)` (see NOVA_LANGUAGE_FEATURES.md §"sort / sort_by") is already a
+// hardened, KAT-proven stable merge sort that returns a NEW list and never touches its input --
+// verified directly against its C implementation (`nova_rt_sort_by` in nova_runtime.c): it allocates
+// `new_list`, `memcpy`s the source list's backing array into it, and the original list handle `l` is
+// never written to anywhere in the function. This file's job is therefore NOT to reinvent a sort --
+// it is to feed that builtin a key it can compare, and to derive DESCENDING order without breaking
+// stability, which the builtin has no direct support for:
+//   1. `_prism_table_build_pairs` calls `extract_fn(row)` EXACTLY ONCE per row (not once for
+//      validation and again inside the sort, which double-calling the raw extract_fn would cost),
+//      validates each result is actually a string (extract_fn is a caller-supplied untyped callback
+//      -- same class of guard prism_each/prism_grid apply to `key_fn`'s return, PRISM_SPEC.md's own
+//      "guard before first use of an untyped value" discipline), and decorates each row into a
+//      `{"row": ..., "key": ...}` pair, built by iterating `rows` in their ORIGINAL order.
+//   2. ASCENDING: `sort_by(pairs, fn(p) p["key"])` -- a plain dict-field read as the sort key, which
+//      the builtin's own stable merge sort then orders. Ties keep the ORIGINAL relative order for
+//      free, because the pairs array was built in original order and the merge is stable.
+//   3. DESCENDING is NOT "sort ascending then reverse the whole list" -- that would also reverse the
+//      order of every TIED group, which is NOT what a stable descending sort means (Python's own
+//      `sorted(reverse=True)` docs are explicit that reverse=True still preserves original relative
+//      order among equal keys; it is not equivalent to `sorted(...)[::-1]` in the presence of ties).
+//      `_prism_table_stable_desc_rows` gets the correct result cheaply by walking the ALREADY-STABLE
+//      ascending array backwards, one MAXIMAL run of equal keys at a time, emitting each run
+//      forwards (i.e. in its original relative order) before moving to the next (lower-key) run.
+//      Net effect: groups of equal keys are reordered highest-to-lowest, but WITHIN a group the
+//      original relative order survives untouched -- exactly the same guarantee ascending gets, just
+//      applied at group granularity instead of element granularity. O(n) beyond the O(n log n) sort.
+//   4. Because every step above (decorate / sort_by / undecorate-or-regroup) ONLY ever reads `rows`
+//      and pushes into freshly-allocated output lists, `table.rows` (and the caller's original list
+//      passed into `prism_table`) is never mutated by any of this -- proven directly in the KAT by
+//      re-reading the pristine table after multiple sorts and asserting its row order is untouched.
+//
+// ── WHY SORTING IS ALWAYS LEXICOGRAPHIC (an honest, stated limitation, not a bug) ────────────
+// `extract_fn(row) -> string` is the column's ENTIRE contract (this task's own spec, and prism_grid's
+// `cell_fn` follows the identical string-out convention). That means every sort in this file compares
+// DISPLAY TEXT, never a numeric or date value underneath it -- "9" sorts after "80" lexicographically
+// even though 9 < 80 numerically. This is inherent to a string-extraction contract, not a defect
+// introduced here, and it is the same tradeoff every one of this codebase's string-keyed sorts makes
+// (`sort_by(recs, fn(r) r.name)` is exactly this). A caller needing numeric-correct ordering must
+// format its extract_fn's output with fixed-width zero-padding; that is a caller-side concern, not
+// something a `-> string` contract can special-case without lying about its own return type.
+//
+// ── WHY EMPTY AND LOADING ARE TWO FUNCTIONS, NOT ONE WITH A FLAG ─────────────────────────────
+// "The table has zero confirmed results" and "the table doesn't know yet" are different facts a UI
+// must not conflate -- collapsing them into one function with a caller-supplied string would let a
+// caller ship a "Loading..." empty-state message while actually meaning "confirmed empty," or vice
+// versa, with nothing in the type system to catch the mix-up. Two named entry points make the
+// caller's INTENT part of the call site instead of buried in a string argument. `prism_table_empty_
+// message` additionally rejects being called on a table that still has rows (a real caller mistake:
+// showing "no results" while results exist is a correctness bug, not a style choice) -- `prism_table_
+// loading` does not enforce this, because showing a loading indicator OVER stale, previously-loaded
+// rows during a refetch is legitimate, common UX, not a mistake.
+//
+// ── CONSTRUCTORS ARE FILE-LOCAL, CROSS-MODULE (NOVA_LANGUAGE_FEATURES.md §7 trap 11) ─────────
+// `PrismSortDirection`'s variants and `PrismTableColumn`/`PrismTable`'s positional constructors all
+// resolve ONLY inside this file -- hence `prism_sort_ascending()`/`_descending()`/`_unsorted()` and
+// the `prism_table_column`/`prism_table` wrapper functions below, the same pattern prism_node.nova
+// established for `prism_kind_*` and prism_interact.nova/_structure.nova established for
+// `prism_pick_option`/`prism_tab_panel`.
+//
+// ── UNTYPED CALLBACKS GET A COARSE "OBVIOUSLY NOT CALLABLE" GUARD WHERE THEY ARE STORED, NOT CALLED
+// `extract_fn` (in `prism_table_column`) and `row_key_fn` (in `prism_table`) are both stored into a
+// struct field and never invoked by the function that receives them -- the same shape as prism_
+// content.nova's `prism_draw`'s `paint` parameter, and for the identical reason documented there:
+// NOVA has no `is_fn`/callable-arity introspection, so the ONE thing provably true of a bad argument
+// is that it reports true from is_string/is_int/is_float/is_bool/is_list/is_dict, which a real
+// closure never does. Guarded before storage. In contrast, `_prism_table_build_pairs`'s `extract`
+// parameter and `_prism_table_cell`'s `col.extract` ARE called locally within the function that
+// receives them, which lets NOVA's own call-site type inference constrain the parameter -- so those
+// call sites validate only the untyped RETURN value (a string), not the callback's callability,
+// mirroring prism_each's/prism_grid's own `key_fn`/`render_fn`/`cell_fn` treatment exactly.
+//
+// PUBLIC API
+//   Sort direction (closed, 3 values)
+//     PrismSortDirection                                    Ascending() | Descending() | Unsorted()
+//     prism_sort_ascending() / _descending() / _unsorted()   cross-module ctors
+//     prism_sort_direction_name(dir) -> string    exhaustive: "ascending" | "descending" | "none"
+//   Column
+//     PrismTableColumn { key, header, extract: any }
+//     prism_table_column(key: string, header: string, extract_fn) -> Result<PrismTableColumn>
+//       rejects: empty key, empty header, an obviously-non-callable extract_fn
+//     prism_table_column_key(col) / _header(col) -> string    field accessors
+//   Table
+//     PrismTable { columns, rows, row_key: any, sort_key: string, sort_dir, original_rows }
+//     prism_table(columns: list, rows: list, row_key_fn) -> Result<PrismTable>
+//       rejects: 0 columns, a non-PrismTableColumn element, a duplicate column key, an
+//       obviously-non-callable row_key_fn
+//     prism_table_columns(table) / _rows(table) -> list        field accessors
+//     prism_table_row_count(table) -> int
+//     prism_table_sort_key(table) -> string          "" when no active sort
+//     prism_table_sort_direction(table) -> string    "ascending" | "descending" | "none"
+//   Sorting
+//     prism_table_sorted(table, key: string, dir: PrismSortDirection) -> Result<PrismTable>
+//       rejects a key that names no column (never silently no-ops); STABLE; never mutates
+//       `table.rows` or the caller's original row list (see header note above)
+//   Rendering
+//     prism_table_render(table) -> Result<PrismNode>
+//       header band (with an active-sort chevron glyph) stacked above the `prism_grid` body
+//     prism_table_empty_message(table, message: string) -> Result<PrismNode>
+//       rejects an empty message and a table that still has rows
+//     prism_table_loading(table, message: string) -> Result<PrismNode>
+//       rejects an empty message
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_structure
+
+// ── Sort direction: closed, 3 values (see header) ────────────────────────────────────────────
+enum PrismSortDirection
+    Ascending()
+    Descending()
+    Unsorted()
+
+fn prism_sort_ascending() -> PrismSortDirection
+    Ascending()
+fn prism_sort_descending() -> PrismSortDirection
+    Descending()
+fn prism_sort_unsorted() -> PrismSortDirection
+    Unsorted()
+
+// Exhaustive, no wildcard arm -- same discipline PrismNodeKind/PrismMeshTrack/PrismIcon follow.
+fn prism_sort_direction_name(dir: PrismSortDirection) -> string
+    match dir
+        Ascending() => "ascending"
+        Descending() => "descending"
+        Unsorted() => "none"
+
+// ── Column ────────────────────────────────────────────────────────────────────────────────────
+
+type PrismTableColumn
+    key: string
+    header: string
+    extract: any
+
+// See header note: extract_fn is stored, never called here, so only an obviously-wrong coarse
+// kind can be ruled out (the same boundary prism_draw's `paint` guard sits on).
+fn prism_table_column(key: string, header: string, extract_fn) -> Result<PrismTableColumn>
+    if key == ""
+        return err("prism_table_column: key must not be empty")
+    if header == ""
+        return err("prism_table_column: header must not be empty")
+    if is_string(extract_fn) or is_int(extract_fn) or is_float(extract_fn) or is_bool(extract_fn) or is_list(extract_fn) or is_dict(extract_fn)
+        return err("prism_table_column: extract_fn must be a callback fn(row) -> string, got a " + type_of(extract_fn))
+    ok(PrismTableColumn(key, header, extract_fn))
+
+fn prism_table_column_key(col: PrismTableColumn) -> string
+    col.key
+
+fn prism_table_column_header(col: PrismTableColumn) -> string
+    col.header
+
+// ── Table ─────────────────────────────────────────────────────────────────────────────────────
+
+type PrismTable
+    columns: list
+    rows: list
+    row_key: any
+    sort_key: string
+    sort_dir: PrismSortDirection
+    original_rows: list
+
+// Rejects: 0 columns, a non-PrismTableColumn element (named by index and actual type -- the same
+// wild-pointer-read class prism_node_new's `children` guard closes, applied to `columns` here), a
+// duplicate column key (named -- ambiguous sort/cell addressing otherwise, see header), and an
+// obviously-non-callable row_key_fn (stored, never called here -- see header note).
+fn prism_table(columns: list, rows: list, row_key_fn) -> Result<PrismTable>
+    if len(columns) == 0
+        return err("prism_table: needs at least one column")
+    if is_string(row_key_fn) or is_int(row_key_fn) or is_float(row_key_fn) or is_bool(row_key_fn) or is_list(row_key_fn) or is_dict(row_key_fn)
+        return err("prism_table: row_key_fn must be a callback fn(row) -> string, got a " + type_of(row_key_fn))
+    let seen = {}
+    let mut idx = 0
+    for c in columns
+        if type_name(c) != "PrismTableColumn"
+            return err("prism_table: column " + str(idx) + " is not a PrismTableColumn (got " + type_name(c) + ")")
+        if c.key in seen
+            return err("prism_table: duplicate column key '" + c.key + "'")
+        seen[c.key] = true
+        idx += 1
+    ok(PrismTable(columns, rows, row_key_fn, "", prism_sort_unsorted(), rows))
+
+fn prism_table_columns(table: PrismTable) -> list
+    table.columns
+
+fn prism_table_rows(table: PrismTable) -> list
+    table.rows
+
+fn prism_table_row_count(table: PrismTable) -> int
+    len(table.rows)
+
+fn prism_table_sort_key(table: PrismTable) -> string
+    table.sort_key
+
+fn prism_table_sort_direction(table: PrismTable) -> string
+    prism_sort_direction_name(table.sort_dir)
+
+// The one chokepoint every column-key lookup in this file funnels through (see header). Named,
+// typed rejection on an unknown key -- never a silent no-op.
+fn _prism_table_find_column(columns: list, key: string) -> Result<PrismTableColumn>
+    for c in columns
+        if c.key == key
+            return ok(c)
+    err("prism_table: unknown column key '" + key + "'")
+
+fn _prism_table_column_keys(table: PrismTable) -> list
+    let out = []
+    for c in table.columns
+        out.push(c.key)
+    out
+
+// ── Sorting (see header for the full stability/non-mutation argument) ───────────────────────
+
+// Decorates each row with its extract_fn(row) key, computed EXACTLY ONCE per row, validating the
+// untyped callback's return is actually a string before it is ever used as a sort key (same guard
+// class as prism_each's key_fn / prism_grid's key_fn). Built by iterating `rows` in their ORIGINAL
+// order -- what makes the later stable sort's tie-breaking equal to "keep original relative order".
+fn _prism_table_build_pairs(rows: list, extract) -> Result<list>
+    let out = []
+    let mut idx = 0
+    for r in rows
+        let k = extract(r)
+        if not is_string(k)
+            return err("prism_table: column extract_fn must return a string, row " + str(idx) + " returned " + type_name(k))
+        out.push({"row": r, "key": k})
+        idx += 1
+    ok(out)
+
+fn _prism_table_rows_from_pairs(pairs: list) -> list
+    let out = []
+    for p in pairs
+        out.push(p["row"])
+    out
+
+// Turns an ALREADY-ascending-stable-sorted pairs array into descending order WITHOUT reversing the
+// internal order of any tied group (see header: this is what makes descending stable, not merely
+// reversed). Walks backwards one maximal equal-key run at a time; each run is emitted forwards.
+fn _prism_table_stable_desc_rows(sorted_pairs: list) -> list
+    let n = len(sorted_pairs)
+    let out = []
+    let mut i = n - 1
+    while i >= 0
+        let k = sorted_pairs[i]["key"]
+        let mut j = i
+        while j - 1 >= 0 and sorted_pairs[j - 1]["key"] == k
+            j -= 1
+        let mut t = j
+        while t <= i
+            out.push(sorted_pairs[t]["row"])
+            t += 1
+        i = j - 1
+    out
+
+// Returns a NEW PrismTable with `rows` reordered per (key, dir); `table` itself is never mutated
+// (NOVA values are not mutated in place by this file anywhere -- every transformation here builds a
+// fresh list/struct). Rejects a key naming no column BEFORE dispatching on `dir` -- the rejection
+// must fire regardless of which direction was requested (see header). `Unsorted()` reverts to the
+// table's pristine construction-time row order (`original_rows`), the standard tri-state
+// asc->desc->original toggle real table UIs use, not a no-op that leaves whatever order was last set.
+fn prism_table_sorted(table: PrismTable, key: string, dir: PrismSortDirection) -> Result<PrismTable>
+    let col = _prism_table_find_column(table.columns, key)?
+    match dir
+        Unsorted() =>
+            ok(PrismTable(table.columns, table.original_rows, table.row_key, "", prism_sort_unsorted(), table.original_rows))
+        Ascending() =>
+            let pairs = _prism_table_build_pairs(table.rows, col.extract)?
+            let sorted_pairs = sort_by(pairs, fn(p) p["key"])
+            ok(PrismTable(table.columns, _prism_table_rows_from_pairs(sorted_pairs), table.row_key, key, prism_sort_ascending(), table.original_rows))
+        Descending() =>
+            let pairs2 = _prism_table_build_pairs(table.rows, col.extract)?
+            let sorted_pairs2 = sort_by(pairs2, fn(p) p["key"])
+            ok(PrismTable(table.columns, _prism_table_stable_desc_rows(sorted_pairs2), table.row_key, key, prism_sort_descending(), table.original_rows))
+
+// ── Rendering ─────────────────────────────────────────────────────────────────────────────────
+
+// One header cell: the column's label, plus (only for the currently-active sort column) a chevron
+// glyph naming the direction. Composed from `label`/`glyph`/`band` -- no new primitive.
+fn _prism_table_header_cell(col: PrismTableColumn, active_key: string, dir: PrismSortDirection) -> Result<PrismNode>
+    let label_node = prism_content.prism_label(col.header)?
+    if col.key != active_key
+        return ok(label_node)
+    match dir
+        Unsorted() => ok(label_node)
+        Ascending() =>
+            let icon_node = prism_content.prism_glyph(prism_content.prism_icon_chevron_up())?
+            prism_arrange.prism_band([label_node, icon_node])
+        Descending() =>
+            let icon_node2 = prism_content.prism_glyph(prism_content.prism_icon_chevron_down())?
+            prism_arrange.prism_band([label_node, icon_node2])
+
+fn _prism_table_header_band(table: PrismTable) -> Result<PrismNode>
+    let cells = []
+    for c in table.columns
+        let cell = _prism_table_header_cell(c, table.sort_key, table.sort_dir)?
+        cells.push(cell)
+    prism_arrange.prism_band(cells)
+
+// One grid cell: looks up the column by key (always found -- `col_key` is always sourced from
+// `columns` itself at the prism_grid call site below), pulls display text via its extract_fn, and
+// validates that text is actually a string before handing it to `prism_label` (same untyped-
+// callback-return guard as sorting's `_prism_table_build_pairs`).
+//
+// NOTE (verified directly, cost real link time): `col.extract(row)` -- calling a closure stored in
+// a struct FIELD via direct dot-call syntax -- resolves through NOVA's method-call dispatch (struct
+// method -> module function -> stdlib builtin -> runtime function) rather than "read the field,
+// then invoke the value", and when no method/builtin named `extract` exists it falls through to
+// guessing a runtime symbol (`nova_rt_extract`) that was never declared -- an UNDEFINED SYMBOL at
+// LINK time, not a compile-time error. The fix (confirmed against the compiler's own comment on
+// this exact fallback: "the exact IR the `let f = obj.field` / `f(args)` workaround already
+// produces") is to read the field into a local FIRST, then call the local as a plain identifier --
+// which is never ambiguous with method-call dispatch. Same fix applied to `col.extract` wherever
+// this file calls it (never bare `col.extract(...)`).
+fn _prism_table_cell(columns: list, row, col_key: string) -> Result<PrismNode>
+    let col = _prism_table_find_column(columns, col_key)?
+    let extract_fn = col.extract
+    let text = extract_fn(row)
+    if not is_string(text)
+        return err("prism_table: column '" + col_key + "' extract_fn must return a string, got " + type_name(text))
+    prism_content.prism_label(text)
+
+// Composes: header band of column headers (with the active-sort chevron), then the body via
+// `prism_grid` -- `table.row_key` is threaded straight through as grid's mandatory identity
+// selector (see header), so a duplicate row identity or a non-string row key is rejected exactly
+// where prism_grid already rejects it, with the same message quality, not re-implemented here.
+fn prism_table_render(table: PrismTable) -> Result<PrismNode>
+    let header_node = _prism_table_header_band(table)?
+    let col_keys = _prism_table_column_keys(table)
+    let grid_node = prism_structure.prism_grid(table.rows, table.row_key, col_keys, fn(row, col_key) _prism_table_cell(table.columns, row, col_key))?
+    prism_arrange.prism_stack([header_node, grid_node])
+
+// A message body: glyph + label (empty state -- the icon marks this as an intentional, informative
+// state, not a broken one) or label alone (loading -- none of the closed 12 icons represents a
+// spinner/in-progress state, and using one that doesn't would be misleading, see header).
+fn _prism_table_message_with_icon(message: string, icon: PrismIcon) -> Result<PrismNode>
+    let label_node = prism_content.prism_label(message)?
+    let glyph_node = prism_content.prism_glyph(icon)?
+    prism_arrange.prism_stack([glyph_node, label_node])
+
+fn _prism_table_message_only(message: string) -> Result<PrismNode>
+    prism_content.prism_label(message)
+
+// Renders the table's header (still showing real column headers -- this is recognizably the SAME
+// table, just with its body swapped out) above a labelled empty-state message. Rejects an empty
+// message (a blank table is indistinguishable from a broken one -- the entire reason this function
+// exists instead of callers rendering nothing) and rejects being called while `table.rows` is
+// non-empty (showing "no results" while results exist is a correctness bug -- see header).
+fn prism_table_empty_message(table: PrismTable, message: string) -> Result<PrismNode>
+    if message == ""
+        return err("prism_table_empty_message: needs a non-empty message (a blank table is indistinguishable from a broken one)")
+    if len(table.rows) != 0
+        return err("prism_table_empty_message: table has " + str(len(table.rows)) + " row(s) -- an empty state must not be rendered when rows exist (call prism_table_render instead)")
+    let header_node = _prism_table_header_band(table)?
+    let body_node = _prism_table_message_with_icon(message, prism_content.prism_icon_info())?
+    prism_arrange.prism_stack([header_node, body_node])
+
+// Same header-preserving shape as prism_table_empty_message, but does NOT require `table.rows` to
+// be empty -- a loading indicator legitimately overlays stale, previously-loaded rows during a
+// refetch (see header). Rejects only an empty message.
+fn prism_table_loading(table: PrismTable, message: string) -> Result<PrismNode>
+    if message == ""
+        return err("prism_table_loading: needs a non-empty message (a blank table is indistinguishable from a broken one)")
+    let header_node = _prism_table_header_band(table)?
+    let body_node = _prism_table_message_only(message)?
+    prism_arrange.prism_stack([header_node, body_node])

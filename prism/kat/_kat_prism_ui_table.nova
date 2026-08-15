@@ -1,0 +1,295 @@
+// KAT for prism/ui/prism_ui_table.nova (PRISM_ROADMAP.md milestone MB.1, the `ui/` composition
+// layer's table component).
+//
+// Proves, against concrete expected values:
+//   1. Column construction + rejections (empty key, empty header, non-callable extract_fn).
+//   2. Table construction + rejections (0 columns, non-PrismTableColumn element, duplicate column
+//      key, non-callable row_key_fn).
+//   3. A 3-column x 4-row table renders with EXACT depth=4/count=22 (unsorted), correct kinds at
+//      every level (stack > band/grid), correct header text, and correct cell text.
+//   4. Sorting ASCENDING by a column produces the EXACT expected row order.
+//   5. Sorting DESCENDING by the same column produces the EXACT expected row order.
+//   6. Sorting is STABLE in BOTH directions: two rows sharing a sort key (deliberately constructed)
+//      keep their original relative order, proven by index comparison in both sorted results.
+//   7. Sorting does NOT mutate the input rows: the pristine table's row order is unchanged after
+//      multiple sorts, checked directly.
+//   8. Sorting by an unknown column key is rejected (never a silent no-op).
+//   9. The rendered header indicates the active sort column and direction with the correct chevron
+//      glyph (up for ascending, down for descending) -- and the OTHER columns stay plain labels.
+//      Re-rendering after a sort produces EXACT depth=4/count=24 (header grows by one glyph node).
+//   10. Header text round-trips through the accessor AND through the rendered tree.
+//   11. The empty state renders a labelled message (EXACT depth=3/count=8), rejects an empty
+//       message, and rejects being called on a table that still has rows.
+//   12. The loading state renders a labelled message (EXACT depth=3/count=6) and rejects an empty
+//       message -- and, unlike empty, is legal to call on a table that still has rows.
+//   13. A duplicate row-identity key is rejected at render time (surfaced from prism_grid's own
+//       mandatory identity-selector guard, threaded through unmodified).
+//   14. A column whose extract_fn returns a non-string is rejected at SORT time (this module's own
+//       guard, not prism_grid's).
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_node` / `import prism_ui_table` resolve.
+//   ./gen3_test.exe _kat_prism_ui_table.nova
+//   clang -O2 -o _kat_prism_ui_table.exe _kat_prism_ui_table.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_ui_table.exe
+
+import prism_node
+import prism_ui_table
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn main()
+    // ── 1. Column construction + rejections ─────────────────────────────────────────────────
+    let name_col_r = prism_ui_table.prism_table_column("name", "Name", fn(r) r["name"])
+    if is_err(name_col_r)
+        _fail("prism_table_column(name) construction: " + unwrap_err(name_col_r))
+    let name_col = unwrap(name_col_r)
+    assert_eq(prism_ui_table.prism_table_column_key(name_col), "name")
+    assert_eq(prism_ui_table.prism_table_column_header(name_col), "Name")
+
+    let score_col = unwrap(prism_ui_table.prism_table_column("score", "Score", fn(r) str(r["score"])))
+    let dept_col = unwrap(prism_ui_table.prism_table_column("dept", "Department", fn(r) r["dept"]))
+
+    let col_empty_key_r = prism_ui_table.prism_table_column("", "Name", fn(r) r["name"])
+    if is_ok(col_empty_key_r)
+        _fail("prism_table_column should reject an empty key, but construction succeeded")
+    let col_empty_header_r = prism_ui_table.prism_table_column("name", "", fn(r) r["name"])
+    if is_ok(col_empty_header_r)
+        _fail("prism_table_column should reject an empty header, but construction succeeded")
+    let col_bad_extract_r = prism_ui_table.prism_table_column("name", "Name", "not a function")
+    if is_ok(col_bad_extract_r)
+        _fail("prism_table_column should reject a non-callable extract_fn, but construction succeeded")
+    print("1. column construction + rejections (empty key / empty header / non-callable extract_fn): OK -- " + unwrap_err(col_empty_key_r) + " / " + unwrap_err(col_empty_header_r) + " / " + unwrap_err(col_bad_extract_r))
+
+    // ── 2. Table construction + rejections ──────────────────────────────────────────────────
+    // Deliberate stability case: r1 (Charlie, score 80) and r3 (Bob, score 80) share a sort key.
+    // r1 appears BEFORE r3 in this original construction order -- both a stable ascending AND a
+    // stable descending sort must keep r1 before r3 in their output (see section 6).
+    let rows = [{"id": "r1", "name": "Charlie", "score": 80, "dept": "Eng"}, {"id": "r2", "name": "Alice", "score": 92, "dept": "Sales"}, {"id": "r3", "name": "Bob", "score": 80, "dept": "Eng"}, {"id": "r4", "name": "Dave", "score": 65, "dept": "HR"}]
+    let columns = [name_col, score_col, dept_col]
+
+    let table_r = prism_ui_table.prism_table(columns, rows, fn(r) r["id"])
+    if is_err(table_r)
+        _fail("prism_table construction: " + unwrap_err(table_r))
+    let table = unwrap(table_r)
+    assert_eq(prism_ui_table.prism_table_row_count(table), 4)
+    assert_eq(prism_ui_table.prism_table_sort_key(table), "")
+    assert_eq(prism_ui_table.prism_table_sort_direction(table), "none")
+
+    let table_zero_cols_r = prism_ui_table.prism_table([], rows, fn(r) r["id"])
+    if is_ok(table_zero_cols_r)
+        _fail("prism_table should reject 0 columns, but construction succeeded")
+    let table_bad_col_elem_r = prism_ui_table.prism_table([name_col, "not a column"], rows, fn(r) r["id"])
+    if is_ok(table_bad_col_elem_r)
+        _fail("prism_table should reject a non-PrismTableColumn element, but construction succeeded")
+    let table_dup_col_key_r = prism_ui_table.prism_table([name_col, name_col], rows, fn(r) r["id"])
+    if is_ok(table_dup_col_key_r)
+        _fail("prism_table should reject a duplicate column key 'name', but construction succeeded")
+    let table_bad_row_key_r = prism_ui_table.prism_table(columns, rows, 42)
+    if is_ok(table_bad_row_key_r)
+        _fail("prism_table should reject a non-callable row_key_fn, but construction succeeded")
+    print("2. table construction + rejections (0 columns / bad column element / duplicate column key / non-callable row_key_fn): OK -- " + unwrap_err(table_zero_cols_r) + " / " + unwrap_err(table_bad_col_elem_r) + " / " + unwrap_err(table_dup_col_key_r) + " / " + unwrap_err(table_bad_row_key_r))
+
+    // ── 3. Unsorted render: exact structure, kinds, header text, cell text ──────────────────
+    let rendered_r = prism_ui_table.prism_table_render(table)
+    if is_err(rendered_r)
+        _fail("prism_table_render (unsorted) construction: " + unwrap_err(rendered_r))
+    let rendered = unwrap(rendered_r)
+    assert_eq(prism_node.prism_node_kind_str(rendered), "stack")
+    assert_eq(prism_node.prism_node_depth(rendered), 4)
+    assert_eq(prism_node.prism_node_count(rendered), 22)
+
+    let top_children = prism_node.prism_node_children(rendered)
+    assert_eq(len(top_children), 2)
+    let header_node = top_children[0]
+    let grid_node = top_children[1]
+    assert_eq(prism_node.prism_node_kind_str(header_node), "band")
+    assert_eq(prism_node.prism_node_kind_str(grid_node), "grid")
+    assert_eq(prism_node.prism_node_attr_int(grid_node, "columns", -1), 3)
+
+    let header_cells = prism_node.prism_node_children(header_node)
+    assert_eq(len(header_cells), 3)
+    assert_eq(prism_node.prism_node_kind_str(header_cells[0]), "label")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[0], "text", ""), "Name")
+    assert_eq(prism_node.prism_node_kind_str(header_cells[1]), "label")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[1], "text", ""), "Score")
+    assert_eq(prism_node.prism_node_kind_str(header_cells[2]), "label")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[2], "text", ""), "Department")
+
+    let grid_rows = prism_node.prism_node_children(grid_node)
+    assert_eq(len(grid_rows), 4)
+    // Unsorted: original construction order r1, r2, r3, r4.
+    match prism_node.prism_node_key(grid_rows[0])
+        Some(k) => assert_eq(k, "r1")
+        None => _fail("unsorted row 0 should have key 'r1'")
+    match prism_node.prism_node_key(grid_rows[1])
+        Some(k) => assert_eq(k, "r2")
+        None => _fail("unsorted row 1 should have key 'r2'")
+    match prism_node.prism_node_key(grid_rows[2])
+        Some(k) => assert_eq(k, "r3")
+        None => _fail("unsorted row 2 should have key 'r3'")
+    match prism_node.prism_node_key(grid_rows[3])
+        Some(k) => assert_eq(k, "r4")
+        None => _fail("unsorted row 3 should have key 'r4'")
+
+    let r1_cells = prism_node.prism_node_children(grid_rows[0])
+    assert_eq(len(r1_cells), 3)
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[0], "text", ""), "Charlie")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[1], "text", ""), "80")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[2], "text", ""), "Eng")
+    print("3. unsorted render: exact depth=4/count=22, stack>band+grid kinds, header text, cell text: OK")
+
+    // ── 4 + 5 + 6. Sort ascending/descending: exact row order + stability in BOTH directions ──
+    let asc_r = prism_ui_table.prism_table_sorted(table, "score", prism_ui_table.prism_sort_ascending())
+    if is_err(asc_r)
+        _fail("prism_table_sorted (ascending, score): " + unwrap_err(asc_r))
+    let asc_table = unwrap(asc_r)
+    assert_eq(prism_ui_table.prism_table_sort_key(asc_table), "score")
+    assert_eq(prism_ui_table.prism_table_sort_direction(asc_table), "ascending")
+    let asc_rows = prism_ui_table.prism_table_rows(asc_table)
+    assert_eq(len(asc_rows), 4)
+    // Scores: r4=65, r1=80, r3=80 (tie), r2=92 -> ascending expected: r4, r1, r3, r2.
+    // r1 before r3 within the tie proves ascending stability (r1 precedes r3 in construction order).
+    assert_eq(asc_rows[0]["id"], "r4")
+    assert_eq(asc_rows[1]["id"], "r1")
+    assert_eq(asc_rows[2]["id"], "r3")
+    assert_eq(asc_rows[3]["id"], "r2")
+    print("4. ascending sort by 'score': exact row order [r4, r1, r3, r2]: OK")
+
+    let desc_r = prism_ui_table.prism_table_sorted(table, "score", prism_ui_table.prism_sort_descending())
+    if is_err(desc_r)
+        _fail("prism_table_sorted (descending, score): " + unwrap_err(desc_r))
+    let desc_table = unwrap(desc_r)
+    assert_eq(prism_ui_table.prism_table_sort_key(desc_table), "score")
+    assert_eq(prism_ui_table.prism_table_sort_direction(desc_table), "descending")
+    let desc_rows = prism_ui_table.prism_table_rows(desc_table)
+    assert_eq(len(desc_rows), 4)
+    // Descending expected: r2 (92), then the tie group (80) in ORIGINAL relative order r1, r3
+    // (NOT r3, r1 -- a naive "sort ascending then reverse" would wrongly produce r3 before r1),
+    // then r4 (65).
+    assert_eq(desc_rows[0]["id"], "r2")
+    assert_eq(desc_rows[1]["id"], "r1")
+    assert_eq(desc_rows[2]["id"], "r3")
+    assert_eq(desc_rows[3]["id"], "r4")
+    print("5. descending sort by 'score': exact row order [r2, r1, r3, r4]: OK")
+    print("6. stability proven in BOTH directions: r1 precedes r3 (equal score=80) in ascending (index 1 < 2) AND in descending (index 1 < 2) -- neither sort reordered the tied pair: OK")
+
+    // ── 7. Sorting does NOT mutate the input rows ───────────────────────────────────────────
+    // Re-read the ORIGINAL `rows` list (passed into prism_table above) directly -- if sorting had
+    // mutated it in place, this would now read back in whatever order asc/desc left it in.
+    assert_eq(rows[0]["id"], "r1")
+    assert_eq(rows[1]["id"], "r2")
+    assert_eq(rows[2]["id"], "r3")
+    assert_eq(rows[3]["id"], "r4")
+    // And the pristine `table` value itself (never reassigned) still reports its own original order.
+    let table_rows_after = prism_ui_table.prism_table_rows(table)
+    assert_eq(table_rows_after[0]["id"], "r1")
+    assert_eq(table_rows_after[1]["id"], "r2")
+    assert_eq(table_rows_after[2]["id"], "r3")
+    assert_eq(table_rows_after[3]["id"], "r4")
+    print("7. sorting does not mutate the input rows -- original list and pristine table both unchanged after 2 sorts: OK")
+
+    // ── 8. Sorting by an unknown column key is rejected ─────────────────────────────────────
+    let unknown_sort_r = prism_ui_table.prism_table_sorted(table, "nonexistent", prism_ui_table.prism_sort_ascending())
+    if is_ok(unknown_sort_r)
+        _fail("prism_table_sorted should reject an unknown column key 'nonexistent', but it succeeded")
+    print("9. sorting by an unknown column key is rejected (never a silent no-op): OK -- " + unwrap_err(unknown_sort_r))
+
+    // ── 9. Rendered header indicates the active sort column + direction; exact depth/count ──
+    let asc_rendered = unwrap(prism_ui_table.prism_table_render(asc_table))
+    assert_eq(prism_node.prism_node_depth(asc_rendered), 4)
+    assert_eq(prism_node.prism_node_count(asc_rendered), 24)
+    let asc_header_cells = prism_node.prism_node_children(prism_node.prism_node_children(asc_rendered)[0])
+    assert_eq(len(asc_header_cells), 3)
+    // Column 0 ("name") and column 2 ("dept") are NOT the active sort column -- stay plain labels.
+    assert_eq(prism_node.prism_node_kind_str(asc_header_cells[0]), "label")
+    assert_eq(prism_node.prism_node_kind_str(asc_header_cells[2]), "label")
+    // Column 1 ("score") IS the active sort column -- becomes a band of [label, chevron_up glyph].
+    assert_eq(prism_node.prism_node_kind_str(asc_header_cells[1]), "band")
+    let asc_score_header_children = prism_node.prism_node_children(asc_header_cells[1])
+    assert_eq(len(asc_score_header_children), 2)
+    assert_eq(prism_node.prism_node_kind_str(asc_score_header_children[0]), "label")
+    assert_eq(prism_node.prism_node_attr_str(asc_score_header_children[0], "text", ""), "Score")
+    assert_eq(prism_node.prism_node_kind_str(asc_score_header_children[1]), "glyph")
+    assert_eq(prism_node.prism_node_attr_str(asc_score_header_children[1], "icon", ""), "chevron_up")
+
+    let desc_rendered = unwrap(prism_ui_table.prism_table_render(desc_table))
+    assert_eq(prism_node.prism_node_depth(desc_rendered), 4)
+    assert_eq(prism_node.prism_node_count(desc_rendered), 24)
+    let desc_header_cells = prism_node.prism_node_children(prism_node.prism_node_children(desc_rendered)[0])
+    assert_eq(prism_node.prism_node_kind_str(desc_header_cells[1]), "band")
+    let desc_score_header_children = prism_node.prism_node_children(desc_header_cells[1])
+    assert_eq(prism_node.prism_node_kind_str(desc_score_header_children[1]), "glyph")
+    assert_eq(prism_node.prism_node_attr_str(desc_score_header_children[1], "icon", ""), "chevron_down")
+    print("10. rendered header indicates active sort column + direction (chevron_up/chevron_down), other columns stay plain labels, exact depth=4/count=24 after sort: OK")
+
+    // ── 10. Header text round-trips ──────────────────────────────────────────────────────────
+    assert_eq(prism_ui_table.prism_table_column_header(score_col), "Score")
+    assert_eq(prism_ui_table.prism_table_column_header(dept_col), "Department")
+    print("11. header text round-trips through the accessor (already proven through the rendered tree in section 3): OK")
+
+    // ── 11. Empty state ──────────────────────────────────────────────────────────────────────
+    let empty_table = unwrap(prism_ui_table.prism_table(columns, [], fn(r) r["id"]))
+    let empty_r = prism_ui_table.prism_table_empty_message(empty_table, "No results found")
+    if is_err(empty_r)
+        _fail("prism_table_empty_message construction: " + unwrap_err(empty_r))
+    let empty_node = unwrap(empty_r)
+    assert_eq(prism_node.prism_node_kind_str(empty_node), "stack")
+    assert_eq(prism_node.prism_node_depth(empty_node), 3)
+    assert_eq(prism_node.prism_node_count(empty_node), 8)
+    let empty_body = prism_node.prism_node_children(empty_node)[1]
+    assert_eq(prism_node.prism_node_kind_str(empty_body), "stack")
+    let empty_body_children = prism_node.prism_node_children(empty_body)
+    assert_eq(prism_node.prism_node_kind_str(empty_body_children[0]), "glyph")
+    assert_eq(prism_node.prism_node_attr_str(empty_body_children[0], "icon", ""), "info")
+    assert_eq(prism_node.prism_node_kind_str(empty_body_children[1]), "label")
+    assert_eq(prism_node.prism_node_attr_str(empty_body_children[1], "text", ""), "No results found")
+
+    let empty_blank_msg_r = prism_ui_table.prism_table_empty_message(empty_table, "")
+    if is_ok(empty_blank_msg_r)
+        _fail("prism_table_empty_message should reject an empty message, but construction succeeded")
+    let empty_on_nonempty_r = prism_ui_table.prism_table_empty_message(table, "No results found")
+    if is_ok(empty_on_nonempty_r)
+        _fail("prism_table_empty_message should reject a table that still has rows, but construction succeeded")
+    print("12. empty state: exact depth=3/count=8, labelled with info glyph; rejects empty message + non-empty table: OK -- " + unwrap_err(empty_blank_msg_r) + " / " + unwrap_err(empty_on_nonempty_r))
+
+    // ── 12. Loading state ────────────────────────────────────────────────────────────────────
+    // Deliberately called on `table` (4 rows) -- loading may legitimately overlay stale rows.
+    let loading_r = prism_ui_table.prism_table_loading(table, "Loading...")
+    if is_err(loading_r)
+        _fail("prism_table_loading construction: " + unwrap_err(loading_r))
+    let loading_node = unwrap(loading_r)
+    assert_eq(prism_node.prism_node_kind_str(loading_node), "stack")
+    assert_eq(prism_node.prism_node_depth(loading_node), 3)
+    assert_eq(prism_node.prism_node_count(loading_node), 6)
+    let loading_body = prism_node.prism_node_children(loading_node)[1]
+    assert_eq(prism_node.prism_node_kind_str(loading_body), "label")
+    assert_eq(prism_node.prism_node_attr_str(loading_body, "text", ""), "Loading...")
+
+    let loading_blank_msg_r = prism_ui_table.prism_table_loading(table, "")
+    if is_ok(loading_blank_msg_r)
+        _fail("prism_table_loading should reject an empty message, but construction succeeded")
+    print("13. loading state: exact depth=3/count=6, label-only body, legal on a table with rows; rejects empty message: OK -- " + unwrap_err(loading_blank_msg_r))
+
+    // ── 13. Duplicate row-identity key rejected at render (prism_grid's own guard, threaded) ──
+    let dup_col = unwrap(prism_ui_table.prism_table_column("x", "X", fn(r) r["x"]))
+    let dup_rows = [{"id": "dup", "x": "a"}, {"id": "dup", "x": "b"}]
+    let dup_table = unwrap(prism_ui_table.prism_table([dup_col], dup_rows, fn(r) r["id"]))
+    let dup_render_r = prism_ui_table.prism_table_render(dup_table)
+    if is_ok(dup_render_r)
+        _fail("prism_table_render should reject a duplicate row-identity key 'dup', but it succeeded")
+    print("14. duplicate row-identity key is rejected at render (prism_grid's mandatory identity selector, threaded through unmodified): OK -- " + unwrap_err(dup_render_r))
+
+    // ── 14. A column whose extract_fn returns a non-string is rejected at SORT time ─────────
+    let bad_col = unwrap(prism_ui_table.prism_table_column("bad", "Bad", fn(r) r["n"]))
+    let bad_rows = [{"id": "b1", "n": 5}]
+    let bad_table = unwrap(prism_ui_table.prism_table([bad_col], bad_rows, fn(r) r["id"]))
+    let bad_sort_r = prism_ui_table.prism_table_sorted(bad_table, "bad", prism_ui_table.prism_sort_ascending())
+    if is_ok(bad_sort_r)
+        _fail("prism_table_sorted should reject a column extract_fn that returns a non-string, but it succeeded")
+    print("15. a column extract_fn returning a non-string is rejected at sort time (this module's own guard): OK -- " + unwrap_err(bad_sort_r))
+
+    print("KAT prism_ui_table PASSED: columns + table construction/rejections, exact render structure, stable ascending/descending sort with proven tie-order + non-mutation, unknown-key rejection, header sort indicator, empty/loading states, duplicate-identity + non-string-key rejections -- all exact")
