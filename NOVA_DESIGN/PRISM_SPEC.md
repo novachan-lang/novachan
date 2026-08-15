@@ -801,6 +801,32 @@ node, so the key rides on the row rather than on a container.
 | `hint` | `span` + `role="tooltip"` | `aria-describedby` wiring |
 | `tabs` | `div` | `role="tablist"` / `role="tab"` / `role="tabpanel"` |
 
+### 17A.3b Dispatch must not rely on cross-module exhaustiveness (measured 2026-08-15)
+
+The natural way to guarantee rule 1 is to dispatch with a wildcard-free `match` over
+`PrismNodeKind`, so that adding primitive #23 without teaching the renderer about it fails the
+build. **That does not work — and it was measured, not assumed**, by deleting the `Tabs()` arm and
+rebuilding:
+
+| Match site | Missing arm |
+|---|---|
+| **Same file as the enum** | ✅ `error[E1009]: non-exhaustive match on enum 'PrismNodeKind': missing Tabs` |
+| **Any other module** | ❌ compiles silently; the un-matched variant yields **`""`** at runtime |
+
+The renderer is by definition not the file declaring the enum, so a wildcard-free match there buys
+**nothing while looking like it carries a guarantee** — the worst combination, in the one file where
+silence is most dangerous. Primitive #23 would have rendered as nothing at all.
+
+**Binding rule.** The renderer dispatches on `prism_node_kind_str()`, whose own match lives beside
+the enum and therefore *is* exhaustiveness-checked, plus an explicit default arm returning a **loud
+typed error**. The guarantee is assembled from two halves in two files, because exhaustiveness does
+not cross a module boundary.
+
+**Generalize beyond Prism:** any claim of the form *"the closed vocabulary is enforced by the
+compiler"* holds **only inside the declaring file**. Asserted about a consumer in another module, it
+is false. §7's closed-vocabulary axiom (A7) still holds as a *design* property; it is simply not
+self-enforcing at every consumer.
+
 ### 17A.4 What would prove this section wrong
 
 A renderer that passes every escaping test but emits an element name derived from data; an `on*`
