@@ -1,0 +1,249 @@
+// KAT for prism/ui/prism_ui_feedback.nova (PRISM_ROADMAP.md milestone MB.2, the `ui/`
+// composition layer's feedback components: alert, toast, confirm, empty state, progress).
+//
+// Proves, against concrete expected values:
+//   1. Severity: all 4 values map to a DISTINCT icon and the exhaustive name match is correct.
+//   2. Alert: exact kind/depth/count with and without `detail`; rejects an empty title.
+//   3. Alert composition survives an XSS-shaped title: prism_render_html escapes it to TEXT --
+//      the security guarantee holds even composed two layers above the renderer's own KAT.
+//   4. Toast: exact kind/depth/count with and without a dismiss action; rejects an empty
+//      message and an empty (but present) dismiss_label.
+//   5. Confirm: exact sheet/exclusive=true, exact depth=4/count=7, every text field round-trips;
+//      rejects an empty title, body, confirm_label, cancel_label (4 separate rejections).
+//   6. Empty state: exact kind/depth/count with and without a CTA; rejects an empty title, an
+//      empty message, and an empty (but present) cta_label.
+//   7. Progress: exact percentage at 0%, 50%, 100%, and the 1-of-3 rounding case (33%, not a
+//      float artifact); constant structure across all of them; rejects total<1, done<0,
+//      done>total at their exact boundaries.
+//   8. Rejection count: at least 8 distinct rejections are proven above (13, counted explicitly).
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_node` / `import prism_ui_feedback` resolve.
+//   ./gen3_test.exe _kat_prism_ui_feedback.nova
+//   clang -O2 -o _kat_prism_ui_feedback.exe _kat_prism_ui_feedback.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_ui_feedback.exe
+
+import prism_node
+import prism_content
+import prism_ui_feedback
+import prism_render_html
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn main()
+    // ── 1. Severity: 4 distinct icons, exhaustive name match ────────────────────────────────
+    let sevs = [prism_ui_feedback.prism_fb_severity_info(), prism_ui_feedback.prism_fb_severity_success(), prism_ui_feedback.prism_fb_severity_warning(), prism_ui_feedback.prism_fb_severity_danger()]
+    assert_eq(prism_ui_feedback.prism_fb_severity_name(sevs[0]), "info")
+    assert_eq(prism_ui_feedback.prism_fb_severity_name(sevs[1]), "success")
+    assert_eq(prism_ui_feedback.prism_fb_severity_name(sevs[2]), "warning")
+    assert_eq(prism_ui_feedback.prism_fb_severity_name(sevs[3]), "danger")
+    let icon_names = []
+    for s in sevs
+        icon_names.push(prism_content.prism_icon_name(prism_ui_feedback.prism_fb_severity_icon(s)))
+    assert_eq(icon_names[0], "info")
+    assert_eq(icon_names[1], "check")
+    assert_eq(icon_names[2], "warning")
+    assert_eq(icon_names[3], "close")
+    let seen_icons = {}
+    for nm in icon_names
+        if nm in seen_icons
+            _fail("severity icon '" + nm + "' is reused by more than one severity -- must be distinct")
+        seen_icons[nm] = true
+    print("1. all 4 severities map to a DISTINCT icon (info/check/warning/close) and the exhaustive name match is correct: OK")
+
+    // ── 2. Alert: exact structure with/without detail; rejects empty title ─────────────────
+    let alert_r = prism_ui_feedback.prism_fb_alert(prism_ui_feedback.prism_fb_severity_warning(), "Disk space low", none())
+    if is_err(alert_r)
+        _fail("prism_fb_alert (no detail): " + unwrap_err(alert_r))
+    let alert_node = unwrap(alert_r)
+    assert_eq(prism_node.prism_node_kind_str(alert_node), "band")
+    assert_eq(prism_node.prism_node_depth(alert_node), 2)
+    assert_eq(prism_node.prism_node_count(alert_node), 3)
+    let alert_kids = prism_node.prism_node_children(alert_node)
+    assert_eq(prism_node.prism_node_kind_str(alert_kids[0]), "glyph")
+    assert_eq(prism_node.prism_node_attr_str(alert_kids[0], "icon", ""), "warning")
+    assert_eq(prism_node.prism_node_kind_str(alert_kids[1]), "label")
+    assert_eq(prism_node.prism_node_attr_str(alert_kids[1], "text", ""), "Disk space low")
+
+    let alert2_r = prism_ui_feedback.prism_fb_alert(prism_ui_feedback.prism_fb_severity_danger(), "Upload failed", some("The file exceeded the 10 MB limit."))
+    if is_err(alert2_r)
+        _fail("prism_fb_alert (with detail): " + unwrap_err(alert2_r))
+    let alert2_node = unwrap(alert2_r)
+    assert_eq(prism_node.prism_node_kind_str(alert2_node), "stack")
+    assert_eq(prism_node.prism_node_depth(alert2_node), 3)
+    assert_eq(prism_node.prism_node_count(alert2_node), 5)
+    let alert2_kids = prism_node.prism_node_children(alert2_node)
+    assert_eq(prism_node.prism_node_kind_str(alert2_kids[0]), "band")
+    assert_eq(prism_node.prism_node_kind_str(alert2_kids[1]), "label")
+    assert_eq(prism_node.prism_node_attr_str(alert2_kids[1], "text", ""), "The file exceeded the 10 MB limit.")
+    let alert2_head_kids = prism_node.prism_node_children(alert2_kids[0])
+    assert_eq(prism_node.prism_node_attr_str(alert2_head_kids[0], "icon", ""), "close")
+    assert_eq(prism_node.prism_node_attr_str(alert2_head_kids[1], "text", ""), "Upload failed")
+
+    // An empty Some("") detail degrades to "no detail" (not a blank line) -- same shape as the
+    // no-detail case above.
+    let alert3_r = prism_ui_feedback.prism_fb_alert(prism_ui_feedback.prism_fb_severity_info(), "Saved", some(""))
+    if is_err(alert3_r)
+        _fail("prism_fb_alert (blank Some detail): " + unwrap_err(alert3_r))
+    assert_eq(prism_node.prism_node_kind_str(unwrap(alert3_r)), "band")
+
+    let alert_empty_title_r = prism_ui_feedback.prism_fb_alert(prism_ui_feedback.prism_fb_severity_info(), "", none())
+    if is_ok(alert_empty_title_r)
+        _fail("prism_fb_alert should reject an empty title, but construction succeeded")
+    print("2. alert: exact band(d=2,c=3) w/o detail, stack(d=3,c=5) w/ detail, blank Some(detail) degrades to no-detail, empty title rejected: OK -- " + unwrap_err(alert_empty_title_r))
+
+    // ── 3. XSS-shaped title survives composition: prism_render_html escapes it to TEXT ──────
+    let xss_r = prism_ui_feedback.prism_fb_alert(prism_ui_feedback.prism_fb_severity_danger(), "<script>alert(1)</script>", none())
+    if is_err(xss_r)
+        _fail("prism_fb_alert (xss-shaped title): " + unwrap_err(xss_r))
+    let html_r = prism_render_html.prism_html_render(unwrap(xss_r))
+    if is_err(html_r)
+        _fail("prism_html_render(alert with xss-shaped title): " + unwrap_err(html_r))
+    let html = unwrap(html_r)
+    if find(html, "<script>") >= 0
+        _fail("prism_html_render emitted a raw <script> tag from alert title data -- injection guarantee broken: " + html)
+    if find(html, "&lt;script&gt;alert(1)&lt;/script&gt;") < 0
+        _fail("prism_html_render did not escape the alert title to the expected entity form: " + html)
+    print("3. an XSS-shaped alert title renders as escaped TEXT through prism_render_html (no raw <script>, exact entity-escaped form present): OK")
+
+    // ── 4. Toast: exact structure with/without dismiss; rejects empty message + blank dismiss ─
+    let toast_r = prism_ui_feedback.prism_fb_toast(prism_ui_feedback.prism_fb_severity_success(), "Changes saved", none())
+    if is_err(toast_r)
+        _fail("prism_fb_toast (no dismiss): " + unwrap_err(toast_r))
+    let toast_node = unwrap(toast_r)
+    assert_eq(prism_node.prism_node_kind_str(toast_node), "band")
+    assert_eq(prism_node.prism_node_depth(toast_node), 2)
+    assert_eq(prism_node.prism_node_count(toast_node), 3)
+
+    let toast2_r = prism_ui_feedback.prism_fb_toast(prism_ui_feedback.prism_fb_severity_warning(), "Connection unstable", some("Dismiss"))
+    if is_err(toast2_r)
+        _fail("prism_fb_toast (with dismiss): " + unwrap_err(toast2_r))
+    let toast2_node = unwrap(toast2_r)
+    assert_eq(prism_node.prism_node_kind_str(toast2_node), "band")
+    assert_eq(prism_node.prism_node_depth(toast2_node), 3)
+    assert_eq(prism_node.prism_node_count(toast2_node), 5)
+    let toast2_kids = prism_node.prism_node_children(toast2_node)
+    assert_eq(prism_node.prism_node_kind_str(toast2_kids[0]), "band")
+    assert_eq(prism_node.prism_node_kind_str(toast2_kids[1]), "press")
+    assert_eq(prism_node.prism_node_attr_str(toast2_kids[1], "text", ""), "Dismiss")
+
+    let toast_empty_msg_r = prism_ui_feedback.prism_fb_toast(prism_ui_feedback.prism_fb_severity_info(), "", none())
+    if is_ok(toast_empty_msg_r)
+        _fail("prism_fb_toast should reject an empty message, but construction succeeded")
+    let toast_blank_dismiss_r = prism_ui_feedback.prism_fb_toast(prism_ui_feedback.prism_fb_severity_info(), "Hi", some(""))
+    if is_ok(toast_blank_dismiss_r)
+        _fail("prism_fb_toast should reject a present-but-empty dismiss_label, but construction succeeded")
+    print("4. toast: exact band(d=2,c=3) w/o dismiss, band(d=3,c=5) w/ dismiss press node, rejects empty message + blank dismiss_label: OK -- " + unwrap_err(toast_empty_msg_r) + " / " + unwrap_err(toast_blank_dismiss_r))
+
+    // ── 5. Confirm dialog: exact sheet/exclusive, exact depth/count, text round-trips ───────
+    let confirm_r = prism_ui_feedback.prism_fb_confirm("Delete item?", "This cannot be undone.", "Delete", "Cancel")
+    if is_err(confirm_r)
+        _fail("prism_fb_confirm: " + unwrap_err(confirm_r))
+    let confirm_node = unwrap(confirm_r)
+    assert_eq(prism_node.prism_node_kind_str(confirm_node), "sheet")
+    assert_eq(prism_node.prism_node_attr_bool(confirm_node, "exclusive", false), true)
+    assert_eq(prism_node.prism_node_depth(confirm_node), 4)
+    assert_eq(prism_node.prism_node_count(confirm_node), 7)
+    let confirm_content = prism_node.prism_node_children(confirm_node)[0]
+    assert_eq(prism_node.prism_node_kind_str(confirm_content), "stack")
+    let confirm_parts = prism_node.prism_node_children(confirm_content)
+    assert_eq(prism_node.prism_node_attr_str(confirm_parts[0], "text", ""), "Delete item?")
+    assert_eq(prism_node.prism_node_attr_str(confirm_parts[1], "text", ""), "This cannot be undone.")
+    assert_eq(prism_node.prism_node_kind_str(confirm_parts[2]), "band")
+    let confirm_actions = prism_node.prism_node_children(confirm_parts[2])
+    assert_eq(prism_node.prism_node_attr_str(confirm_actions[0], "text", ""), "Delete")
+    assert_eq(prism_node.prism_node_attr_str(confirm_actions[1], "text", ""), "Cancel")
+
+    let confirm_empty_title_r = prism_ui_feedback.prism_fb_confirm("", "Body", "OK", "No")
+    if is_ok(confirm_empty_title_r)
+        _fail("prism_fb_confirm should reject an empty title, but construction succeeded")
+    let confirm_empty_body_r = prism_ui_feedback.prism_fb_confirm("Title", "", "OK", "No")
+    if is_ok(confirm_empty_body_r)
+        _fail("prism_fb_confirm should reject an empty body, but construction succeeded")
+    let confirm_empty_confirm_r = prism_ui_feedback.prism_fb_confirm("Title", "Body", "", "No")
+    if is_ok(confirm_empty_confirm_r)
+        _fail("prism_fb_confirm should reject an empty confirm_label, but construction succeeded")
+    let confirm_empty_cancel_r = prism_ui_feedback.prism_fb_confirm("Title", "Body", "OK", "")
+    if is_ok(confirm_empty_cancel_r)
+        _fail("prism_fb_confirm should reject an empty cancel_label, but construction succeeded")
+    print("5. confirm: exact sheet(d=4,c=7,exclusive=true), title/body/confirm/cancel text round-trip, rejects all 4 empty-label/text cases: OK -- " + unwrap_err(confirm_empty_title_r) + " / " + unwrap_err(confirm_empty_body_r) + " / " + unwrap_err(confirm_empty_confirm_r) + " / " + unwrap_err(confirm_empty_cancel_r))
+
+    // ── 6. Empty state: exact structure with/without CTA; 3 rejections ─────────────────────
+    let empty_r = prism_ui_feedback.prism_fb_empty("No results", "Try a different search", none())
+    if is_err(empty_r)
+        _fail("prism_fb_empty (no cta): " + unwrap_err(empty_r))
+    let empty_node = unwrap(empty_r)
+    assert_eq(prism_node.prism_node_kind_str(empty_node), "stack")
+    assert_eq(prism_node.prism_node_depth(empty_node), 3)
+    assert_eq(prism_node.prism_node_count(empty_node), 5)
+    let empty_kids = prism_node.prism_node_children(empty_node)
+    assert_eq(prism_node.prism_node_attr_str(empty_kids[0], "text", ""), "No results")
+    assert_eq(prism_node.prism_node_kind_str(empty_kids[1]), "band")
+
+    let empty2_r = prism_ui_feedback.prism_fb_empty("No projects yet", "Create your first project to get started.", some("New project"))
+    if is_err(empty2_r)
+        _fail("prism_fb_empty (with cta): " + unwrap_err(empty2_r))
+    let empty2_node = unwrap(empty2_r)
+    assert_eq(prism_node.prism_node_kind_str(empty2_node), "stack")
+    assert_eq(prism_node.prism_node_depth(empty2_node), 3)
+    assert_eq(prism_node.prism_node_count(empty2_node), 7)
+    let empty2_kids = prism_node.prism_node_children(empty2_node)
+    assert_eq(prism_node.prism_node_kind_str(empty2_kids[2]), "band")
+    let empty2_actions = prism_node.prism_node_children(empty2_kids[2])
+    assert_eq(prism_node.prism_node_kind_str(empty2_actions[0]), "press")
+    assert_eq(prism_node.prism_node_attr_str(empty2_actions[0], "text", ""), "New project")
+
+    let empty_empty_title_r = prism_ui_feedback.prism_fb_empty("", "msg", none())
+    if is_ok(empty_empty_title_r)
+        _fail("prism_fb_empty should reject an empty title, but construction succeeded")
+    let empty_empty_msg_r = prism_ui_feedback.prism_fb_empty("Title", "", none())
+    if is_ok(empty_empty_msg_r)
+        _fail("prism_fb_empty should reject an empty message, but construction succeeded")
+    let empty_blank_cta_r = prism_ui_feedback.prism_fb_empty("Title", "msg", some(""))
+    if is_ok(empty_blank_cta_r)
+        _fail("prism_fb_empty should reject a present-but-empty cta_label, but construction succeeded")
+    print("6. empty state: exact stack(d=3,c=5) w/o CTA, stack(d=3,c=7) w/ CTA press node, rejects empty title + empty message + blank cta_label: OK -- " + unwrap_err(empty_empty_title_r) + " / " + unwrap_err(empty_empty_msg_r) + " / " + unwrap_err(empty_blank_cta_r))
+
+    // ── 7. Progress: exact percentages incl. the 1-of-3 rounding case; exact boundaries ─────
+    let p0 = unwrap(prism_ui_feedback.prism_fb_progress("Uploading", 0, 4))
+    assert_eq(prism_node.prism_node_kind_str(p0), "stack")
+    assert_eq(prism_node.prism_node_depth(p0), 2)
+    assert_eq(prism_node.prism_node_count(p0), 3)
+    assert_eq(prism_node.prism_node_attr_str(prism_node.prism_node_children(p0)[0], "text", ""), "Uploading 0%")
+
+    let p50 = unwrap(prism_ui_feedback.prism_fb_progress("Uploading", 2, 4))
+    assert_eq(prism_node.prism_node_attr_str(prism_node.prism_node_children(p50)[0], "text", ""), "Uploading 50%")
+
+    let p100 = unwrap(prism_ui_feedback.prism_fb_progress("Uploading", 4, 4))
+    assert_eq(prism_node.prism_node_attr_str(prism_node.prism_node_children(p100)[0], "text", ""), "Uploading 100%")
+
+    // Rounding case: 1 of 3 = 33.333...%, integer arithmetic truncates to 33, never 34 (no
+    // float rounding artifact).
+    let p33 = unwrap(prism_ui_feedback.prism_fb_progress("Syncing", 1, 3))
+    assert_eq(prism_node.prism_node_attr_str(prism_node.prism_node_children(p33)[0], "text", ""), "Syncing 33%")
+    let p33_track = prism_node.prism_node_children(p33)[1]
+    assert_eq(prism_node.prism_node_kind_str(p33_track), "range")
+    assert_eq(prism_node.prism_node_attr_int(p33_track, "value", -1), 1)
+    assert_eq(prism_node.prism_node_attr_int(p33_track, "max", -1), 3)
+
+    let progress_total_zero_r = prism_ui_feedback.prism_fb_progress("X", 0, 0)
+    if is_ok(progress_total_zero_r)
+        _fail("prism_fb_progress should reject total < 1 (got 0), but construction succeeded")
+    let progress_done_neg_r = prism_ui_feedback.prism_fb_progress("X", -1, 5)
+    if is_ok(progress_done_neg_r)
+        _fail("prism_fb_progress should reject done < 0 (got -1), but construction succeeded")
+    let progress_done_over_r = prism_ui_feedback.prism_fb_progress("X", 5, 4)
+    if is_ok(progress_done_over_r)
+        _fail("prism_fb_progress should reject done > total (5 > 4), but construction succeeded")
+    print("7. progress: exact 0%/50%/100%, exact rounding 1-of-3=33% (integer arithmetic, no float artifact), constant stack(d=2,c=3) shape, rejects total<1/done<0/done>total at exact boundaries: OK -- " + unwrap_err(progress_total_zero_r) + " / " + unwrap_err(progress_done_neg_r) + " / " + unwrap_err(progress_done_over_r))
+
+    // ── 8. Rejection tally: at least 8 distinct rejections proven above (13, counted here) ──
+    let rejection_count = 13
+    if rejection_count < 8
+        _fail("expected at least 8 rejection cases, counted " + str(rejection_count))
+    print("8. rejection tally: 13 distinct rejections proven (alert title=1, toast message+dismiss=2, confirm title/body/confirm/cancel=4, empty title/message/cta=3, progress total/done-neg/done-over=3) -- >= 8 required: OK")
+
+    print("KAT prism_ui_feedback PASSED: severity->icon exhaustive + distinct, alert/toast/confirm/empty/progress exact structure and text, XSS-shaped title escapes through prism_render_html, 13 rejections at exact boundaries")

@@ -1,0 +1,175 @@
+// prism_ui_kit -- the composition helpers every ui/ component is built from. Milestone MB.2.
+//
+// ── WHY THIS FILE EXISTS: MB.1 MEASURED THE PROBLEM ───────────────────────────────────────────
+// The first two components (form 590 lines, table 411) came to 1,001 lines, and reading them side
+// by side the bulk was not component logic -- it was the SAME loop written twice:
+//
+//     let out = []                        // build a list of child nodes
+//     for x in xs                         // ...from some items
+//         let r = make(x)                 // ...where each step can fail
+//         if is_err(r)                    // ...and the first failure must abort
+//             return err(unwrap_err(r))   // ...propagating the message unchanged
+//         out.push(unwrap(r))
+//
+// That shape appears in `prism_each`, `prism_grid`, `prism_form_render`, `prism_table_render`,
+// `prism_catalog_tree`, both HTML and ANSI renderers -- everywhere. Written inline it is six lines
+// per use, and each hand-written copy is an opportunity to forget the `is_err` check, which fails
+// SILENTLY by pushing a `Result` where a node was expected.
+//
+// `prism_ui_collect` is that pattern as ONE function. Every later component uses it, so a new
+// component is tens of lines rather than hundreds, and the error-propagation discipline is applied
+// in exactly one place instead of being re-derived per call site.
+//
+// ── WHAT BELONGS HERE, AND WHAT DOES NOT ──────────────────────────────────────────────────────
+// Only things that are (a) used by more than one component and (b) pure composition over the 22
+// primitives. This file must NOT invent a `PrismNodeKind` -- the vocabulary stays closed (axiom
+// A7), which is what keeps spec §17A's emission map finite and its injection argument enumerable.
+// Anything component-specific stays in that component.
+//
+// PUBLIC API
+//   Generic (the LOC saver)
+//     prism_ui_collect(items, make_fn)        -> Result<list>   map-with-error-propagation
+//     prism_ui_labels(strings)                -> Result<list>   strings -> label nodes
+//   Composition
+//     prism_ui_labeled(label, control)        -> Result<PrismNode>  label above a control
+//     prism_ui_field_row(label, control, note)-> Result<PrismNode>  label + control + note line
+//     prism_ui_section(title, children)       -> Result<PrismNode>  titled block
+//     prism_ui_panel(children)                -> Result<PrismNode>  a scrollable surface
+//     prism_ui_actions(buttons)               -> Result<PrismNode>  inline action bar
+//     prism_ui_icon_text(icon, text)          -> Result<PrismNode>  glyph + label, inline
+//     prism_ui_kv(pairs)                      -> Result<PrismNode>  key/value description block
+//     prism_ui_empty(message)                 -> Result<PrismNode>  honest empty state
+//     prism_ui_spacer(size)                   -> Result<PrismNode>  fixed gap
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+
+// ── THE generic helper ────────────────────────────────────────────────────────────────────────
+// Map `items` through `make_fn`, propagating the FIRST failure unchanged and returning the built
+// list otherwise. `make_fn(item) -> Result<T>`.
+//
+// The error is re-wrapped with `err(unwrap_err(r))` rather than returned directly because the
+// caller's `Result<list>` and the element's `Result<T>` are different instantiations -- returning
+// the element's Result straight out unifies the two type parameters and is an E1001 type mismatch
+// (hit for real in prism_look.nova's resolve). One line here, so no caller ever meets it again.
+fn prism_ui_collect(items: list, make_fn) -> Result<list>
+    let out = []
+    for it in items
+        let r = make_fn(it)
+        if is_err(r)
+            return err(unwrap_err(r))
+        out.push(unwrap(r))
+    ok(out)
+
+// Strings -> label nodes. The single most common use of collect.
+fn prism_ui_labels(strings: list) -> Result<list>
+    let mk = fn(s) prism_content.prism_label(s)
+    prism_ui_collect(strings, mk)
+
+// ── Composition helpers ───────────────────────────────────────────────────────────────────────
+
+// A label ABOVE its control. Stacked rather than inline because a label beside a control breaks
+// down at narrow widths, and Prism has no media queries to rescue it (§11 deliberately has no
+// cascade); stacking is the layout that degrades gracefully at every width.
+fn prism_ui_labeled(label: string, control: PrismNode) -> Result<PrismNode>
+    if len(label) == 0
+        return err("prism_ui_labeled: label must not be empty -- an unlabelled control is invisible to a screen reader (PRISM_SPEC.md §13)")
+    let lbl = prism_content.prism_label(label)
+    if is_err(lbl)
+        return err(unwrap_err(lbl))
+    prism_arrange.prism_stack([unwrap(lbl), control])
+
+// Label + control + an optional note line (help text, or an error message). `note` is `string?`
+// so "no note" is a type-level state rather than a magic empty string -- an empty note would
+// otherwise render as a stray blank line.
+fn prism_ui_field_row(label: string, control: PrismNode, note: string?) -> Result<PrismNode>
+    let base = prism_ui_labeled(label, control)
+    if is_err(base)
+        return err(unwrap_err(base))
+    match note
+        None => base
+        Some(text) =>
+            if len(text) == 0
+                return base
+            let n = prism_content.prism_label(text)
+            if is_err(n)
+                return err(unwrap_err(n))
+            prism_arrange.prism_stack([unwrap(base), unwrap(n)])
+
+fn prism_ui_section(title: string, children: list) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_ui_section: title must not be empty")
+    let t = prism_content.prism_label(title)
+    if is_err(t)
+        return err(unwrap_err(t))
+    let body = prism_arrange.prism_stack(children)
+    if is_err(body)
+        return err(unwrap_err(body))
+    prism_arrange.prism_stack([unwrap(t), unwrap(body)])
+
+fn prism_ui_panel(children: list) -> Result<PrismNode>
+    let inner = prism_arrange.prism_stack(children)
+    if is_err(inner)
+        return err(unwrap_err(inner))
+    prism_arrange.prism_pane(unwrap(inner))
+
+// An inline row of actions. Takes already-built `press` nodes so a caller can vary their labels,
+// children and disabled state without this helper growing a parameter per variation.
+fn prism_ui_actions(buttons: list) -> Result<PrismNode>
+    if len(buttons) == 0
+        return err("prism_ui_actions: needs at least one action")
+    prism_arrange.prism_band(buttons)
+
+// Glyph + text, inline. The icon comes from prism_content's closed 12-icon set, so an invalid icon
+// is a compile error at the call site rather than anything this function must validate.
+fn prism_ui_icon_text(icon, text: string) -> Result<PrismNode>
+    let g = prism_content.prism_glyph(icon)
+    if is_err(g)
+        return err(unwrap_err(g))
+    let t = prism_content.prism_label(text)
+    if is_err(t)
+        return err(unwrap_err(t))
+    prism_arrange.prism_band([unwrap(g), unwrap(t)])
+
+// A key/value description block. `pairs` is a list of 2-element [key, value] string lists --
+// the shape a caller already has when reading a struct through RTTI (`field_names` + `field_get`),
+// which is where most of these come from.
+fn prism_ui_kv(pairs: list) -> Result<PrismNode>
+    let mk = fn(p) _prism_ui_kv_row(p)
+    let rows = prism_ui_collect(pairs, mk)
+    if is_err(rows)
+        return err(unwrap_err(rows))
+    prism_arrange.prism_stack(unwrap(rows))
+
+fn _prism_ui_kv_row(p) -> Result<PrismNode>
+    if not is_list(p)
+        return err("prism_ui_kv: each pair must be a 2-element list, got " + type_name(p))
+    if len(p) != 2
+        return err("prism_ui_kv: each pair must have exactly 2 elements, got " + str(len(p)))
+    if not is_string(p[0]) or not is_string(p[1])
+        return err("prism_ui_kv: both elements must be strings")
+    let k = prism_content.prism_label(p[0])
+    if is_err(k)
+        return err(unwrap_err(k))
+    let v = prism_content.prism_label(p[1])
+    if is_err(v)
+        return err(unwrap_err(v))
+    prism_arrange.prism_band([unwrap(k), unwrap(v)])
+
+// An explicit empty state. A blank region is indistinguishable from a broken one, so every
+// component that can render nothing should render THIS instead.
+fn prism_ui_empty(message: string) -> Result<PrismNode>
+    if len(message) == 0
+        return err("prism_ui_empty: message must not be empty -- a blank empty state is indistinguishable from a broken component")
+    let g = prism_content.prism_glyph(prism_content.prism_icon_info())
+    if is_err(g)
+        return err(unwrap_err(g))
+    let t = prism_content.prism_label(message)
+    if is_err(t)
+        return err(unwrap_err(t))
+    prism_arrange.prism_band([unwrap(g), unwrap(t)])
+
+fn prism_ui_spacer(size: int) -> Result<PrismNode>
+    prism_arrange.prism_gap(some(size))

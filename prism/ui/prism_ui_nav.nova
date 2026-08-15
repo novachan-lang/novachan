@@ -1,0 +1,306 @@
+// prism_ui_nav -- the navigation components (prism/ui/ composition layer, milestone MB.2).
+// Breadcrumb, Menu, Pagination, Steps. Built entirely on prism_ui_kit.nova's `prism_ui_collect`
+// plus the 22-primitive widget vocabulary -- no new `PrismNodeKind` (axiom A7 stays closed).
+//
+// ── THE ONE IDEA ALL FOUR COMPONENTS SHARE: "WHERE YOU ARE" IS NEVER A CONTROL ────────────────
+// A breadcrumb's last crumb, a menu's active entry, and a disabled pagination arrow are three
+// instances of the SAME fact: a control whose action is "go to where you already are" (or "go
+// nowhere, because there is nowhere to go") is not a real affordance, and rendering it as one
+// (`link`/`press`) is a genuine a11y defect -- a screen reader announces it as an option, and
+// activating it does nothing observable. None of `link`/`press` carries a `disabled` attr at this
+// milestone (PRISM_SPEC.md defers bound-cell state -- disabled/checked/expanded -- to the
+// reactivity engine, well past this plain-function layer), so "cannot currently act" cannot be
+// expressed AS a link/press with a flag turned off. The only honest representation with today's
+// closed vocabulary is to not build the interactive kind at all: render `label` (or a plain
+// `band` of glyph+label) in exactly the same position instead. This is what makes a disabled
+// pagination arrow STILL PRESENT rather than hidden -- the position in the tree does not move,
+// only the node's kind changes from `press`/`link` to `label`. Applied consistently, this is one
+// design principle, not four ad hoc special cases.
+//
+// ── STEPS' "step_state" ATTR: THE `prism_tabs` PRECEDENT, NOT A NEW MECHANISM ─────────────────
+// A step's complete/current/pending state needs to be QUERYABLE (by this KAT, and eventually by
+// the style layer) even though only "complete" changes the node's rendered shape (an icon).
+// `prism_structure.prism_tabs` already solves this exact problem -- attaching caller metadata
+// (`tab_label`) onto an already-built child node without inventing a new PrismNodeKind -- by
+// reading the built node's own `kind`/`attrs`/`children`/`key` and re-constructing it through
+// `prism_node.prism_node_new` with a merged attrs dict. `_prism_nav_step_node` below does the
+// identical thing for `step_state`. Reusing a proven idiom here rather than inventing a second one.
+//
+// ── ROUTES ARE VALIDATED EVEN WHEN THE RESULT IS NEVER RENDERED AS A LINK ─────────────────────
+// A breadcrumb's current-page item and a menu's active entry both still carry a `route` field
+// (deep-linking / analytics / a future routing layer all have legitimate reasons to read it), but
+// this file never turns either into a clickable `link` (see above). It would be easy to let an
+// unvalidated route sit in that unlinked item -- nothing downstream YET reads it, so a malformed
+// value costs nothing today. But "costs nothing today" is exactly how a `javascript:` string
+// survives to the day something DOES read it. Both `_prism_nav_breadcrumb_pair` and
+// `_prism_nav_menu_content` therefore run every item's route through `prism_interact.prism_link`
+// unconditionally -- keeping (or discarding) the resulting node depending on active/last state,
+// but never skipping the validation call itself. One call, whose return value happens to be
+// unused for the current-location case, is cheaper than a second, hand-rolled route validator.
+//
+// ── WHY EVERY FIELD ON BOTH STRUCTS BELOW IS PREFIXED (a real, reproduced compiler defect) ────
+// Verified directly while wiring this file's own KAT: `PrismBreadcrumbItem{label,route}` and
+// `PrismMenuEntry{label,...,route}` sharing the bare names `label`/`route` corrupted reads of
+// `route` specifically (`it.route` on a `PrismBreadcrumbItem` read back "" instead of "/", while
+// `.label` happened to read correctly). Root cause is the SAME class already tracked in this
+// codebase's memory as the struct-field-name-collision defect: a field access on a receiver whose
+// concrete type the compiler could not statically pin (here, `pair[0]` off a bare `list` -- the
+// SAME "un-inferred receiver" boundary trap 13 documents for method calls, just for a plain field
+// READ instead of a call) resolves the field's storage OFFSET from a single GLOBAL name table,
+// last-registration-wins. `route` differs in slot index between the two structs (1 vs 2), so it
+// broke; `label` is slot 0 in both (and in `PrismTabPanel`/`PrismPickOption` elsewhere in prism/),
+// so it happened to survive by coincidence -- exactly the kind of accidental alignment that masks
+// this bug until a future struct's field order differs. Every field on `PrismBreadcrumbItem` and
+// `PrismMenuEntry` is therefore prefixed (`crumb_*` / `menu_*`) so neither name can EVER collide
+// with another struct's field anywhere in the whole program, matching this codebase's documented
+// workaround ("prefix all struct fields") rather than relying on slot-0 luck.
+//
+// PUBLIC API
+//   Breadcrumb
+//     PrismBreadcrumbItem { label, route } + prism_breadcrumb_item(label, route)
+//     prism_nav_breadcrumb(trail: list) -> Result<PrismNode>
+//       rejects: empty trail, a non-PrismBreadcrumbItem element, an empty label, an invalid route
+//       (on ANY item, including the last). Renders a `band`; every item but the last is a `link`,
+//       the last is a plain `label` (current page -- never a link, see header).
+//   Menu
+//     PrismMenuEntry { label, icon: PrismIcon?, route, active } + prism_menu_entry(...)
+//     prism_nav_menu(entries: list) -> Result<PrismNode>
+//       rejects: empty entries, a non-PrismMenuEntry element, an empty label, a duplicate route,
+//       a count of active entries != 1. Renders a `stack`; each entry is glyph+content (if it has
+//       an icon) or content alone, where content is a `link` (inactive) or a `label` (active --
+//       same "current location" rule as breadcrumb).
+//   Pagination
+//     prism_nav_pages(current: int, total: int) -> Result<PrismNode>
+//       rejects: total < 1, current < 1, current > total. Renders a `band` of
+//       [prev, page_1, ..., page_total, next]; prev/next are `press` when usable, a plain
+//       glyph+label `band` (not hidden) when not; the current page indicator is a `label`, every
+//       other page indicator is a `press`.
+//   Steps
+//     prism_nav_steps(labels: list, current_idx: int) -> Result<PrismNode>
+//       rejects: zero labels, a non-string or empty label, an out-of-range current_idx. Renders a
+//       `band` of one node per step: complete (index < current_idx) is glyph(check)+label, current
+//       and pending are a plain `label`, distinguished only by the queryable "step_state" attr
+//       (see header) since neither is a real control.
+//     prism_nav_step_state(node: PrismNode) -> string   "complete" | "current" | "pending"
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// ── Breadcrumb ────────────────────────────────────────────────────────────────────────────────
+
+// A struct's positional constructor is file-local cross-module (NOVA_LANGUAGE_FEATURES.md §7
+// trap 11) -- `prism_breadcrumb_item` is the wrapper every OTHER file must use. Fields are
+// `crumb_`-prefixed -- see header note on the struct-field-name-collision defect.
+type PrismBreadcrumbItem
+    crumb_label: string
+    crumb_route: string
+
+fn prism_breadcrumb_item(label: string, route: string) -> PrismBreadcrumbItem
+    PrismBreadcrumbItem(label, route)
+
+// One crumb. `pair` is `[item, is_last]` (the same 2-element-list decoration prism_ui_kit's own
+// `_prism_ui_kv_row` uses) -- decorating the item with its position BEFORE handing the whole list
+// to `prism_ui_collect` is what lets the last-item-is-different rule fit the kit's uniform-map
+// shape, instead of hand-writing a second error-propagating loop that only differs from the kit's
+// in having an `if idx == last` branch.
+fn _prism_nav_breadcrumb_pair(pair: list) -> Result<PrismNode>
+    let it = pair[0]
+    let is_last = pair[1]
+    if type_name(it) != "PrismBreadcrumbItem"
+        return err("prism_nav_breadcrumb: item is not a PrismBreadcrumbItem (got " + type_name(it) + ")")
+    if it.crumb_label == ""
+        return err("prism_nav_breadcrumb: item has an empty label")
+    let link_r = prism_interact.prism_link(it.crumb_label, prism_interact.prism_link_target_route(it.crumb_route))
+    if is_err(link_r)
+        return err(unwrap_err(link_r))
+    if is_last
+        return prism_content.prism_label(it.crumb_label)
+    ok(unwrap(link_r))
+
+// Rejects an empty trail. The last item is the current page -- rendered as a plain `label`, never
+// a `link` (see header: linking the page you are on is a real usability defect, and a screen
+// reader announces it as a navigation option that goes nowhere).
+fn prism_nav_breadcrumb(trail: list) -> Result<PrismNode>
+    let n = len(trail)
+    if n == 0
+        return err("prism_nav_breadcrumb: needs at least one item")
+    let pairs = []
+    for idx, it in trail
+        pairs.push([it, idx == n - 1])
+    let mk = fn(p) _prism_nav_breadcrumb_pair(p)
+    let crumbs = prism_ui_kit.prism_ui_collect(pairs, mk)?
+    prism_arrange.prism_band(crumbs)
+
+// ── Menu ──────────────────────────────────────────────────────────────────────────────────────
+
+// Fields are `menu_`-prefixed -- see header note on the struct-field-name-collision defect.
+type PrismMenuEntry
+    menu_label: string
+    menu_icon: PrismIcon?
+    menu_route: string
+    menu_active: bool
+
+fn prism_menu_entry(label: string, icon: PrismIcon?, route: string, active: bool) -> PrismMenuEntry
+    PrismMenuEntry(label, icon, route, active)
+
+// The entry's content, before any icon is applied: a `link` for an inactive entry, a `label` for
+// the active one (same current-location rule as breadcrumb) -- but the route is validated
+// UNCONDITIONALLY first (see header), so an active entry's route still cannot be malformed.
+fn _prism_nav_menu_content(e: PrismMenuEntry) -> Result<PrismNode>
+    let link_r = prism_interact.prism_link(e.menu_label, prism_interact.prism_link_target_route(e.menu_route))
+    if is_err(link_r)
+        return err(unwrap_err(link_r))
+    if e.menu_active
+        return prism_content.prism_label(e.menu_label)
+    ok(unwrap(link_r))
+
+fn _prism_nav_menu_entry(e: PrismMenuEntry) -> Result<PrismNode>
+    let content_r = _prism_nav_menu_content(e)
+    if is_err(content_r)
+        return err(unwrap_err(content_r))
+    let content = unwrap(content_r)
+    match e.menu_icon
+        None => ok(content)
+        Some(ic) =>
+            let g = prism_content.prism_glyph(ic)?
+            prism_arrange.prism_band([g, content])
+
+// Rejects: an empty entry set, a non-PrismMenuEntry element, an empty label, a duplicate route
+// (ambiguous navigation target), and any active count other than exactly 1 (PRISM_SPEC.md's own
+// "no way to silently do nothing" principle, applied to selection state instead of style: a menu
+// with 0 or 2+ active entries has no well-defined "where am I", which is worse than rejecting it).
+// These four checks share running state across the whole list (`seen_routes`, `active_count`), so
+// they are a plain loop, not a `prism_ui_collect` map -- the kit's helper is for per-item
+// construction with no cross-item accumulator, exactly the boundary prism_table's own duplicate-
+// column-key check draws in the same place.
+fn prism_nav_menu(entries: list) -> Result<PrismNode>
+    if len(entries) == 0
+        return err("prism_nav_menu: needs at least one entry")
+    let seen_routes = {}
+    let mut active_count = 0
+    for idx, e in entries
+        if type_name(e) != "PrismMenuEntry"
+            return err("prism_nav_menu: entry " + str(idx) + " is not a PrismMenuEntry (got " + type_name(e) + ")")
+        if e.menu_label == ""
+            return err("prism_nav_menu: entry " + str(idx) + " has an empty label")
+        if e.menu_route in seen_routes
+            return err("prism_nav_menu: duplicate route '" + e.menu_route + "'")
+        seen_routes[e.menu_route] = true
+        if e.menu_active
+            active_count += 1
+    if active_count != 1
+        return err("prism_nav_menu: exactly one entry must be active, got " + str(active_count))
+    let mk = fn(e) _prism_nav_menu_entry(e)
+    let items = prism_ui_kit.prism_ui_collect(entries, mk)?
+    prism_arrange.prism_stack(items)
+
+// ── Pagination ────────────────────────────────────────────────────────────────────────────────
+
+// prev/next: `prism_ui_icon_text` builds the glyph+label visual (chevron + "Previous"/"Next").
+// When usable, that visual becomes a REAL `press`'s single child (text is the accessible name);
+// when not, the SAME visual is returned bare -- present, in the same position, just not wrapped
+// as an activatable control (see header).
+fn _prism_nav_page_control(icon: PrismIcon, text: string, enabled: bool) -> Result<PrismNode>
+    let content = prism_ui_kit.prism_ui_icon_text(icon, text)?
+    if not enabled
+        return ok(content)
+    prism_interact.prism_press(text, [content])
+
+// One page indicator: the current page is a `label` (no point making "go to where you are" a
+// control -- same rule again), every other page is a `press` naming the destination page number.
+fn _prism_nav_page_indicator(page_num: int, current: int) -> Result<PrismNode>
+    if page_num == current
+        return prism_content.prism_label(str(page_num))
+    prism_interact.prism_press(str(page_num), [])
+
+// Rejects: total < 1, current < 1, current > total. `current == 1` disables prev; `current ==
+// total` disables next -- both still render (see header), so the control count in the output
+// band is always exactly `total + 2` regardless of position.
+fn prism_nav_pages(current: int, total: int) -> Result<PrismNode>
+    if total < 1
+        return err("prism_nav_pages: total must be >= 1, got " + str(total))
+    if current < 1
+        return err("prism_nav_pages: current must be >= 1, got " + str(current))
+    if current > total
+        return err("prism_nav_pages: current (" + str(current) + ") must be <= total (" + str(total) + ")")
+    let prev_node = _prism_nav_page_control(prism_content.prism_icon_chevron_left(), "Previous", current > 1)?
+    let next_node = _prism_nav_page_control(prism_content.prism_icon_chevron_right(), "Next", current < total)?
+    let page_range = []
+    let mut p = 1
+    while p <= total
+        page_range.push(p)
+        p += 1
+    let mk = fn(n) _prism_nav_page_indicator(n, current)
+    let pages = prism_ui_kit.prism_ui_collect(page_range, mk)?
+    prism_arrange.prism_band([prev_node, ...pages, next_node])
+
+// ── Steps ─────────────────────────────────────────────────────────────────────────────────────
+
+// Closed, 3-value -- purely an internal tag (never appears in this file's public signatures), so
+// unlike `PrismSortDirection`/`PrismIcon` it needs no cross-module constructor wrappers: nothing
+// outside this file ever constructs one, only reads its name back off a rendered node's attr.
+enum PrismStepState
+    Complete()
+    Current()
+    Pending()
+
+fn _prism_nav_step_state_name(s: PrismStepState) -> string
+    match s
+        Complete() => "complete"
+        Current() => "current"
+        Pending() => "pending"
+
+fn _prism_nav_step_state_for(idx: int, current_idx: int) -> PrismStepState
+    if idx < current_idx
+        return Complete()
+    if idx == current_idx
+        return Current()
+    Pending()
+
+// Complete gets the closed icon set's checkmark (the brief's explicit instruction); current and
+// pending are both a plain `label` -- they are told apart only by the "step_state" attr (see
+// header), never by shape, since neither is a control and inventing a second icon for "current"
+// would be guessing at a glyph the closed 12-icon set does not actually contain.
+fn _prism_nav_step_node(label: string, state: PrismStepState) -> Result<PrismNode>
+    let base_r = match state
+        Complete() => prism_ui_kit.prism_ui_icon_text(prism_content.prism_icon_check(), label)
+        Current() => prism_content.prism_label(label)
+        Pending() => prism_content.prism_label(label)
+    if is_err(base_r)
+        return err(unwrap_err(base_r))
+    let node = unwrap(base_r)
+    let merged = dict_merge(node.attrs, {"step_state": _prism_nav_step_state_name(state)})
+    prism_node.prism_node_new(node.kind, merged, node.children, node.key)
+
+// `pair` is `[label, PrismStepState]`, decorated up front the same way breadcrumb decorates
+// `[item, is_last]` -- computing each step's state depends on the whole list's `current_idx`, but
+// building each step's NODE does not, so the state is computed once per index outside the map and
+// carried alongside the label into the one `prism_ui_collect` call.
+fn _prism_nav_step_pair(pair: list) -> Result<PrismNode>
+    let lbl = pair[0]
+    let state = pair[1]
+    if not is_string(lbl)
+        return err("prism_nav_steps: step label must be a string, got " + type_name(lbl))
+    if lbl == ""
+        return err("prism_nav_steps: step label must not be empty")
+    _prism_nav_step_node(lbl, state)
+
+// Rejects zero labels and an out-of-range `current_idx` (< 0 or >= the label count).
+fn prism_nav_steps(labels: list, current_idx: int) -> Result<PrismNode>
+    let n = len(labels)
+    if n == 0
+        return err("prism_nav_steps: needs at least one step")
+    if current_idx < 0 or current_idx >= n
+        return err("prism_nav_steps: current_idx " + str(current_idx) + " is out of range for " + str(n) + " step(s)")
+    let pairs = []
+    for idx, lbl in labels
+        pairs.push([lbl, _prism_nav_step_state_for(idx, current_idx)])
+    let mk = fn(p) _prism_nav_step_pair(p)
+    let nodes = prism_ui_kit.prism_ui_collect(pairs, mk)?
+    prism_arrange.prism_band(nodes)
+
+fn prism_nav_step_state(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "step_state", "")

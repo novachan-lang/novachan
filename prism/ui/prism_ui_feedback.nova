@@ -1,0 +1,178 @@
+// prism_ui_feedback -- feedback components (prism/ui/, milestone MB.2): alert, toast, confirm
+// dialog, empty state, progress. Every one is a COMPOSITION over the closed 22-primitive
+// vocabulary (widget/), built through prism_ui_kit.nova's helpers wherever they fit -- no new
+// PrismNodeKind, matching prism_ui_table.nova's own "this is a composition, not a new primitive"
+// discipline (PRISM_SPEC.md axiom A7). MB.1 measured what re-deriving the collect-with-error-
+// propagation loop by hand costs (~1,000 lines across 2 components); this file is the payoff of
+// not doing that again.
+//
+// ── WHY SEVERITY IS A CLOSED 4-VARIANT ENUM, EACH MAPPING TO A DISTINCT ICON ─────────────────
+// Same reasoning as PrismSortDirection/PrismIcon: a free-form severity string would make an
+// invalid severity a runtime surprise; the enum makes it a compile error. `prism_fb_severity_icon`
+// is EXHAUSTIVE with no wildcard arm -- add a 5th severity without a case there, and the compiler
+// rejects the build. Variant names are `Fb`-prefixed (`FbInfo`, not `Info`): NOVA's flat LLVM
+// symbol space already has an `Info()`/`Warning()` pair on `PrismIcon` (prism_content.nova), and a
+// second bare `Info()`/`Warning()` constructor here would collide -- the exact class of bug
+// prism_ui_form.nova's `FormFieldText`/`FormRuleRequired` prefixing already works around, for the
+// identical reason (NOVA_LANGUAGE_FEATURES.md trap 11: constructors, and the symbols they compile
+// to, are the thing that collides).
+//
+// ── WHY `detail` IS `string?`, NOT A MAGIC EMPTY STRING ──────────────────────────────────────
+// "No detail" and "detail is the empty string" are different facts; `None` is the former, never a
+// smuggled `""`. An empty `Some("")` degrades to "no detail" rather than rendering a blank line --
+// the same tolerant handling prism_ui_kit's own `prism_ui_field_row`'s `note: string?` gives.
+//
+// ── WHY CONFIRM REJECTS BOTH LABELS, NEVER DEFAULTS TO "OK"/"CANCEL" ─────────────────────────
+// A caller-omitted label defaulting to "OK"/"Cancel" hides what the button actually DOES ("OK" to
+// what?) -- exactly the ambiguous-control class PRISM_SPEC.md's a11y requirement (§13, echoed in
+// prism_interact.nova's press/flag/range/link header) exists to prevent. Checked explicitly here
+// rather than left to `prism_press`'s own empty-text guard, because that guard alone would also
+// accept an empty label paired with a non-empty `children` list -- a shape this dialog never wants.
+//
+// ── WHY PROGRESS IS A LABEL + `prism_range`, NOT A HAND-ROLLED BAR OUT OF `gap` ──────────────
+// `prism_range` (widget/prism_interact.nova) already IS "a bounded numeric control" (a11y role
+// slider) -- `min=0, max=total, value=done` is exactly a determinate progress meter's own
+// semantics, so reusing it is composition, not a new primitive. A "filled/unfilled" bar built out
+// of two `prism_gap` nodes was considered and rejected: `gap` is documented as LAYOUT SPACING
+// (PRISM_SPEC.md §7), and stretching its `size` attr to mean "proportion filled" would silently
+// reinterpret an existing primitive -- the same failure class axiom A7 forbids for adding a new one.
+// Percentage is `(done * 100) / total`, int/int truncating division; since both operands are
+// validated non-negative that is equivalent to floor, so "1 of 3" reports 33, never a float
+// rounding artifact (no float appears anywhere in this function).
+//
+// PUBLIC API
+//   Severity (closed, 4 values, each -> a distinct icon from the closed 12-icon set)
+//     PrismFbSeverity                                   FbInfo()|FbSuccess()|FbWarning()|FbDanger()
+//     prism_fb_severity_info() / _success() / _warning() / _danger()   cross-module ctors
+//     prism_fb_severity_name(sev) -> string     exhaustive: "info"|"success"|"warning"|"danger"
+//     prism_fb_severity_icon(sev) -> PrismIcon  exhaustive, no wildcard
+//   Components (all Result<PrismNode>; every one validates, none fails silently)
+//     prism_fb_alert(severity, title: string, detail: string?)
+//     prism_fb_toast(severity, message: string, dismiss_label: string?)
+//     prism_fb_confirm(title, body, confirm_label, cancel_label: string) -> sheet(exclusive=true)
+//       rejects an empty title/body/confirm_label/cancel_label
+//     prism_fb_empty(title, message: string, cta_label: string?)
+//     prism_fb_progress(label: string, done: int, total: int)
+//       rejects total < 1, done < 0, done > total
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_structure
+import prism_ui_kit
+
+// ── Severity: closed, 4 values (see header) ──────────────────────────────────────────────────
+enum PrismFbSeverity
+    FbInfo()
+    FbSuccess()
+    FbWarning()
+    FbDanger()
+
+fn prism_fb_severity_info() -> PrismFbSeverity
+    FbInfo()
+fn prism_fb_severity_success() -> PrismFbSeverity
+    FbSuccess()
+fn prism_fb_severity_warning() -> PrismFbSeverity
+    FbWarning()
+fn prism_fb_severity_danger() -> PrismFbSeverity
+    FbDanger()
+
+// Exhaustive, no wildcard arm -- adding a 5th severity without a case here is a compile error.
+fn prism_fb_severity_name(sev: PrismFbSeverity) -> string
+    match sev
+        FbInfo() => "info"
+        FbSuccess() => "success"
+        FbWarning() => "warning"
+        FbDanger() => "danger"
+
+// Exhaustive, no wildcard arm. Each arm names a DIFFERENT icon from the closed 12-icon set --
+// the KAT proves all 4 stay distinct, which is the entire payoff of doing this as a match
+// instead of, say, "warning for everything but info".
+fn prism_fb_severity_icon(sev: PrismFbSeverity) -> PrismIcon
+    match sev
+        FbInfo() => prism_content.prism_icon_info()
+        FbSuccess() => prism_content.prism_icon_check()
+        FbWarning() => prism_content.prism_icon_warning()
+        FbDanger() => prism_content.prism_icon_close()
+
+// ── Alert / banner ────────────────────────────────────────────────────────────────────────────
+// icon + title (prism_ui_kit's `icon_text`), plus an optional detail line stacked below.
+fn prism_fb_alert(severity: PrismFbSeverity, title: string, detail: string?) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_fb_alert: title must not be empty")
+    let head = prism_ui_kit.prism_ui_icon_text(prism_fb_severity_icon(severity), title)?
+    match detail
+        None => ok(head)
+        Some(text) =>
+            if len(text) == 0
+                return ok(head)
+            let note = prism_content.prism_label(text)?
+            prism_arrange.prism_stack([head, note])
+
+// ── Toast ─────────────────────────────────────────────────────────────────────────────────────
+// Same icon+message shape as an alert, plus an optional dismiss button. `dismiss_label`'s
+// emptiness is validated by `prism_press` itself (an empty label + no children is its own
+// rejection) -- reused rather than re-checked here.
+fn prism_fb_toast(severity: PrismFbSeverity, message: string, dismiss_label: string?) -> Result<PrismNode>
+    if len(message) == 0
+        return err("prism_fb_toast: message must not be empty")
+    let head = prism_ui_kit.prism_ui_icon_text(prism_fb_severity_icon(severity), message)?
+    match dismiss_label
+        None => ok(head)
+        Some(label) =>
+            let btn = prism_interact.prism_press(label, [])?
+            prism_arrange.prism_band([head, btn])
+
+// ── Confirm dialog ────────────────────────────────────────────────────────────────────────────
+// title + body stacked above a confirm/cancel action row, wrapped in a `sheet` marked exclusive
+// (PRISM_SPEC.md §15.8: a modal grant exclusive input). See header for why both labels are
+// mandatory.
+fn prism_fb_confirm(title: string, body: string, confirm_label: string, cancel_label: string) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_fb_confirm: title must not be empty")
+    if len(body) == 0
+        return err("prism_fb_confirm: body must not be empty")
+    if len(confirm_label) == 0
+        return err("prism_fb_confirm: confirm_label must not be empty -- an unlabelled action is unusable")
+    if len(cancel_label) == 0
+        return err("prism_fb_confirm: cancel_label must not be empty -- an unlabelled action is unusable")
+    let title_node = prism_content.prism_label(title)?
+    let body_node = prism_content.prism_label(body)?
+    let confirm_btn = prism_interact.prism_press(confirm_label, [])?
+    let cancel_btn = prism_interact.prism_press(cancel_label, [])?
+    let actions = prism_ui_kit.prism_ui_actions([confirm_btn, cancel_btn])?
+    let content = prism_arrange.prism_stack([title_node, body_node, actions])?
+    prism_structure.prism_sheet(content, true)
+
+// ── Empty state ───────────────────────────────────────────────────────────────────────────────
+// A title above `prism_ui_kit.prism_ui_empty`'s honest icon+message body, plus an optional
+// call-to-action button. `message`'s emptiness is validated by `prism_ui_empty` itself.
+fn prism_fb_empty(title: string, message: string, cta_label: string?) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_fb_empty: title must not be empty")
+    let title_node = prism_content.prism_label(title)?
+    let body = prism_ui_kit.prism_ui_empty(message)?
+    match cta_label
+        None => prism_arrange.prism_stack([title_node, body])
+        Some(label) =>
+            let btn = prism_interact.prism_press(label, [])?
+            let actions = prism_ui_kit.prism_ui_actions([btn])?
+            prism_arrange.prism_stack([title_node, body, actions])
+
+// ── Progress / status line ───────────────────────────────────────────────────────────────────
+// See header for why this is a label + `prism_range`, and why the percentage is exact integer
+// arithmetic. Checked in the same order the caller reads them: total's own validity first (a
+// bad total makes checking `done` against it meaningless), then done's lower bound, then done
+// against total.
+fn prism_fb_progress(label: string, done: int, total: int) -> Result<PrismNode>
+    if total < 1
+        return err("prism_fb_progress: total must be >= 1, got " + str(total))
+    if done < 0
+        return err("prism_fb_progress: done must be >= 0, got " + str(done))
+    if done > total
+        return err("prism_fb_progress: done (" + str(done) + ") must be <= total (" + str(total) + ")")
+    let pct = (done * 100) / total
+    let text_node = prism_content.prism_label(label + " " + str(pct) + "%")?
+    let track = prism_interact.prism_range(label, 0, total, 1, done)?
+    prism_arrange.prism_stack([text_node, track])
