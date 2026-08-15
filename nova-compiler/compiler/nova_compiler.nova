@@ -11569,6 +11569,7 @@ type IrBuilder
     ir_fn_name: string
     ir_fn_param_stypes: dict
     ir_const_baked: dict
+    ir_methods_ambig: dict
     ir_const_build_order: list
     ir_list_elem_stype: dict
     ir_fn_ret_list_elem: dict
@@ -11578,7 +11579,7 @@ type IrBuilder
     ir_sredact: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {}, {}, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
 
 // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
 // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
@@ -12509,6 +12510,39 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     ir_emit_side(b, "dyn_call", dest, ir_type_any(), mc_args, "", len(arg_regs) - 1)
                 else if list_contains(b.ir_fnames, value)
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
+                else if len(arg_regs) > 0 and contains(b.ir_fmap, value)
+                    // ── `obj.f(args)` where f is a CLOSURE-VALUED FIELD and the receiver's struct
+                    // type could NOT be inferred ────────────────────────────────────────────────
+                    // The typed path above already handles this when ir_expr_struct_type knows the
+                    // receiver (`cols[0].extract(x)`), but it returns "" for anything the inferrer
+                    // cannot pin down -- e.g. a value that arrived through `unwrap(find(...))`.
+                    // Reaching HERE with an unknown receiver used to fall into the final else,
+                    // which fabricates `@nova_rt_<f>` from resolve_method_fn's catch-all: a symbol
+                    // that does not exist, so the program fails at LINK with "use of undefined
+                    // value", never at type-check. That is the long-standing @nova_rt_sql bug
+                    // (OrmQuery.sql()), and it is not ORM-specific -- it bites every
+                    // callback-in-a-struct design: table column extractors, form validators, event
+                    // handlers, strategy objects.
+                    //
+                    // Guard is `contains(b.ir_fmap, value)`: SOME struct in this program declares a
+                    // field with this name. Every real method/builtin/module-fn branch is above, so
+                    // arriving here means nothing claimed the call -- and the only two outcomes are
+                    // a field-held callable or a fabricated undefined symbol. Reading the field is
+                    // strictly better than emitting a symbol that cannot link.
+                    //
+                    // The field is read BY NAME at runtime (nova_rt_field_get, the same entry RTTI
+                    // uses) precisely because the static type is unknown here, then invoked
+                    // indirectly with the remaining arguments -- exactly what the typed path does,
+                    // minus the compile-time slot index.
+                    let dc_name = ir_lower_expr(b, Expr("str", value, 0, [], [], 0))
+                    let dc_fld = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", dc_fld, ir_type_any(), [arg_regs[0], dc_name], "nova_rt_field_get", 0)
+                    let dc_args = [dc_fld]
+                    let dc_i = 1
+                    while dc_i < len(arg_regs)
+                        push(dc_args, arg_regs[dc_i])
+                        dc_i = dc_i + 1
+                    ir_emit_side(b, "dyn_call", dest, ir_type_any(), dc_args, "", len(arg_regs) - 1)
                 else
                     let rt_name = resolve_method_fn(value)
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, rt_name, 0)
@@ -27519,6 +27553,35 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                     push(mod_fns, s)
                     push(b.ir_fnames, name)
                     b.ir_fn_arity[name] = len(params)
+                    // ── Register an imported module's METHODS, exactly as the main module does (~24714).
+                    // Its absence here is the root cause of the long-standing `@nova_rt_sql` LINK
+                    // failures. `fn OrmQuery.sql()` lowers to the flat name `OrmQuery__sql`; the main
+                    // module records suffix -> mangled name in ir_methods so that a call `q.sql()` still
+                    // resolves when the inferrer cannot pin `q` down to OrmQuery. For an IMPORTED module
+                    // that registration never happened, so the dot-call fell past every resolution branch
+                    // to resolve_method_fn's catch-all, which fabricates `@nova_rt_sql` -- a symbol that
+                    // does not exist. The failure therefore surfaced at LINK, never at type-check, and
+                    // only for receivers the inferrer could not type (a directly-constructed OrmQuery
+                    // worked fine, which is why it looked ORM-specific rather than structural).
+                    // Same omission class as the module-level let/const gap fixed in b37f501d: this
+                    // function performs a SUBSET of the registrations the main-module path performs.
+                    // COLLISION-SAFE, unlike the main-module path: `ir_methods` is keyed by the
+                    // BARE suffix, so two types each defining `.size()` would make one silently win
+                    // and a call on the other receiver would jump into the WRONG type's method --
+                    // type confusion, i.e. a crash or silent corruption rather than a link error.
+                    // The main module accepts that risk for its own handful of methods; registering
+                    // EVERY imported module's methods widens it across the whole dependency graph,
+                    // so an ambiguous suffix is DROPPED here instead of guessed. A dropped suffix
+                    // simply falls through to the pre-existing resolution paths -- exactly today's
+                    // behaviour -- so this can only ever be as good as before, never worse.
+                    let mod_dunder = find(name, "__")
+                    if mod_dunder > 0
+                        let mod_msuffix = name[mod_dunder + 2:999999999]
+                        if contains(b.ir_methods, mod_msuffix)
+                            if b.ir_methods[mod_msuffix] != name
+                                b.ir_methods_ambig[mod_msuffix] = 1
+                        if not contains(b.ir_methods_ambig, mod_msuffix)
+                            b.ir_methods[mod_msuffix] = name
                     // TRACK-A: register the imported fn's RETURN type (mirrors the main module at
                     // ~16008) so an unannotated `let x = mod.fn()` resolves x's struct type via
                     // ir_expr_struct_type -> ir_fn_returns, and field access uses the PER-STRUCT
