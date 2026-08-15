@@ -1,0 +1,206 @@
+// prism_ui_layout -- the layout components (prism/ui/ composition layer, milestone MB.3): app
+// shell, split, drawer, grid layout, toolbar. Every one is a COMPOSITION over the closed
+// 22-primitive vocabulary (widget/) -- no new PrismNodeKind (axiom A7 stays closed), matching
+// prism_ui_feedback.nova's and prism_ui_nav.nova's own discipline. None of these five needs
+// prism_ui_kit's `prism_ui_collect` -- every component here takes already-built PrismNode groups
+// (panes, tracks+children, leading/centre/trailing lists) rather than mapping a caller callback
+// over raw items, so there is no error-propagating map loop to reuse.
+//
+// ── SHELL: WHY CONTENT IS `prism_pane`D AND HEADER NEVER IS ──────────────────────────────────
+// "content is the scrolling region, header is not" is expressed structurally, not by a flag:
+// `content` is always wrapped in `prism_arrange.prism_pane` (the one scrollable-viewport
+// primitive, §7) before it joins the tree; `header` is threaded straight through untouched. A
+// KAT reading `header`'s own kind back off the shell's first child (never "pane") is therefore
+// proof the boundary holds, not just an assertion about intent.
+//
+// ── SPLIT: RATIO AS `PrismMeshTrack` WEIGHTS, REUSING `prism_mesh` UNCHANGED ─────────────────
+// A closed enum (half/third/quarter/golden) makes an invalid split unrepresentable, per the
+// brief -- but the brief also requires "every split ratio produces a DISTINCT arrangement",
+// which a bare 2-child `band` could never show (all four ratios would render the identical
+// tree shape). `prism_mesh`'s `Fixed(px)` track already carries a real per-column integer, so
+// each ratio is encoded as a `[w_first, w_second]` WEIGHT pair fed straight into two
+// `prism_track_fixed` columns -- half=[1,1], third=[1,2], quarter=[1,3], golden=[382,618]
+// (permille approximation of the golden ratio's 61.8/38.2 split). This is composition, not a
+// new primitive: no behaviour is added to `prism_mesh`, only a caller that knows how to name
+// its two columns. The KAT proves distinctness by reading the weights back via
+// `prism_arrange.prism_mesh_cols`/`prism_mesh_track_size`, not by depth/count (which is
+// necessarily IDENTICAL across all four ratios -- same 2-leaf-child shape every time).
+//
+// ── SPLIT: "AN INVERTED OR EMPTY CONFIGURATION" -- WHAT IS ACTUALLY CHECKED, STATED PLAINLY ──
+// `panes` is a `list` (not two named `PrismNode` params) specifically so "empty" is a real,
+// checkable state: `len(panes) != 2` rejects both zero panes and any other wrong count. That
+// check alone satisfies "empty". Separately, this file ALSO rejects `panes[0] == panes[1]`
+// (NOVA's universal structural `==`, verified always available -- NOVA_LANGUAGE_FEATURES.md
+// §6 "Universal structural equality") -- two structurally identical panes is a genuine degenerate
+// case worth catching on its own merits (a split that shows the same content on both sides
+// divides nothing), stated honestly here as this file's own reading of "inverted", not claimed
+// as the one true interpretation of an inherently informal brief.
+//
+// ── DRAWER: `drawer_edge` ATTR, THE `prism_tabs`/`prism_nav_steps` PRECEDENT ─────────────────
+// Same idiom prism_structure.prism_tabs (`tab_label`) and prism_ui_nav's steps (`step_state`)
+// already use: build the underlying primitive (`prism_sheet`) first, then re-construct via
+// `prism_node.prism_node_new` with a merged attrs dict carrying the extra queryable fact. No new
+// mechanism -- `exclusive` survives untouched in the merge, `drawer_edge` is additive.
+//
+// ── GRID: WHY DIVISIBILITY IS CHECKED HERE, NOT LEFT TO `prism_mesh` ─────────────────────────
+// `prism_mesh` validates only what its OWN attrs need (cols non-empty, Fixed px > 0) -- a
+// "responsive-ish column arrangement" additionally implies `children` are meant to fill whole
+// rows of `tracks.len()` columns each, a fact `prism_mesh` has no way to know since it never
+// reasons about rows. `len(children) % len(tracks) != 0` catches the real, easy-to-make mistake
+// (an off-by-one child count) that `prism_mesh` cannot. This is genuinely new validation, not a
+// duplicate of `prism_mesh`'s own -- and `len(tracks) == 0` is checked FIRST here only because
+// this file's own modulo would divide by zero otherwise, not to shadow `prism_mesh`'s identical
+// check (both fire on the same bad input; only one message is ever seen). The non-positive
+// Fixed-width case is deliberately NOT duplicated: `prism_mesh` already rejects it, and this
+// function just propagates that `Result` unchanged, per the brief's own instruction.
+//
+// ── TOOLBAR: WHY THE OUTPUT IS ALWAYS 3 CHILDREN, NEVER FEWER ────────────────────────────────
+// Each of leading/centre/trailing becomes its own `band` (possibly of zero items -- `prism_band`
+// accepts an empty list, since `prism_node_new` only cares that EVERY given child is a real
+// `PrismNode`, not that there is at least one). Wrapping every group unconditionally, rather than
+// omitting empty ones, keeps the toolbar's shape constant and its group's position addressable
+// by a fixed child index regardless of which groups are populated.
+//
+// PUBLIC API
+//   Split
+//     PrismSplitRatio                                   SplitHalf()|SplitThird()|SplitQuarter()|SplitGolden()
+//     prism_split_ratio_half() / _third() / _quarter() / _golden()   cross-module ctors
+//     prism_split_ratio_name(r) -> string       exhaustive: "half"|"third"|"quarter"|"golden"
+//     prism_split(panes: list, ratio: PrismSplitRatio) -> Result<PrismNode>
+//       rejects: len(panes) != 2 (covers empty), panes[0] == panes[1] (degenerate/identical)
+//   Drawer
+//     PrismDrawerEdge                                   DrawerLeft()|DrawerRight()|DrawerTop()|DrawerBottom()
+//     prism_drawer_edge_left() / _right() / _top() / _bottom()   cross-module ctors
+//     prism_drawer_edge_name(e) -> string       exhaustive: "left"|"right"|"top"|"bottom"
+//     prism_drawer(content: PrismNode, edge: PrismDrawerEdge, exclusive: bool) -> Result<PrismNode>
+//       a sheet(exclusive) carrying a queryable "drawer_edge" attr
+//     prism_drawer_edge(n) -> string     accessor, "" if absent
+//   Shell
+//     prism_shell(header: PrismNode, sidebar: PrismNode?, content: PrismNode, footer: PrismNode?) -> Result<PrismNode>
+//       content is always paned (scrolling region); header never is
+//   Grid
+//     prism_grid_layout(tracks: list<PrismMeshTrack>, children: list) -> Result<PrismNode>
+//       rejects: zero tracks; children not a multiple of len(tracks); propagates prism_mesh's
+//       own non-positive-fixed-width rejection unchanged
+//   Toolbar
+//     prism_toolbar(leading: list, centre: list, trailing: list) -> Result<PrismNode>
+//       rejects: all three groups empty. Always renders exactly 3 children (band per group).
+
+import prism_node
+import prism_arrange
+import prism_structure
+
+// ── Split ─────────────────────────────────────────────────────────────────────────────────────
+
+enum PrismSplitRatio
+    SplitHalf()
+    SplitThird()
+    SplitQuarter()
+    SplitGolden()
+
+fn prism_split_ratio_half() -> PrismSplitRatio
+    SplitHalf()
+fn prism_split_ratio_third() -> PrismSplitRatio
+    SplitThird()
+fn prism_split_ratio_quarter() -> PrismSplitRatio
+    SplitQuarter()
+fn prism_split_ratio_golden() -> PrismSplitRatio
+    SplitGolden()
+
+// Exhaustive, no wildcard arm -- see house convention (PrismNodeKind, PrismMeshTrack, PrismIcon).
+fn prism_split_ratio_name(r: PrismSplitRatio) -> string
+    match r
+        SplitHalf() => "half"
+        SplitThird() => "third"
+        SplitQuarter() => "quarter"
+        SplitGolden() => "golden"
+
+// [w_first, w_second] -- see header for why these are the actual `Fixed(px)` track widths, not
+// just documentation. Always two positive ints: the closed enum makes a zero/negative weight
+// unrepresentable by construction.
+fn _prism_layout_split_weights(r: PrismSplitRatio) -> list
+    match r
+        SplitHalf() => [1, 1]
+        SplitThird() => [1, 2]
+        SplitQuarter() => [1, 3]
+        SplitGolden() => [382, 618]
+
+// See header for what "inverted or empty configuration" means here concretely.
+fn prism_split(panes: list, ratio: PrismSplitRatio) -> Result<PrismNode>
+    if len(panes) != 2
+        return err("prism_split: needs exactly 2 panes, got " + str(len(panes)))
+    if panes[0] == panes[1]
+        return err("prism_split: first and second panes are structurally identical -- a split with matching sides has no real division")
+    let w = _prism_layout_split_weights(ratio)
+    let cols = [prism_arrange.prism_track_fixed(w[0]), prism_arrange.prism_track_fixed(w[1])]
+    prism_arrange.prism_mesh(cols, panes)
+
+// ── Drawer ────────────────────────────────────────────────────────────────────────────────────
+
+enum PrismDrawerEdge
+    DrawerLeft()
+    DrawerRight()
+    DrawerTop()
+    DrawerBottom()
+
+fn prism_drawer_edge_left() -> PrismDrawerEdge
+    DrawerLeft()
+fn prism_drawer_edge_right() -> PrismDrawerEdge
+    DrawerRight()
+fn prism_drawer_edge_top() -> PrismDrawerEdge
+    DrawerTop()
+fn prism_drawer_edge_bottom() -> PrismDrawerEdge
+    DrawerBottom()
+
+fn prism_drawer_edge_name(e: PrismDrawerEdge) -> string
+    match e
+        DrawerLeft() => "left"
+        DrawerRight() => "right"
+        DrawerTop() => "top"
+        DrawerBottom() => "bottom"
+
+// A sheet, `exclusive` threaded straight through, plus a queryable "drawer_edge" attr -- see
+// header for the prism_tabs/prism_nav_steps precedent this reuses.
+fn prism_drawer(content: PrismNode, edge: PrismDrawerEdge, exclusive: bool) -> Result<PrismNode>
+    let sheet_node = prism_structure.prism_sheet(content, exclusive)?
+    let merged = dict_merge(sheet_node.attrs, {"drawer_edge": prism_drawer_edge_name(edge)})
+    prism_node.prism_node_new(sheet_node.kind, merged, sheet_node.children, sheet_node.key)
+
+fn prism_drawer_edge(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "drawer_edge", "")
+
+// ── Shell ─────────────────────────────────────────────────────────────────────────────────────
+
+// See header: `content` is always the paned (scrolling) region, `header` never is. `sidebar`
+// sits beside the paned content when present; `footer` closes the stack when present. Four
+// distinct shapes result (neither/sidebar-only/footer-only/both), each with its own exact
+// depth/count -- the KAT proves all four.
+fn prism_shell(header: PrismNode, sidebar: PrismNode?, content: PrismNode, footer: PrismNode?) -> Result<PrismNode>
+    let paned = prism_arrange.prism_pane(content)?
+    let body = match sidebar
+        None => paned
+        Some(side) => prism_arrange.prism_band([side, paned])?
+    match footer
+        None => prism_arrange.prism_stack([header, body])
+        Some(f) => prism_arrange.prism_stack([header, body, f])
+
+// ── Grid ──────────────────────────────────────────────────────────────────────────────────────
+
+// See header for why divisibility is checked here and non-positive-fixed-width is not.
+fn prism_grid_layout(tracks: list<PrismMeshTrack>, children: list) -> Result<PrismNode>
+    if len(tracks) == 0
+        return err("prism_grid_layout: needs at least one column track, got 0")
+    if len(children) % len(tracks) != 0
+        return err("prism_grid_layout: " + str(len(children)) + " children do not divide evenly into " + str(len(tracks)) + " column(s)")
+    prism_arrange.prism_mesh(tracks, children)
+
+// ── Toolbar ───────────────────────────────────────────────────────────────────────────────────
+
+// See header for why the result is always exactly 3 children.
+fn prism_toolbar(leading: list, centre: list, trailing: list) -> Result<PrismNode>
+    if len(leading) == 0 and len(centre) == 0 and len(trailing) == 0
+        return err("prism_toolbar: at least one of leading/centre/trailing must be non-empty")
+    let lead = prism_arrange.prism_band(leading)?
+    let mid = prism_arrange.prism_band(centre)?
+    let trail = prism_arrange.prism_band(trailing)?
+    prism_arrange.prism_band([lead, mid, trail])

@@ -1,0 +1,277 @@
+// prism_ui_data -- data-display components (prism/ui/, milestone MB.3): list, tree, descriptions,
+// stat/metric, timeline. Every one is a COMPOSITION over the closed 22-primitive vocabulary
+// (widget/), built through prism_ui_kit.nova wherever it fits -- no new PrismNodeKind (axiom A7).
+//
+// ── LIST PROPAGATES prism_each's IDENTITY CONTRACT, IT DOES NOT RE-DERIVE IT ──────────────────
+// `prism_ui_list` takes `key_fn` as a REQUIRED parameter and hands it straight to
+// `prism_structure.prism_each` unmodified -- duplicate-key and non-string-key rejection are
+// entirely `prism_each`'s job (the same "propagate, don't reimplement" discipline
+// prism_table_render already applies to `prism_grid`'s row_key_fn).
+//
+// ── TREE: WHY NODES ARE A FLAT ARRAY + INTEGER CHILD INDICES, NOT NESTED VALUES ────────────────
+// A genuinely self-referential VALUE (a node whose own children list contains itself) is not
+// constructible under NOVA's value semantics -- a child must be built before its parent, so a
+// nested `children: list<PrismUiTreeNode>` design can express "very deep" but never "cyclic".
+// Representing the tree as `nodes: list<PrismUiTreeNode>` (flat) with each node's children given
+// as INDICES into that same list makes a cycle actually representable (node i can legally list
+// index i, or an ancestor's index) -- the only way to honestly test "a tree with a cycle must not
+// hang" instead of asserting something structurally impossible to construct in the first place.
+//
+// Termination is proved two ways, not one:
+//   1. An ANCESTOR-PATH set (mirroring prism_each's own `seen`-dict idiom, rebuilt per recursion
+//      branch via `dict_merge` -- never mutated in place, so sibling branches never see each
+//      other's ancestors) rejects the instant a child index repeats one already on the path from
+//      root to here. A self-loop or an N-node cycle both hit this on their very next step.
+//   2. `PRISM_UI_TREE_MAX_DEPTH` (see its own comment) is a hard ceiling independent of #1 -- it
+//      is what actually satisfies "enforce a maximum depth" for a perfectly ACYCLIC but too-deep
+//      chain, which #1 alone would never catch (no repeated ancestor to trip on).
+// Both guards run BEFORE any recursive call, so recursion depth can never exceed the cap
+// regardless of the input graph's shape -- proved, not assumed.
+//
+// PUBLIC API
+//   List
+//     PrismUiListItem { list_title, list_secondary: string?, list_icon: PrismIcon? } +
+//       prism_ui_list_item(title, secondary, icon)
+//     prism_ui_list(items: list, key_fn) -> Result<PrismNode>
+//       rejects: empty items, a non-PrismUiListItem element, an empty title; duplicate keys are
+//       prism_each's own rejection, propagated unchanged.
+//   Tree
+//     PrismUiTreeNode { tree_label, tree_child_idx: list, tree_expanded: bool } +
+//       prism_ui_tree_node(label, child_idx, expanded)
+//     prism_ui_tree(nodes: list, root_idx: int) -> Result<PrismNode>
+//       rejects: empty nodes, an out-of-bounds root_idx/child index, a non-int child index, an
+//       empty label, depth > PRISM_UI_TREE_MAX_DEPTH, and a cycle (see above) -- never hangs.
+//   Descriptions
+//     prism_ui_descriptions(pairs: list) -> Result<PrismNode>   thin, validated prism_ui_kv wrapper
+//   Stat / metric
+//     PrismStatTrend (closed, 3 values) StatUp()|StatDown()|StatFlat() +
+//       prism_stat_trend_up()/_down()/_flat(), prism_stat_trend_name(t), prism_stat_trend_icon(t)
+//       -- exhaustive, no wildcard; each trend maps to a DISTINCT closed-set icon.
+//     prism_ui_stat(label, value: string, delta: string?, trend) -> Result<PrismNode>
+//       rejects an empty label or value.
+//   Timeline
+//     PrismTimelineStatus (closed, 3 values) TlDone()|TlActive()|TlPending() +
+//       prism_timeline_status_done()/_active()/_pending(), prism_timeline_status_name(s)
+//     PrismUiTimelineEvent { tl_label, tl_status } + prism_ui_timeline_event(label, status)
+//     prism_ui_timeline(events: list) -> Result<PrismNode>
+//       rejects an empty timeline, a non-PrismUiTimelineEvent element, an empty event label.
+//     prism_ui_timeline_status_of(node) -> string   accessor ("done"|"active"|"pending")
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_structure
+import prism_ui_kit
+
+// ── List ────────────────────────────────────────────────────────────────────────────────────────
+
+// Fields are `list_`-prefixed -- the global field-name collision defect (reference_struct_field_
+// name_collision, hit for real building prism_ui_nav.nova's PrismMenuEntry/PrismBreadcrumbItem)
+// means no bare field name here may risk colliding with another struct anywhere in the program.
+type PrismUiListItem
+    list_title: string
+    list_secondary: string?
+    list_icon: PrismIcon?
+
+fn prism_ui_list_item(title: string, secondary: string?, icon: PrismIcon?) -> PrismUiListItem
+    PrismUiListItem(title, secondary, icon)
+
+fn _prism_data_list_content(item: PrismUiListItem) -> Result<PrismNode>
+    let title_node = prism_content.prism_label(item.list_title)?
+    match item.list_secondary
+        None => ok(title_node)
+        Some(sec) =>
+            if len(sec) == 0
+                return ok(title_node)
+            let sec_node = prism_content.prism_label(sec)?
+            prism_arrange.prism_stack([title_node, sec_node])
+
+fn _prism_data_list_row(item) -> Result<PrismNode>
+    if type_name(item) != "PrismUiListItem"
+        return err("prism_ui_list: item is not a PrismUiListItem (got " + type_name(item) + ")")
+    if len(item.list_title) == 0
+        return err("prism_ui_list: item title must not be empty")
+    let content = _prism_data_list_content(item)?
+    match item.list_icon
+        None => ok(content)
+        Some(ic) =>
+            let g = prism_content.prism_glyph(ic)?
+            prism_arrange.prism_band([g, content])
+
+// Propagates prism_each's mandatory identity-selector contract unmodified (see header).
+fn prism_ui_list(items: list, key_fn) -> Result<PrismNode>
+    if len(items) == 0
+        return err("prism_ui_list: needs at least one item")
+    let mk = fn(it) _prism_data_list_row(it)
+    prism_structure.prism_each(items, key_fn, mk)
+
+// ── Tree ────────────────────────────────────────────────────────────────────────────────────────
+
+// Fields are `tree_`-prefixed, same collision discipline as List above.
+type PrismUiTreeNode
+    tree_label: string
+    tree_child_idx: list
+    tree_expanded: bool
+
+fn prism_ui_tree_node(label: string, child_idx: list, expanded: bool) -> PrismUiTreeNode
+    PrismUiTreeNode(label, child_idx, expanded)
+
+// prism_node.nova's own hard bound (PRISM_MAX_TREE_DEPTH) is 256 PrismNode layers for the WHOLE
+// composed page, not just one tree widget. Each UI-tree level here costs 1 PrismNode layer when
+// collapsed (a bare `band`) or 2 when expanded with children (`band` wrapped by a `stack`) --
+// capping the CALLER-FACING tree depth at 32 keeps the worst case at 32*2=64 PrismNode layers,
+// comfortably under 256 with headroom for whatever this tree is composed into (a
+// prism_ui_section, a page around it). 32 also exceeds any realistic nested-outliner or
+// file-tree depth a human actually navigates.
+let PRISM_UI_TREE_MAX_DEPTH = 32
+
+fn _prism_data_tree_chevron(expanded: bool) -> PrismIcon
+    if expanded
+        return prism_content.prism_icon_chevron_down()
+    prism_content.prism_icon_chevron_right()
+
+// See header for the two-part termination proof. Both guards fire BEFORE any recursive call.
+fn _prism_data_tree_build(nodes: list, idx, depth: int, ancestors: dict) -> Result<PrismNode>
+    if not is_int(idx)
+        return err("prism_ui_tree: child index must be an int, got " + type_name(idx))
+    if depth >= PRISM_UI_TREE_MAX_DEPTH
+        return err("prism_ui_tree: depth exceeds max " + str(PRISM_UI_TREE_MAX_DEPTH) + " at node index " + str(idx))
+    if idx < 0 or idx >= len(nodes)
+        return err("prism_ui_tree: child index " + str(idx) + " out of bounds for " + str(len(nodes)) + " node(s)")
+    let path_key = str(idx)
+    if path_key in ancestors
+        return err("prism_ui_tree: cycle detected -- node index " + str(idx) + " re-visited on its own ancestor path")
+    let node = nodes[idx]
+    if type_name(node) != "PrismUiTreeNode"
+        return err("prism_ui_tree: nodes[" + str(idx) + "] is not a PrismUiTreeNode (got " + type_name(node) + ")")
+    if len(node.tree_label) == 0
+        return err("prism_ui_tree: node " + str(idx) + " label must not be empty")
+    let head = prism_ui_kit.prism_ui_icon_text(_prism_data_tree_chevron(node.tree_expanded), node.tree_label)?
+    if not node.tree_expanded or len(node.tree_child_idx) == 0
+        return ok(head)
+    let path = dict_merge(ancestors, {path_key: true})
+    let mk = fn(child_idx) _prism_data_tree_build(nodes, child_idx, depth + 1, path)
+    let child_nodes = prism_ui_kit.prism_ui_collect(node.tree_child_idx, mk)?
+    let body = prism_arrange.prism_stack(child_nodes)?
+    prism_arrange.prism_stack([head, body])
+
+fn prism_ui_tree(nodes: list, root_idx: int) -> Result<PrismNode>
+    if len(nodes) == 0
+        return err("prism_ui_tree: nodes must not be empty")
+    if root_idx < 0 or root_idx >= len(nodes)
+        return err("prism_ui_tree: root_idx " + str(root_idx) + " out of bounds for " + str(len(nodes)) + " node(s)")
+    _prism_data_tree_build(nodes, root_idx, 0, {})
+
+// ── Descriptions ────────────────────────────────────────────────────────────────────────────────
+
+// A thin, validated prism_ui_kv wrapper: adds the one check the kit's generic helper does not --
+// an empty key/value block is a "nothing to describe" state, honestly represented by
+// prism_ui_kit.prism_ui_empty, never a silently-empty stack.
+fn prism_ui_descriptions(pairs: list) -> Result<PrismNode>
+    if len(pairs) == 0
+        return err("prism_ui_descriptions: needs at least one key/value pair -- use prism_ui_kit.prism_ui_empty for nothing to describe")
+    prism_ui_kit.prism_ui_kv(pairs)
+
+// ── Stat / metric ───────────────────────────────────────────────────────────────────────────────
+
+enum PrismStatTrend
+    StatUp()
+    StatDown()
+    StatFlat()
+
+fn prism_stat_trend_up() -> PrismStatTrend
+    StatUp()
+fn prism_stat_trend_down() -> PrismStatTrend
+    StatDown()
+fn prism_stat_trend_flat() -> PrismStatTrend
+    StatFlat()
+
+fn prism_stat_trend_name(t: PrismStatTrend) -> string
+    match t
+        StatUp() => "up"
+        StatDown() => "down"
+        StatFlat() => "flat"
+
+// Exhaustive, no wildcard arm -- each trend maps to a DISTINCT closed-set icon (KAT proves it).
+fn prism_stat_trend_icon(t: PrismStatTrend) -> PrismIcon
+    match t
+        StatUp() => prism_content.prism_icon_chevron_up()
+        StatDown() => prism_content.prism_icon_chevron_down()
+        StatFlat() => prism_content.prism_icon_minus()
+
+// `delta` only renders (icon + text) when present; a bare `Some("")` degrades to no-delta, same
+// tolerance prism_ui_kit's own `note: string?` gives.
+fn prism_ui_stat(label: string, value: string, delta: string?, trend: PrismStatTrend) -> Result<PrismNode>
+    if len(label) == 0
+        return err("prism_ui_stat: label must not be empty")
+    if len(value) == 0
+        return err("prism_ui_stat: value must not be empty")
+    let label_node = prism_content.prism_label(label)?
+    let value_node = prism_content.prism_label(value)?
+    match delta
+        None => prism_arrange.prism_stack([label_node, value_node])
+        Some(d) =>
+            if len(d) == 0
+                return prism_arrange.prism_stack([label_node, value_node])
+            let delta_row = prism_ui_kit.prism_ui_icon_text(prism_stat_trend_icon(trend), d)?
+            prism_arrange.prism_stack([label_node, value_node, delta_row])
+
+// ── Timeline ────────────────────────────────────────────────────────────────────────────────────
+
+enum PrismTimelineStatus
+    TlDone()
+    TlActive()
+    TlPending()
+
+fn prism_timeline_status_done() -> PrismTimelineStatus
+    TlDone()
+fn prism_timeline_status_active() -> PrismTimelineStatus
+    TlActive()
+fn prism_timeline_status_pending() -> PrismTimelineStatus
+    TlPending()
+
+fn prism_timeline_status_name(s: PrismTimelineStatus) -> string
+    match s
+        TlDone() => "done"
+        TlActive() => "active"
+        TlPending() => "pending"
+
+// Fields are `tl_`-prefixed, same collision discipline as List/Tree above.
+type PrismUiTimelineEvent
+    tl_label: string
+    tl_status: PrismTimelineStatus
+
+fn prism_ui_timeline_event(label: string, status: PrismTimelineStatus) -> PrismUiTimelineEvent
+    PrismUiTimelineEvent(label, status)
+
+// Done gets the closed set's checkmark (reusing prism_nav_steps' "complete" precedent rather than
+// inventing a second icon-for-status idiom); active/pending render identically as a plain label
+// and are told apart only by the queryable "tl_status" attr merged on afterward -- the exact
+// prism_tabs/prism_nav_steps idiom (attach caller metadata onto an already-built node without a
+// new PrismNodeKind), reused rather than re-derived.
+fn _prism_data_timeline_node(e) -> Result<PrismNode>
+    if type_name(e) != "PrismUiTimelineEvent"
+        return err("prism_ui_timeline: element is not a PrismUiTimelineEvent (got " + type_name(e) + ")")
+    if len(e.tl_label) == 0
+        return err("prism_ui_timeline: event label must not be empty")
+    let base_r = match e.tl_status
+        TlDone() => prism_ui_kit.prism_ui_icon_text(prism_content.prism_icon_check(), e.tl_label)
+        TlActive() => prism_content.prism_label(e.tl_label)
+        TlPending() => prism_content.prism_label(e.tl_label)
+    if is_err(base_r)
+        return err(unwrap_err(base_r))
+    let base = unwrap(base_r)
+    let merged = dict_merge(base.attrs, {"tl_status": prism_timeline_status_name(e.tl_status)})
+    prism_node.prism_node_new(base.kind, merged, base.children, base.key)
+
+// Rejects an empty timeline; order is preserved because prism_ui_collect maps in list order and
+// prism_stack keeps its children in that same order.
+fn prism_ui_timeline(events: list) -> Result<PrismNode>
+    if len(events) == 0
+        return err("prism_ui_timeline: needs at least one event")
+    let mk = fn(e) _prism_data_timeline_node(e)
+    let nodes = prism_ui_kit.prism_ui_collect(events, mk)?
+    prism_arrange.prism_stack(nodes)
+
+fn prism_ui_timeline_status_of(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "tl_status", "")
