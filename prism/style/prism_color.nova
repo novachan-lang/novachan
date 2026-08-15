@@ -1,0 +1,184 @@
+// prism_color -- the Color value type underlying `look`/`palette` (PRISM_SPEC.md §11).
+// Milestone MA.4 part A. Every `look` property typed `Color` (`fill`, `edge`, `ink`, per §11's
+// "Complete property set" table) and every `palette` slot (prism_palette.nova, same milestone)
+// resolves to a value of THIS type. Nothing in this file knows about `look`/`palette` syntax,
+// cascade resolution, or the eventual renderer's paint model -- see that header note in
+// prism_node.nova for why the same discipline (one file, one job) applies here too.
+//
+// ── DESIGN DECISION: int channels 0-255, not float 0.0-1.0 ────────────────────────────────
+// PRISM_SPEC.md's own syntax is exclusively hex literals (`#ffffff`, `#111827`, ...) -- there is
+// no float-triple color literal anywhere in the spec. Int channels are therefore both the more
+// faithful representation of what a NOVA author actually writes AND the one that sidesteps two
+// separate, independently-verified NOVA float codegen/soundness bugs entirely for the color type
+// itself (a float-returning fn can return an uninitialized garbage value for a multi-term inline
+// expression, and a float-variable-vs-int compare is unsound -- both documented in
+// NOVA_LANGUAGE_FEATURES.md and hit hard enough in this codebase to earn named memory entries).
+// Any float arithmetic Color's CONSUMERS need (WCAG relative luminance, for instance) happens in
+// a module that already carries the float-hazard discipline in its own header -- see the next
+// note -- rather than being reinvented here where it isn't needed at all.
+//
+// ── DESIGN DECISION: WCAG contrast math is NOT reimplemented here (or in prism_palette.nova) ──
+// `std/color/contrast.nova` (`cst_luminance` / `cst_ratio`) already exists, is KAT-proven
+// (`_contrast_test.nova`: black/white = 21.0, `#777` vs white correctly fails AA), and its own
+// header documents every float hazard this exact computation would otherwise re-trip (uninit
+// return-slot on multi-term float exprs, unsound float-vs-int compare, `abs()` returning int).
+// CLAUDE.md's "does this already exist?" rule is explicit that duplicating existing, verified
+// functionality is a recurring real failure -- reinventing sRGB linearization + relative
+// luminance here would be exactly that failure. prism_palette.nova imports it directly.
+//
+// ── DESIGN DECISION: `prism_color_hex` requires the leading '#' ───────────────────────────────
+// std/color/hex.nova's `chex_to_rgb` treats '#' as optional (CSS attribute-value contexts allow
+// bare hex). PRISM_SPEC.md §11 never writes a color literal without '#' -- `fill #gg0000 is a
+// lexical error` is the spec's OWN phrasing for the invalid case, always with the sigil present --
+// so a Prism color string missing '#' is treated as a distinct, named rejection (see below),
+// not silently tolerated the way the general-purpose std codec tolerates it.
+//
+// ── DESIGN DECISION: `prism_color_rgba` is the one real constructor ───────────────────────────
+// Mirrors prism_node.nova's `prism_node_new` chokepoint pattern: every other constructor in this
+// file (`prism_color_hex`) funnels through `prism_color_rgba` rather than calling the bare
+// `PrismColor(...)` positional constructor a second time, so channel-range validation lives in
+// exactly one place. This is also the file's Trap-11 cross-module wrapper (NOVA_LANGUAGE_FEATURES.md
+// ★11: constructors are file-local) -- prism_palette.nova and every other consumer that needs to
+// BUILD a PrismColor from raw channel ints goes through `prism_color_rgba`, since `PrismColor(...)`
+// itself only resolves inside this file.
+//
+// PUBLIC API
+//   PrismColor { r, g, b, a: int }               all channels 0-255; alpha defaults to opaque
+//                                                  (255) via prism_color_hex's 3/6-digit forms
+//   prism_color_rgba(r, g, b, a) -> Result<PrismColor>   the one real ctor; range-checks all 4
+//   prism_color_hex(s: string) -> Result<PrismColor>     parses "#rgb" / "#rrggbb" / "#rrggbbaa",
+//                                                          case-insensitive digits; typed lexical
+//                                                          errors (missing '#', bad length,
+//                                                          non-hex digit -- see below)
+//   prism_color_to_hex(c) -> string                       canonical lowercase "#rrggbb", or
+//                                                          "#rrggbbaa" when a != 255; round-trips
+//                                                          through prism_color_hex
+//   prism_color_r(c) / _g(c) / _b(c) / _a(c) -> int       accessors
+
+// ── Hex digit alphabet + nibble/byte helpers (private) ────────────────────────────────────────
+// Same table-lookup approach std/color/hex.nova's _chex_nibble/_chex_byte_to_hex use, verified
+// working in this codebase already. Prefixed _prism_color_ (not bare _chex_) -- NOVA's flat LLVM
+// symbol space means a private helper is just as collision-prone as a public one.
+
+fn _prism_color_alphabet() -> string
+    "0123456789abcdef"
+
+// One hex character (either case) -> nibble value 0-15, or -1 if not a hex digit at all.
+fn _prism_color_nibble(c: string) -> int
+    let lc = lower(c)
+    let alpha = _prism_color_alphabet()
+    let mut i = 0
+    while i < 16
+        if alpha[i] == lc
+            return i
+        i += 1
+    0 - 1
+
+// Two consecutive hex characters in `digits` at `pos` -> byte value 0-255.
+// PRECONDITION: both characters already verified valid by the caller's scan (prism_color_hex
+// validates every character before parsing), so no -1 propagation is needed here.
+fn _prism_color_parse_byte(digits: string, pos: int) -> int
+    let hi = _prism_color_nibble(digits[pos])
+    let lo = _prism_color_nibble(digits[pos + 1])
+    hi * 16 + lo
+
+// One hex character in `digits` at `pos`, expanded CSS-shorthand style ('a' -> 0xaa = 170).
+// Same precondition as _prism_color_parse_byte.
+fn _prism_color_expand_nibble(digits: string, pos: int) -> int
+    let n = _prism_color_nibble(digits[pos])
+    n * 16 + n
+
+// Render an int 0-255 as exactly two lowercase hex characters.
+fn _prism_color_byte_to_hex(b: int) -> string
+    let alpha = _prism_color_alphabet()
+    let hi = b / 16
+    let lo = b - hi * 16
+    alpha[hi] + alpha[lo]
+
+// ── The value type ─────────────────────────────────────────────────────────────────────────
+
+type PrismColor
+    r: int
+    g: int
+    b: int
+    a: int
+
+// ── The one real constructor ──────────────────────────────────────────────────────────────
+
+// Range-checks all four channels independently so the error names the SPECIFIC bad channel and
+// value, rather than a generic "invalid color" -- matching prism_node_new's own "typed error,
+// never a crash, name what was wrong" discipline.
+fn prism_color_rgba(r: int, g: int, b: int, a: int) -> Result<PrismColor>
+    if r < 0 or r > 255
+        return err("prism_color: r channel out of range [0,255], got " + str(r))
+    if g < 0 or g > 255
+        return err("prism_color: g channel out of range [0,255], got " + str(g))
+    if b < 0 or b > 255
+        return err("prism_color: b channel out of range [0,255], got " + str(b))
+    if a < 0 or a > 255
+        return err("prism_color: a channel out of range [0,255], got " + str(a))
+    ok(PrismColor(r, g, b, a))
+
+// ── Hex parsing ────────────────────────────────────────────────────────────────────────────
+
+// Parses "#rgb" (CSS shorthand, each nibble doubled), "#rrggbb" (opaque), or "#rrggbbaa"
+// (explicit alpha). Case-insensitive hex digits. Every rejection names exactly what was wrong
+// (missing '#', wrong digit count, or the specific invalid character and its position) --
+// PRISM_SPEC.md §11's own example of an invalid color, `fill #gg0000`, is "a lexical error", not
+// a runtime crash or a silently-accepted garbage value, and that is exactly what this returns.
+fn prism_color_hex(s: string) -> Result<PrismColor>
+    if len(s) == 0
+        return err("prism_color: hex string is empty")
+    if s[0] != "#"
+        return err("prism_color: hex string must start with '#', got \"" + s + "\"")
+    let digits = slice(s, 1, len(s))
+    let n = len(digits)
+    if n != 3 and n != 6 and n != 8
+        return err("prism_color: hex string must have 3, 6, or 8 digits after '#' (got " + str(n) + " in \"" + s + "\")")
+    // Validate every digit BEFORE parsing any of them, so a bad character anywhere is reported
+    // by position rather than surfacing as a confusing downstream parse artifact.
+    let mut i = 0
+    while i < n
+        if _prism_color_nibble(digits[i]) < 0
+            return err("prism_color: invalid hex digit '" + digits[i] + "' at position " + str(i) + " in \"" + s + "\"")
+        i += 1
+    if n == 3
+        let r = _prism_color_expand_nibble(digits, 0)
+        let g = _prism_color_expand_nibble(digits, 1)
+        let b = _prism_color_expand_nibble(digits, 2)
+        return prism_color_rgba(r, g, b, 255)
+    let r = _prism_color_parse_byte(digits, 0)
+    let g = _prism_color_parse_byte(digits, 2)
+    let b = _prism_color_parse_byte(digits, 4)
+    if n == 6
+        return prism_color_rgba(r, g, b, 255)
+    // n == 8
+    let a = _prism_color_parse_byte(digits, 6)
+    prism_color_rgba(r, g, b, a)
+
+// Canonical lowercase "#rrggbb" -- or "#rrggbbaa" when alpha is not fully opaque. Every
+// PrismColor was itself constructed through prism_color_rgba's range check, so channels are
+// guaranteed 0-255 here; no re-validation needed (bounds validated at construction, not on
+// every read -- same invariant prism_node.nova's cached depth/count relies on).
+fn prism_color_to_hex(c: PrismColor) -> string
+    let rs = _prism_color_byte_to_hex(c.r)
+    let gs = _prism_color_byte_to_hex(c.g)
+    let bs = _prism_color_byte_to_hex(c.b)
+    if c.a != 255
+        let as_hex = _prism_color_byte_to_hex(c.a)
+        return "#" + rs + gs + bs + as_hex
+    "#" + rs + gs + bs
+
+// ── Accessors ──────────────────────────────────────────────────────────────────────────────
+
+fn prism_color_r(c: PrismColor) -> int
+    c.r
+
+fn prism_color_g(c: PrismColor) -> int
+    c.g
+
+fn prism_color_b(c: PrismColor) -> int
+    c.b
+
+fn prism_color_a(c: PrismColor) -> int
+    c.a
