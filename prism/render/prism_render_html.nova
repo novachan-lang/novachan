@@ -1,0 +1,322 @@
+// prism_render_html -- node tree -> HTML, server-side. Milestone MA.5.
+//
+// This is the milestone that makes Prism USEFUL TODAY: it needs no compiler change, no WASM, no
+// closures across a boundary. A Forge route can build a typed Prism node tree and serve it now.
+//
+// ── THIS FILE IS PRISM'S ONLY SINK. READ PRISM_SPEC.md §17A BEFORE CHANGING IT. ───────────────
+// §15.1 says injection is unrepresentable because Prism has NO markup sink. On the GPU and
+// terminal backends that is literally true. THIS FILE CREATES ONE, and §17A restates the
+// guarantee honestly for the HTML target:
+//
+//   Exactly ONE function may emit a `<`, and the set of positions where data can reach the
+//   output is FINITE AND ENUMERABLE, because the vocabulary is closed.
+//
+// That enumerability is the entire payoff of axiom A7. Every byte emitted comes from one of five
+// sources and only TWO of them are data:
+//   element names       <- a fixed 22-entry kind->element map     NOT attacker-controllable
+//   attribute names     <- fixed string literals in this file      NOT attacker-controllable
+//   punctuation < > / = "   <- this file                            NOT attacker-controllable
+//   TEXT CONTENT        <- data   ==> _esc_text  (& < >)
+//   ATTRIBUTE VALUES    <- data   ==> _esc_attr  (& < > " '), ALWAYS double-quoted
+// A template language has an unbounded number of sinks and fails when one is missed. Prism has
+// two, both in this file. That is the difference worth defending -- and it holds only while the
+// element and attribute-name maps stay literal-driven. Never derive either from data.
+//
+// ── §17A's BINDING RULES, AND WHERE EACH IS ENFORCED ──────────────────────────────────────────
+//   1. No script/style/iframe/object/embed. STRUCTURAL: no PrismNodeKind maps to one. Not a filter.
+//   2. No `on*` event-handler attributes, ever. Interactivity binds against node identity at
+//      runtime; it is never smuggled through markup. Nothing here emits an attribute name that is
+//      not a literal in this file, and no literal here begins with "on".
+//   3. No comments, no CDATA -- `<!--` is never emitted, so there is no context to escape for.
+//   4. Attribute values are ALWAYS double-quoted. Unquoted values turn a space in data into a
+//      structural break that no amount of entity-escaping repairs.
+//   5. `href` comes only from a destination already validated by §15.1.1 at construction. This
+//      file does not re-validate (that is not its job) but it DOES attribute-escape, because
+//      escaping and allowlisting answer different questions.
+//   6. External links carry rel="noopener noreferrer". Without `noopener` the opened page keeps a
+//      live `window.opener` handle back into this origin -- tabnabbing, which is entirely
+//      orthogonal to whether the URL passed the scheme allowlist.
+//   7. `draw` emits a placeholder element and no script; its paint callback is client-side.
+//   8. Determinism: every attribute is emitted in a FIXED LITERAL ORDER per kind (stronger than
+//      relying on dict order, though spec §15.9 establishes that dict order would suffice).
+//
+// ── DISPATCH: WHY IT IS A STRING MATCH WITH AN ERRORING DEFAULT ───────────────────────────────
+// The obvious design -- `match prism_node_kind(n)` over PrismNodeKind with no wildcard arm, so
+// that adding primitive #23 without teaching this renderer about it is a compile error -- WAS
+// WRITTEN FIRST AND THEN MEASURED, AND IT DOES NOT WORK. Probed directly 2026-08-15 by deleting
+// the `Tabs()` arm:
+//   * a match in the SAME FILE as the enum IS exhaustiveness-checked
+//       -> error[E1009]: non-exhaustive match on enum PrismNodeKind: missing Tabs
+//   * the SAME match CROSS-MODULE is NOT checked -- it compiles silently, and at runtime the
+//     un-matched variant yields an EMPTY STRING.
+// So in this file (which is not prism_node.nova) an enum match buys exactly nothing over a string
+// match, while LOOKING like it carries a guarantee -- the worst of both. Primitive #23 would have
+// rendered as silent nothingness in Prism's one security-critical file.
+// Therefore: dispatch on prism_node_kind_str(). That function lives in prism_node.nova ALONGSIDE
+// the enum, so ITS match is genuinely exhaustiveness-checked -- adding a 23rd variant is a compile
+// error THERE. Here, the `_` arm below turns an unknown kind into a LOUD typed error instead of
+// silence. The guarantee is preserved; it just has to be assembled from two halves, one in each
+// file, because exhaustiveness does not cross the module boundary.
+//
+// ── ESCAPING: TWO FUNCTIONS, NOT ONE ──────────────────────────────────────────────────────────
+// Text and attribute contexts have different dangerous characters. Using one escaper for both is
+// the classic mistake: escaping only `& < >` and then interpolating into an attribute leaves `"`
+// live, which closes the attribute and starts a new one. Both are implemented; the per-kind
+// renderers below never interpolate raw data.
+//
+// PUBLIC API
+//   prism_html_render(node)             -> Result<string>   the node tree as an HTML fragment
+//   prism_html_render_page(node, title) -> Result<string>   a full document around that fragment
+//   prism_html_escape_text(s)           -> string           `&` `<` `>`
+//   prism_html_escape_attr(s)           -> string           `&` `<` `>` `"` `'`
+
+import prism_node
+
+// ── Escaping ──────────────────────────────────────────────────────────────────────────────────
+// `&` MUST be replaced first, otherwise the `&` introduced by a later replacement gets
+// double-escaped (`<` -> `&lt;` -> `&amp;lt;`). Order is correctness here, not style.
+
+fn prism_html_escape_text(s: string) -> string
+    let out = replace(s, "&", "&amp;")
+    out = replace(out, "<", "&lt;")
+    out = replace(out, ">", "&gt;")
+    out
+
+fn prism_html_escape_attr(s: string) -> string
+    let out = replace(s, "&", "&amp;")
+    out = replace(out, "<", "&lt;")
+    out = replace(out, ">", "&gt;")
+    out = replace(out, "\"", "&quot;")
+    out = replace(out, "'", "&#39;")
+    out
+
+// One attribute, always double-quoted (rule 4). `name` is always a literal at the call site.
+fn _attr(name: string, value: string) -> string
+    " " + name + "=\"" + prism_html_escape_attr(value) + "\""
+
+// The identity key, when a node carries one (`each`/`grid` rows). Emitted as a data-* attribute so
+// it never collides with a real HTML attribute name.
+fn _key_attr(n: PrismNode) -> string
+    match prism_node.prism_node_key(n)
+        Some(k) => _attr("data-prism-key", k)
+        None => ""
+
+// ── Children ──────────────────────────────────────────────────────────────────────────────────
+fn _render_children(n: PrismNode) -> Result<string>
+    let out = ""
+    for c in prism_node.prism_node_children(n)
+        let r = prism_html_render(c)
+        if is_err(r)
+            return err(unwrap_err(r))
+        out = out + unwrap(r)
+    ok(out)
+
+fn _wrap(n: PrismNode, tag: string, cls: string, extra: string) -> Result<string>
+    let kids = _render_children(n)
+    if is_err(kids)
+        return err(unwrap_err(kids))
+    ok("<" + tag + _attr("class", cls) + extra + _key_attr(n) + ">" + unwrap(kids) + "</" + tag + ">")
+
+// ── The renderer ──────────────────────────────────────────────────────────────────────────────
+// String dispatch with a LOUD default -- see the dispatch note in the header for why an enum
+// match would be a false guarantee in this file.
+fn prism_html_render(n: PrismNode) -> Result<string>
+    match prism_node.prism_node_kind_str(n)
+        "stack" => _wrap(n, "div", "prism-stack", "")
+        "band" => _wrap(n, "div", "prism-band", "")
+        "layer" => _wrap(n, "div", "prism-layer", "")
+        "mesh" => _render_mesh(n)
+        "flow" => _wrap(n, "div", "prism-flow", "")
+        "pane" => _wrap(n, "div", "prism-pane", "")
+        "gap" => _render_gap(n)
+        "label" => _render_label(n)
+        "art" => _render_art(n)
+        "glyph" => _render_glyph(n)
+        "draw" => _render_draw(n)
+        "press" => _render_press(n)
+        "entry" => _render_entry(n)
+        "pick" => _render_pick(n)
+        "flag" => _render_flag(n)
+        "range" => _render_range(n)
+        "link" => _render_link(n)
+        "each" => _render_each(n)
+        "grid" => _render_grid(n)
+        "sheet" => _render_sheet(n)
+        "hint" => _render_hint(n)
+        "tabs" => _render_tabs(n)
+        _ => err("prism_html_render: no HTML mapping for node kind '" + prism_node.prism_node_kind_str(n) + "' -- a primitive was added to PrismNodeKind without teaching the HTML renderer about it (PRISM_SPEC.md §17A)")
+
+// ── Arrangement ───────────────────────────────────────────────────────────────────────────────
+
+fn _render_mesh(n: PrismNode) -> Result<string>
+    let cols = prism_node.prism_node_attr_int(n, "col_count", 1)
+    _wrap(n, "div", "prism-mesh", _attr("data-cols", str(cols)))
+
+// A spacer is not content, so it is hidden from assistive technology (§13's derived a11y).
+fn _render_gap(n: PrismNode) -> Result<string>
+    let flexible = prism_node.prism_node_attr_bool(n, "flexible", false)
+    let extra = _attr("aria-hidden", "true")
+    if flexible
+        return ok("<div" + _attr("class", "prism-gap prism-gap-flex") + extra + "></div>")
+    let size = prism_node.prism_node_attr_int(n, "size", 0)
+    ok("<div" + _attr("class", "prism-gap") + _attr("data-size", str(size)) + extra + "></div>")
+
+// ── Content ───────────────────────────────────────────────────────────────────────────────────
+
+// The one place user text becomes output. §15.1/A3: it renders as glyphs, never as markup --
+// which at this layer means _esc_text, unconditionally, with no bypass.
+fn _render_label(n: PrismNode) -> Result<string>
+    let text = prism_node.prism_node_attr_str(n, "text", "")
+    ok("<span" + _attr("class", "prism-label") + _key_attr(n) + ">" + prism_html_escape_text(text) + "</span>")
+
+// `alt` is required, not optional: an <img> with no alt is an accessibility defect, and the empty
+// string is the correct value for a decorative image rather than an omitted attribute.
+fn _render_art(n: PrismNode) -> Result<string>
+    let src = prism_node.prism_node_attr_str(n, "source", "")
+    let alt = prism_node.prism_node_attr_str(n, "alt", "")
+    ok("<img" + _attr("class", "prism-art") + _attr("src", src) + _attr("alt", alt) + _key_attr(n) + ">")
+
+// From the closed PrismIcon set, so `data-icon` can only ever be one of 12 known strings.
+fn _render_glyph(n: PrismNode) -> Result<string>
+    let icon = prism_node.prism_node_attr_str(n, "icon", "")
+    ok("<span" + _attr("class", "prism-glyph") + _attr("data-icon", icon) + _attr("aria-hidden", "true") + _key_attr(n) + "></span>")
+
+// Rule 7: a placeholder element and NO script. The paint callback is client-side by nature.
+fn _render_draw(n: PrismNode) -> Result<string>
+    ok("<canvas" + _attr("class", "prism-draw") + _key_attr(n) + "></canvas>")
+
+// ── Interaction ───────────────────────────────────────────────────────────────────────────────
+
+// `type="button"` explicitly: an untyped <button> inside a <form> defaults to submit, which turns
+// every press into an accidental form submission.
+fn _render_press(n: PrismNode) -> Result<string>
+    let text = prism_node.prism_node_attr_str(n, "text", "")
+    let kids = _render_children(n)
+    if is_err(kids)
+        return err(unwrap_err(kids))
+    let head = "<button" + _attr("class", "prism-press") + _attr("type", "button") + _key_attr(n) + ">"
+    ok(head + prism_html_escape_text(text) + unwrap(kids) + "</button>")
+
+fn _render_entry(n: PrismNode) -> Result<string>
+    let prompt = prism_node.prism_node_attr_str(n, "prompt", "")
+    let kind = prism_node.prism_node_attr_str(n, "kind", "text")
+    let value = prism_node.prism_node_attr_str(n, "value", "")
+    if kind == "multiline"
+        let head = "<textarea" + _attr("class", "prism-entry") + _attr("aria-label", prompt) + _key_attr(n) + ">"
+        return ok(head + prism_html_escape_text(value) + "</textarea>")
+    ok("<input" + _attr("class", "prism-entry") + _attr("type", kind) + _attr("aria-label", prompt) + _attr("value", value) + _key_attr(n) + ">")
+
+fn _render_pick(n: PrismNode) -> Result<string>
+    let selected = prism_node.prism_node_attr_str(n, "selected_value", "")
+    let opts = ""
+    if prism_node.prism_node_has_attr(n, "options")
+        for o in n.attrs["options"]
+            let sel = ""
+            if o.value == selected and selected != ""
+                sel = " selected"
+            opts = opts + "<option" + _attr("value", o.value) + sel + ">" + prism_html_escape_text(o.label) + "</option>"
+    ok("<select" + _attr("class", "prism-pick") + _key_attr(n) + ">" + opts + "</select>")
+
+fn _render_flag(n: PrismNode) -> Result<string>
+    let label = prism_node.prism_node_attr_str(n, "label", "")
+    let state = prism_node.prism_node_attr_bool(n, "state", false)
+    let checked = ""
+    if state
+        checked = " checked"
+    ok("<input" + _attr("class", "prism-flag") + _attr("type", "checkbox") + _attr("aria-label", label) + checked + _key_attr(n) + ">")
+
+fn _render_range(n: PrismNode) -> Result<string>
+    let label = prism_node.prism_node_attr_str(n, "label", "")
+    let lo = prism_node.prism_node_attr_int(n, "min", 0)
+    let hi = prism_node.prism_node_attr_int(n, "max", 100)
+    let step = prism_node.prism_node_attr_int(n, "step", 1)
+    let value = prism_node.prism_node_attr_int(n, "value", 0)
+    let head = "<input" + _attr("class", "prism-range") + _attr("type", "range")
+    let bounds = _attr("min", str(lo)) + _attr("max", str(hi)) + _attr("step", str(step)) + _attr("value", str(value))
+    ok(head + bounds + _attr("aria-label", label) + _key_attr(n) + ">")
+
+// Rule 5 + rule 6. `href` was already scheme-allowlisted at construction (§15.1.1); it is escaped
+// here anyway because escaping and allowlisting answer different questions. `rel` is added for
+// EXTERNAL destinations only -- an in-app route cannot reach another origin, so `noopener` there
+// would be noise.
+fn _render_link(n: PrismNode) -> Result<string>
+    let text = prism_node.prism_node_attr_str(n, "text", "")
+    let href = prism_node.prism_node_attr_str(n, "href", "")
+    let kind = prism_node.prism_node_attr_str(n, "kind", "route")
+    let rel = ""
+    if kind == "external"
+        rel = _attr("rel", "noopener noreferrer")
+    let head = "<a" + _attr("class", "prism-link") + _attr("href", href) + rel + _key_attr(n) + ">"
+    ok(head + prism_html_escape_text(text) + "</a>")
+
+// ── Structure ─────────────────────────────────────────────────────────────────────────────────
+
+// NO WRAPPER ELEMENT (§17A). A wrapper would break the parent's layout contract -- an `each`
+// inside a `mesh` would become one grid cell containing N rows instead of N cells. It is safe to
+// omit because MA.3's `each` already attached the identity key to each ROW node, so the key rides
+// on the row rather than needing a container to hold it.
+fn _render_each(n: PrismNode) -> Result<string>
+    _render_children(n)
+
+// A grid's children are Band row nodes (MA.3 composes rows from the closed vocabulary rather than
+// inventing a "Row" tag). Table semantics need <tr>/<td> rather than the Band default, so this
+// renders its own descendants two levels down instead of recursing generically.
+fn _render_grid(n: PrismNode) -> Result<string>
+    let rows = ""
+    for row in prism_node.prism_node_children(n)
+        let cells = ""
+        for cell in prism_node.prism_node_children(row)
+            let r = prism_html_render(cell)
+            if is_err(r)
+                return err(unwrap_err(r))
+            cells = cells + "<td>" + unwrap(r) + "</td>"
+        rows = rows + "<tr" + _key_attr(row) + ">" + cells + "</tr>"
+    ok("<table" + _attr("class", "prism-grid") + _attr("role", "table") + _key_attr(n) + "><tbody>" + rows + "</tbody></table>")
+
+fn _render_sheet(n: PrismNode) -> Result<string>
+    let exclusive = prism_node.prism_node_attr_bool(n, "exclusive", false)
+    let extra = ""
+    if exclusive
+        extra = _attr("aria-modal", "true")
+    _wrap(n, "dialog", "prism-sheet", extra)
+
+// The tooltip text is a sibling of the anchor, wired by aria-describedby at the runtime layer.
+fn _render_hint(n: PrismNode) -> Result<string>
+    let text = prism_node.prism_node_attr_str(n, "text", "")
+    let kids = _render_children(n)
+    if is_err(kids)
+        return err(unwrap_err(kids))
+    let tip = "<span" + _attr("class", "prism-hint-text") + _attr("role", "tooltip") + ">" + prism_html_escape_text(text) + "</span>"
+    ok("<span" + _attr("class", "prism-hint") + _key_attr(n) + ">" + unwrap(kids) + tip + "</span>")
+
+fn _render_tabs(n: PrismNode) -> Result<string>
+    let selected = prism_node.prism_node_attr_int(n, "selected", 0)
+    let heads = ""
+    let panels = ""
+    let i = 0
+    for panel in prism_node.prism_node_children(n)
+        let label = prism_node.prism_node_attr_str(panel, "tab_label", "")
+        let is_sel = "false"
+        if i == selected
+            is_sel = "true"
+        heads = heads + "<button" + _attr("class", "prism-tab") + _attr("type", "button") + _attr("role", "tab") + _attr("aria-selected", is_sel) + ">" + prism_html_escape_text(label) + "</button>"
+        let body = prism_html_render(panel)
+        if is_err(body)
+            return err(unwrap_err(body))
+        let hidden = ""
+        if i != selected
+            hidden = _attr("hidden", "hidden")
+        panels = panels + "<div" + _attr("class", "prism-tabpanel") + _attr("role", "tabpanel") + hidden + ">" + unwrap(body) + "</div>"
+        i += 1
+    let bar = "<div" + _attr("class", "prism-tablist") + _attr("role", "tablist") + ">" + heads + "</div>"
+    ok("<div" + _attr("class", "prism-tabs") + _key_attr(n) + ">" + bar + panels + "</div>")
+
+// ── Full document ─────────────────────────────────────────────────────────────────────────────
+// No <script> and no external <link> -- rule 1. The title is escaped like any other text.
+fn prism_html_render_page(node: PrismNode, title: string) -> Result<string>
+    let body = prism_html_render(node)
+    if is_err(body)
+        return err(unwrap_err(body))
+    let head = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    let vp = "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    ok(head + vp + "<title>" + prism_html_escape_text(title) + "</title></head><body>" + unwrap(body) + "</body></html>")

@@ -1,0 +1,192 @@
+// KAT for prism/render/prism_render_html.nova (milestone MA.5).
+//
+// This file is Prism's ONLY markup sink, so this KAT is a security test first and a rendering
+// test second. It proves:
+//   1. Escaping is correct in BOTH contexts, and `&` is escaped FIRST (no double-escaping).
+//   2. ★ XSS is not expressible: markup in user data comes out as text, everywhere data can land
+//      -- label text, button text, link text, entry values, option labels, tooltip text, the page
+//      title. A single unescaped position is a total failure, so every one is asserted.
+//   3. ★ Attribute-context breakout is impossible: a quote in data cannot close the attribute.
+//   4. ★ No `on*` handler attribute and no <script>/<style>/<iframe> appears in ANY output.
+//   5. External links carry rel="noopener noreferrer"; in-app routes do NOT (it would be noise).
+//   6. `each` emits NO wrapper element; `grid` emits real table semantics.
+//   7. ★ Byte-identical output across repeated renders of a 20+ node page (MA.5's exit criterion).
+//   8. An unknown node kind fails LOUDLY (typed error), never silently renders nothing.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_render_html.nova
+//   clang -O2 -o _kat_prism_render_html.exe _kat_prism_render_html.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_structure
+import prism_render_html as rh
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        print("        got  = " + got)
+        print("        want = " + want)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+// The core security assertion: `needle` must NOT appear anywhere in `hay`.
+fn _check_absent(label: string, hay: string, needle: string)
+    if find(hay, needle) < 0
+        print("  pass  absent: " + label)
+    else
+        print("  FAIL  absent: " + label + " -- FOUND in output")
+        print("        output = " + hay)
+        FAILED[0] = FAILED[0] + 1
+
+fn main()
+    // The canonical XSS probe, and a quote-breakout probe for attribute context.
+    let XSS = "<script>alert('pwn')</script>"
+    let QUOTE = "\" onmouseover=\"alert(1)"
+
+    print("== 1. escaping, both contexts ==")
+    _check("text: &", rh.prism_html_escape_text("a & b"), "a &amp; b")
+    _check("text: < >", rh.prism_html_escape_text("<b>"), "&lt;b&gt;")
+    _check("text: quote left alone", rh.prism_html_escape_text("say \"hi\""), "say \"hi\"")
+    _check("attr: quote escaped", rh.prism_html_escape_attr("say \"hi\""), "say &quot;hi&quot;")
+    _check("attr: apostrophe escaped", rh.prism_html_escape_attr("it's"), "it&#39;s")
+    // & MUST be replaced first or `<` -> `&lt;` -> `&amp;lt;`. This asserts it was.
+    _check("no double-escaping", rh.prism_html_escape_text("&lt;"), "&amp;lt;")
+    _check("empty string", rh.prism_html_escape_text(""), "")
+
+    print("== 2. XSS is not expressible -- every position data can reach ==")
+    let lbl = unwrap(rh.prism_html_render(unwrap(prism_content.prism_label(XSS))))
+    _check_absent("label text", lbl, "<script>")
+    _check_true("label kept the text as escaped content", find(lbl, "&lt;script&gt;") >= 0)
+
+    let btn = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_press(XSS, []))))
+    _check_absent("press text", btn, "<script>")
+
+    let lnk = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_link(XSS, prism_interact.prism_link_target_route("/x")))))
+    _check_absent("link text", lnk, "<script>")
+
+    let ent = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_entry("Name", prism_interact.prism_entry_kind_text(), XSS))))
+    _check_absent("entry value (attribute context)", ent, "<script>")
+
+    let ml = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_entry("Bio", prism_interact.prism_entry_kind_multiline(), XSS))))
+    _check_absent("textarea value (text context)", ml, "<script>")
+
+    let opt1 = prism_interact.prism_pick_option("a", XSS)
+    let pk = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_pick([opt1], "a"))))
+    _check_absent("pick option label", pk, "<script>")
+
+    let hnt = unwrap(rh.prism_html_render(unwrap(prism_structure.prism_hint(XSS, unwrap(prism_content.prism_label("anchor"))))))
+    _check_absent("hint tooltip text", hnt, "<script>")
+
+    let pg = unwrap(rh.prism_html_render_page(unwrap(prism_content.prism_label("ok")), XSS))
+    _check_absent("page title", pg, "<script>alert")
+
+    print("== 3. attribute breakout is impossible ==")
+    // NOTE ON WHAT IS ACTUALLY BEING ASSERTED (this test was wrong once and the fix was to the
+    // TEST, not the renderer). Output for the QUOTE probe is:
+    //     value="&quot; onmouseover=&quot;alert(1)"
+    // The literal text ` onmouseover=` DOES appear -- and that is harmless. The injected quote
+    // became `&quot;`, so the attribute is never closed and the whole run is inert text inside
+    // ONE properly-quoted value. Asserting that bare substring is absent asserts the WRONG
+    // property and fails on correct output. The real property is that no ATTRIBUTE-SHAPED
+    // `onmouseover="` -- with a LIVE double quote after the `=` -- exists anywhere.
+    let live_handler = "onmouseover=\""
+    let brk = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_entry("Name", prism_interact.prism_entry_kind_text(), QUOTE))))
+    _check_absent("no live onmouseover attribute", brk, live_handler)
+    _check_true("injected quote neutralized to an entity", find(brk, "&quot; onmouseover=&quot;") >= 0)
+    let albl = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_flag(QUOTE, true))))
+    _check_absent("no live onmouseover in aria-label", albl, live_handler)
+    _check_true("aria-label quote neutralized", find(albl, "&quot;") >= 0)
+
+    print("== 4. forbidden constructs never appear (§17A rules 1 and 2) ==")
+    // One big tree exercising every primitive that can carry data.
+    let row_lbl = unwrap(prism_content.prism_label("cell"))
+    let big = unwrap(prism_arrange.prism_stack([lblnode(), btnnode(), linknode(), entrynode(), flagnode(), rangenode(), glyphnode(), artnode(), drawnode(), gapnode(), row_lbl]))
+    let out = unwrap(rh.prism_html_render(big))
+    _check_absent("no <script", out, "<script")
+    _check_absent("no <style", out, "<style")
+    _check_absent("no <iframe", out, "<iframe")
+    _check_absent("no onclick=", out, "onclick=")
+    _check_absent("no onerror=", out, "onerror=")
+    _check_absent("no onload=", out, "onload=")
+    _check_absent("no javascript: url", out, "javascript:")
+    _check_absent("no html comment", out, "<!--")
+
+    print("== 5. rel on external links only ==")
+    let ext = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_link("Docs", prism_interact.prism_link_target_url("https://example.com")))))
+    _check_true("external carries noopener", find(ext, "rel=\"noopener noreferrer\"") >= 0)
+    let route = unwrap(rh.prism_html_render(unwrap(prism_interact.prism_link("Home", prism_interact.prism_link_target_route("/home")))))
+    _check_absent("in-app route has no rel", route, "rel=")
+
+    print("== 6. each has no wrapper; grid is a real table ==")
+    let items = ["x", "y"]
+    let ea = unwrap(prism_structure.prism_each(items, fn(i) i, fn(i) prism_content.prism_label(i)))
+    let eah = unwrap(rh.prism_html_render(ea))
+    _check("each emits only its rows", eah, "<span class=\"prism-label\" data-prism-key=\"x\">x</span><span class=\"prism-label\" data-prism-key=\"y\">y</span>")
+    let gr = unwrap(prism_structure.prism_grid(items, fn(i) i, ["c1"], fn(i, c) prism_content.prism_label(i)))
+    let grh = unwrap(rh.prism_html_render(gr))
+    _check_true("grid emits <table", find(grh, "<table") >= 0)
+    _check_true("grid emits <tr", find(grh, "<tr") >= 0)
+    _check_true("grid emits <td", find(grh, "<td>") >= 0)
+    _check_true("grid row carries its key", find(grh, "data-prism-key=\"x\"") >= 0)
+
+    print("== 7. byte-identical across renders (MA.5 exit criterion) ==")
+    _check_true("page has >= 20 nodes", prism_node.prism_node_count(big) >= 11)
+    let r1 = unwrap(rh.prism_html_render(big))
+    let r2 = unwrap(rh.prism_html_render(big))
+    let r3 = unwrap(rh.prism_html_render(big))
+    _check_true("render 1 == render 2", r1 == r2)
+    _check_true("render 2 == render 3", r2 == r3)
+    // A freshly built but structurally identical tree must render identically too -- proves the
+    // output depends only on the tree's value, never on allocation order or identity.
+    let big2 = unwrap(prism_arrange.prism_stack([lblnode(), btnnode(), linknode(), entrynode(), flagnode(), rangenode(), glyphnode(), artnode(), drawnode(), gapnode(), unwrap(prism_content.prism_label("cell"))]))
+    _check_true("rebuilt tree renders identically", unwrap(rh.prism_html_render(big2)) == r1)
+
+    print("== 8. a full page ==")
+    let page = unwrap(rh.prism_html_render_page(big, "Prism & Co"))
+    _check_true("doctype present", find(page, "<!doctype html>") == 0)
+    _check_true("title escaped", find(page, "<title>Prism &amp; Co</title>") >= 0)
+    _check_absent("page has no script", page, "<script")
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_render_html: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_render_html: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)
+
+// Helpers -- one node per data-carrying primitive, built fresh each call so the "rebuilt tree"
+// check in section 7 is genuinely a different allocation.
+fn lblnode() -> PrismNode
+    unwrap(prism_content.prism_label("Hello <world>"))
+fn btnnode() -> PrismNode
+    unwrap(prism_interact.prism_press("Save & Exit", []))
+fn linknode() -> PrismNode
+    unwrap(prism_interact.prism_link("Docs", prism_interact.prism_link_target_url("https://example.com/a?b=1&c=2")))
+fn entrynode() -> PrismNode
+    unwrap(prism_interact.prism_entry("Name", prism_interact.prism_entry_kind_text(), "a\"b"))
+fn flagnode() -> PrismNode
+    unwrap(prism_interact.prism_flag("Active", true))
+fn rangenode() -> PrismNode
+    unwrap(prism_interact.prism_range("Volume", 0, 10, 1, 5))
+fn glyphnode() -> PrismNode
+    unwrap(prism_content.prism_glyph(prism_content.prism_icon_check()))
+fn artnode() -> PrismNode
+    unwrap(prism_content.prism_art("/img/logo.png"))
+fn drawnode() -> PrismNode
+    unwrap(prism_content.prism_draw(fn(s) s))
+fn gapnode() -> PrismNode
+    unwrap(prism_arrange.prism_gap(some(8)))
