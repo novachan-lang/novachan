@@ -1,0 +1,199 @@
+// prism_ui_input -- advanced input components (prism/ui/, milestone MB.4): date field,
+// multi-select, search box, number stepper, rating. Every one is a COMPOSITION over the closed
+// 22-primitive vocabulary (widget/), built through prism_ui_kit.nova wherever it fits -- no new
+// PrismNodeKind (axiom A7). Same discipline as MB.2 (prism_ui_feedback.nova) and MB.3
+// (prism_ui_data.nova): the loop-with-error-propagation shape goes through prism_ui_collect, never
+// hand-rolled again.
+//
+// ── DATE: LEAP YEARS PROVEN BOTH WAYS, PURE INTEGER ARITHMETIC ──────────────────────────────────
+// Gregorian rule: divisible by 4, EXCEPT centuries, UNLESS divisible by 400 (2024 is leap; 2023
+// and 1900 are not; 2000 is). `_prism_in_is_leap` is exactly that rule, `%` only -- no float
+// anywhere near date math, so the float-compare/float-codegen traps do not apply. The value is
+// zero-padded to "YYYY-MM-DD" with the builtin `pad_left(s, width, fill_char)` (nova_runtime.c's
+// `nova_rt_pad_left`), never raw concatenation, so "2024-02-29" cannot round-trip as "2024-2-29".
+//
+// ── DATE: WHY THE YEAR BOUND IS [1, 9999] ────────────────────────────────────────────────────────
+// Proleptic Gregorian, no year 0 (year 1 is the first representable year), rendered as a
+// conventional 4-digit "YYYY" (ISO 8601's own convention, matching this file's own zero-padding to
+// exactly 4 digits) -- there is no 5th digit to hold a year past 9999 and the format cannot
+// represent one honestly. A narrower bound would assume a specific domain (birthdates, a
+// scheduling window); this file assumes none.
+//
+// ── RATING: THE CLOSED 12-ICON SET HAS NO STAR ───────────────────────────────────────────────────
+// PrismIcon (prism_content.nova) is closed and this file may not add to it (prism/widget/ is
+// off-limits here). Reusing two already-distinct icons follows the precedent prism_ui_data.nova's
+// own `StatFlat()` set (`prism_icon_minus()` standing in for "neutral, nothing here" before a
+// dedicated glyph existed): `Check()` for a filled star (the same "earned/positive" reading
+// `FbSuccess()` gives it in prism_ui_feedback.nova), `Minus()` for an empty one.
+//
+// ── STEPPER: INERT-BUT-PRESENT, THE SAME RULE prism_ui_nav ALREADY USES ──────────────────────────
+// prism_interact has no `disabled` attr yet (PRISM_SPEC.md defers bound-cell state to the
+// reactivity engine). prism_ui_nav's prev/next arrows solve "cannot currently act" by rendering
+// the SAME glyph+label content either bare (inert) or wrapped in `press` (active) -- tree position
+// never moves, so layout never jumps. `_prism_in_stepper_ctrl` reuses that exact rule. The KAT
+// proves the row's child COUNT stays 3 at both bounds and total node count is IDENTICAL at min
+// (dec inert) and max (inc inert) -- one inert, one active, either direction, never asymmetric.
+//
+// PUBLIC API
+//   prism_in_date(label: string, year, month, day: int) -> Result<PrismNode>
+//     rejects: empty label, year outside [1,9999], month outside 1-12, day outside the REAL
+//     length of that month (leap Feb honored both ways)
+//   prism_in_multiselect(label: string, options: list, selected: list, max_selected: int?) -> Result<PrismNode>
+//     options: list<PrismPickOption> (prism_interact.nova). rejects: empty label, empty options, a
+//     non-PrismPickOption element, a duplicate option value, a selected value naming no option, a
+//     duplicate within the selection, a negative max_selected, a selection over max_selected
+//   prism_in_search(prompt: string, query: string) -> Result<PrismNode>
+//     rejects an empty prompt; the clear action renders only when query != ""
+//   prism_in_stepper(label: string, value, min_val, max_val, step_val: int) -> Result<PrismNode>
+//     rejects min>max, step<=0, value out of [min,max]; inc/dec are inert (not hidden) at max/min
+//   prism_in_rating(label: string, value: int, max_val: int) -> Result<PrismNode>
+//     rejects max_val<1, value outside [0, max_val]
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// ── Date field ────────────────────────────────────────────────────────────────────────────────
+// See header for why [1, 9999].
+let PRISM_IN_DATE_MIN_YEAR = 1
+let PRISM_IN_DATE_MAX_YEAR = 9999
+
+fn _prism_in_is_leap(year: int) -> bool
+    if year % 4 != 0
+        return false
+    if year % 100 != 0
+        return true
+    year % 400 == 0
+
+// Exhaustive over the 12 real month lengths; Feb defers to `_prism_in_is_leap`.
+fn _prism_in_days_in_month(year: int, month: int) -> int
+    if month == 4 or month == 6 or month == 9 or month == 11
+        return 30
+    if month == 2
+        if _prism_in_is_leap(year)
+            return 29
+        return 28
+    31
+
+fn _prism_in_date_str(year: int, month: int, day: int) -> string
+    pad_left(str(year), 4, ord("0")) + "-" + pad_left(str(month), 2, ord("0")) + "-" + pad_left(str(day), 2, ord("0"))
+
+fn prism_in_date(label: string, year: int, month: int, day: int) -> Result<PrismNode>
+    if label == ""
+        return err("prism_in_date: needs a non-empty label (accessible name required)")
+    if year < PRISM_IN_DATE_MIN_YEAR or year > PRISM_IN_DATE_MAX_YEAR
+        return err("prism_in_date: year " + str(year) + " is out of range [" + str(PRISM_IN_DATE_MIN_YEAR) + ", " + str(PRISM_IN_DATE_MAX_YEAR) + "]")
+    if month < 1 or month > 12
+        return err("prism_in_date: month must be 1-12, got " + str(month))
+    let max_day = _prism_in_days_in_month(year, month)
+    if day < 1 or day > max_day
+        return err("prism_in_date: day " + str(day) + " is out of range [1, " + str(max_day) + "] for " + str(year) + "-" + pad_left(str(month), 2, ord("0")))
+    let field = prism_interact.prism_entry(label, prism_interact.prism_entry_kind_text(), _prism_in_date_str(year, month, day))?
+    prism_ui_kit.prism_ui_labeled(label, field)
+
+// ── Multi-select ──────────────────────────────────────────────────────────────────────────────
+// One `flag` (checkbox) per option, `state` = membership in `selected`. Duplicate-option-value and
+// membership checks mirror `prism_interact.prism_pick`'s own loop (this file cannot reuse `pick()`
+// itself: its `selected_value` is a single string, not a set) -- same "seen dict, reject the second
+// occurrence" idiom, just for N selections instead of one.
+fn _prism_in_multiselect_flag(o, sel: dict) -> Result<PrismNode>
+    if type_name(o) != "PrismPickOption"
+        return err("prism_in_multiselect: option is not a PrismPickOption (got " + type_name(o) + ")")
+    prism_interact.prism_flag(o.label, o.value in sel)
+
+fn prism_in_multiselect(label: string, options: list, selected: list, max_selected: int?) -> Result<PrismNode>
+    if label == ""
+        return err("prism_in_multiselect: needs a non-empty label (accessible name required)")
+    if len(options) == 0
+        return err("prism_in_multiselect: needs at least one option")
+    let seen = {}
+    let mut idx = 0
+    for o in options
+        if type_name(o) != "PrismPickOption"
+            return err("prism_in_multiselect: option " + str(idx) + " is not a PrismPickOption (got " + type_name(o) + ")")
+        if o.value in seen
+            return err("prism_in_multiselect: duplicate option value '" + o.value + "'")
+        seen[o.value] = true
+        idx += 1
+    let sel = {}
+    for v in selected
+        if v not in seen
+            return err("prism_in_multiselect: selected value '" + v + "' names no option")
+        if v in sel
+            return err("prism_in_multiselect: duplicate selected value '" + v + "'")
+        sel[v] = true
+    match max_selected
+        None => 0
+        Some(m) =>
+            if m < 0
+                return err("prism_in_multiselect: max_selected must be >= 0, got " + str(m))
+            if len(selected) > m
+                return err("prism_in_multiselect: selected count " + str(len(selected)) + " exceeds max_selected " + str(m))
+            0
+    let mk = fn(o) _prism_in_multiselect_flag(o, sel)
+    let flags = prism_ui_kit.prism_ui_collect(options, mk)?
+    let body = prism_arrange.prism_stack(flags)?
+    prism_ui_kit.prism_ui_labeled(label, body)
+
+// ── Search box ────────────────────────────────────────────────────────────────────────────────
+// glyph(search) + entry(kind=search) [+ press("Clear") only when there is something to clear -- a
+// clear button over an empty query is a dead control]. Left as separate `band` children rather than
+// fused via `prism_ui_icon_text` (which pairs a glyph with a `label`, not an `entry`).
+fn prism_in_search(prompt: string, query: string) -> Result<PrismNode>
+    if prompt == ""
+        return err("prism_in_search: needs a non-empty prompt (accessible name required)")
+    let g = prism_content.prism_glyph(prism_content.prism_icon_search())?
+    let field = prism_interact.prism_entry(prompt, prism_interact.prism_entry_kind_search(), query)?
+    if query == ""
+        return prism_arrange.prism_band([g, field])
+    let clear = prism_interact.prism_press("Clear", [])?
+    prism_arrange.prism_band([g, field, clear])
+
+// ── Number stepper ────────────────────────────────────────────────────────────────────────────
+// See header for why inert-but-present, reusing prism_ui_nav's own rule.
+fn _prism_in_stepper_ctrl(icon: PrismIcon, text: string, enabled: bool) -> Result<PrismNode>
+    let content = prism_ui_kit.prism_ui_icon_text(icon, text)?
+    if not enabled
+        return ok(content)
+    prism_interact.prism_press(text, [content])
+
+fn prism_in_stepper(label: string, value: int, min_val: int, max_val: int, step_val: int) -> Result<PrismNode>
+    if label == ""
+        return err("prism_in_stepper: needs a non-empty label (accessible name required)")
+    if min_val > max_val
+        return err("prism_in_stepper: min (" + str(min_val) + ") must be <= max (" + str(max_val) + ")")
+    if step_val <= 0
+        return err("prism_in_stepper: step (" + str(step_val) + ") must be > 0")
+    if value < min_val or value > max_val
+        return err("prism_in_stepper: value (" + str(value) + ") must be within [" + str(min_val) + ", " + str(max_val) + "]")
+    let dec = _prism_in_stepper_ctrl(prism_content.prism_icon_minus(), "Decrease", value > min_val)?
+    let inc = _prism_in_stepper_ctrl(prism_content.prism_icon_plus(), "Increase", value < max_val)?
+    let value_node = prism_content.prism_label(str(value))?
+    let row = prism_arrange.prism_band([dec, value_node, inc])?
+    prism_ui_kit.prism_ui_labeled(label, row)
+
+// ── Rating ────────────────────────────────────────────────────────────────────────────────────
+// See header for why Check()/Minus() stand in for filled/empty -- the closed set has no star.
+fn _prism_in_rating_star(idx: int, value: int) -> Result<PrismNode>
+    if idx < value
+        return prism_content.prism_glyph(prism_content.prism_icon_check())
+    prism_content.prism_glyph(prism_content.prism_icon_minus())
+
+fn prism_in_rating(label: string, value: int, max_val: int) -> Result<PrismNode>
+    if label == ""
+        return err("prism_in_rating: needs a non-empty label (accessible name required)")
+    if max_val < 1
+        return err("prism_in_rating: max must be >= 1, got " + str(max_val))
+    if value < 0 or value > max_val
+        return err("prism_in_rating: value (" + str(value) + ") must be within [0, " + str(max_val) + "]")
+    let idxs = []
+    let mut i = 0
+    while i < max_val
+        idxs.push(i)
+        i += 1
+    let mk = fn(idx) _prism_in_rating_star(idx, value)
+    let stars = prism_ui_kit.prism_ui_collect(idxs, mk)?
+    let row = prism_arrange.prism_band(stars)?
+    prism_ui_kit.prism_ui_labeled(label, row)

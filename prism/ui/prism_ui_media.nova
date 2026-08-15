@@ -1,0 +1,272 @@
+// prism_ui_media -- media and disclosure components (prism/ui/, milestone MB.4): avatar, figure,
+// gallery, accordion, card. Every one is a COMPOSITION over the closed 22-primitive vocabulary
+// (widget/), built through prism_ui_kit.nova wherever it fits -- no new PrismNodeKind (axiom A7).
+//
+// ── WHY AVATAR SIZE IS A CLOSED 3-VARIANT ENUM, `Av`-PREFIXED ────────────────────────────────
+// Same reasoning as PrismFbSeverity/PrismStatTrend: a free-form size string would make an invalid
+// size a runtime surprise; the enum makes it a compile error. `Av`-prefixed (not bare `Small`/
+// `Medium`/`Large`) because NOVA's flat LLVM symbol space is shared across every enum in the
+// program -- the exact collision class prism_ui_feedback.nova's header documents for `FbInfo` vs
+// content's `Info()`.
+//
+// ── WHY INITIALS ARE DERIVED AND CAPPED, NOT A RAW TEXT FIELD ────────────────────────────────
+// An "initials" parameter the caller fills in by hand is just an unvalidated string wearing a
+// costume -- nothing stops "INITIALS-ARE-WHATEVER-I-WANT" reaching the fallback badge. Deriving
+// them from `name` (first letter of each of the first two non-blank words, trimmed, uppercased)
+// makes the value provably a FUNCTION of the name rather than arbitrary caller text, and capping
+// at the first TWO words (not "however many words exist") is real capping, not incidental --
+// proven by the many-word KAT case ("John Ronald Reuel Tolkien" -> "JR", never "JRRT").
+//
+// ── WHY `alt` IS TWO CONSTRUCTORS, NOT ONE WITH `alt: string?` ───────────────────────────────
+// `caption: string?` legitimately means "no caption" via `None`. `alt: string?` meaning "None =
+// decorative" would NOT be the same kind of optional -- a caller in a hurry could pass `none()`
+// for a real photograph out of laziness, and the compiler would never catch the resulting
+// accessibility defect (an image with no alt text). Splitting into `prism_ui_figure` (alt
+// mandatory, non-empty) and `prism_ui_figure_decorative` (alt hard-coded "") makes "this image is
+// decorative" an explicit, auditable call-site choice instead of a silently-defaulted parameter.
+//
+// ── WHY ACCORDION OMITS COLLAPSED CONTENT AT CONSTRUCTION, NOT JUST AT ONE RENDERER ──────────
+// prism_structure.prism_tabs keeps every panel in the tree and leaves "only show the selected one"
+// to EACH backend separately (the HTML renderer marks the rest `hidden`; the ANSI renderer's own
+// header notes it must render only the selected panel because "a terminal has no hidden-but-
+// present concept"). That is two renderers independently required to remember the same rule --
+// a future third backend that forgets it silently leaks every collapsed section's content. This
+// component takes the stronger position: a collapsed section's body is simply never added as a
+// child in the first place, so EVERY backend, present and future, is correct by construction with
+// no rule to remember. The KAT proves this via both node count and by rendering to ANSI text.
+//
+// ── FIELD PREFIXES ────────────────────────────────────────────────────────────────────────────
+// `acc_*` / `gal_*`, same collision discipline as prism_ui_data.nova's `list_*`/`tree_*`/`tl_*` --
+// NOVA's field-name->slot table is GLOBAL and last-registration-wins across the whole program.
+//
+// PUBLIC API
+//   Avatar
+//     PrismAvatarSize (closed, 3 values)                 AvSmall()|AvMedium()|AvLarge()
+//     prism_avatar_size_small() / _medium() / _large()   cross-module ctors
+//     prism_avatar_size_name(sz) -> string                exhaustive: "small"|"medium"|"large"
+//     prism_ui_avatar(name, image_source: string?, size) -> Result<PrismNode>
+//       an image (non-empty `image_source`) -> `art` node, alt=name; otherwise -> initials
+//       `label` (derived from name, capped at 2 chars). Rejects a blank name (empty or
+//       all-whitespace) when there is no image.
+//     prism_ui_avatar_size_of(node) -> string             accessor
+//   Figure (image + optional caption)
+//     prism_ui_figure(source, alt, caption: string?) -> Result<PrismNode>
+//       rejects an empty alt (see header) and an empty source (propagated from prism_art).
+//     prism_ui_figure_decorative(source, caption: string?) -> Result<PrismNode>   alt is always ""
+//   Gallery
+//     PrismGalleryItem { gal_source, gal_alt, gal_caption: string? } + prism_gallery_item(...)
+//     prism_ui_gallery(items: list) -> Result<PrismNode>
+//       rejects an empty item list and a non-PrismGalleryItem element; an empty alt propagates
+//       unchanged from prism_ui_figure.
+//   Accordion / disclosure
+//     PrismAccordionSection { acc_title, acc_body: PrismNode, acc_expanded: bool } +
+//       prism_accordion_section(title, body, expanded)
+//     prism_ui_accordion(sections: list) -> Result<PrismNode>
+//       built on prism_structure.prism_each keyed by title -- propagates its mandatory-identity
+//       and duplicate-key rejection unmodified (same "propagate, don't reimplement" discipline
+//       prism_ui_data.nova's prism_ui_list already applies), so a duplicate section title is
+//       rejected as a duplicate KEY. Also rejects an empty section set, a non-
+//       PrismAccordionSection element, and an empty title.
+//   Card
+//     prism_ui_card(title, body: string?, media: PrismNode?, actions: list) -> Result<PrismNode>
+//       rejects an empty title. A single resulting part (title alone, nothing else supplied) is
+//       returned unwrapped -- no redundant single-child stack -- matching prism_fb_alert's own
+//       no-detail case in prism_ui_feedback.nova.
+
+import prism_node
+import prism_content
+import prism_arrange
+import prism_structure
+import prism_ui_kit
+
+// ── Shared helper: attach extra attrs onto an already-built node ────────────────────────────────
+// Same dict_merge + prism_node_new re-construction prism_structure.prism_tabs and
+// prism_ui_data._prism_data_timeline_node already use to attach caller metadata without inventing
+// a new PrismNodeKind -- generalized here since two components (avatar, figure) both need it.
+fn _prism_md_with_attrs(n: PrismNode, extra: dict) -> Result<PrismNode>
+    let merged = dict_merge(n.attrs, extra)
+    prism_node.prism_node_new(n.kind, merged, n.children, n.key)
+
+// ── Avatar ────────────────────────────────────────────────────────────────────────────────────
+enum PrismAvatarSize
+    AvSmall()
+    AvMedium()
+    AvLarge()
+
+fn prism_avatar_size_small() -> PrismAvatarSize
+    AvSmall()
+fn prism_avatar_size_medium() -> PrismAvatarSize
+    AvMedium()
+fn prism_avatar_size_large() -> PrismAvatarSize
+    AvLarge()
+
+// Exhaustive, no wildcard arm -- see header note on the closed-vocabulary discipline this mirrors
+// from PrismFbSeverity / PrismStatTrend.
+fn prism_avatar_size_name(sz: PrismAvatarSize) -> string
+    match sz
+        AvSmall() => "small"
+        AvMedium() => "medium"
+        AvLarge() => "large"
+
+fn _prism_md_has_image(image_source: string?) -> bool
+    match image_source
+        None => false
+        Some(src) => len(src) > 0
+
+fn _prism_md_image_source(image_source: string?) -> string
+    match image_source
+        None => ""
+        Some(src) => src
+
+// First letter of each of the first two non-blank words, trimmed, uppercased. See header: this
+// caps at the first TWO WORDS, not "however many exist" -- the KAT's 4-word name proves the
+// difference by dropping words 3 and 4, not merely by having nothing left to drop.
+fn _prism_md_initials(name: string) -> string
+    let words = split(trim(name), " ")
+    let mut out = ""
+    let mut count = 0
+    for w in words
+        if len(w) > 0 and count < 2
+            out = out + upper(w[0])
+            count += 1
+    out
+
+fn prism_ui_avatar(name: string, image_source: string?, size: PrismAvatarSize) -> Result<PrismNode>
+    if _prism_md_has_image(image_source)
+        let art = prism_content.prism_art(_prism_md_image_source(image_source))?
+        return _prism_md_with_attrs(art, {"alt": name, "avatar_size": prism_avatar_size_name(size)})
+    if len(trim(name)) == 0
+        return err("prism_ui_avatar: name must not be empty (or all whitespace) when there is no image")
+    let lbl = prism_content.prism_label(_prism_md_initials(name))?
+    _prism_md_with_attrs(lbl, {"avatar_size": prism_avatar_size_name(size)})
+
+fn prism_ui_avatar_size_of(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "avatar_size", "")
+
+// ── Figure (image + optional caption) ────────────────────────────────────────────────────────
+fn _prism_md_figure_build(source: string, alt: string, caption: string?) -> Result<PrismNode>
+    let art = prism_content.prism_art(source)?
+    let img = _prism_md_with_attrs(art, {"alt": alt})?
+    match caption
+        None => ok(img)
+        Some(text) =>
+            if len(text) == 0
+                return ok(img)
+            let cap = prism_content.prism_label(text)?
+            prism_arrange.prism_stack([img, cap])
+
+// alt is REQUIRED and non-empty -- see header on why this is two constructors, not one with
+// `alt: string?`. Empty source rejection is prism_content.prism_art's own, propagated unchanged.
+fn prism_ui_figure(source: string, alt: string, caption: string?) -> Result<PrismNode>
+    if len(alt) == 0
+        return err("prism_ui_figure: alt text must not be empty -- use prism_ui_figure_decorative for a decorative image")
+    _prism_md_figure_build(source, alt, caption)
+
+// The explicit decorative path: alt is always "", never inferred or defaulted from elsewhere.
+fn prism_ui_figure_decorative(source: string, caption: string?) -> Result<PrismNode>
+    _prism_md_figure_build(source, "", caption)
+
+// ── Gallery ───────────────────────────────────────────────────────────────────────────────────
+// Fields are `gal_`-prefixed -- see header's field-collision note.
+type PrismGalleryItem
+    gal_source: string
+    gal_alt: string
+    gal_caption: string?
+
+fn prism_gallery_item(source: string, alt: string, caption: string?) -> PrismGalleryItem
+    PrismGalleryItem(source, alt, caption)
+
+fn _prism_md_gallery_figure(item) -> Result<PrismNode>
+    if type_name(item) != "PrismGalleryItem"
+        return err("prism_ui_gallery: item is not a PrismGalleryItem (got " + type_name(item) + ")")
+    prism_ui_figure(item.gal_source, item.gal_alt, item.gal_caption)
+
+// A blank region is indistinguishable from a broken one (prism_ui_kit's own prism_ui_empty
+// rationale) -- an empty gallery is rejected rather than silently rendering nothing.
+fn prism_ui_gallery(items: list) -> Result<PrismNode>
+    if len(items) == 0
+        return err("prism_ui_gallery: needs at least one item -- use prism_ui_kit.prism_ui_empty for nothing to show")
+    let mk = fn(it) _prism_md_gallery_figure(it)
+    let figs = prism_ui_kit.prism_ui_collect(items, mk)?
+    prism_arrange.prism_flow(figs)
+
+// ── Accordion / disclosure ────────────────────────────────────────────────────────────────────
+// Fields are `acc_`-prefixed, same discipline as Gallery above.
+type PrismAccordionSection
+    acc_title: string
+    acc_body: PrismNode
+    acc_expanded: bool
+
+fn prism_accordion_section(title: string, body: PrismNode, expanded: bool) -> PrismAccordionSection
+    PrismAccordionSection(title, body, expanded)
+
+fn _prism_md_accordion_chevron(expanded: bool) -> PrismIcon
+    if expanded
+        return prism_content.prism_icon_chevron_down()
+    prism_content.prism_icon_chevron_right()
+
+// Collapsed: the header alone, `acc_body` is NEVER touched -- it is absent from the returned
+// tree, not merely unrendered (see header). Expanded: header stacked above the body.
+fn _prism_md_accordion_node(sec) -> Result<PrismNode>
+    if len(sec.acc_title) == 0
+        return err("prism_ui_accordion: section title must not be empty")
+    let head = prism_ui_kit.prism_ui_icon_text(_prism_md_accordion_chevron(sec.acc_expanded), sec.acc_title)?
+    if not sec.acc_expanded
+        return ok(head)
+    prism_arrange.prism_stack([head, sec.acc_body])
+
+// Type-checks every element BEFORE handing anything to prism_each -- prism_each's own key_fn
+// (below) reads `s.acc_title` directly and is NOT itself guarded against a wrong-shaped element,
+// so this loop is what keeps that read safe (the same wild-pointer-read class prism_node_new's
+// children guard closes, one level up the call chain). Built on prism_structure.prism_each keyed
+// by title: duplicate-title rejection is prism_each's own "duplicate key" error, propagated
+// unchanged (see header) -- not re-derived here.
+fn prism_ui_accordion(sections: list) -> Result<PrismNode>
+    if len(sections) == 0
+        return err("prism_ui_accordion: needs at least one section")
+    let mut idx = 0
+    for s in sections
+        if type_name(s) != "PrismAccordionSection"
+            return err("prism_ui_accordion: section " + str(idx) + " is not a PrismAccordionSection (got " + type_name(s) + ")")
+        idx += 1
+    let key_fn = fn(s) s.acc_title
+    let render_fn = fn(s) _prism_md_accordion_node(s)
+    prism_structure.prism_each(sections, key_fn, render_fn)
+
+// ── Card ──────────────────────────────────────────────────────────────────────────────────────
+fn _prism_md_card_media_parts(media: PrismNode?) -> list
+    match media
+        None => []
+        Some(m) => [m]
+
+// `body`'s emptiness tolerance mirrors prism_ui_kit.prism_ui_field_row's `note: string?`: a
+// present-but-blank `Some("")` degrades to "no body" rather than a stray blank line.
+fn _prism_md_card_body_parts(body: string?) -> Result<list>
+    match body
+        None => ok([])
+        Some(text) =>
+            if len(text) == 0
+                return ok([])
+            let b = prism_content.prism_label(text)?
+            ok([b])
+
+fn _prism_md_card_action_parts(actions: list) -> Result<list>
+    if len(actions) == 0
+        return ok([])
+    let bar = prism_ui_kit.prism_ui_actions(actions)?
+    ok([bar])
+
+// A surface: title (required) + optional media/body/actions, in that fixed order. When title is
+// the ONLY part supplied, it is returned unwrapped rather than inside a redundant single-child
+// stack (see header).
+fn prism_ui_card(title: string, body: string?, media: PrismNode?, actions: list) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_ui_card: title must not be empty")
+    let title_node = prism_content.prism_label(title)?
+    let media_parts = _prism_md_card_media_parts(media)
+    let body_parts = _prism_md_card_body_parts(body)?
+    let action_parts = _prism_md_card_action_parts(actions)?
+    let parts = [title_node, ...media_parts, ...body_parts, ...action_parts]
+    if len(parts) == 1
+        return ok(parts[0])
+    prism_arrange.prism_stack(parts)
