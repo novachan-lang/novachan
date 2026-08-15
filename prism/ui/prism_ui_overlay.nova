@@ -1,0 +1,249 @@
+// prism_ui_overlay -- overlay and utility components (prism/ui/, milestone MB.5): dropdown menu,
+// popover, modal, command palette, skeleton/loading placeholder. Every one is a COMPOSITION over
+// the closed 22-primitive vocabulary (widget/), built through prism_ui_kit.nova wherever it fits --
+// no new PrismNodeKind is invented anywhere in this file (axiom A7), matching every other ui/
+// module's own discipline.
+//
+// ── WHY DROPDOWN'S CLOSED CONTENT IS ABSENT BY CONSTRUCTION, NOT PER-BACKEND ─────────────────
+// Same fork prism_ui_media.nova's accordion header already resolved, reused here rather than
+// re-derived: prism_structure.prism_tabs keeps EVERY panel in the tree and trusts EACH backend to
+// separately hide the non-selected ones (the HTML renderer marks them `hidden`; the ANSI renderer
+// only walks the selected one, by its own header's admission "a terminal has no hidden-but-present
+// concept"). That is two renderers independently required to remember the same rule, and a future
+// third backend that forgets it leaks every closed item's label. A closed dropdown takes the
+// stronger position the accordion already established: when `open` is false, the item list is
+// never turned into nodes AT ALL -- not merely unrendered -- so every backend, present and future,
+// is correct by construction with nothing to remember. The KAT proves this by node count AND by
+// rendering through prism_render_ansi and confirming item text never appears.
+//
+// ── FIELD PREFIX: `dd_`, CHECKED AGAINST EVERY OTHER ui/ MODULE FIRST ─────────────────────────
+// NOVA's field-name -> slot table is GLOBAL and last-registration-wins (MB.2 hit this for real).
+// `menu_*` is already taken by prism_ui_nav.nova's PrismMenuEntry -- confirmed by reading that file
+// before naming anything here, not assumed. `dd_*` (dropdown) was grepped project-wide as a field
+// prefix (`^\s+dd_\w+:`) and found unclaimed; the same grep also cleared `PrismDropdownItem` and
+// `PrismPopoverPlacement`/`PopTop`/`PopBottom`/`PopStart`/`PopEnd` as fresh type/constructor names.
+//
+// ── WHY MODAL IS NOT JUST A WIDER `prism_fb_confirm` ──────────────────────────────────────────
+// prism_ui_feedback.nova's `prism_fb_confirm` is the fixed two-button (confirm/cancel), string-only
+// special case. Modal here is the general N-action case with an arbitrary PrismNode `body` (any
+// composition, not just a label) -- that is the actual difference that justifies a second
+// component rather than a duplicate of the first. A modal with zero actions is rejected outright:
+// with no action to take, there is no way out of a surface built `exclusive` (compositor-enforced
+// input exclusivity, PRISM_SPEC.md §15.8) -- a trap, not a feature.
+//
+// ── WHY POPOVER RECONSTRUCTS `hint` TO ADD A SECOND CHILD, NOT JUST EXTRA ATTRS ───────────────
+// prism_structure.prism_hint's own signature is `(text: string, child: PrismNode)` -- a tooltip's
+// plain-text message over a SINGLE anchor. A popover's `content` is a full PrismNode (any
+// composition a caller wants to float), which `text` cannot carry. This calls `prism_hint` first
+// (inheriting the Hint kind and its non-empty-text validation -- trivially satisfied, see below),
+// then reconstructs with `content` appended as a SECOND child. Every earlier reconstruction in this
+// codebase (prism_tabs' "tab_label", prism_drawer's "drawer_edge", media's `_prism_md_with_attrs`)
+// only ever extends ATTRS; this is the first to also extend CHILDREN, because content is exactly
+// what `hint`'s own parameter list has no room for. The resulting "text" attr duplicates the
+// placement name -- a real, harmless, and DELIBERATE tradeoff: `prism_hint` demands some non-empty
+// text and a popover has no separate tooltip message, so the placement name (always non-empty,
+// because the enum is closed) is the only value on hand that is always valid. The dedicated
+// "placement" attr is the one callers/renderers should actually read; documented here so the next
+// reader does not mistake the duplicated "text" for a second, independent piece of data.
+//
+// ── WHY SKELETON'S ROW CAP IS 500, NOT prism_node's OWN 100,000 ───────────────────────────────
+// PRISM_MAX_NODE_COUNT (prism_node.nova, currently 100,000) is a global safety net sized for ANY
+// tree in the whole system -- it is not a sane per-call default for one component's loading
+// placeholder. A caller-supplied `rows` piped straight from an unvalidated page-size parameter is
+// exactly the unchecked-caller-controlled-size class the code-review checklist warns about. No
+// real loading UI ever needs more rows than fit on one screen, so 500 is generous for any
+// legitimate use while still failing fast, by two orders of magnitude, before a mistaken or
+// hostile `rows` could meaningfully stress the shared 100,000-node ceiling every OTHER component's
+// tree also counts against.
+//
+// PUBLIC API
+//   Dropdown menu
+//     PrismDropdownItem { dd_label: string, dd_icon: PrismIcon?, dd_disabled: bool } +
+//       prism_dropdown_item(label, icon, disabled)
+//     prism_ov_dropdown(trigger: PrismNode, items: list, open: bool) -> Result<PrismNode>
+//       validated regardless of `open` (empty item set, non-PrismDropdownItem element, empty item
+//       label, duplicate item label are all rejected whether the menu is open or closed).
+//       Closed (open=false): `band(trigger)` alone -- items are never built into nodes.
+//       Open: `band(trigger, stack(item nodes))`; a disabled item carries a "disabled" attr.
+//   Popover
+//     PrismPopoverPlacement (closed, 4 values)          PopTop()|PopBottom()|PopStart()|PopEnd()
+//     prism_popover_placement_top()/_bottom()/_start()/_end()   cross-module ctors
+//     prism_popover_placement_name(p) -> string   exhaustive: "top"|"bottom"|"start"|"end"
+//     prism_ov_popover(anchor, content, placement) -> Result<PrismNode>   over `hint` (see header)
+//     prism_ov_popover_placement_of(n) -> string   accessor (reads the dedicated "placement" attr)
+//   Modal
+//     prism_ov_modal(title: string, body: PrismNode, actions: list) -> Result<PrismNode>
+//       over `sheet(exclusive=true)`; rejects an empty title and a zero-action list
+//   Command palette
+//     prism_ov_command_palette(prompt, query: string, items: list, matches, empty_message: string)
+//       -> Result<PrismNode>
+//       `matches`: fn(item) -> bool, applied via NOVA's own builtin `filter()`; survivors are
+//       rendered via prism_ui_kit.prism_ui_collect. An empty match set renders
+//       prism_ui_kit.prism_ui_empty rather than a blank stack. Rejects an empty prompt and an
+//       empty empty_message.
+//   Skeleton / loading placeholder
+//     prism_ov_skeleton(rows: int) -> Result<PrismNode>
+//       rejects rows < 1 and rows > 500 (see header note on the bound); each row is an empty-text
+//       `label` marked with a "skeleton" attr, never a repurposed `gap` (prism_arrange's own header
+//       reserves `gap`'s `size` attr for layout spacing only).
+
+import prism_node
+import prism_content
+import prism_arrange
+import prism_structure
+import prism_interact
+import prism_ui_kit
+
+// ── Shared helper: attach extra attrs onto an already-built node ────────────────────────────────
+// Same dict_merge + prism_node_new re-construction prism_ui_media.nova's `_prism_md_with_attrs`
+// uses -- kept as this file's own copy rather than importing prism_ui_media, matching how each
+// ui/ module already carries its own small copy of this pattern rather than sharing one.
+fn _prism_ov_with_attrs(n: PrismNode, extra: dict) -> Result<PrismNode>
+    let merged = dict_merge(n.attrs, extra)
+    prism_node.prism_node_new(n.kind, merged, n.children, n.key)
+
+// ── Dropdown menu ─────────────────────────────────────────────────────────────────────────────
+// Fields are `dd_`-prefixed -- see header's field-collision note.
+type PrismDropdownItem
+    dd_label: string
+    dd_icon: PrismIcon?
+    dd_disabled: bool
+
+fn prism_dropdown_item(label: string, icon: PrismIcon?, disabled: bool) -> PrismDropdownItem
+    PrismDropdownItem(label, icon, disabled)
+
+// Builds ONE item's node: icon (if any) as a child, label as the press text, `disabled` attached
+// as an attr afterward. Trusts `it` is already a validated PrismDropdownItem with a non-empty
+// label -- prism_ov_dropdown below checks both BEFORE this is ever called, the same
+// validate-then-build split prism_ui_media.nova's `_prism_md_accordion_node` already uses.
+fn _prism_ov_dropdown_item_node(it) -> Result<PrismNode>
+    let children = match it.dd_icon
+        None => []
+        Some(icon) => [prism_content.prism_glyph(icon)?]
+    let btn = prism_interact.prism_press(it.dd_label, children)?
+    _prism_ov_with_attrs(btn, {"disabled": it.dd_disabled})
+
+// See header for why closed content is never built at all, not merely hidden. Validation (empty
+// set, element type, empty label, duplicate label) runs unconditionally, BEFORE the open/closed
+// fork -- a closed dropdown over an invalid item set is still rejected, not silently accepted
+// because its content happens not to be shown.
+fn prism_ov_dropdown(trigger: PrismNode, items: list, open: bool) -> Result<PrismNode>
+    if len(items) == 0
+        return err("prism_ov_dropdown: needs at least one item")
+    let seen = {}
+    let mut idx = 0
+    for it in items
+        if type_name(it) != "PrismDropdownItem"
+            return err("prism_ov_dropdown: item " + str(idx) + " is not a PrismDropdownItem (got " + type_name(it) + ")")
+        if len(it.dd_label) == 0
+            return err("prism_ov_dropdown: item " + str(idx) + " label must not be empty")
+        if it.dd_label in seen
+            return err("prism_ov_dropdown: duplicate item label '" + it.dd_label + "'")
+        seen[it.dd_label] = true
+        idx += 1
+    if not open
+        let closed = prism_arrange.prism_band([trigger])?
+        return _prism_ov_with_attrs(closed, {"open": false})
+    let mk = fn(it) _prism_ov_dropdown_item_node(it)
+    let item_nodes = prism_ui_kit.prism_ui_collect(items, mk)?
+    let menu = prism_arrange.prism_stack(item_nodes)?
+    let full = prism_arrange.prism_band([trigger, menu])?
+    _prism_ov_with_attrs(full, {"open": true})
+
+fn prism_ov_dropdown_is_open(n: PrismNode) -> bool
+    prism_node.prism_node_attr_bool(n, "open", false)
+
+// ── Popover placement (closed, 4-variant enum) ───────────────────────────────────────────────
+enum PrismPopoverPlacement
+    PopTop()
+    PopBottom()
+    PopStart()
+    PopEnd()
+
+fn prism_popover_placement_top() -> PrismPopoverPlacement
+    PopTop()
+fn prism_popover_placement_bottom() -> PrismPopoverPlacement
+    PopBottom()
+fn prism_popover_placement_start() -> PrismPopoverPlacement
+    PopStart()
+fn prism_popover_placement_end() -> PrismPopoverPlacement
+    PopEnd()
+
+// Exhaustive, no wildcard arm -- see prism_ui_media.nova's PrismAvatarSize for the identical
+// closed-vocabulary discipline this mirrors.
+fn prism_popover_placement_name(p: PrismPopoverPlacement) -> string
+    match p
+        PopTop() => "top"
+        PopBottom() => "bottom"
+        PopStart() => "start"
+        PopEnd() => "end"
+
+// ── Popover: anchor + content over `hint` ────────────────────────────────────────────────────
+// See header for why this reconstructs `hint`'s own node to add `content` as a second child, and
+// why the placement name doubles as the required "text".
+fn prism_ov_popover(anchor: PrismNode, content: PrismNode, placement: PrismPopoverPlacement) -> Result<PrismNode>
+    let name = prism_popover_placement_name(placement)
+    let base = prism_structure.prism_hint(name, anchor)?
+    let merged = dict_merge(base.attrs, {"placement": name})
+    prism_node.prism_node_new(base.kind, merged, [anchor, content], base.key)
+
+fn prism_ov_popover_placement_of(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "placement", "")
+
+// ── Modal: over `sheet`, exclusive, a required title + body + >=1 action ────────────────────────
+// See header for why this is not just a wider prism_fb_confirm.
+fn prism_ov_modal(title: string, body: PrismNode, actions: list) -> Result<PrismNode>
+    if len(title) == 0
+        return err("prism_ov_modal: title must not be empty")
+    if len(actions) == 0
+        return err("prism_ov_modal: needs at least one action -- a modal with no way out is a trap")
+    let title_node = prism_content.prism_label(title)?
+    let actions_bar = prism_ui_kit.prism_ui_actions(actions)?
+    let content = prism_arrange.prism_stack([title_node, body, actions_bar])?
+    prism_structure.prism_sheet(content, true)
+
+// ── Command palette: query entry + predicate-filtered results ───────────────────────────────────
+// See header: `matches` is applied via NOVA's own builtin `filter()` (CLAUDE.md's "does this
+// already exist?" rule -- a hand-rolled predicate loop would just re-derive it), and only the
+// surviving items are turned into nodes via prism_ui_kit.prism_ui_collect. An empty match set
+// renders prism_ui_kit's own honest empty state -- a blank region is indistinguishable from a
+// broken palette (the exact rationale prism_ui_kit.prism_ui_empty's own header already gives).
+fn _prism_ov_palette_results(filtered: list, empty_message: string) -> Result<PrismNode>
+    if len(filtered) == 0
+        return prism_ui_kit.prism_ui_empty(empty_message)
+    let mk = fn(s) prism_content.prism_label(s)
+    let nodes = prism_ui_kit.prism_ui_collect(filtered, mk)?
+    prism_arrange.prism_stack(nodes)
+
+fn prism_ov_command_palette(prompt: string, query: string, items: list, matches, empty_message: string) -> Result<PrismNode>
+    if len(prompt) == 0
+        return err("prism_ov_command_palette: prompt must not be empty (accessible name required)")
+    if len(empty_message) == 0
+        return err("prism_ov_command_palette: empty_message must not be empty")
+    let entry = prism_interact.prism_entry(prompt, prism_interact.prism_entry_kind_search(), query)?
+    let filtered = filter(items, matches)
+    let results = _prism_ov_palette_results(filtered, empty_message)?
+    prism_arrange.prism_stack([entry, results])
+
+// ── Skeleton / loading placeholder ───────────────────────────────────────────────────────────
+// See header for why 500, not prism_node's own 100,000.
+let PRISM_OV_MAX_SKELETON_ROWS = 500
+
+// An empty-text `label` (content vocabulary), marked with a "skeleton" attr so a renderer can
+// paint a shimmer bar instead of literally nothing -- never a repurposed `gap` (see header).
+fn _prism_ov_skeleton_row() -> Result<PrismNode>
+    let base = prism_content.prism_label("")?
+    _prism_ov_with_attrs(base, {"skeleton": true})
+
+fn prism_ov_skeleton(rows: int) -> Result<PrismNode>
+    if rows < 1
+        return err("prism_ov_skeleton: rows must be >= 1, got " + str(rows))
+    if rows > PRISM_OV_MAX_SKELETON_ROWS
+        return err("prism_ov_skeleton: rows must be <= " + str(PRISM_OV_MAX_SKELETON_ROWS) + ", got " + str(rows))
+    let out = []
+    let mut i = 0
+    while i < rows
+        let row = _prism_ov_skeleton_row()?
+        out.push(row)
+        i += 1
+    prism_arrange.prism_stack(out)

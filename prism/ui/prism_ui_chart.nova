@@ -1,0 +1,267 @@
+// prism_ui_chart -- server-renderable chart components (prism/ui/, milestone MB.5): bar,
+// sparkline (line), pie/share, gauge, legend. Every one is a COMPOSITION over the closed
+// 22-primitive vocabulary (widget/), built through prism_ui_kit.nova and prism_structure.nova
+// wherever they fit -- no new PrismNodeKind (axiom A7). None of the five depends on a canvas: bar
+// is a `prism_grid` table, pie/legend are rows of `label`/`glyph`, gauge is a labelled `range`,
+// sparkline is a `band` of glyphs -- the same vocabulary a text-mode bar chart tool uses, so both
+// `prism_html_render` (a real `<table>` / `<input type=range>`) and `prism_ansi_render` (an
+// aligned ASCII table / ASCII progress bar) already know how to draw every one of them without
+// this file teaching either renderer anything new.
+//
+// ── WHY BAR IS BUILT ON prism_grid, NOT A HAND-STACKED band PER ROW ──────────────────────────
+// A chart's bars must line up in a column -- label, bar, and value all starting at the same x
+// position on every row. `band`/`stack` alone have no notion of a shared column width across
+// SIBLING rows (each row's `band` sizes itself independently); `prism_structure.prism_grid` IS
+// "tabular data" (PRISM_SPEC.md §10) and both backends already know how to align it: the ANSI
+// renderer's `_ansi_grid` measures every column's widest cell and pads to it (reusing v0.1's
+// `prism_ansi_table`), and the HTML renderer emits a real `<table>`. Composing on `prism_grid`
+// gets column alignment in BOTH backends for free instead of re-deriving padding logic that
+// `prism_ansi_table` already has. `key_fn = it.ch_item_label` also gives a duplicate series label
+// `prism_grid`'s own "duplicate row key" rejection as a bonus (defense in depth) -- but
+// `_prism_ch_check_items` below is still the check every caller actually hits first, because
+// pie/legend do not route through grid/each at all and need it regardless.
+//
+// ── BAR WIDTH: A "TEXT-MODE BAR" IS A ROW OF check()/minus() GLYPHS, NOT A SIZED gap ────────────
+// A `gap(size)` was considered and rejected for the same reason prism_ui_feedback.nova's progress
+// rejected it: `gap` is LAYOUT SPACING (PRISM_SPEC.md §7), and the ANSI renderer emits a SINGLE
+// space for a `gap` regardless of its `size` attr (prism_render_ansi.nova: `_ansi_gap` / the
+// inline `"gap" => ok(" ")` arm) -- a gap-sized bar would be invisible on the one backend a
+// text-mode bar chart most needs to work on. `prism_in_rating`'s own precedent
+// (prism_ui_input.nova) already solved "the closed 12-icon set has no bar/block glyph" by reusing
+// `Check()`/`Minus()` as filled/empty; this file reuses that exact precedent for a bar's cells.
+// Width is an integer count of filled cells out of `PRISM_CH_BAR_TRACK`, computed as
+// `(value * PRISM_CH_BAR_TRACK) / max_value` -- truncating integer division, guarded to 0 when
+// `max_value == 0` (only possible when every value in the series is 0, since values are validated
+// non-negative), so an all-zero series renders every bar fully empty instead of dividing by zero.
+//
+// ── GAUGE: WHY IT DOES NOT CALL prism_fb_progress DIRECTLY ───────────────────────────────────────
+// `prism_fb_progress(label, done, total)` (prism_ui_feedback.nova) IS the "label + prism_range"
+// idiom this component reuses -- but calling it as `prism_fb_progress(label, value - min_val,
+// max_val - min_val)` would shift the underlying `range` node's own `min`/`max` attrs to `0` /
+// `max_val - min_val` instead of the caller's REAL bounds. A gauge over, say, [32, 212] would then
+// carry a `range` node reporting `min=0, max=180` -- correct arithmetic, wrong domain, and any
+// caller reading those attrs back (a11y tooling, a test, a future DevTools inspector) would see a
+// lie. `prism_ch_gauge` reuses the IDIOM (a percentage label above a `prism_range` track) but
+// calls `prism_range` directly with the caller's own `min_val`/`max_val` -- the same "propagate,
+// don't reimplement" discipline applied everywhere else in this file: `prism_range`'s own
+// non-empty-label rejection is what actually rejects an empty label here, unchanged.
+//
+// ── PIE: LARGEST-REMAINDER APPORTIONMENT REUSES std/money/allocate.nova, NOT A NEW ALGORITHM ────
+// "Percentages must sum to exactly 100" is precisely what std/money/allocate.nova's
+// `alloc_weighted(minor, weights)` already guarantees (CLAUDE.md: does this already exist? -- yes;
+// cent-safe money splitting IS the largest-remainder problem, restated in cents instead of
+// percentage points). `alloc_weighted(100, values)` treats the series' own values as weights; a
+// tied 3-way split of equal weights lands as `[34, 33, 33]` (traced through the algorithm, not
+// assumed -- the KAT asserts the exact list, plus two more awkward splits). An all-zero series
+// (every weight 0) is `alloc_weighted`'s own already-handled edge case: it falls back to
+// `alloc_equal`, an even split, instead of dividing by a zero weight-total.
+//
+// ── SPARKLINE: A FLAT SERIES MAPS TO Minus(), THE SAME "NEUTRAL" READING StatFlat ALREADY GIVES IT
+// Each point is classified against the SERIES' OWN [min, max] range: `Check()` ("at or above the
+// midpoint") or `Minus()` ("below it") -- the identical binary vocabulary `_prism_in_rating_star`
+// already established for "no star glyph exists, reuse check/minus". `pct = ((point - min) * 100)
+// / (max - min)` is guarded when `max == min` (every point identical, so there is no meaningful
+// position within a zero-width range) -- instead of dividing by zero, every point renders
+// `Minus()`, mirroring `prism_stat_trend_flat`'s own choice of `Minus()` for "flat, nothing to
+// report" (prism_ui_data.nova).
+//
+// ── FIELD PREFIX: ONE SHARED ITEM TYPE FOR BAR, PIE, AND LEGEND ──────────────────────────────
+// `PrismChItem` is ONE record shape for all three (each is "a label paired with an integer value")
+// rather than three near-identical structs with three near-identical prefixes -- `ch_item_*` is
+// the single collision-safe prefix all three need (NOVA's field-name -> slot table is GLOBAL,
+// last-registration-wins).
+//
+// PUBLIC API
+//   PrismChItem { ch_item_label: string, ch_item_value: int } + prism_ch_item(label, value)
+//   prism_ch_bar(title: string, series: list) -> Result<PrismNode>
+//     series: list<PrismChItem>. rejects: empty title, empty series, a non-PrismChItem element, a
+//     negative value, a duplicate series label. An all-zero series renders every bar fully empty
+//     (never divides by zero).
+//   prism_ch_sparkline(points: list) -> Result<PrismNode>
+//     points: list<int>. rejects fewer than 2 points, a non-int element. A flat series (every
+//     point equal) renders every point Minus() (never divides by zero).
+//   prism_ch_pie(title: string, series: list) -> Result<PrismNode>
+//     series: list<PrismChItem>. Same rejections as bar. Percentages sum to exactly 100 via
+//     largest-remainder apportionment (std/money/allocate.nova, reused not reimplemented).
+//   prism_ch_gauge(label: string, value: int, min_val: int, max_val: int) -> Result<PrismNode>
+//     rejects min_val >= max_val, value outside [min_val, max_val], an empty label (propagated
+//     from prism_range).
+//   prism_ch_legend(series: list) -> Result<PrismNode>
+//     series: list<PrismChItem>. Same rejections as bar/pie. Built with
+//     prism_ui_kit.prism_ui_kv (itself built on prism_ui_collect) -- never a hand-rolled loop.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_structure
+import prism_ui_kit
+import std/money/allocate as alloc
+
+// ── Shared series-item type (bar, pie, legend) ────────────────────────────────────────────────
+type PrismChItem
+    ch_item_label: string
+    ch_item_value: int
+
+fn prism_ch_item(label: string, value: int) -> PrismChItem
+    PrismChItem(label, value)
+
+// Type + non-negativity + duplicate-label check, shared by bar/pie/legend. See header: this is
+// the FIRST and only check for pie/legend (neither routes through prism_grid/prism_each); bar gets
+// a second, redundant "duplicate row key" rejection from prism_grid itself, never actually reached
+// because this one runs first.
+fn _prism_ch_check_items(items: list) -> Result<int>
+    let seen = {}
+    let mut idx = 0
+    for it in items
+        if type_name(it) != "PrismChItem"
+            return err("prism_ch: series item " + str(idx) + " is not a PrismChItem (got " + type_name(it) + ")")
+        if it.ch_item_value < 0
+            return err("prism_ch: series item '" + it.ch_item_label + "' has a negative value (" + str(it.ch_item_value) + ")")
+        if it.ch_item_label in seen
+            return err("prism_ch: duplicate series label '" + it.ch_item_label + "'")
+        seen[it.ch_item_label] = true
+        idx += 1
+    ok(idx)
+
+fn _prism_ch_max(items: list) -> int
+    let mut m = 0
+    for it in items
+        if it.ch_item_value > m
+            m = it.ch_item_value
+    m
+
+fn _prism_ch_weights(items: list) -> list
+    let out = []
+    for it in items
+        out.push(it.ch_item_value)
+    out
+
+fn _prism_ch_pcts(items: list) -> list
+    alloc.alloc_weighted(100, _prism_ch_weights(items))
+
+// ── Bar ────────────────────────────────────────────────────────────────────────────────────────
+let PRISM_CH_BAR_TRACK = 10
+
+fn _prism_ch_track_idxs() -> list
+    let out = []
+    let mut i = 0
+    while i < PRISM_CH_BAR_TRACK
+        out.push(i)
+        i += 1
+    out
+
+// See header: guarded to 0 when max_value == 0 (only possible when every value is 0).
+fn _prism_ch_bar_width(value: int, max_value: int) -> int
+    if max_value == 0
+        return 0
+    (value * PRISM_CH_BAR_TRACK) / max_value
+
+fn _prism_ch_bar_glyph(idx: int, width: int) -> Result<PrismNode>
+    if idx < width
+        return prism_content.prism_glyph(prism_content.prism_icon_check())
+    prism_content.prism_glyph(prism_content.prism_icon_minus())
+
+// prism_grid's cell_fn contract: (row_item, column) -> Result<PrismNode>.
+fn _prism_ch_bar_cell(item, column: string, max_value: int) -> Result<PrismNode>
+    if column == "label"
+        return prism_content.prism_label(item.ch_item_label)
+    if column == "value"
+        return prism_content.prism_label(str(item.ch_item_value))
+    let width = _prism_ch_bar_width(item.ch_item_value, max_value)
+    let mk = fn(idx) _prism_ch_bar_glyph(idx, width)
+    let cells = prism_ui_kit.prism_ui_collect(_prism_ch_track_idxs(), mk)?
+    prism_arrange.prism_band(cells)
+
+fn prism_ch_bar(title: string, series: list) -> Result<PrismNode>
+    if title == ""
+        return err("prism_ch_bar: title must not be empty")
+    if len(series) == 0
+        return err("prism_ch_bar: needs at least one series entry")
+    _prism_ch_check_items(series)?
+    let max_value = _prism_ch_max(series)
+    let title_node = prism_content.prism_label(title)?
+    let key_fn = fn(it) it.ch_item_label
+    let cell_fn = fn(it, col) _prism_ch_bar_cell(it, col, max_value)
+    let body = prism_structure.prism_grid(series, key_fn, ["label", "bar", "value"], cell_fn)?
+    prism_arrange.prism_stack([title_node, body])
+
+// ── Sparkline / line ──────────────────────────────────────────────────────────────────────────
+// See header: Check() at/above the range midpoint, Minus() below it (or the whole series, flat).
+fn _prism_ch_spark_level(point: int, min_v: int, max_v: int) -> bool
+    if max_v == min_v
+        return false
+    let pct = ((point - min_v) * 100) / (max_v - min_v)
+    pct >= 50
+
+fn _prism_ch_spark_glyph(point: int, min_v: int, max_v: int) -> Result<PrismNode>
+    if _prism_ch_spark_level(point, min_v, max_v)
+        return prism_content.prism_glyph(prism_content.prism_icon_check())
+    prism_content.prism_glyph(prism_content.prism_icon_minus())
+
+fn prism_ch_sparkline(points: list) -> Result<PrismNode>
+    if len(points) < 2
+        return err("prism_ch_sparkline: needs at least 2 points, got " + str(len(points)))
+    let mut idx = 0
+    for p in points
+        if not is_int(p)
+            return err("prism_ch_sparkline: point " + str(idx) + " must be an int, got " + type_name(p))
+        idx += 1
+    let mut min_v = points[0]
+    let mut max_v = points[0]
+    for p in points
+        if p < min_v
+            min_v = p
+        if p > max_v
+            max_v = p
+    let mk = fn(p) _prism_ch_spark_glyph(p, min_v, max_v)
+    let glyphs = prism_ui_kit.prism_ui_collect(points, mk)?
+    prism_arrange.prism_band(glyphs)
+
+// ── Pie / share ────────────────────────────────────────────────────────────────────────────────
+fn _prism_ch_pie_row(text: string) -> Result<PrismNode>
+    prism_ui_kit.prism_ui_icon_text(prism_content.prism_icon_check(), text)
+
+fn prism_ch_pie(title: string, series: list) -> Result<PrismNode>
+    if title == ""
+        return err("prism_ch_pie: title must not be empty")
+    if len(series) == 0
+        return err("prism_ch_pie: needs at least one series entry")
+    _prism_ch_check_items(series)?
+    let pcts = _prism_ch_pcts(series)
+    let texts = []
+    let mut i = 0
+    for it in series
+        texts.push(it.ch_item_label + " " + str(pcts[i]) + "%")
+        i += 1
+    let title_node = prism_content.prism_label(title)?
+    let mk = fn(t) _prism_ch_pie_row(t)
+    let rows = prism_ui_kit.prism_ui_collect(texts, mk)?
+    prism_arrange.prism_stack([title_node, ...rows])
+
+// ── Gauge ──────────────────────────────────────────────────────────────────────────────────────
+// See header for why this calls prism_range directly instead of prism_fb_progress.
+fn prism_ch_gauge(label: string, value: int, min_val: int, max_val: int) -> Result<PrismNode>
+    if min_val >= max_val
+        return err("prism_ch_gauge: min (" + str(min_val) + ") must be < max (" + str(max_val) + ")")
+    if value < min_val or value > max_val
+        return err("prism_ch_gauge: value (" + str(value) + ") must be within [" + str(min_val) + ", " + str(max_val) + "]")
+    let track = prism_interact.prism_range(label, min_val, max_val, 1, value)?
+    let pct = ((value - min_val) * 100) / (max_val - min_val)
+    let text_node = prism_content.prism_label(label + " " + str(pct) + "%")?
+    prism_arrange.prism_stack([text_node, track])
+
+// ── Legend ─────────────────────────────────────────────────────────────────────────────────────
+// Built with prism_ui_kit.prism_ui_kv, itself built on prism_ui_collect (prism_ui_kit.nova) --
+// never a hand-rolled node-building loop here.
+fn prism_ch_legend(series: list) -> Result<PrismNode>
+    if len(series) == 0
+        return err("prism_ch_legend: needs at least one series entry")
+    _prism_ch_check_items(series)?
+    let pcts = _prism_ch_pcts(series)
+    let pairs = []
+    let mut i = 0
+    for it in series
+        pairs.push([it.ch_item_label, str(pcts[i]) + "%"])
+        i += 1
+    prism_ui_kit.prism_ui_kv(pairs)
