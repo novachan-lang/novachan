@@ -1,0 +1,516 @@
+// prism_look -- the `look` value (PRISM_SPEC.md §11). Prism's replacement for CSS.
+// Milestone MA.4 part B.
+//
+// §11 opens with the whole design in three sentences: "No cascade. No specificity. No global
+// namespace. A `look` is a typed value, resolvable to a flat constant at compile time." Everything
+// below exists to make those literally true at the library layer.
+//
+// ── THE CENTRAL DESIGN DECISION: ONE TYPED SETTER PER PROPERTY ────────────────────────────────
+// NOT a generic `prism_look_set(look, "inset", v)`. §11's closing claim is that "there is no way to
+// write a style that silently does nothing", which it correctly identifies as CSS's single most
+// common failure mode -- a misspelled or unsupported property in CSS is not an error, it is
+// silence. A string-keyed setter reintroduces exactly that: `"insett"` becomes a runtime error at
+// best and a silent no-op at worst. With one function per property there is NO STRING TO MISSPELL:
+// an unknown property is an unknown identifier (a COMPILE error), and a wrong value type is a
+// COMPILE error too. That is strictly stronger than the milestone's own exit criterion ("an invalid
+// property is caught at the library boundary") and it costs only ~30 three-line functions.
+//
+// ── WHY ENUM-VALUED PROPERTIES DO NOT EACH GET THEIR OWN NOVA `enum` ──────────────────────────
+// Eight of §11's properties take "typed enums" (align, case, wrap, clip, cursor, pass, weight,
+// ease). Eight NOVA enums + eight exhaustive matches + eight sets of cross-module constructor
+// wrappers is a great deal of code for the same guarantee obtainable another way. The guarantee
+// that actually matters is *the caller cannot express an invalid value*, and that is achieved here
+// because **the only way to produce an enum-valued PrismValue is to call a named constructor**
+// (`prism_align_center()`, `prism_wrap_none()`, ...). There is no public constructor that accepts a
+// raw string. The string inside `VEnum` is a PRIVATE ENCODING the caller never types, so it cannot
+// be misspelled -- the same reason `prism_glyph` takes a `PrismIcon` rather than an icon name.
+// Each setter additionally validates the enum's GROUP, so passing `prism_cursor_grab()` to
+// `prism_align` is rejected by name rather than silently stored.
+//
+// ── NO MODULE-LEVEL CONSTANT COLLECTIONS IN THIS FILE (a compiler bug, verified 2026-08-15) ────
+// A module-level `let` whose initializer is a list or dict literal is SILENTLY EMPTY when the
+// module is imported -- and writes through it are dropped. Every constant collection here is
+// therefore a function returning a freshly-built literal. See
+// prism/style/prism_palette.nova's header for the full probe result.
+//
+// ── MERGE: LATER WINS, AND IT MUST NOT MUTATE ─────────────────────────────────────────────────
+// §11: "`stack.card.tight` to merge two looks (later wins on conflict -- a deterministic,
+// order-based rule, not a specificity computation)." `prism_look_merge(a, b)` builds a FRESH dict
+// and copies into it; it never writes into `a` or `b`. That is not politeness -- a base look is
+// shared by every widget that uses it, so a mutating merge would let one caller's `.tight` silently
+// restyle every other user of `card`. A cascade-free design exists precisely to prevent
+// action-at-a-distance like that, so a mutating merge would defeat the point of the whole section.
+// Merge is also ASSOCIATIVE (proved in the KAT): merge(merge(a,b),c) == merge(a,merge(b,c)).
+//
+// ── KEY ORDER IS DETERMINISTIC, AND THAT MATTERS DOWNSTREAM ───────────────────────────────────
+// NOVA dicts iterate in strict insertion order, and overwriting an existing key KEEPS its position
+// (probed 2026-08-15, recorded in spec §15.9). So merge inserts `a`'s keys first, then `b`'s new
+// ones, and a conflicting key stays at `a`'s position with `b`'s value. The resulting property
+// order is a pure function of the inputs -- which is what lets MA.5 emit byte-identical output
+// without sorting anything.
+//
+// PUBLIC API
+//   Construction / inspection
+//     prism_look_new()                          -> PrismLook          the empty look
+//     prism_look_has(look, prop)                -> bool
+//     prism_look_prop_count(look)               -> int
+//     prism_look_props(look)                    -> dict               name -> PrismValue
+//     prism_look_value_str(look, prop)          -> string             rendered value, "" if absent
+//   Values (the only way to build one -- no public raw-string constructor)
+//     prism_len(px) / prism_frac(pct) / prism_fit() / prism_dur_ms(ms) / prism_elev(level)
+//     prism_paint_hex(hex) / prism_paint_slot(name)
+//     prism_align_start/_center/_end/_stretch()      prism_case_none/_upper/_lower/_title()
+//     prism_wrap_none/_word/_char()                  prism_clip_none/_bounds/_round()
+//     prism_cursor_auto/_hand/_text/_grab()          prism_pass_auto/_none/_all()
+//     prism_weight_light/_normal/_medium/_bold()     prism_ease_linear/_in/_out/_in_out()
+//   Properties (30, one per §11 table entry) -- each returns Result<PrismLook>
+//     Space     prism_inset  prism_outset  prism_space
+//     Size      prism_size   prism_wide    prism_tall  prism_least  prism_most  prism_grow
+//     Paint     prism_fill   prism_edge    prism_round prism_lift   prism_fade
+//     Text      prism_ink    prism_font    prism_weight_of  prism_leading  prism_tracking
+//               prism_case_of  prism_wrap_of
+//     Position  prism_align_of  prism_anchor  prism_offset
+//     Behaviour prism_clip_of   prism_cursor_of  prism_pass_of
+//     Motion    prism_ease_of   prism_over    prism_delay
+//   Composition
+//     prism_look_merge(a, b)                    -> Result<PrismLook>  b wins; neither is mutated
+//     prism_look_when(look, state, overrides)   -> Result<PrismLook>
+//     prism_look_state(look, state)             -> Result<PrismLook>  a state's overrides
+//     prism_look_has_state(look, state)         -> bool
+//     prism_state_hover/_press/_focus/_disabled()
+//     prism_look_resolve(look, slots)           -> Result<PrismLook>  palette refs -> flat colors
+
+// ── Value representation ──────────────────────────────────────────────────────────────────────
+// One closed enum for every legal property value. `VEnum`'s two strings are a private encoding
+// (see header) -- `group` is what lets a setter reject a value built for a different property.
+enum PrismValue
+    VLen(px: int)
+    VFrac(pct: int)
+    VFit()
+    VGrowth(factor: int)
+    VElev(level: int)
+    VDur(ms: int)
+    VColor(hex: string)
+    VSlot(slot: string)
+    VEnum(group: string, name: string)
+
+// Rendered form. EXHAUSTIVE, no wildcard arm: a 10th PrismValue variant without a case here is a
+// compile error, not a silent "" in every downstream renderer.
+fn prism_value_str(v: PrismValue) -> string
+    match v
+        VLen(px) => str(px)
+        VFrac(pct) => str(pct) + "%"
+        VFit() => "fit"
+        VGrowth(factor) => "grow:" + str(factor)
+        VElev(level) => "elev:" + str(level)
+        VDur(ms) => str(ms) + "ms"
+        VColor(hex) => hex
+        VSlot(slot) => "palette." + slot
+        VEnum(group, name) => name
+
+// The private group tag, used only to reject a value built for a different property.
+fn _prism_value_group(v: PrismValue) -> string
+    match v
+        VLen(_) => "len"
+        VFrac(_) => "frac"
+        VFit() => "fit"
+        VGrowth(_) => "growth"
+        VElev(_) => "elev"
+        VDur(_) => "dur"
+        VColor(_) => "paint"
+        VSlot(_) => "paint"
+        VEnum(group, _) => group
+
+// ── Value constructors (cross-module: constructors are file-local, so these are the public door) ─
+
+// §11: "`16` is implicitly device-independent pixels" and "`inset \"16px\"` is a type error".
+// Taking an int is what makes the string form unrepresentable rather than merely discouraged.
+fn prism_len(px: int) -> Result<PrismValue>
+    if px < 0
+        return err("prism_len: length must be >= 0, got " + str(px))
+    ok(VLen(px))
+
+fn prism_frac(pct: int) -> Result<PrismValue>
+    if pct < 0 or pct > 100
+        return err("prism_frac: fraction must be 0..100, got " + str(pct))
+    ok(VFrac(pct))
+
+fn prism_fit() -> PrismValue
+    VFit()
+
+fn prism_grow_by(factor: int) -> Result<PrismValue>
+    if factor < 0
+        return err("prism_grow_by: factor must be >= 0, got " + str(factor))
+    ok(VGrowth(factor))
+
+// Elevation is a small bounded ladder, not an arbitrary depth -- an unbounded `lift` is how a
+// design system ends up with 40 indistinguishable shadow levels.
+fn prism_elev(level: int) -> Result<PrismValue>
+    if level < 0 or level > 24
+        return err("prism_elev: elevation must be 0..24, got " + str(level))
+    ok(VElev(level))
+
+fn prism_dur_ms(ms: int) -> Result<PrismValue>
+    if ms < 0
+        return err("prism_dur_ms: duration must be >= 0 ms, got " + str(ms))
+    ok(VDur(ms))
+
+// A literal color. Validated HERE rather than trusted, because this module deliberately does not
+// import prism_color (it must stay usable without a palette). Same shapes prism_color accepts.
+fn prism_paint_hex(hex: string) -> Result<PrismValue>
+    if not _prism_hex_ok(hex)
+        return err("prism_paint_hex: '" + hex + "' is not #rgb, #rrggbb or #rrggbbaa")
+    ok(VColor(lower(hex)))
+
+// A reference to a palette slot -- §11's `fill palette.ground`. Stays symbolic until
+// prism_look_resolve flattens it, which is what "resolvable to a flat constant" means.
+fn prism_paint_slot(slot: string) -> Result<PrismValue>
+    if len(slot) == 0
+        return err("prism_paint_slot: slot name must not be empty")
+    ok(VSlot(slot))
+
+fn _prism_hex_digit_ok(c: string) -> bool
+    find("0123456789abcdefABCDEF", c) >= 0
+
+fn _prism_hex_ok(hex: string) -> bool
+    let n = len(hex)
+    if n != 4 and n != 7 and n != 9
+        return false
+    if hex[0] != "#"
+        return false
+    let i = 1
+    while i < n
+        if not _prism_hex_digit_ok(hex[i])
+            return false
+        i += 1
+    true
+
+// ── Enum-valued vocabularies (see header: named constructors, never a raw string) ─────────────
+fn prism_align_start() -> PrismValue
+    VEnum("align", "start")
+fn prism_align_center() -> PrismValue
+    VEnum("align", "center")
+fn prism_align_end() -> PrismValue
+    VEnum("align", "end")
+fn prism_align_stretch() -> PrismValue
+    VEnum("align", "stretch")
+
+fn prism_case_none() -> PrismValue
+    VEnum("case", "none")
+fn prism_case_upper() -> PrismValue
+    VEnum("case", "upper")
+fn prism_case_lower() -> PrismValue
+    VEnum("case", "lower")
+fn prism_case_title() -> PrismValue
+    VEnum("case", "title")
+
+fn prism_wrap_none() -> PrismValue
+    VEnum("wrap", "none")
+fn prism_wrap_word() -> PrismValue
+    VEnum("wrap", "word")
+fn prism_wrap_char() -> PrismValue
+    VEnum("wrap", "char")
+
+fn prism_clip_none() -> PrismValue
+    VEnum("clip", "none")
+fn prism_clip_bounds() -> PrismValue
+    VEnum("clip", "bounds")
+fn prism_clip_round() -> PrismValue
+    VEnum("clip", "round")
+
+fn prism_cursor_auto() -> PrismValue
+    VEnum("cursor", "auto")
+fn prism_cursor_hand() -> PrismValue
+    VEnum("cursor", "hand")
+fn prism_cursor_text() -> PrismValue
+    VEnum("cursor", "text")
+fn prism_cursor_grab() -> PrismValue
+    VEnum("cursor", "grab")
+
+// `pass` controls hit-testing pass-through -- §11's Behaviour group.
+fn prism_pass_auto() -> PrismValue
+    VEnum("pass", "auto")
+fn prism_pass_none() -> PrismValue
+    VEnum("pass", "none")
+fn prism_pass_all() -> PrismValue
+    VEnum("pass", "all")
+
+fn prism_weight_light() -> PrismValue
+    VEnum("weight", "light")
+fn prism_weight_normal() -> PrismValue
+    VEnum("weight", "normal")
+fn prism_weight_medium() -> PrismValue
+    VEnum("weight", "medium")
+fn prism_weight_bold() -> PrismValue
+    VEnum("weight", "bold")
+
+fn prism_ease_linear() -> PrismValue
+    VEnum("ease", "linear")
+fn prism_ease_in() -> PrismValue
+    VEnum("ease", "in")
+fn prism_ease_out() -> PrismValue
+    VEnum("ease", "out")
+fn prism_ease_in_out() -> PrismValue
+    VEnum("ease", "in_out")
+
+// ── Interaction states (§11's `when hover -> lift 4`) ─────────────────────────────────────────
+fn prism_state_hover() -> string
+    "hover"
+fn prism_state_press() -> string
+    "press"
+fn prism_state_focus() -> string
+    "focus"
+fn prism_state_disabled() -> string
+    "disabled"
+
+fn _prism_state_names() -> list
+    ["hover", "press", "focus", "disabled"]
+
+fn _prism_state_ok(s: string) -> bool
+    find(join(_prism_state_names(), ","), s) >= 0
+
+// ── The look value ────────────────────────────────────────────────────────────────────────────
+// `props`: property name -> PrismValue. `states`: state name -> a dict of the same shape.
+// States are stored as plain prop dicts rather than nested PrismLook values so that a state cannot
+// itself carry states -- `when hover -> when press -> ...` is not a thing §11 describes, and making
+// it unrepresentable is cheaper than defining what it would mean.
+type PrismLook
+    props: dict
+    states: dict
+
+fn prism_look_new() -> PrismLook
+    PrismLook({}, {})
+
+// ── The single chokepoint every setter funnels through ────────────────────────────────────────
+// Copies rather than mutates (see header): a setter that wrote into `look.props` would mutate a
+// shared base look for every other holder of it.
+fn _prism_set(look: PrismLook, prop: string, v: PrismValue) -> Result<PrismLook>
+    let next = {}
+    for k in look.props
+        next[k] = look.props[k]
+    next[prop] = v
+    ok(PrismLook(next, _prism_copy_states(look.states)))
+
+fn _prism_copy_states(states: dict) -> dict
+    let out = {}
+    for s in states
+        let inner = {}
+        for k in states[s]
+            inner[k] = states[s][k]
+        out[s] = inner
+    out
+
+// Rejects a value built for a different property -- e.g. prism_cursor_grab() handed to prism_align.
+fn _prism_set_grouped(look: PrismLook, prop: string, v: PrismValue, want_group: string) -> Result<PrismLook>
+    let g = _prism_value_group(v)
+    if g != want_group
+        return err("prism_look: property '" + prop + "' expects a " + want_group + " value, got a " + g + " value")
+    _prism_set(look, prop, v)
+
+// A length-or-fraction-or-fit property (§11's Size group accepts all three).
+fn _prism_set_sizing(look: PrismLook, prop: string, v: PrismValue) -> Result<PrismLook>
+    let g = _prism_value_group(v)
+    if g != "len" and g != "frac" and g != "fit" and g != "growth"
+        return err("prism_look: property '" + prop + "' expects a length, fraction, fit or growth value, got a " + g + " value")
+    _prism_set(look, prop, v)
+
+// ── Space (§11) ───────────────────────────────────────────────────────────────────────────────
+fn prism_inset(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "inset", v, "len")
+fn prism_outset(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "outset", v, "len")
+fn prism_space(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "space", v, "len")
+
+// ── Size (§11) ────────────────────────────────────────────────────────────────────────────────
+fn prism_size(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_sizing(look, "size", v)
+fn prism_wide(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_sizing(look, "wide", v)
+fn prism_tall(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_sizing(look, "tall", v)
+fn prism_least(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_sizing(look, "least", v)
+fn prism_most(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_sizing(look, "most", v)
+fn prism_grow(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "grow", v, "growth")
+
+// ── Paint (§11) ───────────────────────────────────────────────────────────────────────────────
+fn prism_fill(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "fill", v, "paint")
+fn prism_edge(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "edge", v, "paint")
+fn prism_round(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "round", v, "len")
+fn prism_lift(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "lift", v, "elev")
+fn prism_fade(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "fade", v, "frac")
+
+// ── Text (§11) ────────────────────────────────────────────────────────────────────────────────
+// `_of` suffixes where the bare name is already taken by this file's own value constructor
+// (prism_weight_bold(), prism_case_upper(), ...) -- NOVA has one flat symbol space, so
+// `prism_weight` as both a setter and a constructor prefix would be ambiguous to a reader even
+// where it links.
+fn prism_ink(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "ink", v, "paint")
+fn prism_font(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "font", v, "len")
+fn prism_weight_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "weight", v, "weight")
+fn prism_leading(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "leading", v, "len")
+fn prism_tracking(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "tracking", v, "len")
+fn prism_case_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "case", v, "case")
+fn prism_wrap_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "wrap", v, "wrap")
+
+// ── Position (§11) ────────────────────────────────────────────────────────────────────────────
+fn prism_align_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "align", v, "align")
+fn prism_anchor(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "anchor", v, "align")
+fn prism_offset(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "offset", v, "len")
+
+// ── Behaviour (§11) ───────────────────────────────────────────────────────────────────────────
+fn prism_clip_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "clip", v, "clip")
+fn prism_cursor_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "cursor", v, "cursor")
+fn prism_pass_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "pass", v, "pass")
+
+// ── Motion (§11) ──────────────────────────────────────────────────────────────────────────────
+fn prism_ease_of(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "ease", v, "ease")
+fn prism_over(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "over", v, "dur")
+fn prism_delay(look: PrismLook, v: PrismValue) -> Result<PrismLook>
+    _prism_set_grouped(look, "delay", v, "dur")
+
+// ── Inspection ────────────────────────────────────────────────────────────────────────────────
+fn prism_look_has(look: PrismLook, prop: string) -> bool
+    prop in look.props
+
+fn prism_look_prop_count(look: PrismLook) -> int
+    len(look.props)
+
+fn prism_look_props(look: PrismLook) -> dict
+    look.props
+
+fn prism_look_value_str(look: PrismLook, prop: string) -> string
+    if prop in look.props
+        return prism_value_str(look.props[prop])
+    ""
+
+// ── Merge (§11: later wins, order-based, not specificity) ─────────────────────────────────────
+// Builds a fresh dict; neither input is touched. `a`'s keys are inserted first so property order is
+// a pure function of the inputs (dict iteration is insertion order, and overwriting an existing key
+// keeps its position -- spec §15.9), which is what makes MA.5's byte-identical output possible.
+fn prism_look_merge(a: PrismLook, b: PrismLook) -> Result<PrismLook>
+    let next = {}
+    for k in a.props
+        next[k] = a.props[k]
+    for k in b.props
+        next[k] = b.props[k]
+    let states = {}
+    for s in a.states
+        let inner = {}
+        for k in a.states[s]
+            inner[k] = a.states[s][k]
+        states[s] = inner
+    for s in b.states
+        let inner2 = {}
+        if s in states
+            for k in states[s]
+                inner2[k] = states[s][k]
+        for k in b.states[s]
+            inner2[k] = b.states[s][k]
+        states[s] = inner2
+    ok(PrismLook(next, states))
+
+// ── State variants (§11's `when hover -> lift 4`) ─────────────────────────────────────────────
+fn prism_look_when(look: PrismLook, state: string, overrides: PrismLook) -> Result<PrismLook>
+    if not _prism_state_ok(state)
+        return err("prism_look_when: unknown state '" + state + "', legal states: " + join(_prism_state_names(), ", "))
+    if len(overrides.states) != 0
+        return err("prism_look_when: a state's overrides may not themselves carry states")
+    let next_props = {}
+    for k in look.props
+        next_props[k] = look.props[k]
+    let next_states = _prism_copy_states(look.states)
+    let inner = {}
+    if state in next_states
+        for k in next_states[state]
+            inner[k] = next_states[state][k]
+    for k in overrides.props
+        inner[k] = overrides.props[k]
+    next_states[state] = inner
+    ok(PrismLook(next_props, next_states))
+
+fn prism_look_has_state(look: PrismLook, state: string) -> bool
+    state in look.states
+
+fn prism_look_state(look: PrismLook, state: string) -> Result<PrismLook>
+    if not (state in look.states)
+        return err("prism_look_state: no '" + state + "' state on this look")
+    let inner = {}
+    for k in look.states[state]
+        inner[k] = look.states[state][k]
+    ok(PrismLook(inner, {}))
+
+// ── Resolve (§11: "resolvable to a flat constant") ────────────────────────────────────────────
+// Replaces every `palette.slot` reference with the slot's flat value. `slots` is a PLAIN DICT of
+// slot-name -> color, deliberately NOT a PrismPalette: taking the dict is what lets this module
+// stay independent of prism_palette.nova (which imports prism_color, which this file does not
+// need). prism_palette_slots() returns exactly this shape.
+// A missing slot is a typed error naming the slot -- never a silently-dropped property, which
+// would be the CSS failure mode §11 exists to eliminate.
+fn prism_look_resolve(look: PrismLook, slots: dict) -> Result<PrismLook>
+    let next = {}
+    for k in look.props
+        let rv = _prism_resolve_value(look.props[k], slots, k)
+        if is_err(rv)
+            return err(unwrap_err(rv))
+        next[k] = unwrap(rv)
+    let states = {}
+    for s in look.states
+        let inner = {}
+        for k in look.states[s]
+            let rv2 = _prism_resolve_value(look.states[s][k], slots, s + "." + k)
+            if is_err(rv2)
+                return err(unwrap_err(rv2))
+            inner[k] = unwrap(rv2)
+        states[s] = inner
+    ok(PrismLook(next, states))
+
+fn _prism_resolve_value(v: PrismValue, slots: dict, where_at: string) -> Result<PrismValue>
+    match v
+        VSlot(slot) =>
+            if not (slot in slots)
+                return err("prism_look_resolve: property '" + where_at + "' references palette slot '" + slot + "', which the palette does not define")
+            ok(_prism_color_to_value(slots[slot]))
+        _ => ok(v)
+
+// A resolved slot value arrives as whatever the palette stored (a PrismColor struct from
+// prism_palette, or a plain hex string if a caller supplied its own slot dict). Both are accepted
+// and normalized to a VColor, so this module never has to import prism_color to understand one.
+fn _prism_color_to_value(c) -> PrismValue
+    if is_string(c)
+        return VColor(lower(c))
+    if type_name(c) == "PrismColor"
+        let hx = "#" + _prism_hex2(c.r) + _prism_hex2(c.g) + _prism_hex2(c.b)
+        if c.a != 255
+            return VColor(hx + _prism_hex2(c.a))
+        return VColor(hx)
+    VColor("#000000")
+
+fn _prism_hex2(n: int) -> string
+    let digits = "0123456789abcdef"
+    let hi = n / 16
+    let lo = n - (hi * 16)
+    digits[hi] + digits[lo]
