@@ -120,6 +120,16 @@ Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native m
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }
 
+# Prism (framework #5) KAT gate -- PRISM_ROADMAP.md milestone MA.8. The sub-script DISCOVERS every
+# prism/kat/_kat_*.nova rather than taking a hard-coded list, so adding a KAT is sufficient to have
+# it gated; a hard-coded list would fail silently-green the day someone forgets to extend it.
+# Verified to actually fail (deliberate-sabotage self-test): a broken KAT gives exit 1 and is named.
+# The $LASTEXITCODE check sits IMMEDIATELY below its own invocation -- see the stage-2k comment
+# above for what happens when that check drifts away from the command it is supposed to be reading.
+Write-Host "`n[CI 2m/3] Prism KAT gate (node tree, 22 widgets, style, HTML + ANSI backends, catalog)..."
+& .\_prism_kat_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m (Prism KATs) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1
