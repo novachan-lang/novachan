@@ -664,6 +664,24 @@ Byte-reproducible output (we own the rasterizer) means a rendered frame can be h
 "this UI displayed what the code specifies." No browser can offer this; rendering varies by version,
 platform, and installed fonts.
 
+**The mechanism, measured (2026-08-15, ahead of MA.5).** Determinism is not a hope here; it rests on
+a property of NOVA I probed directly rather than assumed. A node carries `attrs: dict`, so any
+renderer walks a dict to emit attributes, and dict iteration order therefore *is* emission order.
+Probe result — **NOVA dicts iterate in strict insertion order**, and that order is:
+
+- identical across separate runs of the same binary,
+- identical between a dict built by successive assignment and the same keys written as a literal,
+- **stable across internal resize** (verified past initial capacity at 20 keys — no rehash reordering),
+- **unperturbed by overwriting an existing key** (the key keeps its original position; it does not
+  move to the end).
+
+**Consequence, and it is a binding obligation on widget authors:** byte-identical output needs **no
+key sorting** in the renderer — but only because every widget constructor builds its `attrs` from a
+**fixed literal key order**. A constructor that assembled `attrs` conditionally, in an order varying
+with its arguments, would silently break attestation while every test still passed. Where a
+constructor genuinely has two attr shapes (`gap` flexible vs fixed), each branch must itself be a
+fixed literal — which is how MA.3's constructors are written.
+
 ## 16. Resource bounds — denial of service (T2)
 
 A malicious payload must not be able to exhaust the renderer. Every limit is explicit, enforced at
@@ -696,6 +714,101 @@ induce layout thrash, because the algorithm admits no iteration.
 - **isolated** — no shared memory with the face tree; communication only over a typed channel;
 - **visually attributed** — the compositor marks embedded regions so overlay attacks on them are
   detectable.
+
+## 17A. The HTML emission map — Prism's first sink, and how §15.1 survives it (NORMATIVE)
+
+Added 2026-08-15, ahead of milestone MA.5 (the server-side HTML renderer). This section exists
+because MA.5 is the moment the "no sink" argument stops being free.
+
+### 17A.1 The honest restatement
+
+§15.1 says injection is unrepresentable because Prism has **no markup sink**. On the native GPU and
+terminal backends that is literally true — there is no markup anywhere. **The HTML renderer creates
+one.** Pretending otherwise would be the exact "silence in a spec is a hidden gap" failure this
+project's own quality rules forbid.
+
+The guarantee does not collapse; it changes form, and the new form is still strong — but it must be
+argued, not asserted:
+
+> On the HTML target there is **exactly one** function in the entire system that may emit a `<`, and
+> the set of positions where data can reach the output is **finite and enumerable**, because the
+> vocabulary is closed.
+
+That enumerability is the whole payoff of axiom A7 (a closed 22-primitive vocabulary). Concretely,
+every byte the renderer emits comes from one of five sources, and only two of them are data:
+
+| Output position | Source | Attacker-controllable? |
+|---|---|---|
+| Element names | a fixed 22-entry `PrismNodeKind` → element map | **No** — enum-driven, never data-derived |
+| Attribute names | fixed literals in the widget constructors | **No** — same reason |
+| Structural punctuation (`<`, `>`, `/`, `=`, `"`) | the renderer itself | **No** |
+| **Text content** | data | **Yes → MUST escape `&` `<` `>`** |
+| **Attribute values** | data | **Yes → MUST escape `&` `<` `>` `"` `'`, and MUST always be quoted** |
+
+A template language has an unbounded number of sinks and fails when one is missed. Prism has two,
+both in one file. That is the difference worth defending, and it is defensible only as long as the
+element and attribute-name maps stay enum-driven.
+
+### 17A.2 Binding rules for MA.5
+
+1. **No `<script>`, no `<style>`, no `<iframe>`, no `<object>`, no `<embed>`, ever.** No entry in the
+   kind map may produce one. This is structural, not a filter: those elements have no primitive.
+2. **No event-handler attributes.** Prism never emits `onclick=` or any `on*`. Interactivity is bound
+   by the runtime against node identity, not smuggled through markup. An `on*` attribute appearing in
+   output is a defect, not a feature.
+3. **No comments and no CDATA.** `<!--` never appears; there is no context for it to be escaped in.
+4. **Attribute values are always double-quoted**, without exception. Unquoted attribute values make
+   a space or `>` in data a structural break, which no amount of entity-escaping fixes.
+5. **`href` is emitted only from a destination already validated per §15.1.1.** The renderer does not
+   re-validate and must not be the place that first decides a URL is safe — but it still
+   attribute-escapes, because escaping and allowlisting answer different questions.
+6. **External links carry `rel="noopener noreferrer"`.** Without `noopener` the opened page gets a
+   live `window.opener` handle back into the origin — a tabnabbing vector that has nothing to do with
+   the URL being on the allowlist.
+7. **`draw` renders a placeholder server-side.** Its `paint` callback is client-side by nature; the
+   server emits the element and no script.
+8. **Determinism.** Attribute emission order is `attrs` insertion order (§15.9). No key sorting; no
+   run-varying order.
+
+### 17A.3 The map (all 22)
+
+`each` deliberately emits **no wrapper element** — a wrapper would break the parent's layout
+contract, and it is unnecessary because MA.3's `each` already attaches the identity key to each row
+node, so the key rides on the row rather than on a container.
+
+| Primitive | Element | Derived a11y / attrs |
+|---|---|---|
+| `stack` | `div` | block axis |
+| `band` | `div` | inline axis |
+| `layer` | `div` | overlay; later children paint on top |
+| `mesh` | `div` | grid tracks from `cols` |
+| `flow` | `div` | wrapping inline |
+| `pane` | `div` | scroll viewport |
+| `gap` | `div` | `aria-hidden="true"` — a spacer is not content |
+| `label` | `span` | text content, escaped |
+| `art` | `img` | `alt` derived per §13 |
+| `glyph` | inline `svg` | `aria-hidden="true"` when decorative; from the closed icon set |
+| `draw` | `canvas` | placeholder server-side (rule 7) |
+| `press` | `button` | `type="button"` — never a bare `div` with a handler |
+| `entry` | `input` / `textarea` | `type` from `PrismEntryKind`; `aria-label` from `prompt` |
+| `pick` | `select` + `option` | `aria-label` |
+| `flag` | `input type="checkbox"` | `aria-label` |
+| `range` | `input type="range"` | `min` `max` `step` `value`, `aria-label` |
+| `link` | `a` | validated `href`; `rel="noopener noreferrer"` when external |
+| `each` | *(none — children in sequence)* | key rides on each row node |
+| `grid` | `table` / `tr` / `td` | `role="table"` |
+| `sheet` | `dialog` | `aria-modal` when `exclusive` |
+| `hint` | `span` + `role="tooltip"` | `aria-describedby` wiring |
+| `tabs` | `div` | `role="tablist"` / `role="tab"` / `role="tabpanel"` |
+
+### 17A.4 What would prove this section wrong
+
+A renderer that passes every escaping test but emits an element name derived from data; an `on*`
+attribute reaching output by any path; a primitive added later whose element is chosen by a string
+rather than the enum. Each would move a position out of the "not attacker-controllable" column, and
+the argument in 17A.1 would no longer hold.
+
+---
 
 ## 18. Known limitations (stated, not hidden)
 
