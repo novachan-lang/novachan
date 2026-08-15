@@ -27498,6 +27498,15 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                         else
                             if not contains(visited, sub_mod)
                                 visited[sub_mod] = sub_alias
+    // Every identifier referenced from inside this module's own FUNCTION bodies. A top-level
+    // `let`/`const` is baked (below) only if it appears here -- see the gate note in the "assign"
+    // branch for why baking an unreferenced name corrupts importers' lambda captures.
+    let _mod_fn_refs = []
+    for _mfs in stmts
+        match _mfs
+            Stmt(_ftag, _fname, _fexpr, _fbody, _fparams, _feb, _fann, _fsl) =>
+                if _ftag == "fn"
+                    collect_free_vars_stmt(_mfs, [], _mod_fn_refs)
     let mod_fns = []
     let exported = []
     for s in stmts
@@ -27621,6 +27630,46 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                                                 b.ir_fmap[vpname] = vfi
                                                 b.ir_field_types[vname + "." + vpname] = vptype
                                         vfi = vfi + 1
+                else if tag == "const"
+                    // An imported module's top-level `const X = [...]` had NO branch in this loop
+                    // at all, so it was never baked into the const store. Every reference to it
+                    // inside that module's own functions then fell back to a zero-initialized
+                    // local slot -- i.e. SILENTLY an empty collection, with no error. Mirrors the
+                    // main-module path (~24810). `stmts` is this module's own statement list, so
+                    // the const fold resolves in the right scope.
+                    // Gated on _mod_fn_refs (see below) for the same anti-pollution reason.
+                    let _mcfe = ce_try_fold_const(expr, stmts)
+                    if list_contains(_mod_fn_refs, name)
+                        b.ir_consts[name] = _mcfe
+                        if ir_const_bakeable(_mcfe) == 1
+                            if not contains(b.ir_const_baked, name)
+                                b.ir_const_baked[name] = len(b.ir_const_build_order)
+                                push(b.ir_const_build_order, [name, _mcfe])
+                else if tag == "assign" and name != "" and _is_module_state_init(expr) == 1
+                    // Same hole for a top-level `let X = [...]` / `{...}` / `channel()` -- module
+                    // STATE. Baking it is what makes every function in the module reach the ONE
+                    // shared instance: a counter box `let BX = [0]` must be shared, or a write
+                    // `BX[0] = v` lands in a per-function zero copy and is silently dropped. This
+                    // was breaking shipped code -- forge's set_max_body() was a no-op.
+                    //
+                    // ── GATED ON _mod_fn_refs, AND THAT GATE IS LOAD-BEARING ──────────────────
+                    // Baking inserts `name` into b.ir_const_baked, which is a FLAT, PROGRAM-WIDE
+                    // map -- and filter_captures (12332) uses it to DROP a name from a lambda's
+                    // capture list on the grounds that a baked const is reachable globally. So
+                    // baking a name the module does not actually need makes every IMPORTER with a
+                    // same-named LOCAL silently lose that local from its lambda captures, and the
+                    // lambda then reads the imported module's value instead. Measured, not
+                    // theorized: baking ungated broke _coro_test, whose function-local `sbox` /
+                    // `fbox` / `abox` collided with top-level names in std/util/coro.nova's own
+                    // TEST section -- two generators silently shared one state box.
+                    // Restricting to names the module's own FUNCTIONS reference keeps genuine
+                    // module state working (that is the whole point) while leaving a module's
+                    // top-level test scaffolding out of every importer's namespace.
+                    // FIRST DEFINITION WINS on a name clash, matching the main-module guard.
+                    if list_contains(_mod_fn_refs, name)
+                        if not contains(b.ir_const_baked, name)
+                            b.ir_const_baked[name] = len(b.ir_const_build_order)
+                            push(b.ir_const_build_order, [name, expr])
     let ir_fns = []
     for fn_stmt in mod_fns
         let ir_fn = ir_lower_function(b, fn_stmt)
