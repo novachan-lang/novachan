@@ -1,0 +1,78 @@
+// prism_forge -- the bridge that lets a Forge route serve a Prism component tree.
+// Completes milestone MA.5's remaining exit clause ("wired into a Forge route").
+//
+// ── WHY THIS IS A SEPARATE MODULE AND NOT A FUNCTION IN THE RENDERER ─────────────────────────
+// `prism_render_html.nova` must stay dependency-free: it is Prism's security boundary, and the
+// smaller and more self-contained that file is, the more credible the claim in PRISM_SPEC.md §17A
+// that exactly one function in the system can emit a `<`. Importing a web framework into it would
+// make the sink's dependency surface the web framework's dependency surface. So the coupling lives
+// here instead, in a module that Forge users import and nobody else has to.
+//
+// ── WHAT THIS ACTUALLY BUYS, TODAY ────────────────────────────────────────────────────────────
+// A NOVA developer writes a UI as typed values -- `prism_stack`, `prism_press`, `prism_each` --
+// and serves it from an ordinary Forge route. No template language, no HTML string concatenation,
+// no npm, no build step, no WASM, no compiler change. The full-stack story NOVA claims ("ONE
+// developer, ONE language, builds ANYTHING") is, for the server-rendered case, real as of this
+// module.
+//
+// ── THE ERROR PATH IS THE INTERESTING PART ────────────────────────────────────────────────────
+// Every Prism constructor returns `Result`, so a page can legitimately fail to build (a bound
+// exceeded, a rejected URL scheme, a bad palette slot). A web handler cannot return a Result -- it
+// must return a response. The tempting shortcut is to render the error text into the page, and
+// that would be a real security bug: error strings quote back the offending INPUT, so an attacker
+// who can trigger a construction failure gets a reflected-content primitive on an error page, and
+// error pages are exactly where escaping is most often forgotten.
+// So `prism_forge_page` NEVER puts the error in the response body. It returns a fixed 500 body and
+// hands the detail to the caller's log through an explicit logger, keeping diagnostics on the
+// server side where they belong.
+//
+// PUBLIC API
+//   prism_forge_page(node_result, title)     -> string   200 HTML, or a safe fixed-body 500
+//   prism_forge_page_logged(node_result, title, log_fn) -> string   same, detail to log_fn
+//   prism_forge_handler(build_fn, title)     -> a Forge handler serving what build_fn returns
+//   prism_forge_catalog_handler()            -> a Forge handler serving the component catalog
+
+import forge
+import prism_render_html as rh
+import prism_catalog as pcat
+
+// A single fixed body for every failure. No detail, no echo of any input -- see the header note on
+// why an error page is the worst place to reflect content.
+fn _prism_forge_error_body() -> string
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error</title></head><body><p>The page could not be rendered.</p></body></html>"
+
+// Renders an already-built Result<PrismNode> into a Forge response.
+fn prism_forge_page(node_result, title: string) -> string
+    if is_err(node_result)
+        return forge.html(500, _prism_forge_error_body())
+    let body = rh.prism_html_render_page(unwrap(node_result), title)
+    if is_err(body)
+        return forge.html(500, _prism_forge_error_body())
+    forge.html(200, unwrap(body))
+
+// Same, but the failure detail reaches the SERVER rather than the client. `log_fn` takes one
+// string. Diagnostics belong in the log; the response body stays fixed.
+fn prism_forge_page_logged(node_result, title: string, log_fn) -> string
+    if is_err(node_result)
+        log_fn("prism_forge: page build failed: " + unwrap_err(node_result))
+        return forge.html(500, _prism_forge_error_body())
+    let body = rh.prism_html_render_page(unwrap(node_result), title)
+    if is_err(body)
+        log_fn("prism_forge: render failed: " + unwrap_err(body))
+        return forge.html(500, _prism_forge_error_body())
+    forge.html(200, unwrap(body))
+
+// Wraps a page-builder into a Forge handler. `build_fn(req) -> Result<PrismNode>` is called per
+// request, so the tree is rebuilt from live data each time rather than captured once.
+fn prism_forge_handler(build_fn, title: string)
+    // Bound to a local first: a bare `fn(x) ...` at the start of a statement is parsed as a
+    // function DECLARATION, so returning a lambda directly is E0001. Binding it makes the
+    // expression position unambiguous.
+    let h = fn(req) prism_forge_page(build_fn(req), title)
+    h
+
+// Serves the generated component catalog (MA.7) on any route. Useful in development as a live,
+// always-current reference that cannot drift from the real widget layer.
+fn prism_forge_catalog_handler()
+    let h = fn(req) prism_forge_page(pcat.prism_catalog_tree(), "Prism component catalog")
+    h

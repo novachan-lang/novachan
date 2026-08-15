@@ -79,7 +79,13 @@ foreach ($k in $kats) {
     $ran++
     # Two independent conditions, because a KAT could in principle print a failure line and still
     # exit 0 if its own accounting were wrong. Both must be clean.
-    $sawFail = ($r.StdOut -match "FAIL")
+    #
+    # -cmatch (case-SENSITIVE) and line-anchored, deliberately. A plain `-match "FAIL"` is
+    # case-insensitive in PowerShell, so it matched the word "failed" inside a KAT's own prose --
+    # `== 2. a failed build leaks NOTHING ==` -- and reported a fully-passing KAT as FAIL. A gate
+    # that cries wolf gets ignored, which is the same end state as a gate that cannot fail. The
+    # KATs' failure convention is an uppercase `FAIL` token at the start of a line.
+    $sawFail = ($r.StdOut -cmatch '(?m)^\s*FAIL\b')
     if ($r.ExitCode -ne 0 -or $sawFail) {
         Write-Host "  FAIL  $name  (exit=$($r.ExitCode))"
         Write-Host $r.StdOut

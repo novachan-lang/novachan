@@ -1,0 +1,111 @@
+// KAT for prism/app/prism_forge.nova -- completes MA.5's "wired into a Forge route" clause.
+//
+// This is deliberately an END-TO-END test, not a unit test of the bridge functions. It starts a
+// real Forge HTTP server, fetches a Prism-rendered page over a real socket, and asserts on the
+// bytes that came back off the wire. Every layer that a browser would traverse is exercised:
+//   Prism constructors -> node tree -> HTML renderer -> Forge response -> HTTP -> client
+// A mock at any of those layers could hide exactly the integration bug this milestone exists to
+// rule out, which is why nothing here is mocked.
+//
+// Also asserts the security property the bridge itself owns: a page that FAILS to build must
+// return a fixed 500 body that contains NO detail. Error strings quote the offending input back,
+// so rendering one into an error page would hand an attacker a reflected-content primitive -- on
+// exactly the page where escaping is most often forgotten.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_forge.nova
+//   clang -O2 -o _kat_prism_forge.exe _kat_prism_forge.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import forge
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_forge as pf
+
+let FAILED = [0]
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_absent(label: string, hay: string, needle: string)
+    if find(hay, needle) < 0
+        print("  pass  absent: " + label)
+    else
+        print("  FAIL  absent: " + label + " -- FOUND")
+        FAILED[0] = FAILED[0] + 1
+
+// The page a real application would write: typed Prism values, no HTML anywhere.
+fn build_dashboard(req) -> Result<PrismNode>
+    let title = unwrap(prism_content.prism_label("Prism Dashboard"))
+    let icon = unwrap(prism_content.prism_glyph(prism_content.prism_icon_check()))
+    let head = unwrap(prism_arrange.prism_band([icon, title]))
+    let save = unwrap(prism_interact.prism_press("Save", []))
+    let docs = unwrap(prism_interact.prism_link("Docs", prism_interact.prism_link_target_url("https://example.com/docs")))
+    let body = unwrap(prism_arrange.prism_stack([save, docs]))
+    prism_arrange.prism_stack([head, body])
+
+// A page that cannot build: the node-count bound is exceeded on purpose. The error message will
+// contain the count -- which must NOT reach the client.
+fn build_broken(req) -> Result<PrismNode>
+    err("prism_kat: deliberate failure with SENSITIVE-DETAIL-12345 inside")
+
+// serve_app_n handles exactly n requests then returns, so the KAT terminates on its own instead
+// of needing an external kill.
+fn _run_server(port: int)
+    let a = forge.app()
+    forge.get(a, "/", pf.prism_forge_handler(build_dashboard, "Dashboard"))
+    forge.get(a, "/catalog", pf.prism_forge_catalog_handler())
+    forge.serve_app_n(a, port, 2)
+
+fn main()
+    print("== 1. the bridge, without a server ==")
+    let ok_resp = pf.prism_forge_page(build_dashboard(0), "Dashboard")
+    _check_true("200 status line", find(ok_resp, "200") >= 0)
+    _check_true("carries the rendered page", find(ok_resp, "Prism Dashboard") >= 0)
+    _check_true("is a full HTML document", find(ok_resp, "<!doctype html>") >= 0)
+
+    print("== 2. ★ a failed build leaks NOTHING ==")
+    let bad_resp = pf.prism_forge_page(build_broken(0), "Dashboard")
+    _check_true("500 status", find(bad_resp, "500") >= 0)
+    _check_absent("no error detail in the body", bad_resp, "SENSITIVE-DETAIL-12345")
+    _check_absent("no internal prefix leaked", bad_resp, "prism_kat:")
+    _check_true("still a valid document", find(bad_resp, "<!doctype html>") >= 0)
+    // The logged variant must give the SAME body while the detail reaches the log.
+    let seen = [""]
+    let log_fn = fn(m) seen.push(m)
+    let bad2 = pf.prism_forge_page_logged(build_broken(0), "Dashboard", log_fn)
+    _check_absent("logged variant body still leaks nothing", bad2, "SENSITIVE-DETAIL-12345")
+    _check_true("detail did reach the log", len(seen) > 1)
+    _check_true("log carries the detail", find(join(seen, "|"), "SENSITIVE-DETAIL-12345") >= 0)
+
+    print("== 3. ★ END-TO-END over a real socket ==")
+    // Follows _forge_router_test.nova's proven shape exactly: the app is built INSIDE the spawned
+    // function and the spawn wraps a lambda (`spawn fn() ...`). Spawning the serve call directly
+    // hangs -- the KAT's first attempt did, and only kill-on-timeout kept the host usable.
+    spawn fn() _run_server(8791)
+    sleep(300)
+
+    let got = http_get("http://127.0.0.1:8791/")
+    _check_true("server answered", len(got) > 0)
+    _check_true("served the Prism page", find(got, "Prism Dashboard") >= 0)
+    _check_true("rendered a real button element", find(got, "<button") >= 0)
+    _check_true("rendered the link with noopener", find(got, "noopener noreferrer") >= 0)
+    _check_absent("no script reached the wire", got, "<script")
+
+    let cat = http_get("http://127.0.0.1:8791/catalog")
+    _check_true("catalog route answered", len(cat) > 0)
+    _check_true("catalog served all primitives", find(cat, "tabs") >= 0)
+    _check_true("catalog is substantial", len(cat) > 2000)
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_forge: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_forge: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)
