@@ -1,0 +1,227 @@
+// prism_theme -- connects style/ values to ui/ components (PRISM_SPEC.md §11). Milestone MB.7.
+//
+// ── THE GAP THIS CLOSES ────────────────────────────────────────────────────────────────────────
+// MA.4 built typed `look`/`palette` values: 18 WCAG-verified palettes (9 presets x light/dark) and
+// a `PrismLook` that can hold a `palette.slot` reference and later flatten it. MB.1-6 built 37
+// `ui/` components. Neither side ever imports the other -- no component takes a `look`, so all 18
+// palettes sit unused by the component layer. This file is the missing wire: a small named set of
+// per-role looks (`surface`, `field`, `action_primary`, `action_quiet`, `danger`, `muted`) that a
+// caller builds once from a palette name and hands to components going forward.
+//
+// ── WHY 6 ROLES, NOT A LOOK PER COMPONENT (37 OF THEM) OR ONE GLOBAL LOOK ─────────────────────
+// A role per ui/ component (37 roles) would re-derive Bootstrap's per-widget theming surface --
+// most of those 37 components differ in LAYOUT, not in paint, so most roles would be identical
+// copies wearing different names. A single global look is the opposite failure: a primary button
+// and a danger alert cannot share one fill. The role vocabulary here is the smallest set that
+// covers every DISTINCT paint need actually observed across ui/: a background surface, a bordered
+// input control, a filled call-to-action, a low-emphasis action, a destructive/error accent, and
+// muted secondary text. A component composes its own layout (inset/stack/grid, already built) and
+// asks the theme only for the paint (`fill`/`edge`/`ink`) that role implies -- the same separation
+// CSS gets right with utility classes and wrong with cascade.
+//
+// ── WHY EVERY ROLE LOOK IS BUILT SYMBOLIC, AND IDENTICALLY, FOR ALL 18 PALETTES ───────────────
+// A role's look is built entirely from `prism_paint_slot(name)` references (`palette.ground`,
+// `palette.accent`, ...), never a literal hex. Every preset shares the SAME 7 slot names by
+// construction (`_prism_palette_build` in prism_palette.nova always populates all 7), so the
+// symbolic look for e.g. `action_primary` is byte-identical across all 18 combinations -- only
+// `prism_theme_resolved` (which flattens against ONE palette's slots) produces 18 different
+// answers. This is what makes "all 18 must work" true by construction rather than by 18 hand-built
+// cases: `prism_theme_from` never branches on which preset it was given past the initial
+// `prism_palette_named` lookup.
+//
+// ── WHY `danger` RESOLVES AGAINST THE PALETTE'S `warn` SLOT, NOT A NEW SLOT ───────────────────
+// prism_palette.nova's own header traces `warn`/`ok` to "a validation error or a destructive
+// action needs a color that is NOT accent" -- exactly the `danger` role's job. Adding an 8th slot
+// for a name synonym would be the "20 slots for nothing" CLAUDE.md warns against; this module
+// reuses the palette vocabulary that already exists for that purpose instead of growing it.
+//
+// ── WHY `action_primary`'s TEXT COLOR IS `palette.ground`, NOT A NEW "on-accent" SLOT ─────────
+// The palette has no dedicated "text-on-accent" slot (prism_palette.nova's header is explicit
+// that the 7-slot vocabulary is deliberately closed). `ground` is the closest legible
+// approximation available without inventing one: every preset's `ground` is the near-white
+// (light) or near-black (dark) extreme of its neutral range, which reads as a defensible
+// high-contrast choice against a mid-saturation `accent` fill in both modes. This is a known,
+// documented approximation, not a WCAG-verified pairing (only ink-on-ground carries that
+// guarantee, per prism_palette.nova's header) -- a real per-preset `accent`-contrast check is
+// future work if a component needs it asserted, not assumed.
+//
+// ── WHY BUILD/READ/OVERRIDE ARE THREE SEPARATE FUNCTIONS, NOT ONE WITH FLAGS ──────────────────
+// `prism_theme_look` returns the RAW look (may still hold `palette.slot` references) --
+// deliberately, so a caller composing a `look.merge` chain before ever touching a palette can
+// still work with it. `prism_theme_resolved` is the only function that flattens, and it is a thin
+// wrapper: fetch raw, then `prism_look_resolve` against the theme's own slots. Two failure modes
+// (unknown role vs. missing slot at resolve time) stay distinguishable by which function raised
+// them, rather than one function conflating "you asked for a role that doesn't exist" with "this
+// role's palette reference doesn't resolve".
+//
+// ── WHY `prism_theme_with` COPIES `theme_looks` RATHER THAN WRITING THROUGH IT ────────────────
+// Same reasoning as `prism_look_merge`'s own header: a `PrismTheme` is shared by every component
+// using it, so a mutating override would let one screen's `.with("action_primary", tight)` restyle
+// every other screen sharing that theme. `_prism_theme_copy_looks` builds a fresh dict; the
+// original theme's `theme_looks` dict object is never written to.
+//
+// ── FIELD NAMES ARE PREFIXED ON PURPOSE (MB.6x) ────────────────────────────────────────────────
+// NOVA's field-name -> slot table is GLOBAL and last-registration-wins across every module the
+// program links in. `PrismNode.kind` colliding with `PrismFormField.kind` at a different slot
+// crashed the HTML renderer (MB.6x). `theme_palette` / `theme_looks` are grepped project-wide as
+// unique before being written here.
+//
+// ── `prism_theme_roles()` IS A FUNCTION, NOT A MODULE-LEVEL `let` ─────────────────────────────
+// A module-level `let` whose initializer is a list/dict literal used to be silently empty when
+// the module was imported (the bug that hid MA.4a's 18-palette KAT for an entire session -- see
+// prism_palette.nova's header). Fixed upstream, but every collection constant in style/ stays a
+// function anyway: baking is keyed by name in one flat namespace, first-definition-wins, so two
+// modules each declaring `let ROLES = [...]` would silently share one. A function returning a
+// fresh literal cannot collide.
+//
+// PUBLIC API
+//   PrismTheme                                              a palette + 6 named role looks
+//   prism_theme_roles() -> list                              the 6 legal role names, fixed order
+//   prism_theme_from(palette_name, dark) -> Result<PrismTheme>
+//                                                            builds a complete default theme; typed
+//                                                              error on an unknown preset name
+//   prism_theme_look(theme, role) -> Result<PrismLook>       the role's RAW look (may still hold
+//                                                              palette.slot references); typed error
+//                                                              listing the legal roles if unknown
+//   prism_theme_resolved(theme, role) -> Result<PrismLook>   the role's look with every palette.slot
+//                                                              reference flattened to a flat value
+//   prism_theme_with(theme, role, overrides) -> Result<PrismTheme>
+//                                                            later-wins override of one role; theme
+//                                                              is NOT mutated
+//   prism_theme_name(theme) -> string / prism_theme_is_dark(theme) -> bool / prism_theme_palette(theme) -> PrismPalette
+//                                                            accessors, for a component that needs
+//                                                              the raw palette a role look doesn't cover
+
+import prism_palette
+import prism_look
+
+// ── The value type ────────────────────────────────────────────────────────────────────────────
+type PrismTheme
+    theme_palette: PrismPalette
+    theme_looks: dict
+
+// The 6 legal role names, in the fixed dispatch/error-message order. A function, not a `let` --
+// see header.
+fn prism_theme_roles() -> list
+    ["surface", "field", "action_primary", "action_quiet", "danger", "muted"]
+
+// ── Per-role default looks (all symbolic -- see header) ──────────────────────────────────────
+// A general background surface: cards, panes, sheets.
+fn _prism_theme_look_surface() -> Result<PrismLook>
+    let l0 = prism_look.prism_look_new()
+    let l1 = prism_look.prism_fill(l0, prism_look.prism_paint_slot("ground")?)?
+    let l2 = prism_look.prism_edge(l1, prism_look.prism_paint_slot("edge")?)?
+    let l3 = prism_look.prism_ink(l2, prism_look.prism_paint_slot("ink")?)?
+    let l4 = prism_look.prism_round(l3, prism_look.prism_len(8)?)?
+    prism_look.prism_inset(l4, prism_look.prism_len(16)?)
+
+// A bordered input control: entry, pick, date, search, stepper.
+fn _prism_theme_look_field() -> Result<PrismLook>
+    let l0 = prism_look.prism_look_new()
+    let l1 = prism_look.prism_fill(l0, prism_look.prism_paint_slot("ground")?)?
+    let l2 = prism_look.prism_edge(l1, prism_look.prism_paint_slot("edge")?)?
+    let l3 = prism_look.prism_ink(l2, prism_look.prism_paint_slot("ink")?)?
+    let l4 = prism_look.prism_round(l3, prism_look.prism_len(6)?)?
+    prism_look.prism_inset(l4, prism_look.prism_len(8)?)
+
+// A filled call-to-action: the primary button in a form or action bar.
+fn _prism_theme_look_action_primary() -> Result<PrismLook>
+    let l0 = prism_look.prism_look_new()
+    let l1 = prism_look.prism_fill(l0, prism_look.prism_paint_slot("accent")?)?
+    let l2 = prism_look.prism_ink(l1, prism_look.prism_paint_slot("ground")?)?
+    let l3 = prism_look.prism_round(l2, prism_look.prism_len(6)?)?
+    let l4 = prism_look.prism_inset(l3, prism_look.prism_len(12)?)?
+    prism_look.prism_cursor_of(l4, prism_look.prism_cursor_hand())
+
+// A low-emphasis action: cancel, secondary/tertiary buttons -- accent-colored text, no fill.
+fn _prism_theme_look_action_quiet() -> Result<PrismLook>
+    let l0 = prism_look.prism_look_new()
+    let l1 = prism_look.prism_ink(l0, prism_look.prism_paint_slot("accent")?)?
+    let l2 = prism_look.prism_round(l1, prism_look.prism_len(6)?)?
+    let l3 = prism_look.prism_inset(l2, prism_look.prism_len(12)?)?
+    prism_look.prism_cursor_of(l3, prism_look.prism_cursor_hand())
+
+// A destructive action or a validation error -- resolves against the palette's `warn` slot (see
+// header: no separate "danger" slot exists, and none should be added for a name synonym).
+fn _prism_theme_look_danger() -> Result<PrismLook>
+    let l0 = prism_look.prism_look_new()
+    let l1 = prism_look.prism_ink(l0, prism_look.prism_paint_slot("warn")?)?
+    let l2 = prism_look.prism_edge(l1, prism_look.prism_paint_slot("warn")?)?
+    prism_look.prism_round(l2, prism_look.prism_len(6)?)
+
+// Muted secondary text: captions, placeholders, disabled labels.
+fn _prism_theme_look_muted() -> Result<PrismLook>
+    prism_look.prism_ink(prism_look.prism_look_new(), prism_look.prism_paint_slot("muted")?)
+
+// Single dispatch chokepoint -- every role name funnels through here exactly once, so the role ->
+// builder mapping lives in one place.
+fn _prism_theme_build_look_for_role(role: string) -> Result<PrismLook>
+    match role
+        "surface" => _prism_theme_look_surface()
+        "field" => _prism_theme_look_field()
+        "action_primary" => _prism_theme_look_action_primary()
+        "action_quiet" => _prism_theme_look_action_quiet()
+        "danger" => _prism_theme_look_danger()
+        "muted" => _prism_theme_look_muted()
+        _ => err("prism_theme: unknown role '" + role + "', legal roles: " + join(prism_theme_roles(), ", "))
+
+fn _prism_theme_build_all_looks() -> Result<dict>
+    let out = {}
+    for role in prism_theme_roles()
+        out[role] = _prism_theme_build_look_for_role(role)?
+    ok(out)
+
+// Fresh copy of a role dict -- never write through the original (see header).
+fn _prism_theme_copy_looks(looks: dict) -> dict
+    let out = {}
+    for r in looks
+        out[r] = looks[r]
+    out
+
+// ── Public API ─────────────────────────────────────────────────────────────────────────────
+
+// Builds a complete default theme over any of the 9 presets in either mode -- all 18 combinations
+// build (see header: the role looks are palette-independent, so there is nothing preset-specific
+// to get wrong here beyond the name lookup itself). Typed error listing legal preset names on an
+// unrecognized one (never a partial or silently-empty theme).
+fn prism_theme_from(palette_name: string, dark: bool) -> Result<PrismTheme>
+    let pal = prism_palette.prism_palette_named(palette_name, dark)?
+    let looks = _prism_theme_build_all_looks()?
+    ok(PrismTheme(pal, looks))
+
+// The role's RAW look -- may still hold `palette.slot` references. Typed error listing every
+// legal role on an unknown one; never a silent empty look (a style that silently does nothing is
+// the exact CSS failure §11 exists to eliminate).
+fn prism_theme_look(theme: PrismTheme, role: string) -> Result<PrismLook>
+    if role in theme.theme_looks
+        return ok(theme.theme_looks[role])
+    err("prism_theme_look: unknown role '" + role + "', legal roles: " + join(prism_theme_roles(), ", "))
+
+// The role's look with every `palette.slot` reference flattened to a flat value, resolved against
+// THIS theme's own palette. §11's "resolvable to a flat constant" made real at the theme layer.
+fn prism_theme_resolved(theme: PrismTheme, role: string) -> Result<PrismLook>
+    let raw = prism_theme_look(theme, role)?
+    let slots = prism_palette.prism_palette_slots(theme.theme_palette)
+    prism_look.prism_look_resolve(raw, slots)
+
+// Overrides one role's look, later-wins via `prism_look_merge`. Does NOT mutate `theme` -- a
+// theme is shared by every component using it, so a mutating override would restyle every other
+// screen sharing it (see header). Rejects an unknown role (via `prism_theme_look`'s own check)
+// before any copy is made.
+fn prism_theme_with(theme: PrismTheme, role: string, overrides: PrismLook) -> Result<PrismTheme>
+    let base = prism_theme_look(theme, role)?
+    let merged = prism_look.prism_look_merge(base, overrides)?
+    let next_looks = _prism_theme_copy_looks(theme.theme_looks)
+    next_looks[role] = merged
+    ok(PrismTheme(theme.theme_palette, next_looks))
+
+fn prism_theme_name(theme: PrismTheme) -> string
+    prism_palette.prism_palette_name(theme.theme_palette)
+
+fn prism_theme_is_dark(theme: PrismTheme) -> bool
+    prism_palette.prism_palette_is_dark(theme.theme_palette)
+
+// Escape hatch for a component that needs a slot no role look covers (e.g. a theme-picker
+// swatch grid) -- the raw palette, not just the 6 role looks.
+fn prism_theme_palette(theme: PrismTheme) -> PrismPalette
+    theme.theme_palette

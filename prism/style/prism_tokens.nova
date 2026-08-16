@@ -1,0 +1,461 @@
+// prism_tokens -- design-token SCALES over prism_look.nova's typed setters (PRISM_SPEC.md §11).
+// Milestone MB.7.
+//
+// ── THE PROBLEM THIS CLOSES ───────────────────────────────────────────────────────────────────
+// prism_look.nova's 30 setters take raw typed VALUES (`prism_len(16)`, `prism_elev(2)`, ...) but
+// place NO constraint on WHICH ints get used. 37 component authors each free to write `inset 13`,
+// `inset 15`, `inset 17` for what is meant to be "the same gap" is exactly how design systems
+// drift into visual inconsistency -- CSS's whole reason for existing utility-class scales
+// (Tailwind's `p-4`, Bootstrap's `$spacer * n`) is that the SCALE, not the raw number, is the
+// vocabulary components share. This file is that scale layer for Prism: six closed, named steps
+// that every component picks from instead of inventing pixels.
+//
+// ── WHY EVERY SCALE IS A CLOSED ENUM, NOT A NAMED INT CONSTANT ────────────────────────────────
+// A constant (`SPACE_MD = 16`) still lets a caller write `SPACE_MD + 3` or pass a bare `19` right
+// next to it -- the "off-scale value" stays perfectly representable, just discouraged by
+// convention. An ENUM step makes it a COMPILE error: `prism_space_value` only accepts a
+// `PrismSpaceStep`, and the only way to produce one is one of the 7 named constructors below.
+// There is no arithmetic you can do to a `PrismSpaceStep` that produces a still-a-`PrismSpaceStep`
+// off-scale value, because there is no numeric representation to operate on at the call site at
+// all -- exactly prism_look.nova's own "no string to misspell" argument for `VEnum`, applied one
+// layer up: here there is no INT to drift.
+//
+// ── WHY NONE OF THE SIX ENUMS BELOW CARRIES PAYLOAD DATA (all variants are `Name()`) ───────────
+// A payload field (`SomeStep(n: int)`) would need a field name, and NOVA's field-name -> slot
+// table is GLOBAL and last-registration-wins across every module a program links in -- verified
+// 2026-08-16 in prism_theme.nova's own header, where `PrismNode.kind` collided with
+// `PrismFormField.kind` at a different slot and crashed the HTML renderer. A zero-argument variant
+// (`SpaceMd()`, matching this file's own `VFit()` precedent in prism_look.nova) carries no field
+// at all, so it cannot collide with anything, ever. It also means this file declares NO `type`
+// struct of its own -- every value already has a home (`PrismValue` in prism_look, `PrismColor` in
+// prism_color) and a token is just a name that resolves, through an exhaustive match, to one.
+//
+// ── WHY EVERY VARIANT NAME IS SCALE-PREFIXED (`SpaceNone`, not `None`) ──────────────────────────
+// Trap 11 (NOVA_LANGUAGE_FEATURES.md): constructors are FILE-LOCAL, resolved as plain identifiers
+// in the declaring file's own flat scope -- not type-directed the way a `match` pattern is. Six
+// enums sharing one file means six sets of bare constructor names competing for that SAME flat
+// scope; a generic `None()` reused across two of them would be a duplicate top-level symbol, not
+// a harmless shadow. Fully scale-qualified names (`SpaceNone`, `RadiusNone`, `ElevFlat`, ...) cost
+// nothing and make every constructor call self-documenting at the use site besides.
+//
+// ── WHY EVERY SCALE ALSO EXPOSES A PLAIN INT GETTER (`prism_space_px`, ...) ─────────────────────
+// `prism_space_value` returns a `Result<PrismValue>` for feeding straight into a setter, but a
+// KAT proving "every step maps to its EXACT documented value" needs a bare int to compare against
+// a literal, and a caller doing its own arithmetic (e.g. `stack` gap math) needs the number, not a
+// property-typed wrapper. Both getters funnel through the SAME exhaustive match (the getter IS
+// the match; `_value` just wraps its result through `prism_look.prism_len`/`prism_elev`/
+// `prism_dur_ms`), so the two can never disagree.
+//
+// ── THE SIX SCALES, AND WHERE EACH NUMBER CAME FROM ────────────────────────────────────────────
+// Space  (0/4/8/16/24/32/48px) -- a 4px atomic grid (Material's 4dp baseline, Tailwind's spacing
+//   scale): doubles at the small end (4->8->16) where adjacent steps must stay visually
+//   distinguishable for icon/button padding, then grows by simple grid multiples at the large end
+//   (24/32/48) where section-level gaps don't need fine discrimination.
+// Radius (0/4/8/16/9999px) -- mirrors Space's small end for visual rhythm; `pill` uses 9999, a
+//   value larger than any real element dimension, which is the standard "infinite radius" trick:
+//   any renderer clamps a corner radius to half the shorter side, so 9999 always yields a full
+//   stadium/capsule regardless of the element's actual height, with no special-cased "pill mode".
+// Type (12/16/20/28/40px size; 18/24/30/42/60px leading) -- sizes follow a common editorial scale
+//   (caption smaller than body; title/heading/display step up for hierarchy). Leading is EVERY
+//   step's size times a fixed 3:2 (1.5x) ratio in integer arithmetic -- 1.5x is the WCAG 1.4.8
+//   "sufficient" line-spacing recommendation for body text, and using ONE ratio for every step
+//   (not a per-step hand-picked leading) is what keeps vertical rhythm predictable: a text block's
+//   line-box height is always exactly 1.5x its font size. All five sizes are even, so
+//   `size * 3 / 2` divides exactly -- the KAT asserts `leading * 2 == size * 3` directly, so no
+//   truncation is hidden behind trusting integer division.
+// Elevation (0/2/8/16/24, within prism_elev's own legal 0-24 band) -- follows Material's own
+//   elevation dp bands (resting/raised/floating-menu/drawer/dialog), and the top step (24)
+//   deliberately lands exactly on prism_elev's maximum -- not a coincidence, since Material's own
+//   ceiling is 24dp too.
+// Duration (0/150/250/400ms) -- `instant` is a real ZERO, not "very fast": an explicit
+//   no-animation token (reduced-motion contexts, immediate state changes), distinct from `fast`.
+//   fast/normal/slow follow Material Motion's own duration bands for micro-interactions vs.
+//   standard vs. larger-surface transitions.
+// Neutral ramp -- see the dedicated section below; it is the one scale that takes an INPUT
+//   (a base `PrismColor`) rather than being a fixed table, so its reasoning is longer.
+//
+// ── THE NEUTRAL RAMP: MIXING RULE ──────────────────────────────────────────────────────────────
+// Given a base color, 9 stops (`Neutral100`..`Neutral900`, index 0..8) are produced by INTEGER
+// channel mixing -- no floats anywhere (prism_color.nova's own header documents two independently
+// verified float codegen/soundness bugs in this compiler; Color already sidesteps them by being
+// int-channeled, and this module keeps that discipline for the SAME reason).
+//   Neutral500 (index 4) is the base, UNCHANGED.
+//   Neutral100..400 (index 0..3, the LIGHT half) mix each channel toward 255 (white) by a percent
+//     that grows the further the step is from 500: `light_mix(c, pct) = c + (255 - c) * pct / 100`.
+//   Neutral600..900 (index 5..8, the DARK half) mix each channel toward 0 (black) the same way:
+//     `dark_mix(c, pct) = c - (c * pct) / 100`.
+//   `pct` is `|index - 4| * 20`, so the 9 steps use percentages 80,60,40,20,0,20,40,60,80 --
+//     symmetric around the base, in 20-point increments.
+// Both formulas are written to keep every intermediate value NON-NEGATIVE (`255 - c` is safe since
+// c <= 255; `c - c*pct/100` subtracts a value that is always <= c since pct <= 100) specifically
+// so this file never needs to know or assume NOVA's truncation direction for a division with a
+// negative operand -- there isn't one anywhere in this file.
+//
+// ── WHY A BASE MUST HAVE EVERY CHANNEL IN 16..239 (`prism_neutral_ramp`/`prism_neutral_stop`) ──
+// A base at or near a channel extreme degenerates the formula above: at PURE BLACK (0,0,0), every
+// dark-half stop computes to 0 too (`dark_mix(0, pct) == 0` for any pct) -- Neutral500..900
+// collapse to five identical stops. At PURE WHITE (255,255,255) the light half collapses the same
+// way. This was not assumed -- it was COMPUTED: an exhaustive sweep of the boundary channel values
+// 16 and 239 against the full 16..239 range on the other two channels (298,376 combinations) found
+// zero monotonicity or distinctness failures, while a broader sweep found real failures as close
+// as (0,0,13) and (252,253,221). 16..239 is therefore an evidenced floor/ceiling, not a guess, and
+// `prism_neutral_stop` rejects any base outside it with a typed error naming the bad channel and
+// its value -- never a silently-degenerate ramp.
+//
+// PUBLIC API
+//   Space     (none/xs/sm/md/lg/xl/xxl -> 0/4/8/16/24/32/48px)
+//     prism_space_none/_xs/_sm/_md/_lg/_xl/_xxl()  -> PrismSpaceStep
+//     prism_space_px(step)                          -> int
+//     prism_space_name(step)                        -> string
+//     prism_space_value(step)                       -> Result<PrismValue>   for prism_inset/_outset/_space
+//   Radius    (none/sm/md/lg/pill -> 0/4/8/16/9999px)
+//     prism_radius_none/_sm/_md/_lg/_pill()        -> PrismRadiusStep
+//     prism_radius_px(step)                         -> int
+//     prism_radius_name(step)                       -> string
+//     prism_radius_value(step)                      -> Result<PrismValue>   for prism_round
+//   Type      (caption/body/title/heading/display -> 12/16/20/28/40px size, 1.5x leading)
+//     prism_type_caption/_body/_title/_heading/_display()  -> PrismTypeStep
+//     prism_type_size_px(step) / prism_type_leading_px(step)  -> int
+//     prism_type_name(step)                         -> string
+//     prism_type_size_value(step) / prism_type_leading_value(step)  -> Result<PrismValue>
+//                                                                     for prism_font / prism_leading
+//   Elevation (flat/raised/floating/overlay/modal -> 0/2/8/16/24)
+//     prism_elev_flat/_raised/_floating/_overlay/_modal()  -> PrismElevStep
+//     prism_elev_step_level(step)                   -> int
+//     prism_elev_step_name(step)                    -> string
+//     prism_elev_step_value(step)                   -> Result<PrismValue>   for prism_lift
+//   Duration  (instant/fast/normal/slow -> 0/150/250/400ms)
+//     prism_dur_instant/_fast/_normal/_slow()       -> PrismDurStep
+//     prism_dur_step_ms(step)                       -> int
+//     prism_dur_step_name(step)                     -> string
+//     prism_dur_step_value(step)                    -> Result<PrismValue>   for prism_over/_delay
+//   Neutral ramp (given a base PrismColor, 9 stops 100..900; 500 == the base)
+//     prism_neutral_100/_200/_300/_400/_500/_600/_700/_800/_900()  -> PrismNeutralStep
+//     prism_neutral_step_name(step)                 -> string
+//     prism_neutral_stop(base, step)                -> Result<PrismColor>   one stop
+//     prism_neutral_ramp(base)                      -> Result<list>        all 9, 100->900 order
+//     prism_neutral_paint(base, step)                -> Result<PrismValue>  for prism_fill/_edge/_ink
+
+import prism_look
+import prism_color
+
+// ── Space scale ───────────────────────────────────────────────────────────────────────────────
+enum PrismSpaceStep
+    SpaceNone()
+    SpaceXs()
+    SpaceSm()
+    SpaceMd()
+    SpaceLg()
+    SpaceXl()
+    SpaceXxl()
+
+fn prism_space_none() -> PrismSpaceStep
+    SpaceNone()
+fn prism_space_xs() -> PrismSpaceStep
+    SpaceXs()
+fn prism_space_sm() -> PrismSpaceStep
+    SpaceSm()
+fn prism_space_md() -> PrismSpaceStep
+    SpaceMd()
+fn prism_space_lg() -> PrismSpaceStep
+    SpaceLg()
+fn prism_space_xl() -> PrismSpaceStep
+    SpaceXl()
+fn prism_space_xxl() -> PrismSpaceStep
+    SpaceXxl()
+
+// Exhaustive, no wildcard: an 8th `PrismSpaceStep` variant without a case here is a compile error.
+fn prism_space_px(step: PrismSpaceStep) -> int
+    match step
+        SpaceNone() => 0
+        SpaceXs() => 4
+        SpaceSm() => 8
+        SpaceMd() => 16
+        SpaceLg() => 24
+        SpaceXl() => 32
+        SpaceXxl() => 48
+
+fn prism_space_name(step: PrismSpaceStep) -> string
+    match step
+        SpaceNone() => "none"
+        SpaceXs() => "xs"
+        SpaceSm() => "sm"
+        SpaceMd() => "md"
+        SpaceLg() => "lg"
+        SpaceXl() => "xl"
+        SpaceXxl() => "xxl"
+
+fn prism_space_value(step: PrismSpaceStep) -> Result<PrismValue>
+    prism_look.prism_len(prism_space_px(step))
+
+// ── Radius scale ──────────────────────────────────────────────────────────────────────────────
+enum PrismRadiusStep
+    RadiusNone()
+    RadiusSm()
+    RadiusMd()
+    RadiusLg()
+    RadiusPill()
+
+fn prism_radius_none() -> PrismRadiusStep
+    RadiusNone()
+fn prism_radius_sm() -> PrismRadiusStep
+    RadiusSm()
+fn prism_radius_md() -> PrismRadiusStep
+    RadiusMd()
+fn prism_radius_lg() -> PrismRadiusStep
+    RadiusLg()
+fn prism_radius_pill() -> PrismRadiusStep
+    RadiusPill()
+
+fn prism_radius_px(step: PrismRadiusStep) -> int
+    match step
+        RadiusNone() => 0
+        RadiusSm() => 4
+        RadiusMd() => 8
+        RadiusLg() => 16
+        RadiusPill() => 9999
+
+fn prism_radius_name(step: PrismRadiusStep) -> string
+    match step
+        RadiusNone() => "none"
+        RadiusSm() => "sm"
+        RadiusMd() => "md"
+        RadiusLg() => "lg"
+        RadiusPill() => "pill"
+
+fn prism_radius_value(step: PrismRadiusStep) -> Result<PrismValue>
+    prism_look.prism_len(prism_radius_px(step))
+
+// ── Type scale ────────────────────────────────────────────────────────────────────────────────
+enum PrismTypeStep
+    TypeCaption()
+    TypeBody()
+    TypeTitle()
+    TypeHeading()
+    TypeDisplay()
+
+fn prism_type_caption() -> PrismTypeStep
+    TypeCaption()
+fn prism_type_body() -> PrismTypeStep
+    TypeBody()
+fn prism_type_title() -> PrismTypeStep
+    TypeTitle()
+fn prism_type_heading() -> PrismTypeStep
+    TypeHeading()
+fn prism_type_display() -> PrismTypeStep
+    TypeDisplay()
+
+fn prism_type_size_px(step: PrismTypeStep) -> int
+    match step
+        TypeCaption() => 12
+        TypeBody() => 16
+        TypeTitle() => 20
+        TypeHeading() => 28
+        TypeDisplay() => 40
+
+// 3:2 (1.5x) integer ratio -- see header. All 5 sizes above are even, so this division is always
+// exact; the KAT proves it directly (`leading * 2 == size * 3`) rather than trusting truncation.
+fn prism_type_leading_px(step: PrismTypeStep) -> int
+    prism_type_size_px(step) * 3 / 2
+
+fn prism_type_name(step: PrismTypeStep) -> string
+    match step
+        TypeCaption() => "caption"
+        TypeBody() => "body"
+        TypeTitle() => "title"
+        TypeHeading() => "heading"
+        TypeDisplay() => "display"
+
+fn prism_type_size_value(step: PrismTypeStep) -> Result<PrismValue>
+    prism_look.prism_len(prism_type_size_px(step))
+
+fn prism_type_leading_value(step: PrismTypeStep) -> Result<PrismValue>
+    prism_look.prism_len(prism_type_leading_px(step))
+
+// ── Elevation scale ───────────────────────────────────────────────────────────────────────────
+enum PrismElevStep
+    ElevFlat()
+    ElevRaised()
+    ElevFloating()
+    ElevOverlay()
+    ElevModal()
+
+fn prism_elev_flat() -> PrismElevStep
+    ElevFlat()
+fn prism_elev_raised() -> PrismElevStep
+    ElevRaised()
+fn prism_elev_floating() -> PrismElevStep
+    ElevFloating()
+fn prism_elev_overlay() -> PrismElevStep
+    ElevOverlay()
+fn prism_elev_modal() -> PrismElevStep
+    ElevModal()
+
+// Every level below is inside prism_elev's own legal 0-24 band by construction (see header).
+fn prism_elev_step_level(step: PrismElevStep) -> int
+    match step
+        ElevFlat() => 0
+        ElevRaised() => 2
+        ElevFloating() => 8
+        ElevOverlay() => 16
+        ElevModal() => 24
+
+fn prism_elev_step_name(step: PrismElevStep) -> string
+    match step
+        ElevFlat() => "flat"
+        ElevRaised() => "raised"
+        ElevFloating() => "floating"
+        ElevOverlay() => "overlay"
+        ElevModal() => "modal"
+
+fn prism_elev_step_value(step: PrismElevStep) -> Result<PrismValue>
+    prism_look.prism_elev(prism_elev_step_level(step))
+
+// ── Duration scale ────────────────────────────────────────────────────────────────────────────
+enum PrismDurStep
+    DurInstant()
+    DurFast()
+    DurNormal()
+    DurSlow()
+
+fn prism_dur_instant() -> PrismDurStep
+    DurInstant()
+fn prism_dur_fast() -> PrismDurStep
+    DurFast()
+fn prism_dur_normal() -> PrismDurStep
+    DurNormal()
+fn prism_dur_slow() -> PrismDurStep
+    DurSlow()
+
+fn prism_dur_step_ms(step: PrismDurStep) -> int
+    match step
+        DurInstant() => 0
+        DurFast() => 150
+        DurNormal() => 250
+        DurSlow() => 400
+
+fn prism_dur_step_name(step: PrismDurStep) -> string
+    match step
+        DurInstant() => "instant"
+        DurFast() => "fast"
+        DurNormal() => "normal"
+        DurSlow() => "slow"
+
+fn prism_dur_step_value(step: PrismDurStep) -> Result<PrismValue>
+    prism_look.prism_dur_ms(prism_dur_step_ms(step))
+
+// ── Neutral ramp ──────────────────────────────────────────────────────────────────────────────
+enum PrismNeutralStep
+    Neutral100()
+    Neutral200()
+    Neutral300()
+    Neutral400()
+    Neutral500()
+    Neutral600()
+    Neutral700()
+    Neutral800()
+    Neutral900()
+
+fn prism_neutral_100() -> PrismNeutralStep
+    Neutral100()
+fn prism_neutral_200() -> PrismNeutralStep
+    Neutral200()
+fn prism_neutral_300() -> PrismNeutralStep
+    Neutral300()
+fn prism_neutral_400() -> PrismNeutralStep
+    Neutral400()
+fn prism_neutral_500() -> PrismNeutralStep
+    Neutral500()
+fn prism_neutral_600() -> PrismNeutralStep
+    Neutral600()
+fn prism_neutral_700() -> PrismNeutralStep
+    Neutral700()
+fn prism_neutral_800() -> PrismNeutralStep
+    Neutral800()
+fn prism_neutral_900() -> PrismNeutralStep
+    Neutral900()
+
+fn prism_neutral_step_name(step: PrismNeutralStep) -> string
+    match step
+        Neutral100() => "100"
+        Neutral200() => "200"
+        Neutral300() => "300"
+        Neutral400() => "400"
+        Neutral500() => "500"
+        Neutral600() => "600"
+        Neutral700() => "700"
+        Neutral800() => "800"
+        Neutral900() => "900"
+
+// Position in the 9-stop ramp, 0 (lightest) .. 8 (darkest). Private: callers never need the raw
+// index, only the named step.
+fn _prism_neutral_step_index(step: PrismNeutralStep) -> int
+    match step
+        Neutral100() => 0
+        Neutral200() => 1
+        Neutral300() => 2
+        Neutral400() => 3
+        Neutral500() => 4
+        Neutral600() => 5
+        Neutral700() => 6
+        Neutral800() => 7
+        Neutral900() => 8
+
+// Mix toward white (255) by `pct` percent. `255 - c` is always >= 0, so this expression never
+// carries a negative operand into `/` -- see header.
+fn _prism_tok_light_mix(c: int, pct: int) -> int
+    c + ((255 - c) * pct) / 100
+
+// Mix toward black (0) by `pct` percent. `c * pct / 100` is always <= c (since pct <= 100), so the
+// subtraction never goes negative -- see header.
+fn _prism_tok_dark_mix(c: int, pct: int) -> int
+    c - (c * pct) / 100
+
+fn _prism_neutral_channel_ok(c: int) -> bool
+    c >= 16 and c <= 239
+
+// One stop of the ramp. Rejects a base with any channel outside 16..239 -- an evidenced floor and
+// ceiling (see header), not a guess: at either extreme the mixing formulas below degenerate and
+// collapse several stops to the same value.
+fn prism_neutral_stop(base: PrismColor, step: PrismNeutralStep) -> Result<PrismColor>
+    let r = prism_color.prism_color_r(base)
+    let g = prism_color.prism_color_g(base)
+    let b = prism_color.prism_color_b(base)
+    let a = prism_color.prism_color_a(base)
+    if not _prism_neutral_channel_ok(r)
+        return err("prism_neutral_stop: base r channel must be a genuine mid-range neutral (16..239), got " + str(r))
+    if not _prism_neutral_channel_ok(g)
+        return err("prism_neutral_stop: base g channel must be a genuine mid-range neutral (16..239), got " + str(g))
+    if not _prism_neutral_channel_ok(b)
+        return err("prism_neutral_stop: base b channel must be a genuine mid-range neutral (16..239), got " + str(b))
+    let idx = _prism_neutral_step_index(step)
+    let mut d = idx - 4
+    if d < 0
+        d = 0 - d
+    let pct = d * 20
+    if idx < 4
+        return prism_color.prism_color_rgba(_prism_tok_light_mix(r, pct), _prism_tok_light_mix(g, pct), _prism_tok_light_mix(b, pct), a)
+    if idx > 4
+        return prism_color.prism_color_rgba(_prism_tok_dark_mix(r, pct), _prism_tok_dark_mix(g, pct), _prism_tok_dark_mix(b, pct), a)
+    prism_color.prism_color_rgba(r, g, b, a)
+
+fn _prism_neutral_steps() -> list
+    [prism_neutral_100(), prism_neutral_200(), prism_neutral_300(), prism_neutral_400(), prism_neutral_500(), prism_neutral_600(), prism_neutral_700(), prism_neutral_800(), prism_neutral_900()]
+
+// All 9 stops, lightest (100) to darkest (900). Propagates the first rejection from
+// prism_neutral_stop rather than returning a partial ramp.
+fn prism_neutral_ramp(base: PrismColor) -> Result<list>
+    let out = []
+    for step in _prism_neutral_steps()
+        let r = prism_neutral_stop(base, step)
+        if is_err(r)
+            return err(unwrap_err(r))
+        push(out, unwrap(r))
+    ok(out)
+
+// A single stop, ready for prism_fill/prism_edge/prism_ink.
+fn prism_neutral_paint(base: PrismColor, step: PrismNeutralStep) -> Result<PrismValue>
+    let cr = prism_neutral_stop(base, step)
+    if is_err(cr)
+        return err(unwrap_err(cr))
+    prism_look.prism_paint_hex(prism_color.prism_color_to_hex(unwrap(cr)))
