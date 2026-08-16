@@ -1,0 +1,317 @@
+// prism_inspect -- the TREE INSPECTOR: pretty-printing, index-path addressing, kind/key search,
+// a distinct-kinds summary, and a renderable inspector view over a built PrismNode tree.
+// Milestone MB.11 (the unfinished half -- MB.11's ANSI `cols` wrapping and the MB.11x import-surface
+// lesson landed first; this closes the milestone).
+//
+// ── WHY THIS EXISTS ────────────────────────────────────────────────────────────────────────────
+// `prism_obs_stats` (MB.10, obs/prism_obs.nova) answers "what does this tree COST" -- total nodes,
+// depth, a count per kind. It does NOT answer "where, in a tree of hundreds of nodes, is the ONE
+// node I'm looking for" or "show me the shape of this subtree so I can actually read it." The MB.6
+// docs page alone is 571 nodes; MB.10's own measurement of it is 573 nodes at depth 9 -- printing
+// that whole tree unindented, or hunting through it by eye for "which node is the third `press`",
+// is not a realistic debugging workflow. This file is the difference between "the tree has a
+// problem" (obs) and "here is the exact node, at this exact path, that has the problem" (inspect).
+//
+// ── DESIGN DECISION: PATH ADDRESSING IS INDEX-BASED, NOT KEY-BASED ────────────────────────────
+// `key: string?` (PRISM_SPEC.md §12.6) exists ONLY on rows built through `prism_node_keyed` --
+// typically `each`/`grid` children -- and is `none()` on every other node in a real tree (a
+// `stack`, a `label`, a `press`, ...). A key-based address ("go to the row keyed 'row-42'") cannot
+// name an unkeyed node at all, so it cannot be the GENERAL addressing scheme this file needs --
+// `prism_inspect_at([])` must be able to reach any node in any tree, keyed or not. Every node,
+// keyed or not, DOES have a stable position among its parent's children in source order (the same
+// invariant `prism_obs_diff`'s positional path already leans on for unkeyed containers). An index
+// path is therefore the only addressing scheme complete over the whole vocabulary; find_key (below)
+// is offered as a second, narrower lookup for the keyed case specifically, returning index paths
+// too, so both search modes compose with the one `prism_inspect_at` navigator.
+//
+// ── DESIGN DECISION: FIND_KIND / FIND_KEY HAND-ROLL THEIR OWN RECURSION ───────────────────────
+// `prism_node_walk` (prism_node.nova) is a pre-order visitor with no path context -- `visit(n)`
+// sees only the node, never how it was reached. Finding a node's ADDRESS needs exactly the context
+// that visitor cannot supply, the identical reason `prism_obs_diff` (MB.10) hand-writes its own
+// recursion instead of using `prism_node_walk` for the diff. `prism_inspect_summary`, by contrast,
+// only needs "is a descendant" (collecting distinct kind names), which is exactly what
+// `prism_node_walk`'s visitor gives for free -- so it uses the walk, and find_kind/find_key do not,
+// for the same reason MB.10 made that split.
+//
+// ── DESIGN DECISION: TRUNCATION IS BYTE-LENGTH, NOT DISPLAY-CELL-WIDTH ────────────────────────
+// `text/prism_text.nova` (MB.10) already has a UTF-8-cell-width-aware `prism_text_truncate`. This
+// file does NOT import it. Two independent reasons, not one:
+//   1. IMPORT SURFACE: importing `prism_text` pulls in its own transitive imports, and MB.11x
+//      (this same milestone) found EXACTLY this shape of bug -- widening a backend's import surface
+//      through prism_text made every label render empty, because NOVA's field-name -> slot table is
+//      GLOBAL and last-registration-wins. The fix there was "keep the backend's import surface at
+//      two modules"; the identical discipline applies here. This file's import surface is the three
+//      modules the milestone brief specifies (prism_node, prism_content, prism_arrange) and nothing
+//      wider -- a dev tool is exactly the kind of file that gets imported by other dev tools and
+//      test harnesses, so a slot collision introduced HERE would propagate to whoever pulls this in.
+//   2. HONESTY OF PURPOSE: this is a DEV tool, read in a terminal or a log by the person who wrote
+//      the tree, not a user-facing render. Cutting a multi-byte UTF-8 character in half mid-codepoint
+//      is a real correctness bug for anything a real user reads (MB.10/11's whole point); for a
+//      debug line that says `text="café...`, a byte-exact cut is legible enough and costs zero
+//      import surface. This is a stated tradeoff, not an oversight -- the day this inspector needs
+//      to render CJK/emoji-heavy trees legibly is the day to reconsider, not before.
+// Truncation is proven correct here (never emits a line longer than `max_width`, and the KAT proves
+// it directly against a hostile long label at a small width) rather than merely asserted.
+//
+// ── DESIGN DECISION: DEPTH/COUNT ON BRANCH LINES, ATTR VALUE ON LEAF LINES, KEY ON EITHER ─────
+// A branch node's `attrs` are rarely the interesting thing about it (a `stack`/`band`/`grid` carries
+// structural attrs like `cols`, not a caption) -- what a reader of a tree dump wants at a branch is
+// its SIZE (`prism_node_depth`/`prism_node_count`, already cached at construction -- see
+// prism_node.nova's header -- so reading them here is O(1), not a re-walk). A leaf's `text`/`source`
+// IS the interesting thing about it, and is shown instead. `key` is orthogonal to both (a branch
+// row from `each`/`grid` -- e.g. a keyed `band` -- is exactly as printable a case as a keyed leaf),
+// so it is checked independently and prefixed onto whichever of the other two forms applies.
+//
+// ── HONEST LIMITATION: INDENT IS NOT CLAMPED AT PATHOLOGICAL DEPTH ────────────────────────────
+// PRISM_SPEC.md §16 allows tree depth up to 256; at 2 spaces/level that is 512 columns of pure
+// indent before a single character of content, which could exceed a small `max_width` on its own.
+// The MB.11 ANSI backend clamps its own indent to a floor of 8 cells for exactly this reason. This
+// file does NOT reproduce that clamp: a depth-256 tree is an adversarial-fuzzer shape, not a debugging
+// session's real tree, and a caller who passes an unrealistically small `max_width` to a tool
+// gets a dev tool that told the truth about an unindentable tree rather than a clamp silently
+// second-guessing the request. Stated, not silently guessed around.
+// The SAME reasoning covers a branch line's `(depth=N, count=N)` suffix: it is never truncated,
+// because it isn't an attr VALUE (the thing the milestone brief asks this file to truncate) -- it
+// is bounded structural metadata (N <= 256 for depth, N <= 100000 for count, PRISM_SPEC.md §16's own
+// ceilings, so at most 9 digits total) that would become misleading rather than merely shorter if
+// cut. In practice `kind name + " (depth=256, count=100000)"` is under 40 bytes even at the
+// vocabulary's longest kind name and both ceilings simultaneously, so this is a real bound, not an
+// unbounded risk -- just not one this file's truncation machinery (built for free-form string attr
+// values) applies to.
+//
+// PUBLIC API
+//   prism_inspect_pretty(node, max_width)     -> string           indented, depth/count on
+//                                                                  branches, text/source/key on
+//                                                                  leaves, values truncated to fit
+//   prism_inspect_at(node, path: list<int>)   -> Result<PrismNode> navigate by child indices;
+//                                                                  [] = root; out-of-range or
+//                                                                  non-int path element -> typed Err
+//   prism_inspect_find_kind(node, kind_name)  -> list             every index path to a node whose
+//                                                                  kind_str == kind_name (pre-order)
+//   prism_inspect_find_key(node, key_val)     -> list             every index path to a node whose
+//                                                                  key == some(key_val)
+//   prism_inspect_summary(node)               -> string           "kind: N nodes, depth D, K kinds
+//                                                                  (a, b, c)" -- kinds sorted
+//                                                                  alphabetically (insertion sort)
+//   prism_inspect_tree(node)                  -> Result<PrismNode> the pretty-print, one line per
+//                                                                  prism_label, in a prism_stack --
+//                                                                  so the inspector's own output
+//                                                                  renders through either backend
+
+import prism_node
+import prism_content
+import prism_arrange
+
+// ── Pretty-print ───────────────────────────────────────────────────────────────────────────────
+
+// `level` spaces of indent, 2 per level. A plain accumulation loop -- no string-repeat operator or
+// padding helper is pulled in from elsewhere (see header: import surface stays at exactly three
+// modules), and this is cheap enough (at most 256 iterations, PRISM_MAX_TREE_DEPTH) not to need one.
+fn _inspect_indent(level: int) -> string
+    let mut s = ""
+    let mut i = 0
+    while i < level
+        s = s + "  "
+        i += 1
+    s
+
+// Cuts `value` to fit within `budget` BYTES, appending "..." when something was actually cut so a
+// truncated value is never confused with a short one that happened to fit. `budget <= 0` means
+// there is no room at all -- returns "" rather than a negative-length slice. `budget <= 3` means
+// there isn't room for even one real content byte plus the full "..." marker together in a way that
+// would show both usefully, so it falls back to the raw (still budget-bounded) prefix bytes with no
+// marker -- a documented tie-break for an edge case, not a bug: at that width there is no shown form
+// that is unambiguously better than another.
+fn _inspect_truncate_byte(value: string, budget: int) -> string
+    if budget <= 0
+        return ""
+    if len(value) <= budget
+        return value
+    if budget <= 3
+        return slice(value, 0, budget)
+    slice(value, 0, budget - 3) + "..."
+
+// Appends ` name="VALUE"` to `line`, truncating VALUE so the FINAL line length never exceeds
+// `max_width`. The budget math: this call adds exactly `len(label) + len(shown) + 1` bytes to
+// `line` (label = ` name="`, the trailing `+1` is the closing quote), so the value's budget is
+// whatever remains of `max_width` after `line`'s current length and that fixed overhead -- proven
+// in the KAT by checking every emitted line's length directly against `max_width`, not merely
+// checking that truncation "looks like it happened."
+fn _inspect_append_attr(line: string, attr_name: string, raw_val: string, max_width: int) -> string
+    let label = " " + attr_name + "=\""
+    let overhead = len(line) + len(label) + 1
+    let budget = max_width - overhead
+    let shown = _inspect_truncate_byte(raw_val, budget)
+    line + label + shown + "\""
+
+// One node's own line, with NO trailing newline and NO recursion into children (that is
+// `_inspect_collect_lines`'s job) -- kept separate so `prism_inspect_tree` and the KAT can each
+// exercise exactly one node's rendering in isolation without building a whole subtree first.
+fn _inspect_render_line(n: PrismNode, level: int, max_width: int) -> string
+    let indent = _inspect_indent(level)
+    let mut line = indent + prism_node.prism_node_kind_str(n)
+    if prism_node.prism_node_has_key(n)
+        line = _inspect_append_attr(line, "key", _inspect_key_of(n), max_width)
+    let child_count = prism_node.prism_node_child_count(n)
+    if child_count > 0
+        line = line + " (depth=" + str(prism_node.prism_node_depth(n)) + ", count=" + str(prism_node.prism_node_count(n)) + ")"
+    else
+        if prism_node.prism_node_has_attr(n, "text")
+            line = _inspect_append_attr(line, "text", prism_node.prism_node_attr_str(n, "text", ""), max_width)
+        else if prism_node.prism_node_has_attr(n, "source")
+            line = _inspect_append_attr(line, "source", prism_node.prism_node_attr_str(n, "source", ""), max_width)
+    line
+
+// `n.key` defaulted to "" for None, mirroring the identical helper in obs/prism_obs.nova
+// (`_prism_obs_key_of`) -- not imported from there (import surface, see header), rewritten locally.
+fn _inspect_key_of(n: PrismNode) -> string
+    match prism_node.prism_node_key(n)
+        Some(k) => k
+        None => ""
+
+// Pre-order: this node's own line, then every child's lines at `level + 1`. Children of an
+// already-built `PrismNode` are guaranteed to themselves be valid `PrismNode`s (prism_node_new
+// validates every child at construction -- see that file's header on why its OWN loop needs the
+// `type_name` guard: it is validating a FRESH, caller-supplied list before this invariant exists
+// yet). Reading them here needs no re-guard, the same reasoning prism_obs.nova's diff functions
+// rely on when indexing an already-built tree's children directly.
+fn _inspect_collect_lines(n: PrismNode, level: int, max_width: int, out: list)
+    out.push(_inspect_render_line(n, level, max_width))
+    for c in prism_node.prism_node_children(n)
+        _inspect_collect_lines(c, level + 1, max_width, out)
+
+fn prism_inspect_pretty(node: PrismNode, max_width: int) -> string
+    let lines = []
+    _inspect_collect_lines(node, 0, max_width, lines)
+    join(lines, "\n")
+
+// ── Path addressing ────────────────────────────────────────────────────────────────────────────
+
+// Navigates `path` (a list of child indices) from `node`. `[]` returns `node` itself. Every element
+// is validated BEFORE use: a non-int element (a hostile/malformed path, e.g. built by hand rather
+// than returned from `prism_inspect_find_kind`) and an out-of-range index are both a typed `Err`
+// naming the exact path position and the actual child count -- never a crash and never a silent
+// clamp, matching PRISM_SPEC.md §16's "a typed error... never a crash" standard applied here to a
+// dev tool's own input rather than to tree construction.
+fn prism_inspect_at(node: PrismNode, path: list) -> Result<PrismNode>
+    let mut current = node
+    for idx, step in path
+        if type_name(step) != "int"
+            return err("prism_inspect_at: path[" + str(idx) + "] is not an int (got " + type_name(step) + ")")
+        let kids = prism_node.prism_node_children(current)
+        let n_kids = len(kids)
+        if step < 0 or step >= n_kids
+            return err("prism_inspect_at: path[" + str(idx) + "] = " + str(step) + " is out of range (node has " + str(n_kids) + " children)")
+        // Guard before the field read the next loop iteration (or the final `ok`) performs on
+        // `current` -- see prism_node.nova's header on why an untyped list element needs a
+        // `type_name` check before it is trusted as a PrismNode. A real tree's children are always
+        // valid PrismNodes (prism_node_new enforces it at construction), so this should never fire;
+        // it exists as the same defensive chokepoint prism_node_new itself uses, not because a
+        // failure is expected here.
+        let candidate = kids[step]
+        if type_name(candidate) != "PrismNode"
+            return err("prism_inspect_at: child at path[" + str(idx) + "] is not a PrismNode (got " + type_name(candidate) + ") -- corrupt tree")
+        current = candidate
+    ok(current)
+
+// ── Find by kind / key ─────────────────────────────────────────────────────────────────────────
+
+fn _inspect_walk_kind(n: PrismNode, path: list, kind_name: string, out: list)
+    if prism_node.prism_node_kind_str(n) == kind_name
+        out.push(path)
+    for idx, c in prism_node.prism_node_children(n)
+        _inspect_walk_kind(c, path + [idx], kind_name, out)
+
+// Pre-order paths to every node whose kind matches `kind_name`. `[]` in the result set means the
+// ROOT itself matched. Order is deterministic (source child order, same as every other walk in
+// this codebase -- PRISM_SPEC.md §15.9).
+fn prism_inspect_find_kind(node: PrismNode, kind_name: string) -> list
+    let out = []
+    _inspect_walk_kind(node, [], kind_name, out)
+    out
+
+fn _inspect_walk_key(n: PrismNode, path: list, key_val: string, out: list)
+    if prism_node.prism_node_has_key(n) and _inspect_key_of(n) == key_val
+        out.push(path)
+    for idx, c in prism_node.prism_node_children(n)
+        _inspect_walk_key(c, path + [idx], key_val, out)
+
+// Same shape as `prism_inspect_find_kind`, matching on `key == some(key_val)` instead of kind. An
+// unkeyed node can never match (its key is `none()`), so this quietly returns fewer results on a
+// tree with no keyed rows rather than treating "no key" as a match for `key_val == ""`.
+fn prism_inspect_find_key(node: PrismNode, key_val: string) -> list
+    let out = []
+    _inspect_walk_key(node, [], key_val, out)
+    out
+
+// ── Summary ────────────────────────────────────────────────────────────────────────────────────
+
+fn _inspect_note_kind(n: PrismNode, seen: dict)
+    seen[prism_node.prism_node_kind_str(n)] = true
+
+// Plain insertion sort over strings (ascending, lexicographic `<`/`>`), matching the exact idiom
+// `forge_divisors.nova`/`forge_meetingrooms.nova` already use for ints -- verified directly (a
+// throwaway probe) that NOVA's `<`/`>` on two strings compares lexicographically before relying on
+// it here. At most 22 distinct kind names can ever appear (PrismNodeKind's whole closed vocabulary),
+// so O(n^2) insertion sort costs nothing real; a hand-rolled sort also keeps this file's import
+// surface at its three modules rather than pulling in std/core/sort for a 22-element bound.
+fn _inspect_sort_strings(names: list) -> list
+    let out = []
+    for n in names
+        out.push(n)
+    let len_n = len(out)
+    let mut i = 1
+    while i < len_n
+        let key = out[i]
+        let mut j = i - 1
+        while j >= 0 and out[j] > key
+            out[j + 1] = out[j]
+            j -= 1
+        out[j + 1] = key
+        i += 1
+    out
+
+// One line: root kind, total node count and max depth (both O(1) -- cached at construction, see
+// prism_node.nova's header), and the DISTINCT kind names present anywhere in the tree, sorted
+// alphabetically. "kind" text is collected via `prism_node_walk` (needs no path context, so unlike
+// find_kind/find_key above this reuses the shared visitor rather than hand-rolling recursion again
+// -- see header design note on which of the two patterns applies where).
+fn prism_inspect_summary(node: PrismNode) -> string
+    let seen = {}
+    prism_node.prism_node_walk(node, fn(n) _inspect_note_kind(n, seen))
+    let names = []
+    for kind_name, present in seen
+        names.push(kind_name)
+    let sorted_names = _inspect_sort_strings(names)
+    let root_kind = prism_node.prism_node_kind_str(node)
+    let total = prism_node.prism_node_count(node)
+    let depth = prism_node.prism_node_depth(node)
+    root_kind + ": " + str(total) + " nodes, depth " + str(depth) + ", " + str(len(sorted_names)) + " kinds (" + join(sorted_names, ", ") + ")"
+
+// ── Inspector as a renderable tree ─────────────────────────────────────────────────────────────
+
+// The width used internally for the pretty-print this renders -- wide enough that a realistic tree
+// (short labels, a few attrs) rarely truncates, without being so wide that a rendered inspector page
+// itself becomes unreadable. `prism_inspect_pretty` remains the entry point for a caller who wants
+// their OWN width; this constant is this function's own opinion about "a reasonable default,"
+// exactly the same role MB.6's dashboard/docs pages pick their own reasonable defaults for things
+// PRISM_SPEC.md leaves to the caller.
+fn _inspect_tree_default_width() -> int
+    100
+
+// Renders `prism_inspect_pretty`'s output as a node tree: one `prism_label` per line, in a
+// `prism_stack` -- so the inspector's own output is itself a `PrismNode` and can be handed to
+// EITHER real backend (HTML or ANSI) exactly like any other page, rather than needing its own
+// private rendering path. Mirrors `prism_catalog_tree`'s own reasoning (dev/prism_catalog.nova):
+// a dev tool that is itself built from real primitives cannot silently drift from what those
+// primitives actually do.
+fn prism_inspect_tree(node: PrismNode) -> Result<PrismNode>
+    let text = prism_inspect_pretty(node, _inspect_tree_default_width())
+    let raw_lines = split(text, "\n")
+    let labels = []
+    for ln in raw_lines
+        let lbl = prism_content.prism_label(ln)
+        if is_err(lbl)
+            return err(unwrap_err(lbl))
+        labels.push(unwrap(lbl))
+    prism_arrange.prism_stack(labels)

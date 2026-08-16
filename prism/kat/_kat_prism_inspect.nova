@@ -1,0 +1,170 @@
+// KAT for prism/dev/prism_inspect.nova (milestone MB.11, the tree-inspector half).
+//
+// Three things this proves, beyond "the happy path returns something":
+//   1. The pretty-print's depth/count numbers on a real 5-node tree match EXACTLY what the task's
+//      own worked example shows for that shape (stack depth=3/count=5 over a 2-child band at
+//      depth=2/count=3) -- not just "some numbers appeared."
+//   2. Every path returned by find_kind/find_key is checked by EXACT index sequence, not just by
+//      count -- a wrong-but-same-length path would pass a count-only check and still be useless to
+//      a caller trying to navigate to it.
+//   3. ★ The truncation guarantee is checked adversarially: a real long label at a deliberately
+//      small max_width, asserting every emitted line's length directly (not "it looks shorter"),
+//      plus a positive check that truncation actually fired (the "..." marker is present) so a
+//      no-op that happened to fit would not pass silently.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_inspect.nova
+//   clang -O2 -o _kat_prism_inspect.exe _kat_prism_inspect.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_inspect
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=" + got + "  want=" + want)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+// Renders a path (list of ints) as "1,0" style text so a wrong path shows up in a FAIL line
+// exactly, instead of the check collapsing to a bare true/false.
+fn _path_str(path: list) -> string
+    let parts = []
+    for p in path
+        parts.push(str(p))
+    join(parts, ",")
+
+fn main()
+    // ── The test tree, built exactly as the milestone brief specifies ──────────────────────────
+    //   stack
+    //     label text="Hello"
+    //     band
+    //       press text="Save"
+    //       label text="World"
+    let lbl_hello = unwrap(prism_content.prism_label("Hello"))
+    let press_save = unwrap(prism_interact.prism_press("Save", []))
+    let lbl_world = unwrap(prism_content.prism_label("World"))
+    let band = unwrap(prism_arrange.prism_band([press_save, lbl_world]))
+    let tree = unwrap(prism_arrange.prism_stack([lbl_hello, band]))
+
+    print("== 1. prism_inspect_pretty ==")
+    let pretty = prism_inspect.prism_inspect_pretty(tree, 80)
+    // Exact depth/count, matching the milestone brief's own worked example for this exact shape.
+    _check_true("root line: stack (depth=3, count=5)", find(pretty, "stack (depth=3, count=5)") >= 0)
+    _check_true("band line: band (depth=2, count=3), indented one level", find(pretty, "\n  band (depth=2, count=3)") >= 0)
+    _check_true("label line: text=\"Hello\", indented one level", find(pretty, "\n  label text=\"Hello\"") >= 0)
+    _check_true("press line: text=\"Save\", indented two levels", find(pretty, "\n    press text=\"Save\"") >= 0)
+    _check_true("label line: text=\"World\", indented two levels", find(pretty, "\n    label text=\"World\"") >= 0)
+    // Line order is pre-order source order: stack, label(Hello), band, press(Save), label(World).
+    let hello_at = find(pretty, "Hello")
+    let band_at = find(pretty, "band (depth")
+    let save_at = find(pretty, "Save")
+    let world_at = find(pretty, "World")
+    _check_true("pre-order line order: Hello before band", hello_at < band_at)
+    _check_true("pre-order line order: band before Save", band_at < save_at)
+    _check_true("pre-order line order: Save before World", save_at < world_at)
+
+    print("== 2. prism_inspect_pretty: art shows source=, and a keyed leaf shows key= then text= ==")
+    let art_node = unwrap(prism_content.prism_art("/img/example.png"))
+    let art_tree = unwrap(prism_arrange.prism_stack([art_node]))
+    let art_pretty = prism_inspect.prism_inspect_pretty(art_tree, 80)
+    _check_true("art leaf shows source=\"...\"", find(art_pretty, "source=\"/img/example.png\"") >= 0)
+
+    let keyed_leaf = unwrap(prism_node.prism_node_keyed(prism_node.prism_kind_label(), {"text": "Tagged"}, [], "row-42"))
+    let keyed_solo_tree = unwrap(prism_arrange.prism_stack([keyed_leaf]))
+    let keyed_pretty = prism_inspect.prism_inspect_pretty(keyed_solo_tree, 80)
+    _check_true("keyed leaf shows key=\"...\" BEFORE text=\"...\"", find(keyed_pretty, "key=\"row-42\" text=\"Tagged\"") >= 0)
+
+    print("== 3. prism_inspect_pretty: truncation never exceeds max_width, and actually fires ==")
+    let long_text = "This is a very long label text that should be truncated to fit within a small max width"
+    let long_label = unwrap(prism_content.prism_label(long_text))
+    let small_tree = unwrap(prism_arrange.prism_stack([long_label]))
+    let small_width = 40
+    let small_pretty = prism_inspect.prism_inspect_pretty(small_tree, small_width)
+    let small_lines = split(small_pretty, "\n")
+    let mut all_within_budget = true
+    for ln in small_lines
+        if len(ln) > small_width
+            all_within_budget = false
+    _check_true("every emitted line respects max_width=" + str(small_width), all_within_budget)
+    _check_true("truncation actually fired (ellipsis present)", find(small_pretty, "...") >= 0)
+    _check_true("truncation did not delete the whole value (some prefix survives)", find(small_pretty, "This is a very long") >= 0)
+
+    print("== 4. prism_inspect_at: path navigation and out-of-range errors ==")
+    _check("at([]) returns root", prism_node.prism_node_kind_str(unwrap(prism_inspect.prism_inspect_at(tree, []))), "stack")
+    let at0 = unwrap(prism_inspect.prism_inspect_at(tree, [0]))
+    _check("at([0]) kind", prism_node.prism_node_kind_str(at0), "label")
+    _check("at([0]) text", prism_node.prism_node_attr_str(at0, "text", "<missing>"), "Hello")
+    let at10 = unwrap(prism_inspect.prism_inspect_at(tree, [1, 0]))
+    _check("at([1,0]) kind", prism_node.prism_node_kind_str(at10), "press")
+    _check("at([1,0]) text", prism_node.prism_node_attr_str(at10, "text", "<missing>"), "Save")
+    let at11 = unwrap(prism_inspect.prism_inspect_at(tree, [1, 1]))
+    _check("at([1,1]) kind", prism_node.prism_node_kind_str(at11), "label")
+    _check("at([1,1]) text", prism_node.prism_node_attr_str(at11, "text", "<missing>"), "World")
+    _check_true("at([5]) errors (root has only 2 children)", is_err(prism_inspect.prism_inspect_at(tree, [5])))
+    _check_true("at([-1]) errors (negative index)", is_err(prism_inspect.prism_inspect_at(tree, [-1])))
+    _check_true("at([0,0]) errors (label is a leaf, has no children)", is_err(prism_inspect.prism_inspect_at(tree, [0, 0])))
+
+    print("== 5. prism_inspect_find_kind: exact paths, not just counts ==")
+    let label_paths = prism_inspect.prism_inspect_find_kind(tree, "label")
+    _check("find_kind(\"label\") count", str(len(label_paths)), "2")
+    if len(label_paths) == 2
+        _check("find_kind(\"label\") path 0", _path_str(label_paths[0]), "0")
+        _check("find_kind(\"label\") path 1", _path_str(label_paths[1]), "1,1")
+    let press_paths = prism_inspect.prism_inspect_find_kind(tree, "press")
+    _check("find_kind(\"press\") count", str(len(press_paths)), "1")
+    if len(press_paths) == 1
+        _check("find_kind(\"press\") path 0", _path_str(press_paths[0]), "1,0")
+    let mesh_paths = prism_inspect.prism_inspect_find_kind(tree, "mesh")
+    _check("find_kind(\"mesh\") count (kind absent from this tree)", str(len(mesh_paths)), "0")
+    let stack_paths = prism_inspect.prism_inspect_find_kind(tree, "stack")
+    _check("find_kind(\"stack\") count (matches the root itself)", str(len(stack_paths)), "1")
+    if len(stack_paths) == 1
+        _check("find_kind(\"stack\") path 0 is the root path []", _path_str(stack_paths[0]), "")
+
+    print("== 6. prism_inspect_find_key: keyed rows only, exact path ==")
+    let keyed_child = unwrap(prism_node.prism_node_keyed(prism_node.prism_kind_label(), {"text": "Tagged"}, [], "row-42"))
+    let keyed_tree = unwrap(prism_arrange.prism_stack([lbl_hello, keyed_child]))
+    let key_paths = prism_inspect.prism_inspect_find_key(keyed_tree, "row-42")
+    _check("find_key(\"row-42\") count", str(len(key_paths)), "1")
+    if len(key_paths) == 1
+        _check("find_key(\"row-42\") path", _path_str(key_paths[0]), "1")
+    let missing_key_paths = prism_inspect.prism_inspect_find_key(keyed_tree, "no-such-key")
+    _check("find_key(\"no-such-key\") count", str(len(missing_key_paths)), "0")
+    let unkeyed_tree_paths = prism_inspect.prism_inspect_find_key(tree, "row-42")
+    _check("find_key on a tree with no keyed nodes at all returns 0, not an error", str(len(unkeyed_tree_paths)), "0")
+
+    print("== 7. prism_inspect_summary: exact string, kinds sorted alphabetically ==")
+    let summary = prism_inspect.prism_inspect_summary(tree)
+    _check("summary exact text", summary, "stack: 5 nodes, depth 3, 4 kinds (band, label, press, stack)")
+
+    print("== 8. prism_inspect_tree: renders through the real primitives ==")
+    let itree_r = prism_inspect.prism_inspect_tree(tree)
+    _check_true("prism_inspect_tree succeeds", not is_err(itree_r))
+    let itree = unwrap(itree_r)
+    _check("prism_inspect_tree produces a PrismNode", type_name(itree), "PrismNode")
+    _check("prism_inspect_tree root is a stack", prism_node.prism_node_kind_str(itree), "stack")
+    // One prism_label per pretty-printed line -- this tree pretty-prints to exactly 5 lines.
+    _check("prism_inspect_tree has one child per line (5)", str(prism_node.prism_node_child_count(itree)), "5")
+    let first_child = prism_node.prism_node_children(itree)[0]
+    _check("prism_inspect_tree's children are labels", prism_node.prism_node_kind_str(first_child), "label")
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_inspect: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_inspect: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)
