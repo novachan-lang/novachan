@@ -110,9 +110,138 @@ fn _ansi_block(n: PrismNode, depth: int, cols: int) -> Result<string>
         "tabs" => _ansi_tabs(n, depth, cols)
         "hint" => _ansi_hint(n, depth, cols)
         "gap" => _ansi_gap(n)
+        "label" => _ansi_wrapped_lines(prism_ansi_sanitize(prism_node.prism_node_attr_str(n, "text", "")), depth, cols)
         _ => _ansi_leaf_line(n, depth, cols)
 
 // A leaf (or an interaction primitive) on its own line.
+// ── Width-aware emission (MB.11) ──────────────────────────────────────────────────────────────
+// `cols` has been a parameter of prism_ansi_render_width since MA.6 that this renderer could not
+// honour -- nothing could wrap, so a long label simply overflowed the terminal. prism_text (MB.10)
+// supplies UTF-8-aware measurement and wrapping, so it is honoured now.
+//
+// ── WHY ONLY `label` IS WRAPPED, AND NOT ALL INLINE OUTPUT ────────────────────────────────────
+// `_ansi_inline` composes text that may contain ANSI ESCAPE SEQUENCES -- prism_ansi_link emits an
+// OSC 8 hyperlink, tab heads use prism_ansi_bold. Those bytes occupy ZERO display cells, so
+// measuring the composed string would count escape bytes as content and wrap far too early,
+// mangling the escape sequence in the process (a split OSC 8 is not a hyperlink, it is garbage on
+// screen). Wrapping escape-bearing text needs a measurement that skips escapes, which is a
+// separate piece of work.
+// `label` is the case that actually overflows -- body text, blurbs, messages -- and it is pure
+// SANITIZED text with no escapes, because prism_ansi_sanitize has already stripped every control
+// byte including ESC. So it is safe to measure and wrap, and it is where the value is.
+// Everything else keeps its previous single-line behaviour. Stated rather than left implicit.
+//
+// Sanitization happens BEFORE measurement (inside _ansi_inline), which is the correct order: a
+// stripped control byte must not be counted as a cell, or every wrapped line comes out short by
+// the number of bytes removed.
+fn _ansi_avail(depth: int, cols: int) -> int
+    // Deep nesting must never drive the available width to zero -- prism_text_wrap rejects a width
+    // below 1, and a zero width would otherwise make callers loop. 8 cells is the floor: narrower
+    // than that, wrapping stops conveying structure anyway.
+    let avail = cols - (depth * 2)
+    if avail < 8
+        return 8
+    avail
+
+// One physical line per wrapped line, each at the node's indent.
+// ── Width and wrapping are implemented HERE, not imported from prism/text ─────────────────────
+// prism_text has the same logic and importing it would be the obvious move -- but prism_text
+// imports prism_ui_kit, which imports prism_arrange/prism_content/prism_interact, so every program
+// that renders ANSI would inherit the entire ui/ dependency chain. That is both wrong layering (a
+// BACKEND must not depend on the component kit) and actively risky: NOVA's field-name -> slot table
+// is global and last-registration-wins, and a wide import surface is exactly the condition that
+// made PrismNode.kind read the wrong slot and crash the HTML renderer on 2026-08-16. Measured here:
+// adding the import made every label render as an EMPTY string while the same attr read correctly
+// through prism_node -- the node was intact, the read inside the renderer was not.
+// So the backend keeps its two-module import surface and owns these ~30 lines. The duplication is
+// deliberate and cheap; the coupling would not have been.
+//
+// UTF-8 aware: len() counts BYTES (len("中") == 3), so measuring with it would charge 3 cells for a
+// character that occupies 2 -- the same defect std/text/wcwidth.nova has.
+fn _ansi_char_cells(b: int) -> int
+    // East Asian Wide starts at U+1100; the common CJK/Hangul/Kana blocks all encode as 3-byte
+    // sequences whose lead byte is >= 0xE0. Two cells for those, one for everything else.
+    if b >= 224
+        return 2
+    1
+
+fn _ansi_seq_len(b: int) -> int
+    if b >= 240
+        return 4
+    if b >= 224
+        return 3
+    if b >= 192
+        return 2
+    1
+
+fn _ansi_width(s: string) -> int
+    let w = 0
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(s[i])
+        w = w + _ansi_char_cells(b)
+        i = i + _ansi_seq_len(b)
+    w
+
+// Greedy wrap on spaces; a single word longer than the width is hard-broken so it can never
+// overflow. Returns at least one line for a non-empty input.
+fn _ansi_wrap(s: string, width: int) -> list
+    let out = []
+    if width < 1
+        push(out, s)
+        return out
+    let cur = ""
+    for word in split(s, " ")
+        if word == ""
+            continue
+        let cand = cur
+        if cur != ""
+            cand = cur + " " + word
+        else
+            cand = word
+        if _ansi_width(cand) <= width
+            cur = cand
+        else
+            if cur != ""
+                push(out, cur)
+                cur = ""
+            // hard-break a word that cannot fit on a line of its own
+            let rest = word
+            while _ansi_width(rest) > width
+                let take = ""
+                let j = 0
+                while j < len(rest)
+                    let b = ord(rest[j])
+                    let step = _ansi_seq_len(b)
+                    if _ansi_width(take + slice(rest, j, j + step)) > width
+                        break
+                    take = take + slice(rest, j, j + step)
+                    j = j + step
+                if take == ""
+                    break
+                push(out, take)
+                rest = slice(rest, len(take), len(rest))
+            cur = rest
+    if cur != ""
+        push(out, cur)
+    out
+
+fn _ansi_wrapped_lines(text: string, depth: int, cols: int) -> Result<string>
+    let lines = ok(_ansi_wrap(text, _ansi_avail(depth, cols)))
+    if is_err(lines)
+        return err(unwrap_err(lines))
+    let pad = _ansi_indent(depth)
+    let out = ""
+    // `unwrap(lines)` is bound to a local before the `for` rather than used directly in the loop
+    // header: iterating `for ln in unwrap(lines)` silently produced ZERO iterations here (the whole
+    // render came out empty) even though the same unwrap returned a 1-element list one line earlier.
+    // Same class as the other expression-position fragilities recorded in §7 -- bind first, then use.
+    let wrapped_lines = unwrap(lines)
+    for ln in wrapped_lines
+        out = out + pad + ln + chr(10)
+    ok(out)
+
 fn _ansi_leaf_line(n: PrismNode, depth: int, cols: int) -> Result<string>
     let r = _ansi_inline(n, cols)
     if is_err(r)
