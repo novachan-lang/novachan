@@ -1,0 +1,631 @@
+// prism_intl -- internationalization layer (PRISM_ROADMAP.md milestone MB.8): message catalogs,
+// `{name}` interpolation, CLDR plural categories, locale-aware integer grouping, and text
+// direction. LEAF module -- imports nothing, so it can be adopted by `ui/` later without pulling
+// widget/core/style/render along for the ride.
+//
+// ── WHY THIS EXISTS NOW, NOT LATER ────────────────────────────────────────────────────────────
+// Every string across `ui/`'s 37 components is a literal the CALLER passes in (`prism_label("Save
+// changes")`). That is fine for one language and turns into the single most expensive retrofit in
+// front-end work the moment a second language is needed -- every call site that built a label by
+// string concatenation has to be found and rewritten, and the ones that got missed ship silently
+// untranslated. This layer exists so that obligation is met NOW, while the surface is 37
+// components, not 137.
+//
+// ── SCOPE, AND WHAT `prism/intl/README.md` ORIGINALLY PLANNED INSTEAD ─────────────────────────
+// The pre-existing README sketched THREE files (`prism_i18n.nova` for catalogs, `prism_number.nova`
+// for number formatting, `prism_datetime.nova` for dates -- feature numbers #66/#120, #65, #64).
+// This milestone's brief asks for ONE file covering catalogs + interpolation + plural + number
+// formatting + locale + direction; `prism_datetime` is explicitly out of scope here (no date/time
+// requirement was given, and calendar math deserves its own falsification pass the way MB.4's
+// date field got, not a bolt-on). The README is updated to match what actually shipped rather than
+// left pointing at a filename that was never created.
+//
+// ── DOES THIS ALREADY EXIST? (CLAUDE.md's mandatory check before writing new library surface) ──
+// `std/i18n/locale.nova` already ships `i18n_new` / `i18n_format_number` / `i18n_translate` /
+// `i18n_plural` / `i18n_direction`. It was read in full before writing a line here, and it is NOT
+// reused, for three concrete reasons, not a style preference:
+//   1. No `prism/` module imports `std/` anywhere in this codebase (verified by grep) -- every
+//      Prism layer is self-contained back to `widget/`'s four primitives modules, and `intl/` is
+//      the first layer several future `ui/` call sites will link against, so introducing the
+//      first-ever `prism/` -> `std/` edge here is a bigger architectural decision than this
+//      milestone's brief, not a shortcut this file should take unilaterally.
+//   2. `i18n_translate` returns the RAW KEY on a missing translation (`if key not in table: return
+//      key`). This milestone's #1 requirement is the opposite: a missing key MUST be a typed
+//      error, because a key silently rendered as its own name is indistinguishable from a real
+//      (if oddly-named) translated string once it ships -- exactly the failure this milestone
+//      exists to close, not inherit.
+//   3. `i18n_plural` is binary only (`n == 1 ? singular : plural`) -- no CLDR category enum, no
+//      per-locale selector, so it cannot express Polish's few/many split at all.
+// `std/text/pluralize.nova` (English morphology: cat -> cats) and `std/data/po_parse.nova` /
+// `po_build.nova` (gettext PO file I/O) were also read; neither overlaps this file's job (word
+// *morphology* and *file format* are different problems from *category selection* and *message
+// lookup*), so nothing here duplicates them either.
+//
+// ── DESIGN DECISION: PrismLocale is a small closed enum, not an open BCP-47 string ────────────
+// A catalog can only ever serve translations for languages someone actually wrote, so unlike
+// `art`'s `source` (a genuinely open, unenumerable string -- see prism_content.nova's header),
+// the locale vocabulary IS closed in the same sense `PrismIcon`'s 12-icon set is: extend it by
+// adding a variant + wrapper + match arm, same discipline as every other closed enum in this
+// codebase (axiom A7 one layer up, exactly prism_tokens.nova's own framing). Two locales ship
+// today -- `en` (the default/fallback root) and `pl` (CLDR's few/many split, genuinely different
+// from English's one/other) -- deliberately minimal rather than padding the enum with locales that
+// would need their own real plural-rule research to avoid being decorative.
+//
+// ── THE FALLBACK CHAIN IS A REAL TWO-STEP LOOKUP, NOT A COSMETIC ONE ──────────────────────────
+// `prism_locale_parse("pl-PL")` tries the FULL tag "pl-PL" against the known-locale table first
+// (miss, today -- no region-specific catalog is registered), THEN the bare language "pl" (hit).
+// That first attempt is a genuine no-op today, not a shortcut skipped -- the day a region-specific
+// catalog is needed (`en-GB` spelling differences, say), it is registered in ONE lookup table
+// (`_intl_locale_lookup`) with no change to `prism_locale_parse`'s control flow at all. An unknown
+// but well-formed language ("de-DE") exhausts both steps and resolves to `prism_locale_default()`
+// (`en`) -- the third step. Only a MALFORMED tag (empty, wrong case, multi-hyphen, a region that is
+// neither 2 letters nor 3 digits) is rejected outright; "well-formed but unsupported" always
+// degrades to the default rather than erroring, which is the entire point of a fallback chain.
+//
+// ── PLURAL CATEGORIES ARE SELECTED ON A NON-NEGATIVE COUNT ────────────────────────────────────
+// `prism_plural_category` rejects `n < 0` rather than silently taking an absolute value. Two
+// reasons: CLDR's own cardinal-plural rules are defined only for `n >= 0` (there is no "correct"
+// category to reverse-engineer for a negative count), and rejecting up front means this file NEVER
+// computes `0 - n` on the count -- sidestepping the classic most-negative-int negation overflow
+// entirely rather than trusting that a UI "how many" count is never `INT64_MIN` in practice.
+//
+// ── POLISH PLURAL RULE, CITED ─────────────────────────────────────────────────────────────────
+// CLDR's Polish cardinal rule (integer case, `v == 0` since this file is integer-only):
+//     one:  n = 1
+//     few:  n % 10 in 2..4  AND  n % 100 not in 12..14
+//     many: n % 10 in {0,1}  OR  n % 10 in 5..9  OR  n % 100 in 12..14
+//     other: (unreachable here -- CLDR's `other` covers non-integer operands only)
+// Hand-verified against the exact boundaries this milestone's brief names: 1->one; 2,3,4->few;
+// 5..11->many; 12,13,14->many (the "teen exception" -- 12/13/14 end in 2/3/4 but are excluded from
+// `few` by the `% 100` clause); 15..21->many; 22,23,24->few (back on the `%10 in 2..4` pattern
+// once past the teens); the whole 2..4/12..14-exception/5..9-or-0-1 pattern then repeats every 100.
+//
+// ── ENGLISH AND GERMAN SHARE ONE RULE, WHICH IS WHY GERMAN ISN'T A THIRD LOCALE HERE ──────────
+// CLDR's German cardinal rule is `one: n = 1; other: everything else` -- IDENTICAL to English's.
+// Adding `de` would not exercise any new plural logic, only a third number-grouping style; this
+// milestone's brief asks for "English and ONE non-trivial language", so the enum stays at two
+// rather than padding it with a locale whose only novelty is a different digit separator.
+//
+// ── DIRECTION: THE ENUM IS COMPLETE, THE LOCALE TABLE IS NOT (STATED, NOT HIDDEN) ─────────────
+// `PrismDirection` is a real 2-variant closed enum and `prism_direction_of` is an exhaustive match,
+// but with only `en`/`pl` registered, EVERY locale resolves to `Ltr` today -- there is no RTL
+// locale in this milestone's 2-locale set, and inventing one just to exercise the `Rtl` arm would
+// mean shipping a plural rule for it that is either a real research effort (Arabic's CLDR rule has
+// 6 live categories with modular conditions -- a second non-trivial language, contradicting the
+// "one" in the brief) or a knowingly-wrong approximation (worse than not having the locale at all).
+// Deferred rather than faked, same precedent as `PrismIcon`'s missing star (MB.4x) -- the KAT
+// proves `PrismDirection` itself is a complete, correctly-named 2-variant enum independently of
+// which locales currently reach `Rtl`.
+//
+// ── INTERPOLATION: ONE ESCAPE CONVENTION, THE SAME ONE NOVA ITSELF USES ───────────────────────
+// NOVA's own double-quoted string literals auto-interpolate `{expr}` at COMPILE time (`"Hello,
+// {name}!"` -- NOVA_LANGUAGE_FEATURES.md trap 5 / §19.A.6), escaped with `\{` / `\}`. A catalog
+// TEMPLATE is a RUNTIME string value (loaded from a dict this file never controls the origin of)
+// holding ITS OWN `{name}` placeholders meant for THIS file's interpolator, not NOVA's compiler --
+// so this file's mini-language reuses the identical `\{` / `\}` / `\\` escape convention rather
+// than inventing a second one. Concretely: anyone authoring a catalog entry as a literal directly
+// in NOVA source (as the KAT does) must write it triple-quoted (`"""Hello, {name}!"""`, which does
+// NOT auto-interpolate -- NOVA_LANGUAGE_FEATURES.md trap "triple-quoted strings do NOT
+// interpolate") or with the braces pre-escaped (`"Hello, \{name\}!"`), or NOVA's OWN compiler will
+// try to resolve `name` as a local variable at that call site, which is a different bug from
+// anything this file's interpolator does.
+//
+// ── INTERPOLATED VALUES ARE DATA, NEVER RE-PARSED AS A TEMPLATE ───────────────────────────────
+// `prism_intl_interpolate` walks the TEMPLATE exactly once, left to right, by index. A substituted
+// argument's text is appended to the output buffer and the scan position advances past the
+// `{placeholder}` in the TEMPLATE -- the substituted text itself is never re-entered into the
+// scanner. So an argument value that happens to CONTAIN `{other}` is emitted byte-for-byte and
+// never expanded, the same non-negotiable this codebase's HTML renderer (MA.5, §17A) already
+// applies to markup: data that looks like syntax is still data. Proven directly in the KAT.
+//
+// ── NUMBER FORMATTING NEVER NEGATES THE RAW INT ───────────────────────────────────────────────
+// `prism_intl_format_number` calls `str(n)` FIRST, strips a leading `-` from the STRING (not the
+// int) if present, groups the digit STRING, and re-prepends `-` at the end. It never computes
+// `0 - n`. This is a deliberate correctness improvement over `std/i18n/locale.nova`'s own
+// `i18n_format_number`, which negates the raw int before converting -- correct for every ordinary
+// value, but undefined for the one most-negative representable integer, where negation overflows.
+// Real Polish number grouping uses U+00A0 (non-breaking space); this file uses a plain ASCII space
+// instead -- a documented simplification, not an oversight, since non-ASCII string-literal
+// handling is unverified in this codebase and a plain space is visually indistinguishable in every
+// terminal/HTML context this milestone touches.
+//
+// PUBLIC API
+//   Locale
+//     PrismLocale                                    closed enum: en, pl
+//     prism_locale_en() / prism_locale_pl()          cross-module ctors (trap 11: enum ctors are
+//                                                     file-local; every other file must go through
+//                                                     these rather than writing `LocEn()` itself)
+//     prism_locale_default()                    -> PrismLocale         the fallback root (= en)
+//     prism_locale_name(locale)                 -> string              exhaustive "en" | "pl"
+//     prism_locale_parse(tag)                   -> Result<PrismLocale> validated tag + fallback
+//                                                                       chain (full tag -> bare
+//                                                                       language -> default);
+//                                                                       rejects empty/malformed
+//   Direction
+//     PrismDirection                                 closed enum: ltr, rtl
+//     prism_direction_ltr() / prism_direction_rtl()  cross-module ctors
+//     prism_direction_name(dir)                 -> string              exhaustive "ltr" | "rtl"
+//     prism_direction_of(locale)                -> PrismDirection      exhaustive; en/pl -> ltr
+//   Plural (CLDR categories)
+//     PrismPlural                                    closed enum: zero, one, two, few, many, other
+//     prism_plural_zero/_one/_two/_few/_many/_other() -> PrismPlural   cross-module ctors
+//     prism_plural_name(cat)                    -> string              exhaustive, all 6
+//     prism_plural_category(locale, n)          -> Result<PrismPlural> per-locale CLDR selector;
+//                                                                       rejects n < 0
+//   Number formatting
+//     prism_intl_format_number(locale, n)       -> string   integer grouping, locale separator,
+//                                                            zero/negative-safe, INT64_MIN-safe
+//   Interpolation
+//     prism_intl_interpolate(template, args)    -> Result<string>   `{name}` substitution from a
+//                                                  dict<string,string>; rejects an unfilled
+//                                                  placeholder AND an unreferenced arg; `\{` `\}`
+//                                                  `\\` escapes; never re-expands substituted data
+//   Message catalog
+//     PrismIntlCatalog                               locale + simple messages + plural message sets
+//     prism_intl_catalog(locale, entries)       -> Result<PrismIntlCatalog>   entries:
+//                                                    dict<string,string>, simple (non-plural)
+//                                                    messages; rejects an empty key or template
+//     prism_intl_catalog_add_plural(catalog, key, forms) -> Result<PrismIntlCatalog>
+//                                                    forms: dict<string,string>, CLDR category
+//                                                    name -> template; non-mutating (returns a NEW
+//                                                    catalog); rejects an unknown category name, an
+//                                                    empty form set, or a key already registered
+//                                                    (either as a simple message or a plural one)
+//     prism_intl_catalog_locale(catalog)        -> PrismLocale
+//     prism_intl_t(catalog, key, args)          -> Result<string>   simple lookup + interpolate;
+//                                                    a missing key is a TYPED ERROR, never a
+//                                                    silent fallback to the raw key
+//     prism_intl_plural(catalog, key, count, args) -> Result<string>   plural lookup via the
+//                                                    catalog's OWN locale's selector, then
+//                                                    interpolate; rejects a lookup whose selected
+//                                                    category has no registered form
+
+// ── Locale ─────────────────────────────────────────────────────────────────────────────────────
+enum PrismLocale
+    LocEn()
+    LocPl()
+
+fn prism_locale_en() -> PrismLocale
+    LocEn()
+fn prism_locale_pl() -> PrismLocale
+    LocPl()
+
+fn prism_locale_default() -> PrismLocale
+    LocEn()
+
+// Exhaustive, no wildcard -- adding a 3rd locale without a case here is a compile error.
+fn prism_locale_name(locale: PrismLocale) -> string
+    match locale
+        LocEn() => "en"
+        LocPl() => "pl"
+
+// Registered-tag lookup, used for BOTH steps of the fallback chain (see header). Returns "" (not
+// found) rather than an Option -- matches this codebase's prevailing sentinel idiom (`index_of`
+// returning -1) and avoids threading Option through a private helper only two call sites use.
+fn _intl_locale_lookup(name: string) -> string
+    if name == "en"
+        return "en"
+    if name == "pl"
+        return "pl"
+    ""
+
+fn _intl_locale_from_name(name: string) -> PrismLocale
+    if name == "pl"
+        return LocPl()
+    LocEn()
+
+fn _intl_index_of_hyphen(s: string) -> int
+    let n = len(s)
+    let mut i = 0
+    while i < n
+        if char_at(s, i) == "-"
+            return i
+        i += 1
+    0 - 1
+
+// 2-3 lowercase ASCII letters (ISO 639-1/2 shape). Longer/extended BCP-47 language subtags (up to
+// 8 chars) are out of scope -- a documented simplification, not an oversight.
+fn _intl_valid_lang_subtag(s: string) -> bool
+    let n = len(s)
+    if n < 2 or n > 3
+        return false
+    let mut i = 0
+    while i < n
+        let c = char_at(s, i)
+        if not (c >= "a" and c <= "z")
+            return false
+        i += 1
+    true
+
+// Either 2 uppercase ASCII letters (`US`, `PL`) or 3 digits (`419`, the real UN M49 region code
+// shape BCP-47 uses for macro-regions like "es-419") -- the two BCP-47 region-subtag shapes this
+// file recognizes for FORMAT validation. The region is never used for matching (see header: no
+// region-specific catalog is registered yet), only for rejecting a malformed tag outright.
+fn _intl_valid_region_subtag(s: string) -> bool
+    let n = len(s)
+    if n == 2
+        let mut i = 0
+        while i < n
+            let c = char_at(s, i)
+            if not (c >= "A" and c <= "Z")
+                return false
+            i += 1
+        return true
+    if n == 3
+        let mut i = 0
+        while i < n
+            let c = char_at(s, i)
+            if not (c >= "0" and c <= "9")
+                return false
+            i += 1
+        return true
+    false
+
+// Validated tag + 3-step fallback chain: full tag -> bare language -> default. Rejects only a
+// malformed tag (empty, wrong subtag shape, more than one hyphen); a well-formed but unsupported
+// language degrades to the default rather than erroring -- see header.
+fn prism_locale_parse(tag: string) -> Result<PrismLocale>
+    if len(tag) == 0
+        return err("prism_locale_parse: locale tag must not be empty")
+    let hy = _intl_index_of_hyphen(tag)
+    let mut lang = tag
+    let mut region = ""
+    let mut has_region = false
+    if hy >= 0
+        lang = slice(tag, 0, hy)
+        region = slice(tag, hy + 1, len(tag))
+        has_region = true
+        if _intl_index_of_hyphen(region) >= 0
+            return err("prism_locale_parse: malformed tag '" + tag + "' -- only a single language-region form is supported (e.g. 'pl-PL'), got a second hyphen")
+    if not _intl_valid_lang_subtag(lang)
+        return err("prism_locale_parse: malformed language subtag '" + lang + "' in tag '" + tag + "' -- expected 2-3 lowercase letters")
+    if has_region
+        if not _intl_valid_region_subtag(region)
+            return err("prism_locale_parse: malformed region subtag '" + region + "' in tag '" + tag + "' -- expected 2 uppercase letters or 3 digits")
+    // Step 1: the full tag as-is (a future region-specific catalog would register here).
+    let full_hit = _intl_locale_lookup(tag)
+    if len(full_hit) > 0
+        return ok(_intl_locale_from_name(full_hit))
+    // Step 2: the bare language. Only meaningful when a region was present -- with no region,
+    // `lang == tag` already and step 1 already tried this exact lookup.
+    if has_region
+        let base_hit = _intl_locale_lookup(lang)
+        if len(base_hit) > 0
+            return ok(_intl_locale_from_name(base_hit))
+    // Step 3: default.
+    ok(prism_locale_default())
+
+// ── Direction ──────────────────────────────────────────────────────────────────────────────────
+enum PrismDirection
+    DirLtr()
+    DirRtl()
+
+fn prism_direction_ltr() -> PrismDirection
+    DirLtr()
+fn prism_direction_rtl() -> PrismDirection
+    DirRtl()
+
+fn prism_direction_name(dir: PrismDirection) -> string
+    match dir
+        DirLtr() => "ltr"
+        DirRtl() => "rtl"
+
+// Exhaustive over PrismLocale. Both registered locales are LTR today -- see header for why no RTL
+// locale is invented just to exercise the other arm.
+fn prism_direction_of(locale: PrismLocale) -> PrismDirection
+    match locale
+        LocEn() => DirLtr()
+        LocPl() => DirLtr()
+
+// ── Plural (CLDR categories) ──────────────────────────────────────────────────────────────────
+enum PrismPlural
+    PluralZero()
+    PluralOne()
+    PluralTwo()
+    PluralFew()
+    PluralMany()
+    PluralOther()
+
+fn prism_plural_zero() -> PrismPlural
+    PluralZero()
+fn prism_plural_one() -> PrismPlural
+    PluralOne()
+fn prism_plural_two() -> PrismPlural
+    PluralTwo()
+fn prism_plural_few() -> PrismPlural
+    PluralFew()
+fn prism_plural_many() -> PrismPlural
+    PluralMany()
+fn prism_plural_other() -> PrismPlural
+    PluralOther()
+
+// Exhaustive, no wildcard -- all 6 CLDR category names, independent of which locale can reach them.
+fn prism_plural_name(cat: PrismPlural) -> string
+    match cat
+        PluralZero() => "zero"
+        PluralOne() => "one"
+        PluralTwo() => "two"
+        PluralFew() => "few"
+        PluralMany() => "many"
+        PluralOther() => "other"
+
+// English CLDR cardinal rule: one = n=1; other = everything else. `n` is already validated >= 0
+// by the caller (`prism_plural_category`).
+fn _intl_plural_en(n: int) -> PrismPlural
+    if n == 1
+        return PluralOne()
+    PluralOther()
+
+// Polish CLDR cardinal rule -- see header for the citation and the hand-verified boundaries.
+fn _intl_plural_pl(n: int) -> PrismPlural
+    if n == 1
+        return PluralOne()
+    let m10 = n % 10
+    let m100 = n % 100
+    let teen = m100 >= 12 and m100 <= 14
+    if m10 >= 2 and m10 <= 4 and not teen
+        return PluralFew()
+    PluralMany()
+
+// Per-locale CLDR category selector. Rejects a negative count outright rather than taking an
+// absolute value -- see header (no "correct" CLDR category exists for n < 0, and this sidesteps
+// the INT64_MIN negation-overflow class entirely rather than trusting the caller).
+fn prism_plural_category(locale: PrismLocale, n: int) -> Result<PrismPlural>
+    if n < 0
+        return err("prism_plural_category: count must be >= 0 (CLDR cardinal-plural rules are defined only for non-negative operands), got " + str(n))
+    match locale
+        LocEn() => ok(_intl_plural_en(n))
+        LocPl() => ok(_intl_plural_pl(n))
+
+// ── Number formatting ──────────────────────────────────────────────────────────────────────────
+
+// Real CLDR Polish groups with U+00A0 (non-breaking space); this file uses a plain ASCII space --
+// a documented simplification (see header), not an oversight.
+fn _intl_group_sep(locale: PrismLocale) -> string
+    match locale
+        LocEn() => ","
+        LocPl() => " "
+
+// Integer grouping, locale-specific separator, every 3 digits from the right. See header: `str(n)`
+// is computed FIRST and the sign is stripped/re-added as a STRING operation, so this function never
+// computes `0 - n` and is therefore safe across the full int range, including the one value where
+// negation would overflow.
+fn prism_intl_format_number(locale: PrismLocale, n: int) -> string
+    let sep = _intl_group_sep(locale)
+    let raw = str(n)
+    let mut neg = false
+    let mut digits = raw
+    if len(raw) > 0 and char_at(raw, 0) == "-"
+        neg = true
+        digits = slice(raw, 1, len(raw))
+    let dlen = len(digits)
+    let buf = buffer()
+    let mut i = 0
+    while i < dlen
+        buf_append(buf, char_at(digits, i))
+        let pos_from_right = dlen - i
+        if pos_from_right > 1 and (pos_from_right - 1) % 3 == 0
+            buf_append(buf, sep)
+        i += 1
+    let mut out = buf_to_str(buf)
+    if neg
+        out = "-" + out
+    out
+
+// ── Interpolation ──────────────────────────────────────────────────────────────────────────────
+
+// ★ NOVA COMPILER LIMITATION, found while writing this section (not previously recorded anywhere
+// in NOVA_LANGUAGE_FEATURES.md's trap list): a double-quoted string literal containing an
+// UNMATCHED `{` -- one with no corresponding `}` before THAT SAME literal's closing `"` -- is not
+// treated as a literal open-brace character. The lexer instead starts scanning an interpolation
+// EXPRESSION at that `{` and, finding no `}` before end-of-file, fails with `error[E0010]:
+// unterminated string literal` pointing at line 1 (a fallback location, not the real one) -- NOT
+// the more locatable "unexpected token" class of error one might expect. Probed directly:
+// `"{"` alone => E0010 (consumes to EOF looking for a close). `"a{b}c"` (balanced, non-empty
+// content between the braces) => compiles fine. `"{}"` (balanced but EMPTY between the braces)
+// => a DIFFERENT error, `E0001 unexpected INTERP_END in expression` (an empty interpolation
+// expression is itself invalid). So there is no way to write a bare, unpaired `{` -- or an
+// adjacent `{}` -- as literal characters in an ordinary double-quoted string; `\{`/`\}` escaping
+// only helps once the literal ALREADY parses far enough to apply it, which an unmatched `{`
+// never does. Every brace character this file needs literally (both in the interpolator's own
+// scanner and in its error messages, several of which quote the offending `{name}` syntax) is
+// therefore built via `chr(123)`/`chr(125)` at RUNTIME instead of ever appearing as a literal `{`
+// or `}` inside a plain double-quoted string in this file -- sidestepping the bug entirely rather
+// than trying to work around it string-by-string. (Triple-quoted `"""..."""` strings do NOT hit
+// this -- confirmed separately, see the KAT -- because they skip interpolation scanning
+// altogether; it is specifically plain double-quoted literals that are affected.)
+fn _intl_ob() -> string
+    chr(123)
+fn _intl_cb() -> string
+    chr(125)
+
+fn _intl_is_ident_char(c: string) -> bool
+    if c == "_"
+        return true
+    if c >= "a" and c <= "z"
+        return true
+    if c >= "A" and c <= "Z"
+        return true
+    if c >= "0" and c <= "9"
+        return true
+    false
+
+fn _intl_is_ident(name: string) -> bool
+    let n = len(name)
+    if n == 0
+        return false
+    let mut i = 0
+    while i < n
+        if not _intl_is_ident_char(char_at(name, i))
+            return false
+        i += 1
+    true
+
+// First closing brace at or after `start`, or -1 if the template ends first (an unterminated
+// placeholder).
+fn _intl_find_close(s: string, start: int) -> int
+    let n = len(s)
+    let cb = _intl_cb()
+    let mut i = start
+    while i < n
+        if char_at(s, i) == cb
+            return i
+        i += 1
+    0 - 1
+
+// `{name}` substitution from `args` (dict<string,string>). Both directions are validated: a
+// placeholder with no matching arg, AND an arg never referenced by any placeholder, are both
+// rejected (the second is how a translator silently drops a variable). `\{` / `\}` / `\\` escape
+// to a literal brace/backslash -- the SAME convention NOVA's own compiler uses for string literals
+// (see header), not a second one. Interpolated values are DATA: this walks the TEMPLATE exactly
+// once by index and appends substituted text verbatim -- it is never re-scanned for further
+// `{placeholder}` syntax, the same non-negotiable MA.5's HTML renderer applies to markup.
+fn prism_intl_interpolate(template: string, args: dict) -> Result<string>
+    let tlen = len(template)
+    let buf = buffer()
+    let used = {}
+    let ob = _intl_ob()
+    let cb = _intl_cb()
+    let bs = chr(92)
+    let mut pos = 0
+    while pos < tlen
+        let c = char_at(template, pos)
+        if c == bs and pos + 1 < tlen
+            let nxt = char_at(template, pos + 1)
+            if nxt == ob or nxt == cb or nxt == bs
+                buf_append(buf, nxt)
+                pos = pos + 2
+            else
+                buf_append(buf, c)
+                pos = pos + 1
+        else if c == ob
+            let close = _intl_find_close(template, pos + 1)
+            if close < 0
+                return err("prism_intl_interpolate: unterminated '" + ob + "' at position " + str(pos) + " in template '" + template + "'")
+            let name = slice(template, pos + 1, close)
+            if len(name) == 0
+                return err("prism_intl_interpolate: empty placeholder '" + ob + cb + "' at position " + str(pos) + " in template '" + template + "'")
+            if not _intl_is_ident(name)
+                return err("prism_intl_interpolate: placeholder '" + ob + name + cb + "' is not a valid identifier (letters, digits, underscore only)")
+            if name not in args
+                return err("prism_intl_interpolate: template references '" + ob + name + cb + "' but no argument named '" + name + "' was supplied")
+            let v = args[name]
+            if not is_string(v)
+                return err("prism_intl_interpolate: argument '" + name + "' must be a string, got " + type_name(v))
+            buf_append(buf, v)
+            used[name] = true
+            pos = close + 1
+        else
+            buf_append(buf, c)
+            pos = pos + 1
+    for k in keys(args)
+        if k not in used
+            return err("prism_intl_interpolate: argument '" + k + "' was supplied but never referenced by the template (a translator may have dropped '" + ob + k + cb + "')")
+    ok(buf_to_str(buf))
+
+// ── Message catalog ────────────────────────────────────────────────────────────────────────────
+
+fn _intl_is_plural_name(s: string) -> bool
+    if s == "zero"
+        return true
+    if s == "one"
+        return true
+    if s == "two"
+        return true
+    if s == "few"
+        return true
+    if s == "many"
+        return true
+    if s == "other"
+        return true
+    false
+
+// `icat_` field prefix: this codebase's field-name -> slot table is GLOBAL and last-registration-
+// wins across every struct any program links in (verified 2026-08-16, `prism_theme.nova`'s header
+// -- `PrismNode.kind` collided with `PrismFormField.kind` at a different slot and crashed the HTML
+// renderer). Named `PrismIntlCatalog`, not the bare `PrismCatalog` a first draft would reach for,
+// specifically because `prism/dev/prism_catalog.nova` already owns `PrismCatalogEntry` and the
+// whole "component showcase" sense of the word "catalog" -- no field or type actually collides
+// (grepped project-wide first), but the two concepts are unrelated enough that reusing the bare
+// name would be confusing for a future reader, not just risky for the compiler.
+type PrismIntlCatalog
+    icat_locale: PrismLocale
+    icat_messages: dict
+    icat_plurals: dict
+
+// `entries`: dict<string,string>, simple (non-plural) key -> template messages. Rejects an empty
+// key or an empty/non-string template -- an empty translation is indistinguishable from a missing
+// one once it ships, exactly the failure this milestone exists to close (see header).
+fn prism_intl_catalog(locale: PrismLocale, entries: dict) -> Result<PrismIntlCatalog>
+    let msgs = {}
+    for k, v in entries
+        if len(k) == 0
+            return err("prism_intl_catalog: message key must not be empty")
+        if not is_string(v)
+            return err("prism_intl_catalog: entry '" + k + "' must be a string template, got " + type_name(v))
+        if len(v) == 0
+            return err("prism_intl_catalog: entry '" + k + "' has an empty template")
+        msgs[k] = v
+    ok(PrismIntlCatalog(locale, msgs, {}))
+
+// Adds ONE plural message. `forms`: dict<string,string>, CLDR category name -> template (only the
+// categories the locale's own selector can reach need be present -- e.g. an `en` catalog need only
+// supply "one"/"other"). Non-mutating: builds a FRESH plurals dict rather than writing through the
+// original's, so the input `catalog` is provably unaffected (asserted in the KAT) -- the same
+// "later-wins, non-mutating" discipline `prism_theme_with`/`prism_look` merges already established.
+fn prism_intl_catalog_add_plural(catalog: PrismIntlCatalog, key: string, forms: dict) -> Result<PrismIntlCatalog>
+    if len(key) == 0
+        return err("prism_intl_catalog_add_plural: key must not be empty")
+    if key in catalog.icat_messages
+        return err("prism_intl_catalog_add_plural: key '" + key + "' is already registered as a simple message")
+    if key in catalog.icat_plurals
+        return err("prism_intl_catalog_add_plural: key '" + key + "' already has a plural entry registered")
+    if len(keys(forms)) == 0
+        return err("prism_intl_catalog_add_plural: '" + key + "' has no category forms")
+    let validated = {}
+    for cat_name, tmpl in forms
+        if not _intl_is_plural_name(cat_name)
+            return err("prism_intl_catalog_add_plural: '" + key + "' has an unknown plural category '" + cat_name + "' -- must be one of zero/one/two/few/many/other")
+        if not is_string(tmpl)
+            return err("prism_intl_catalog_add_plural: '" + key + "' category '" + cat_name + "' must be a string template")
+        if len(tmpl) == 0
+            return err("prism_intl_catalog_add_plural: '" + key + "' category '" + cat_name + "' has an empty template")
+        validated[cat_name] = tmpl
+    let new_plurals = {}
+    for pk, pv in catalog.icat_plurals
+        new_plurals[pk] = pv
+    new_plurals[key] = validated
+    ok(PrismIntlCatalog(catalog.icat_locale, catalog.icat_messages, new_plurals))
+
+fn prism_intl_catalog_locale(catalog: PrismIntlCatalog) -> PrismLocale
+    catalog.icat_locale
+
+// Simple (non-plural) lookup + interpolate. A missing key is a TYPED ERROR, never a silent
+// fallback to the raw key -- the #1 requirement this milestone exists to satisfy (see header:
+// `std/i18n/locale.nova`'s `i18n_translate` does exactly the fallback this rejects).
+fn prism_intl_t(catalog: PrismIntlCatalog, key: string, args: dict) -> Result<string>
+    if key in catalog.icat_messages
+        let tmpl = catalog.icat_messages[key]
+        return prism_intl_interpolate(tmpl, args)
+    if key in catalog.icat_plurals
+        return err("prism_intl_t: '" + key + "' is a PLURAL message -- use prism_intl_plural(catalog, key, count, args) instead")
+    err("prism_intl_t: no message registered for key '" + key + "' (locale '" + prism_locale_name(catalog.icat_locale) + "')")
+
+// Plural lookup: selects a CLDR category via the catalog's OWN locale, then interpolates the
+// template registered for that category. Rejects a lookup whose selected category has no
+// registered form -- e.g. a Polish entry that only supplies "one"/"few" rejects a count that
+// selects "many", rather than silently falling back to some other category's wording.
+fn prism_intl_plural(catalog: PrismIntlCatalog, key: string, count: int, args: dict) -> Result<string>
+    if key in catalog.icat_messages
+        return err("prism_intl_plural: '" + key + "' is a SIMPLE message -- use prism_intl_t(catalog, key, args) instead")
+    if key not in catalog.icat_plurals
+        return err("prism_intl_plural: no plural message registered for key '" + key + "' (locale '" + prism_locale_name(catalog.icat_locale) + "')")
+    let forms = catalog.icat_plurals[key]
+    let cat_r = prism_plural_category(catalog.icat_locale, count)
+    if is_err(cat_r)
+        return err(unwrap_err(cat_r))
+    let cat_name = prism_plural_name(unwrap(cat_r))
+    if cat_name not in forms
+        return err("prism_intl_plural: '" + key + "' has no '" + cat_name + "' form for count " + str(count) + " (locale '" + prism_locale_name(catalog.icat_locale) + "')")
+    let tmpl = forms[cat_name]
+    prism_intl_interpolate(tmpl, args)

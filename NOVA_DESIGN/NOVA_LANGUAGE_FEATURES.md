@@ -1595,6 +1595,24 @@ BEHAVIOUR DIFF caught it. **Compiling is not passing.**
    handlers, strategy objects — and it is exactly why `OrmQuery.sql()` fails to link. Prefer the
    local-binding form unconditionally; it costs one line and does not depend on inference.
 
+14. ★ **A LITERAL `{` CANNOT APPEAR IN A DOUBLE-QUOTED STRING — and the error lies about why**
+   (verified 2026-08-16). `{...}` is interpolation syntax, so an unmatched brace makes the lexer
+   scan for an interpolation expression to end-of-file:
+
+   ```nova
+   print("a { b")     // error[E0010]: unterminated string literal    <-- MISLEADING
+   print("a {} b")    // error[E0001]: unexpected INTERP_END ' b' in expression
+   print("a {x} b")   // ok -- this is interpolation, not a literal brace
+   ```
+
+   The first message is actively wrong: the string **is** terminated. The lexer consumed the rest of
+   the file looking for the interpolation's `}`, so the reported location is meaningless (often
+   `1:1`). Anyone hitting it will hunt for a missing quote that does not exist.
+
+   **Workaround: build the brace at runtime** — `chr(123)` for `{`, `chr(125)` for `}`. Needed by
+   any code that emits or parses brace-delimited text: message templates, JSON, code generators,
+   format strings. `prism/intl/prism_intl.nova` does exactly this and documents it in-file.
+
 ---
 
 ## 8. Builtin Data Structures

@@ -1,0 +1,318 @@
+// KAT for prism/intl/prism_intl.nova (milestone MB.8 -- the internationalization layer).
+//
+// Proves, against concrete expected values:
+//   1. Locale: name mapping, default, and the 3-step fallback chain (full tag -> bare language ->
+//      default) -- "pl-PL" resolves to Pl via step 2, "de-DE" (unsupported but well-formed) falls
+//      all the way to the default (En) via step 3, and a battery of malformed tags is rejected.
+//   2. Direction: both variants' names, and `prism_direction_of` for both registered locales.
+//   3. Plural: all 6 CLDR category names; English's one/other split; Polish's few/many split swept
+//      across the EXACT boundaries this milestone's brief names (1->one; 2-4->few; 5-21->many
+//      with the 12-14 "teen exception" still many; 22-24->few again) plus a second period (100s)
+//      to prove the pattern repeats rather than being hard-coded per number; negative counts
+//      rejected for both locales.
+//   4. Number formatting: 0, negatives, and 3/4/7-digit magnitudes in TWO locales (en comma-grouped,
+//      pl space-grouped), plus a large negative to exercise the sign path at scale.
+//   5. Interpolation: basic + multi-placeholder substitution, missing-arg rejection, extra-arg
+//      rejection (a translator dropped a variable), `\{` `\}` `\\` escapes via `chr(92)`-built
+//      strings (never through a NOVA string literal, which would have NOVA's OWN compiler try to
+//      interpolate/escape the very braces this test is trying to hand the runtime function
+//      untouched), an unterminated-brace rejection, an empty-placeholder rejection, an
+//      invalid-identifier-placeholder rejection, a non-string-arg-value rejection, and the ★
+//      re-expansion proof: an argument VALUE containing literal `{other}` text is emitted verbatim
+//      and never re-scanned as a further placeholder.
+//   6. Message catalog: construction + simple lookup + interpolation, a missing key is a TYPED
+//      ERROR (never a silent fallback to the raw key -- asserted both by `is_err` and by checking
+//      the error text is NOT simply the bare key), empty key/template rejected at construction,
+//      simple-vs-plural cross-lookup rejected both directions.
+//   7. Catalog plurals: English one/other and Polish one/few/many registered and looked up across
+//      several counts each; a plural entry deliberately missing its "many" form rejects a count
+//      that selects "many"; `add_plural` rejects a duplicate key, a key that collides with an
+//      existing simple message, an unknown category name, and an empty form set; non-mutation is
+//      asserted directly (the original catalog is unaffected by an `add_plural` derived from it).
+//   8. >= 10 rejection cases (this file exercises 30).
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_intl.nova
+//   clang -O2 -o _kat_prism_intl.exe _kat_prism_intl.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_intl.exe        (always under Invoke-Timed -TimeoutMs, kill-on-timeout)
+
+import prism_intl
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=" + got + "  want=" + want)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+// A rejection must be a typed Err, NOT a crash and NOT a silently-accepted default.
+fn _check_rejected(label: string, r)
+    if is_err(r)
+        print("  pass  reject: " + label)
+    else
+        print("  FAIL  reject: " + label + " -- was ACCEPTED")
+        FAILED[0] = FAILED[0] + 1
+
+fn _mkdict1(k: string, v: string) -> dict
+    let d = {}
+    d[k] = v
+    d
+
+fn main()
+    print("== 1. locale: names, default, fallback chain, malformed rejections ==")
+    _check("en name", prism_intl.prism_locale_name(prism_intl.prism_locale_en()), "en")
+    _check("pl name", prism_intl.prism_locale_name(prism_intl.prism_locale_pl()), "pl")
+    _check("default name", prism_intl.prism_locale_name(prism_intl.prism_locale_default()), "en")
+
+    let p_en = unwrap(prism_intl.prism_locale_parse("en"))
+    _check("parse 'en'", prism_intl.prism_locale_name(p_en), "en")
+    let p_pl = unwrap(prism_intl.prism_locale_parse("pl"))
+    _check("parse 'pl'", prism_intl.prism_locale_name(p_pl), "pl")
+    // Step 2 of the fallback chain: full tag "pl-PL" misses, bare language "pl" hits.
+    let p_plpl = unwrap(prism_intl.prism_locale_parse("pl-PL"))
+    _check("parse 'pl-PL' -> pl (fallback step 2)", prism_intl.prism_locale_name(p_plpl), "pl")
+    let p_enus = unwrap(prism_intl.prism_locale_parse("en-US"))
+    _check("parse 'en-US' -> en (2-letter region boundary accepted)", prism_intl.prism_locale_name(p_enus), "en")
+    let p_en419 = unwrap(prism_intl.prism_locale_parse("en-419"))
+    _check("parse 'en-419' -> en (3-digit region boundary accepted)", prism_intl.prism_locale_name(p_en419), "en")
+    // Step 3: unknown but well-formed language exhausts both steps and reaches the default.
+    let p_dede = unwrap(prism_intl.prism_locale_parse("de-DE"))
+    _check("parse 'de-DE' -> default en (fallback step 3)", prism_intl.prism_locale_name(p_dede), "en")
+    let p_xx = unwrap(prism_intl.prism_locale_parse("xx"))
+    _check("parse 'xx' -> default en (well-formed, unregistered)", prism_intl.prism_locale_name(p_xx), "en")
+
+    _check_rejected("empty tag", prism_intl.prism_locale_parse(""))
+    _check_rejected("uppercase language 'EN'", prism_intl.prism_locale_parse("EN"))
+    _check_rejected("1-char language 'e'", prism_intl.prism_locale_parse("e"))
+    _check_rejected("4-char language 'engl'", prism_intl.prism_locale_parse("engl"))
+    _check_rejected("lowercase region 'en-us'", prism_intl.prism_locale_parse("en-us"))
+    _check_rejected("3-letter region 'en-USA'", prism_intl.prism_locale_parse("en-USA"))
+    _check_rejected("underscore instead of hyphen 'en_US'", prism_intl.prism_locale_parse("en_US"))
+    _check_rejected("leading hyphen '-en'", prism_intl.prism_locale_parse("-en"))
+    _check_rejected("trailing hyphen 'en-'", prism_intl.prism_locale_parse("en-"))
+    _check_rejected("double hyphen 'en-US-x'", prism_intl.prism_locale_parse("en-US-x"))
+
+    print("== 2. direction ==")
+    _check("ltr name", prism_intl.prism_direction_name(prism_intl.prism_direction_ltr()), "ltr")
+    _check("rtl name", prism_intl.prism_direction_name(prism_intl.prism_direction_rtl()), "rtl")
+    _check("direction_of(en)", prism_intl.prism_direction_name(prism_intl.prism_direction_of(prism_intl.prism_locale_en())), "ltr")
+    _check("direction_of(pl)", prism_intl.prism_direction_name(prism_intl.prism_direction_of(prism_intl.prism_locale_pl())), "ltr")
+
+    print("== 3. plural categories ==")
+    _check("zero name", prism_intl.prism_plural_name(prism_intl.prism_plural_zero()), "zero")
+    _check("one name", prism_intl.prism_plural_name(prism_intl.prism_plural_one()), "one")
+    _check("two name", prism_intl.prism_plural_name(prism_intl.prism_plural_two()), "two")
+    _check("few name", prism_intl.prism_plural_name(prism_intl.prism_plural_few()), "few")
+    _check("many name", prism_intl.prism_plural_name(prism_intl.prism_plural_many()), "many")
+    _check("other name", prism_intl.prism_plural_name(prism_intl.prism_plural_other()), "other")
+
+    let en = prism_intl.prism_locale_en()
+    let pl = prism_intl.prism_locale_pl()
+    _check("en(1) -> one", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(en, 1))), "one")
+    _check("en(0) -> other", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(en, 0))), "other")
+    _check("en(2) -> other", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(en, 2))), "other")
+    _check("en(5) -> other", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(en, 5))), "other")
+
+    // Polish CLDR cardinal rule, swept across the exact boundaries the brief names (see
+    // prism_intl.nova header for the citation): 1->one; 2,3,4->few; 5..11->many; 12,13,14->many
+    // (the teen exception); 15..21->many; 22,23,24->few; pattern repeats every 100.
+    _check("pl(0) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 0))), "many")
+    _check("pl(1) -> one", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 1))), "one")
+    _check("pl(2) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 2))), "few")
+    _check("pl(3) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 3))), "few")
+    _check("pl(4) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 4))), "few")
+    _check("pl(5) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 5))), "many")
+    _check("pl(10) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 10))), "many")
+    _check("pl(11) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 11))), "many")
+    _check("pl(12) -> many (teen exception)", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 12))), "many")
+    _check("pl(13) -> many (teen exception)", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 13))), "many")
+    _check("pl(14) -> many (teen exception)", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 14))), "many")
+    _check("pl(15) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 15))), "many")
+    _check("pl(20) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 20))), "many")
+    _check("pl(21) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 21))), "many")
+    _check("pl(22) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 22))), "few")
+    _check("pl(23) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 23))), "few")
+    _check("pl(24) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 24))), "few")
+    _check("pl(25) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 25))), "many")
+    // A second period (100s) proves the pattern is computed, not a lookup table of small numbers.
+    _check("pl(101) -> many", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 101))), "many")
+    _check("pl(102) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 102))), "few")
+    _check("pl(112) -> many (teen exception repeats)", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 112))), "many")
+    _check("pl(122) -> few", prism_intl.prism_plural_name(unwrap(prism_intl.prism_plural_category(pl, 122))), "few")
+
+    _check_rejected("negative count, en", prism_intl.prism_plural_category(en, 0 - 1))
+    _check_rejected("negative count, pl", prism_intl.prism_plural_category(pl, 0 - 5))
+
+    print("== 4. number formatting (zero, negatives, 3/4/7 digits, two locales) ==")
+    _check("en 0", prism_intl.prism_intl_format_number(en, 0), "0")
+    _check("pl 0", prism_intl.prism_intl_format_number(pl, 0), "0")
+    _check("en 123 (3 digits, no separator)", prism_intl.prism_intl_format_number(en, 123), "123")
+    _check("pl 123 (3 digits, no separator)", prism_intl.prism_intl_format_number(pl, 123), "123")
+    _check("en 1234 (4 digits)", prism_intl.prism_intl_format_number(en, 1234), "1,234")
+    _check("pl 1234 (4 digits)", prism_intl.prism_intl_format_number(pl, 1234), "1 234")
+    _check("en 1234567 (7 digits)", prism_intl.prism_intl_format_number(en, 1234567), "1,234,567")
+    _check("pl 1234567 (7 digits)", prism_intl.prism_intl_format_number(pl, 1234567), "1 234 567")
+    _check("en -1234 (negative)", prism_intl.prism_intl_format_number(en, 0 - 1234), "-1,234")
+    _check("pl -1234 (negative)", prism_intl.prism_intl_format_number(pl, 0 - 1234), "-1 234")
+    _check("en -1234567890123 (large negative)", prism_intl.prism_intl_format_number(en, 0 - 1234567890123), "-1,234,567,890,123")
+
+    print("== 5. interpolation ==")
+    let t1 = """Hello, {name}!"""
+    let a1 = {}
+    a1["name"] = "Ada"
+    _check("basic substitution", unwrap(prism_intl.prism_intl_interpolate(t1, a1)), "Hello, Ada!")
+
+    let t2 = """{count} of {total} done"""
+    let a2 = {}
+    a2["count"] = "3"
+    a2["total"] = "10"
+    _check("multi-placeholder substitution", unwrap(prism_intl.prism_intl_interpolate(t2, a2)), "3 of 10 done")
+
+    let t3 = """No placeholders here"""
+    _check("no placeholders, no args needed", unwrap(prism_intl.prism_intl_interpolate(t3, {})), "No placeholders here")
+
+    let t4 = """Hi {name}"""
+    _check_rejected("missing arg", prism_intl.prism_intl_interpolate(t4, {}))
+
+    let t5 = """Hi there"""
+    let a5 = {}
+    a5["name"] = "Ada"
+    _check_rejected("extra arg never referenced (dropped variable)", prism_intl.prism_intl_interpolate(t5, a5))
+
+    let t6 = """Hi {name"""
+    _check_rejected("unterminated brace", prism_intl.prism_intl_interpolate(t6, a1))
+
+    let t7 = """Hi {}"""
+    _check_rejected("empty placeholder name", prism_intl.prism_intl_interpolate(t7, {}))
+
+    let t8 = """Hi {na-me}"""
+    _check_rejected("invalid identifier in placeholder", prism_intl.prism_intl_interpolate(t8, {}))
+
+    let a9 = {}
+    a9["name"] = 5
+    _check_rejected("non-string arg value", prism_intl.prism_intl_interpolate(t1, a9))
+
+    // ★ Escape handling, built via chr(92)/chr(123)/chr(125) so the literal backslash and brace
+    // characters reach the runtime string COMPLETELY untouched by NOVA's OWN compile-time
+    // interpolation/escape processing (see prism_intl.nova header) -- this is testing THIS
+    // module's interpolator, not NOVA's. A brace character is never written literally inside a
+    // plain double-quoted string anywhere in this file, for the same reason: NOVA auto-
+    // interpolates every double-quoted string literal, so `"{code"` alone (before the matching
+    // `+ "}"` even runs) is parsed as an unterminated interpolation, not passed through as text.
+    let bs = chr(92)
+    let ob = chr(123)
+    let cb = chr(125)
+    let esc_tmpl = "Use " + bs + ob + "code" + bs + cb + " literally"
+    let esc_want = "Use " + ob + "code" + cb + " literally"
+    _check("escaped backslash-brace produces a literal brace, 'code' never looked up", unwrap(prism_intl.prism_intl_interpolate(esc_tmpl, {})), esc_want)
+    let esc_tmpl2 = "Keep " + bs + bs + " here"
+    _check("escaped double backslash produces a single literal backslash", unwrap(prism_intl.prism_intl_interpolate(esc_tmpl2, {})), "Keep " + bs + " here")
+
+    // ★ THE re-expansion proof: an argument VALUE containing literal brace-delimited text is
+    // emitted verbatim and never re-scanned as a further placeholder. If it were re-scanned, this
+    // would fail with "no argument named 'other'" instead of succeeding -- so this test is
+    // load-bearing, not vacuous. Built the same chr()-based way, not as a bare `{other}` inside a
+    // double-quoted literal, for the identical reason given above.
+    let t_echo = "Echo: " + ob + "payload" + cb
+    let payload_val = "literal " + ob + "other" + cb + " text"
+    let a_echo = {}
+    a_echo["payload"] = payload_val
+    let echo_r = prism_intl.prism_intl_interpolate(t_echo, a_echo)
+    _check_true("interpolated value containing literal braces does not error as a missing arg", not is_err(echo_r))
+    _check("interpolated value containing literal braces is NOT re-expanded", unwrap(echo_r), "Echo: " + payload_val)
+
+    print("== 6. message catalog: construction, lookup, missing key is a TYPED ERROR ==")
+    let entries = {}
+    entries["greeting"] = """Hello, {name}!"""
+    entries["farewell"] = """Goodbye!"""
+    let cat = unwrap(prism_intl.prism_intl_catalog(en, entries))
+    _check("catalog locale", prism_intl.prism_locale_name(prism_intl.prism_intl_catalog_locale(cat)), "en")
+    let ga = {}
+    ga["name"] = "Grace"
+    _check("t('greeting') interpolates", unwrap(prism_intl.prism_intl_t(cat, "greeting", ga)), "Hello, Grace!")
+    _check("t('farewell') no args needed", unwrap(prism_intl.prism_intl_t(cat, "farewell", {})), "Goodbye!")
+
+    let missing_r = prism_intl.prism_intl_t(cat, "does_not_exist", {})
+    _check_true("missing key is rejected (never a silent fallback)", is_err(missing_r))
+    let missing_msg = unwrap_err(missing_r)
+    _check_true("missing-key error is NOT simply the bare key itself", missing_msg != "does_not_exist")
+    _check_true("missing-key error names the offending key", contains(missing_msg, "does_not_exist"))
+
+    _check_rejected("catalog: empty key", prism_intl.prism_intl_catalog(en, _mkdict1("", "x")))
+    _check_rejected("catalog: empty template", prism_intl.prism_intl_catalog(en, _mkdict1("k", "")))
+    let bad_entries = {}
+    bad_entries["k"] = 5
+    _check_rejected("catalog: non-string template value", prism_intl.prism_intl_catalog(en, bad_entries))
+
+    print("== 7. catalog plurals: en one/other, pl one/few/many, missing-category + add_plural rejections ==")
+    let en_forms = {}
+    en_forms["one"] = """You have {count} item"""
+    en_forms["other"] = """You have {count} items"""
+    let cat2 = unwrap(prism_intl.prism_intl_catalog_add_plural(cat, "items", en_forms))
+    let n1 = {}
+    n1["count"] = prism_intl.prism_intl_format_number(en, 1)
+    _check("en plural(1) -> one form", unwrap(prism_intl.prism_intl_plural(cat2, "items", 1, n1)), "You have 1 item")
+    let n5 = {}
+    n5["count"] = prism_intl.prism_intl_format_number(en, 5)
+    _check("en plural(5) -> other form", unwrap(prism_intl.prism_intl_plural(cat2, "items", 5, n5)), "You have 5 items")
+
+    // Real Polish noun with a genuine one/few/many split ("1 plik, 2 pliki, 5 plików").
+    let cat_pl = unwrap(prism_intl.prism_intl_catalog(pl, {}))
+    let pl_forms = {}
+    pl_forms["one"] = """Masz {count} plik"""
+    pl_forms["few"] = """Masz {count} pliki"""
+    pl_forms["many"] = """Masz {count} plikow"""
+    let cat_pl2 = unwrap(prism_intl.prism_intl_catalog_add_plural(cat_pl, "files", pl_forms))
+    let pn1 = {}
+    pn1["count"] = prism_intl.prism_intl_format_number(pl, 1)
+    _check("pl plural(1) -> one form", unwrap(prism_intl.prism_intl_plural(cat_pl2, "files", 1, pn1)), "Masz 1 plik")
+    let pn3 = {}
+    pn3["count"] = prism_intl.prism_intl_format_number(pl, 3)
+    _check("pl plural(3) -> few form", unwrap(prism_intl.prism_intl_plural(cat_pl2, "files", 3, pn3)), "Masz 3 pliki")
+    let pn10 = {}
+    pn10["count"] = prism_intl.prism_intl_format_number(pl, 10)
+    _check("pl plural(10) -> many form", unwrap(prism_intl.prism_intl_plural(cat_pl2, "files", 10, pn10)), "Masz 10 plikow")
+
+    // A plural entry missing the category the count selects must be rejected, not silently
+    // fall back to some other category's wording.
+    let incomplete_forms = {}
+    incomplete_forms["one"] = """jeden plik"""
+    incomplete_forms["few"] = """kilka plikow"""
+    let cat_pl3 = unwrap(prism_intl.prism_intl_catalog_add_plural(cat_pl, "docs", incomplete_forms))
+    _check_rejected("plural lookup missing the 'many' category the count (10) selects", prism_intl.prism_intl_plural(cat_pl3, "docs", 10, {}))
+    // Isolation proof: cat_pl2 and cat_pl3 were derived INDEPENDENTLY from the same cat_pl. If
+    // add_plural shared the underlying plurals dict instead of copying it, cat_pl3 would also see
+    // "files" (added only to cat_pl2's derivation).
+    _check_true("independently-derived catalogs do not leak each other's plural keys", is_err(prism_intl.prism_intl_plural(cat_pl3, "files", 1, {})))
+
+    _check_rejected("simple lookup on a plural-only key", prism_intl.prism_intl_t(cat2, "items", {}))
+    _check_rejected("plural lookup on a simple-only key", prism_intl.prism_intl_plural(cat, "greeting", 1, {}))
+    _check_rejected("plural lookup on a nonexistent key", prism_intl.prism_intl_plural(cat, "no_such_key", 1, {}))
+
+    _check_rejected("add_plural: duplicate key", prism_intl.prism_intl_catalog_add_plural(cat2, "items", en_forms))
+    _check_rejected("add_plural: key collides with existing simple message", prism_intl.prism_intl_catalog_add_plural(cat, "greeting", en_forms))
+    let unknown_cat_forms = {}
+    unknown_cat_forms["one"] = "x"
+    unknown_cat_forms["bogus"] = "y"
+    _check_rejected("add_plural: unknown category name", prism_intl.prism_intl_catalog_add_plural(cat, "newkey", unknown_cat_forms))
+    _check_rejected("add_plural: empty form set", prism_intl.prism_intl_catalog_add_plural(cat, "newkey2", {}))
+
+    // Non-mutation: deriving cat2 from cat must not have touched cat itself.
+    _check_true("original catalog unaffected by add_plural (non-mutating)", is_err(prism_intl.prism_intl_plural(cat, "items", 1, {})))
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_intl: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_intl: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)

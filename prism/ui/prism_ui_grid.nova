@@ -1,0 +1,595 @@
+// prism_ui_grid -- the data grid (prism/ui/ composition layer, milestone MB.8). INCREMENT 1 of a
+// component `prism/ui/README.md` itself sizes at 3-5 person-months ("AG Grid is a ~1 MB commercial
+// product... the single biggest component in the whole matrix"). This file does NOT attempt that
+// whole surface -- see the explicit scope list below.
+//
+// ── SCOPE OF INCREMENT 1 (built here) ─────────────────────────────────────────────────────────
+//   - Column pinning/freezing (a closed 3-state enum per column: start / none / end), with a
+//     deterministic, total ordering rule (see below).
+//   - Column resize state (`prism_grid_resize_column`) -- a column's width can change after
+//     construction, non-mutating, same discipline as reorder.
+//   - Row selection: none / single / multi, as a closed enum mode.
+//   - Cell-edit state: which (row key, column key) cell is being edited, typed as an Option.
+//   - Column reordering (`prism_grid_reorder`), pin-group-aware, non-mutating.
+//
+// ── EXPLICITLY OUT OF SCOPE FOR THIS INCREMENT (future increments, NOT built here) ────────────
+//   - Virtualization (windowed rendering of only the visible row/column range). This file renders
+//     every row through `prism_structure.prism_grid` every time -- fine for hundreds of rows, not
+//     for AG-Grid-scale (100k+ row) datasets.
+//   - Grouping (collapsing rows under a shared key into an expandable tree).
+//   - Aggregation (column-level sum/avg/count footers, per-group subtotals).
+//   - Fill-down (drag-to-repeat a cell's value across a range).
+//   - Clipboard (copy/paste a cell or rectangular range to/from the OS clipboard).
+//   - Infinite scroll (incremental backend-driven row loading as the viewport nears the end).
+//   - Committing an edited VALUE back into row data. `prism_grid_begin_edit`/`_end_edit` track
+//     WHICH cell is being edited (the state a caller's editor UI needs to render an input in the
+//     right place) -- they do not write a new value into `rows`, which is a caller-side (and,
+//     for undo/redo and validation, a future-increment) concern, adjacent to fill-down/clipboard.
+//   - A deselect/toggle-off/clear-selection API. Only `prism_grid_select_row` exists (replace in
+//     `single`, accumulate in `multi`, reject in `none` -- exactly PRISM's MB.8 increment-1 spec).
+//     A real caller needs a way to unselect eventually; that is deliberately left for the next
+//     increment rather than guessed at here, to keep this increment's surface exactly matched to
+//     its written spec (and its rejection-case KAT) instead of quietly growing it.
+//
+// ── GRID vs TABLE (`prism_ui_table.nova`, MB.1) -- WHEN TO USE WHICH ──────────────────────────
+// `PrismTable` is a read-mostly, SORTABLE list: one active sort column/direction, no per-cell
+// interaction state. `PrismGrid` is an EDITABLE, INTERACTIVE surface: per-column pin/width,
+// per-row selection, a single actively-edited cell. Concretely: reach for `prism_table` when the
+// UI need is "show sortable rows" (a report, a read-only listing); reach for `prism_grid` when the
+// UI need is "let the user select rows, resize/pin/reorder columns, and edit cells" (a data-entry
+// surface, a spreadsheet-like view). Both are compositions over the SAME `prism_structure.prism_grid`
+// primitive for their body -- `prism_ui_table.nova`'s own header already argues at length for why
+// that primitive is the right body for tabular data (mandatory row-identity `by`, so this file does
+// not re-argue it) -- and this file reuses that argument rather than duplicating it. What grid adds
+// on top that table deliberately does NOT have: per-column pin/width/editable metadata, a selection
+// set, and edit-target state -- none of which a plain sortable table needs.
+//
+// ── WHY PIN STATE IS A PER-COLUMN FIELD, AND WHAT "REJECT MORE PINNED THAN TOTAL" MEANS ──────
+// The task spec lists a column's properties as "key, header, extractor, a pin state (closed enum:
+// start/none/end) and a width" -- i.e. pin is data carried on EACH column definition, exactly
+// alongside key/header/width, not a separate list of pinned keys passed to the grid constructor.
+// Given that, the literal condition "more pinned columns than total columns" can never actually
+// fire from the per-column-enum encoding: each column contributes to exactly one of
+// {start, none, end}, so count(start) + count(end) <= total always, with equality only when
+// count(none) == 0. Rather than ship a rejection branch that can never execute (dead code
+// masquerading as a validated invariant -- exactly the kind of "looks checked, isn't" gap
+// CLAUDE.md's failure-hunt discipline exists to catch), this file treats the equality case as the
+// intended, reachable meaning: **at least one column must remain unpinned**. A grid where every
+// column is frozen has no scrollable body left -- pinning has lost its meaning (there is nothing
+// left to pin AGAINST) -- so `count(start) + count(end) >= total` is rejected at construction with
+// a message naming the exact counts. This turns an ambiguous spec sentence into a concrete,
+// testable, always-reachable rule (the KAT proves both the boundary that passes -- 3 of 5 pinned --
+// and the one that is rejected -- 2 of 2 pinned).
+//
+// ── PINNED ORDERING: DETERMINISTIC AND TOTAL, VIA A CONTIGUOUS-RANGE INVARIANT ────────────────
+// "Start-pinned first in their declared order, then unpinned, then end-pinned" is computed ONCE,
+// at construction (`_prism_grid_canonical_order`), by partitioning the caller's column list into
+// three buckets in a single pass (each bucket preserving the RELATIVE order columns already had in
+// the input -- the same stable-partition technique `prism_ui_table.nova`'s descending-sort helper
+// uses for tied keys) and concatenating start ++ mid ++ end. The result is stored as `PrismGrid`'s
+// OWN column order -- there is no separate "declared order" vs "display order" to keep in sync.
+// This is what makes `prism_grid_reorder`'s pin-group guard cheap and provably correct: because
+// the stored order is ALWAYS start-block-then-mid-block-then-end-block, each group occupies a
+// CONTIGUOUS index range (`[0, count_start)`, `[count_start, n-count_end)`, `[n-count_end, n)`),
+// so "would this move cross a pin group" reduces to one range-containment check
+// (`_prism_grid_pin_range`) instead of re-scanning neighbours or re-deriving groups per call.
+//
+// ── FIELD-NAME COLLISIONS: WHY EVERY FIELD HERE IS PREFIXED ───────────────────────────────────
+// NOVA's struct-field resolution is by NAME, not by (declaring type, name) -- confirmed as a live
+// defect, not a style nit: it crashed the HTML renderer on 2026-08-16 when `PrismFormField.kind`
+// (registered later) silently stole `PrismNode.kind`'s slot, so `PrismNode.kind` read back as an
+// unrelated field's value on a mixed import. The fix in THIS file is prevention, not cure: every
+// field on every type declared below carries a component-unique prefix -- `gcol_*` on
+// `PrismGridColumn`, `gec_*` on `PrismGridEditCell`, `pg_*` on `PrismGrid` -- and every one of
+// those exact names was grepped across the ENTIRE repository (not just prism/) before being
+// chosen; none collide with any existing struct field anywhere in the codebase. `PrismNode`'s own
+// six field names (`kind`/`attrs`/`children`/`key`/`depth`/`count`) are deliberately never reused
+// bare here, matching the established rule that the shared foundation type keeps the plain names
+// and every other struct works around it.
+//
+// ── THE CLOSED ENUMS DELIBERATELY AVOID THE BARE TOKEN `None` ─────────────────────────────────
+// Both `PrismColumnPin` (start/none/end) and `PrismSelectionMode` (none/single/multi) have a
+// "nothing" state, and both name it something other than the literal identifier `None` --
+// `Unpinned()` and `SelectionNone()` respectively -- for the exact reason `prism_ui_table.nova`'s
+// `PrismSortDirection` avoided it for its own third state (`Unsorted()`, not `None()`): NOVA's
+// builtin `Option` type already owns `Some`/`None`, and relying on unverified type-directed
+// disambiguation between two different enums that both declare a bare `None` variant is an
+// avoidable risk for zero benefit -- the STRING form (returned by `prism_grid_pin_name` /
+// `prism_grid_selection_mode_name`) is still exactly "none", matching the task's own vocabulary.
+//
+// ── A FOURTH TRAP, FOUND BUILDING THIS FILE: LLVM SYMBOLS ARE FLAT, NOT MODULE-QUALIFIED ─────
+// The constructor below is named `prism_data_grid`, NOT `prism_grid` -- deliberately different
+// from the naming convention `prism_ui_table.nova` uses (its constructor IS named `prism_table`,
+// matching its type). A first draft of this file named the constructor `prism_grid` (matching
+// `PrismGrid`, exactly the table file's pattern) on the assumption that NOVA's module-qualified
+// call syntax (`prism_ui_grid.prism_grid(...)` vs `prism_structure.prism_grid(...)`) would keep
+// the two apart, the same way two Java classes in different packages can share a method name.
+// It does not: verified directly when linking this file's own KAT -- clang rejected the emitted
+// IR with `error: invalid redefinition of function 'prism_grid'`, because NOVA compiles every
+// function to a FLAT, UNMANGLED LLVM symbol (`@prism_grid`), and this file already imports
+// `prism_structure`, which declares a function of that exact name (the `grid` structural
+// primitive body). `_proc_util.ps1`'s own comment on Prism's install step says this outright --
+// "folders are for humans, prefixes are for the linker" -- but it is easy to read that as being
+// about FILE names only; it applies with equal force to every function name, including a
+// constructor whose type-based name looks locally unambiguous. Renamed to `prism_data_grid` to
+// resolve it, and noted here so the next component in this tree does not repeat the assumption.
+// ── THREE VERIFIED NOVA CALL-SITE TRAPS THIS FILE ROUTES AROUND (NOVA_LANGUAGE_FEATURES.md §7) ─
+//   Trap 11 (constructors are file-local): `PrismGridColumn(...)`, `PrismGridEditCell(...)` and
+//     `PrismGrid(...)` positional constructors are called bare ONLY inside this file (legal --
+//     trap 11 only blocks CROSS-module bare construction); every other module gets them through
+//     the `prism_grid_column` / `prism_grid_edit_cell` / `prism_data_grid` wrapper functions below.
+//   Trap 13 (`obj.field(args)` on an un-inferred receiver emits an undefined `@nova_rt_<field>`):
+//     every call through a column's stored `extract_fn` or a grid's stored `row_key_fn` binds the
+//     field to a local FIRST (`let extract_fn = col.gcol_extract` / `let row_key_fn = grid.pg_row_key`),
+//     then calls the local -- never `col.gcol_extract(row)` directly, mirroring
+//     `prism_ui_table.nova`'s identical fix for the identical shape.
+//   Call-site formatting: every function call below keeps its FULL argument list on one source
+//     line (however long), matching every existing prism/ file -- NOVA's indentation-significant
+//     parser has no verified precedent for a call continued across lines in this codebase, so this
+//     file does not attempt to be the first.
+//
+// PUBLIC API
+//   Column pin (closed, 3 states)
+//     PrismColumnPin                                        PinnedStart() | Unpinned() | PinnedEnd()
+//     prism_grid_pin_start() / _none() / _end()             cross-module ctors
+//     prism_grid_pin_name(pin) -> string           exhaustive: "start" | "none" | "end"
+//   Selection mode (closed, 3 states)
+//     PrismSelectionMode                                    SelectionNone() | SelectionSingle() | SelectionMulti()
+//     prism_grid_selection_mode_none() / _single() / _multi()   cross-module ctors
+//     prism_grid_selection_mode_name(mode) -> string   exhaustive: "none" | "single" | "multi"
+//   Column
+//     PrismGridColumn { gcol_key, gcol_header, gcol_extract: any, gcol_pin, gcol_width, gcol_editable }
+//     prism_grid_column(key, header, extract_fn, pin, width: int, editable: bool) -> Result<PrismGridColumn>
+//       rejects: empty key, empty header, an obviously-non-callable extract_fn, width <= 0
+//     prism_grid_column_key/_header(col) -> string   _pin(col) -> string   _width(col) -> int
+//     prism_grid_column_editable(col) -> bool
+//   Cell-edit target (typed optional payload)
+//     PrismGridEditCell { gec_row_key, gec_col_key: string }
+//     prism_grid_edit_cell(row_key, col_key) -> PrismGridEditCell     cross-module ctor
+//     prism_grid_edit_cell_row_key(e) / _col_key(e) -> string
+//   Grid
+//     PrismGrid { pg_columns, pg_rows, pg_row_key: any, pg_selection_mode, pg_selected_keys,
+//                 pg_editing: PrismGridEditCell? }
+//     prism_data_grid(columns: list, rows: list, row_key_fn, selection_mode) -> Result<PrismGrid>
+//       rejects: 0 columns, a non-PrismGridColumn element, a duplicate column key, an
+//       obviously-non-callable row_key_fn, and "all (or all-but-none) columns pinned" (see header)
+//       -- stores `columns` in the deterministic pin-grouped order (see header), not input order.
+//     prism_grid_columns(grid) -> list      (pin-grouped order)     _rows(grid) -> list
+//     prism_grid_row_count(grid) -> int
+//     prism_grid_selection_mode(grid) -> string        _selected_keys(grid) -> list
+//     prism_grid_editing_cell(grid) -> PrismGridEditCell?
+//   Row selection
+//     prism_grid_select_row(grid, key: string) -> Result<PrismGrid>
+//       `none` mode: always rejected. `single`: REPLACES the selection. `multi`: ACCUMULATES
+//       (re-selecting an already-selected key is a no-op, not a duplicate entry). Rejects a key
+//       naming no row. Non-mutating.
+//   Cell edit state
+//     prism_grid_begin_edit(grid, row_key: string, col_key: string) -> Result<PrismGrid>
+//       rejects an unknown column, a non-editable column, or an unknown row. Non-mutating.
+//     prism_grid_end_edit(grid) -> PrismGrid    (cannot fail -- clears edit state)
+//   Column resize
+//     prism_grid_resize_column(grid, key: string, new_width: int) -> Result<PrismGrid>
+//       rejects new_width <= 0 or an unknown column key. Non-mutating.
+//   Column reorder
+//     prism_grid_reorder(grid, key: string, to_index: int) -> Result<PrismGrid>
+//       rejects an unknown key, an out-of-range to_index, or a to_index that would move the
+//       column OUT of its own pin group (never silently clamped). Non-mutating.
+//   Rendering
+//     prism_grid_render(grid) -> Result<PrismNode>
+//       header band of column headers, stacked above the body built via
+//       `prism_structure.prism_grid` (mandatory row-identity threaded through unmodified, exactly
+//       as `prism_ui_table.nova` does). Every body cell carries "selected" and "editing" bool
+//       attrs (always present, never merely absent-means-false) marking whether that cell's row
+//       is in the current selection and whether that exact (row, column) is the active edit target.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_structure
+import prism_ui_kit
+
+// ── Column pin: closed, 3 states (see header) ────────────────────────────────────────────────
+enum PrismColumnPin
+    PinnedStart()
+    Unpinned()
+    PinnedEnd()
+
+fn prism_grid_pin_start() -> PrismColumnPin
+    PinnedStart()
+fn prism_grid_pin_none() -> PrismColumnPin
+    Unpinned()
+fn prism_grid_pin_end() -> PrismColumnPin
+    PinnedEnd()
+
+// Exhaustive, no wildcard arm -- same discipline PrismSortDirection/PrismNodeKind follow.
+fn prism_grid_pin_name(pin: PrismColumnPin) -> string
+    match pin
+        PinnedStart() => "start"
+        Unpinned() => "none"
+        PinnedEnd() => "end"
+
+// ── Selection mode: closed, 3 states (see header) ────────────────────────────────────────────
+enum PrismSelectionMode
+    SelectionNone()
+    SelectionSingle()
+    SelectionMulti()
+
+fn prism_grid_selection_mode_none() -> PrismSelectionMode
+    SelectionNone()
+fn prism_grid_selection_mode_single() -> PrismSelectionMode
+    SelectionSingle()
+fn prism_grid_selection_mode_multi() -> PrismSelectionMode
+    SelectionMulti()
+
+fn prism_grid_selection_mode_name(mode: PrismSelectionMode) -> string
+    match mode
+        SelectionNone() => "none"
+        SelectionSingle() => "single"
+        SelectionMulti() => "multi"
+
+// ── Column ────────────────────────────────────────────────────────────────────────────────────
+
+type PrismGridColumn
+    gcol_key: string
+    gcol_header: string
+    gcol_extract: any
+    gcol_pin: PrismColumnPin
+    gcol_width: int
+    gcol_editable: bool
+
+// `extract_fn` is stored, never called here -- same coarse "obviously not callable" guard
+// `prism_ui_table.nova`'s `prism_table_column` uses, for the identical reason (no `is_fn`
+// introspection exists; a real closure never reports true from these coarse kind checks).
+fn prism_grid_column(key: string, header: string, extract_fn, pin: PrismColumnPin, width: int, editable: bool) -> Result<PrismGridColumn>
+    if key == ""
+        return err("prism_grid_column: key must not be empty")
+    if header == ""
+        return err("prism_grid_column: header must not be empty")
+    if is_string(extract_fn) or is_int(extract_fn) or is_float(extract_fn) or is_bool(extract_fn) or is_list(extract_fn) or is_dict(extract_fn)
+        return err("prism_grid_column: extract_fn must be a callback fn(row) -> string, got a " + type_of(extract_fn))
+    if width <= 0
+        return err("prism_grid_column: width must be > 0, got " + str(width))
+    ok(PrismGridColumn(key, header, extract_fn, pin, width, editable))
+
+fn prism_grid_column_key(col: PrismGridColumn) -> string
+    col.gcol_key
+
+fn prism_grid_column_header(col: PrismGridColumn) -> string
+    col.gcol_header
+
+fn prism_grid_column_pin(col: PrismGridColumn) -> string
+    prism_grid_pin_name(col.gcol_pin)
+
+fn prism_grid_column_width(col: PrismGridColumn) -> int
+    col.gcol_width
+
+fn prism_grid_column_editable(col: PrismGridColumn) -> bool
+    col.gcol_editable
+
+// Rebuilds a column with a NEW width, everything else unchanged -- an internal helper for
+// `prism_grid_resize_column`, which has already validated `new_width > 0` before calling this, so
+// no re-validation happens here (this is not the public constructor).
+fn _prism_grid_column_resized(col: PrismGridColumn, new_width: int) -> PrismGridColumn
+    PrismGridColumn(col.gcol_key, col.gcol_header, col.gcol_extract, col.gcol_pin, new_width, col.gcol_editable)
+
+// ── Cell-edit target ──────────────────────────────────────────────────────────────────────────
+
+type PrismGridEditCell
+    gec_row_key: string
+    gec_col_key: string
+
+fn prism_grid_edit_cell(row_key: string, col_key: string) -> PrismGridEditCell
+    PrismGridEditCell(row_key, col_key)
+
+fn prism_grid_edit_cell_row_key(e: PrismGridEditCell) -> string
+    e.gec_row_key
+
+fn prism_grid_edit_cell_col_key(e: PrismGridEditCell) -> string
+    e.gec_col_key
+
+// ── Grid ──────────────────────────────────────────────────────────────────────────────────────
+
+type PrismGrid
+    pg_columns: list
+    pg_rows: list
+    pg_row_key: any
+    pg_selection_mode: PrismSelectionMode
+    pg_selected_keys: list
+    pg_editing: PrismGridEditCell?
+
+fn _prism_grid_is_start_pinned(pin: PrismColumnPin) -> bool
+    match pin
+        PinnedStart() => true
+        Unpinned() => false
+        PinnedEnd() => false
+
+fn _prism_grid_is_end_pinned(pin: PrismColumnPin) -> bool
+    match pin
+        PinnedStart() => false
+        Unpinned() => false
+        PinnedEnd() => true
+
+fn _prism_grid_count_start_pinned(columns: list) -> int
+    let mut n = 0
+    for c in columns
+        if _prism_grid_is_start_pinned(c.gcol_pin)
+            n += 1
+    n
+
+fn _prism_grid_count_end_pinned(columns: list) -> int
+    let mut n = 0
+    for c in columns
+        if _prism_grid_is_end_pinned(c.gcol_pin)
+            n += 1
+    n
+
+// Stable 3-way partition: start-pinned (declared order) ++ unpinned (declared order) ++
+// end-pinned (declared order) -- see header for why this makes the ordering deterministic AND
+// total, and why it is computed exactly once (at construction) rather than at every read.
+fn _prism_grid_canonical_order(columns: list) -> list
+    let start_cols = []
+    let mid_cols = []
+    let end_cols = []
+    for c in columns
+        match c.gcol_pin
+            PinnedStart() => start_cols.push(c)
+            Unpinned() => mid_cols.push(c)
+            PinnedEnd() => end_cols.push(c)
+    let out = []
+    for c in start_cols
+        out.push(c)
+    for c in mid_cols
+        out.push(c)
+    for c in end_cols
+        out.push(c)
+    out
+
+// The one chokepoint every column-key lookup funnels through (mirrors `prism_ui_table.nova`'s
+// `_prism_table_find_column`).
+fn _prism_grid_find_column(columns: list, key: string) -> Result<PrismGridColumn>
+    for c in columns
+        if c.gcol_key == key
+            return ok(c)
+    err("prism_grid: unknown column key '" + key + "'")
+
+fn _prism_grid_list_contains(xs: list, v: string) -> bool
+    for x in xs
+        if x == v
+            return true
+    false
+
+// Computes every row's identity key EXACTLY ONCE per call, validating the untyped row_key_fn's
+// return is actually a string before it is used (same guard class as `prism_ui_table.nova`'s
+// `_prism_table_build_pairs`). Used by selection/edit validation to answer "does this key name a
+// real row" without duplicating the guard at each call site.
+fn _prism_grid_row_keys(grid: PrismGrid) -> Result<list>
+    let row_key_fn = grid.pg_row_key
+    let out = []
+    let mut idx = 0
+    for r in grid.pg_rows
+        let k = row_key_fn(r)
+        if not is_string(k)
+            return err("prism_grid: row_key_fn must return a string, row " + str(idx) + " returned " + type_name(k))
+        out.push(k)
+        idx += 1
+    ok(out)
+
+// Rejects: 0 columns, a non-PrismGridColumn element (named by index and actual type), a duplicate
+// column key, an obviously-non-callable row_key_fn (stored, never called here), and the
+// all-pinned invariant (see header: count(start)+count(end) >= total is rejected, naming both
+// counts). Stores `columns` in the deterministic pin-grouped order, not the caller's input order.
+fn prism_data_grid(columns: list, rows: list, row_key_fn, selection_mode: PrismSelectionMode) -> Result<PrismGrid>
+    if len(columns) == 0
+        return err("prism_grid: needs at least one column")
+    if is_string(row_key_fn) or is_int(row_key_fn) or is_float(row_key_fn) or is_bool(row_key_fn) or is_list(row_key_fn) or is_dict(row_key_fn)
+        return err("prism_grid: row_key_fn must be a callback fn(row) -> string, got a " + type_of(row_key_fn))
+    let seen = {}
+    let mut idx = 0
+    for c in columns
+        if type_name(c) != "PrismGridColumn"
+            return err("prism_grid: column " + str(idx) + " is not a PrismGridColumn (got " + type_name(c) + ")")
+        if c.gcol_key in seen
+            return err("prism_grid: duplicate column key '" + c.gcol_key + "'")
+        seen[c.gcol_key] = true
+        idx += 1
+    let n = len(columns)
+    let count_start = _prism_grid_count_start_pinned(columns)
+    let count_end = _prism_grid_count_end_pinned(columns)
+    if count_start + count_end >= n
+        return err("prism_grid: " + str(count_start + count_end) + " of " + str(n) + " column(s) are pinned -- at least one column must remain unpinned (a grid with no scrollable columns is not usable)")
+    let ordered = _prism_grid_canonical_order(columns)
+    ok(PrismGrid(ordered, rows, row_key_fn, selection_mode, [], none()))
+
+fn prism_grid_columns(grid: PrismGrid) -> list
+    grid.pg_columns
+
+fn prism_grid_rows(grid: PrismGrid) -> list
+    grid.pg_rows
+
+fn prism_grid_row_count(grid: PrismGrid) -> int
+    len(grid.pg_rows)
+
+fn prism_grid_selection_mode(grid: PrismGrid) -> string
+    prism_grid_selection_mode_name(grid.pg_selection_mode)
+
+fn prism_grid_selected_keys(grid: PrismGrid) -> list
+    grid.pg_selected_keys
+
+fn prism_grid_editing_cell(grid: PrismGrid) -> PrismGridEditCell?
+    grid.pg_editing
+
+// ── Row selection ─────────────────────────────────────────────────────────────────────────────
+// `none`: always rejected. `single`: REPLACES the current selection with `[key]`. `multi`:
+// ACCUMULATES -- appends `key` unless it is already selected (idempotent, never a duplicate
+// entry). Both `single` and `multi` reject a key naming no row (checked via `_prism_grid_row_keys`,
+// which itself guards the untyped row_key_fn's return). Non-mutating: every branch builds a FRESH
+// `PrismGrid` value; `grid` itself is never altered.
+fn prism_grid_select_row(grid: PrismGrid, key: string) -> Result<PrismGrid>
+    match grid.pg_selection_mode
+        SelectionNone() =>
+            err("prism_grid_select_row: selection is disabled (mode = none)")
+        SelectionSingle() =>
+            let keys = _prism_grid_row_keys(grid)?
+            if not _prism_grid_list_contains(keys, key)
+                return err("prism_grid_select_row: unknown row key '" + key + "'")
+            ok(PrismGrid(grid.pg_columns, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, [key], grid.pg_editing))
+        SelectionMulti() =>
+            let keys2 = _prism_grid_row_keys(grid)?
+            if not _prism_grid_list_contains(keys2, key)
+                return err("prism_grid_select_row: unknown row key '" + key + "'")
+            if _prism_grid_list_contains(grid.pg_selected_keys, key)
+                return ok(grid)
+            let new_keys = []
+            for k in grid.pg_selected_keys
+                new_keys.push(k)
+            new_keys.push(key)
+            ok(PrismGrid(grid.pg_columns, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, new_keys, grid.pg_editing))
+
+// ── Cell edit state ───────────────────────────────────────────────────────────────────────────
+// Rejects, in order: an unknown column key, a column marked non-editable, an unknown row key.
+// Non-mutating.
+fn prism_grid_begin_edit(grid: PrismGrid, row_key: string, col_key: string) -> Result<PrismGrid>
+    let col = _prism_grid_find_column(grid.pg_columns, col_key)?
+    if not col.gcol_editable
+        return err("prism_grid_begin_edit: column '" + col_key + "' is not editable")
+    let keys = _prism_grid_row_keys(grid)?
+    if not _prism_grid_list_contains(keys, row_key)
+        return err("prism_grid_begin_edit: unknown row key '" + row_key + "'")
+    ok(PrismGrid(grid.pg_columns, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, grid.pg_selected_keys, some(prism_grid_edit_cell(row_key, col_key))))
+
+// Cannot fail: clearing the edit target is always legal, whether or not one was set.
+fn prism_grid_end_edit(grid: PrismGrid) -> PrismGrid
+    PrismGrid(grid.pg_columns, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, grid.pg_selected_keys, none())
+
+// ── Column resize ─────────────────────────────────────────────────────────────────────────────
+// Rejects new_width <= 0 or an unknown column key. Non-mutating: every other column is copied
+// through unchanged; only the matched column is rebuilt (via `_prism_grid_column_resized`).
+fn prism_grid_resize_column(grid: PrismGrid, key: string, new_width: int) -> Result<PrismGrid>
+    if new_width <= 0
+        return err("prism_grid_resize_column: width must be > 0, got " + str(new_width))
+    let mut found = false
+    let new_cols = []
+    for c in grid.pg_columns
+        if c.gcol_key == key
+            found = true
+            new_cols.push(_prism_grid_column_resized(c, new_width))
+        else
+            new_cols.push(c)
+    if not found
+        return err("prism_grid_resize_column: unknown column key '" + key + "'")
+    ok(PrismGrid(new_cols, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, grid.pg_selected_keys, grid.pg_editing))
+
+// ── Column reorder ────────────────────────────────────────────────────────────────────────────
+
+// The valid `[lo, hi)` index range for a column carrying `pin`, given the grid's pin-group sizes
+// -- see header: because `pg_columns` is ALWAYS stored start-block-then-mid-block-then-end-block,
+// each group is a single contiguous range, so this is a pure arithmetic lookup, not a re-scan.
+fn _prism_grid_pin_range(pin: PrismColumnPin, count_start: int, count_end: int, n: int) -> list
+    match pin
+        PinnedStart() => [0, count_start]
+        Unpinned() => [count_start, n - count_end]
+        PinnedEnd() => [n - count_end, n]
+
+// Moves the element at `from_index` to end up at `to_index` in the returned list (both indices
+// into the FINAL n-length list). O(n): remove, then re-insert while walking the shortened list.
+fn _prism_grid_move_column(cols: list, from_index: int, to_index: int) -> list
+    let moved = cols[from_index]
+    let without = []
+    let mut i = 0
+    for c in cols
+        if i != from_index
+            without.push(c)
+        i += 1
+    let result = []
+    let mut inserted = false
+    let mut j = 0
+    for c in without
+        if j == to_index
+            result.push(moved)
+            inserted = true
+        result.push(c)
+        j += 1
+    if not inserted
+        result.push(moved)
+    result
+
+// Rejects, in order: an unknown column key, an out-of-range `to_index`, and a `to_index` that
+// falls outside the column's OWN pin group's contiguous range -- the last case explicitly named
+// ("would cross pin groups"), never silently clamped into range. Non-mutating: builds a fresh
+// column list via `_prism_grid_move_column`; `grid.pg_columns` itself is untouched.
+fn prism_grid_reorder(grid: PrismGrid, key: string, to_index: int) -> Result<PrismGrid>
+    let cols = grid.pg_columns
+    let n = len(cols)
+    let mut from_index = -1
+    let mut idx = 0
+    for c in cols
+        if c.gcol_key == key
+            from_index = idx
+        idx += 1
+    if from_index < 0
+        return err("prism_grid_reorder: unknown column key '" + key + "'")
+    if to_index < 0 or to_index >= n
+        return err("prism_grid_reorder: to_index " + str(to_index) + " is out of range for " + str(n) + " column(s)")
+    let found = cols[from_index]
+    let count_start = _prism_grid_count_start_pinned(cols)
+    let count_end = _prism_grid_count_end_pinned(cols)
+    let range = _prism_grid_pin_range(found.gcol_pin, count_start, count_end, n)
+    let lo = range[0]
+    let hi = range[1]
+    if to_index < lo or to_index >= hi
+        return err("prism_grid_reorder: column '" + key + "' is " + prism_grid_pin_name(found.gcol_pin) + "-pinned -- cannot move it to index " + str(to_index) + ", outside its pin group's range [" + str(lo) + ", " + str(hi) + ")")
+    let new_cols = _prism_grid_move_column(cols, from_index, to_index)
+    ok(PrismGrid(new_cols, grid.pg_rows, grid.pg_row_key, grid.pg_selection_mode, grid.pg_selected_keys, grid.pg_editing))
+
+// ── Rendering ─────────────────────────────────────────────────────────────────────────────────
+
+fn _prism_grid_header_texts(grid: PrismGrid) -> list
+    let out = []
+    for c in grid.pg_columns
+        out.push(c.gcol_header)
+    out
+
+fn _prism_grid_column_keys(grid: PrismGrid) -> list
+    let out = []
+    for c in grid.pg_columns
+        out.push(c.gcol_key)
+    out
+
+fn _prism_grid_header_band(grid: PrismGrid) -> Result<PrismNode>
+    let texts = _prism_grid_header_texts(grid)
+    let labels = prism_ui_kit.prism_ui_labels(texts)?
+    prism_arrange.prism_band(labels)
+
+// One body cell: resolves the column, extracts display text (validated to actually be a string,
+// same guard class as `prism_ui_table.nova`'s `_prism_table_cell`), then marks the cell with two
+// ALWAYS-PRESENT bool attrs -- "selected" (this cell's row is in the current selection) and
+// "editing" (this exact row+column is the active edit target) -- via the same
+// build-then-dict_merge-then-reconstruct technique `prism_structure.nova`'s `prism_tabs` uses for
+// its "tab_label" attr. `col.gcol_extract` and `grid.pg_row_key` are both bound to a LOCAL before
+// being called (never `col.gcol_extract(row)` directly) -- see header, NOVA_LANGUAGE_FEATURES.md
+// trap 13.
+fn _prism_grid_cell(grid: PrismGrid, row, col_key: string) -> Result<PrismNode>
+    let col = _prism_grid_find_column(grid.pg_columns, col_key)?
+    let extract_fn = col.gcol_extract
+    let text = extract_fn(row)
+    if not is_string(text)
+        return err("prism_grid: column '" + col_key + "' extract_fn must return a string, got " + type_name(text))
+    let base = prism_content.prism_label(text)?
+    let row_key_fn = grid.pg_row_key
+    let rkey = row_key_fn(row)
+    let is_selected = _prism_grid_list_contains(grid.pg_selected_keys, rkey)
+    let is_editing = match grid.pg_editing
+        Some(ec) => ec.gec_row_key == rkey and ec.gec_col_key == col_key
+        None => false
+    let merged = dict_merge(base.attrs, {"selected": is_selected, "editing": is_editing})
+    prism_node.prism_node_new(base.kind, merged, base.children, base.key)
+
+// Composes: header band of column headers (in the deterministic pin-grouped order), then the
+// body via `prism_structure.prism_grid` -- `grid.pg_row_key` threaded through unmodified as the
+// mandatory row-identity selector, exactly as `prism_ui_table.nova`'s `prism_table_render` does,
+// so a duplicate row identity is rejected exactly where that primitive already rejects it.
+fn prism_grid_render(grid: PrismGrid) -> Result<PrismNode>
+    let header_node = _prism_grid_header_band(grid)?
+    let col_keys = _prism_grid_column_keys(grid)
+    let body_node = prism_structure.prism_grid(grid.pg_rows, grid.pg_row_key, col_keys, fn(row, col_key) _prism_grid_cell(grid, row, col_key))?
+    prism_arrange.prism_stack([header_node, body_node])

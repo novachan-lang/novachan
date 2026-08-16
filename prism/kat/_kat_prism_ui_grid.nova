@@ -1,0 +1,318 @@
+// KAT for prism/ui/prism_ui_grid.nova (PRISM_ROADMAP.md milestone MB.8, increment 1 of the data
+// grid -- pinning/freezing, resize state, row selection, cell-edit state, column reorder).
+//
+// Proves, against concrete expected values:
+//   1. Column construction + rejections (empty key, empty header, non-callable extract_fn,
+//      non-positive width).
+//   2. Grid construction + rejections (0 columns, non-PrismGridColumn element, duplicate column
+//      key, non-callable row_key_fn, "all columns pinned" invariant).
+//   3. Pinned column ordering is EXACT for a mixed 5-column set: 2 start-pinned (in their declared
+//      relative order), 2 unpinned (in their declared relative order), 1 end-pinned.
+//   4. Single-select REPLACES; multi-select ACCUMULATES (and is idempotent on a repeat select);
+//      selection is rejected outright in `none` mode; an unknown row key is rejected.
+//   5. Cell-edit state: begin_edit succeeds and round-trips through the accessor; rejects an
+//      unknown row, an unknown column, and a non-editable column; end_edit clears it.
+//   6. Column resize: succeeds and round-trips; is non-mutating (the pristine grid's width is
+//      unchanged); rejects a non-positive width and an unknown column key.
+//   7. Column reorder: succeeds within a pin group and is non-mutating (the pristine grid's order
+//      is unchanged); rejects an unknown key, an out-of-range index, and a move that would cross
+//      pin groups (never silently clamped).
+//   8. Render: exact depth/count, header text in pin-grouped order, cell text in pin-grouped
+//      column order per row, and "selected"/"editing" attrs correctly marking a selected row and
+//      the active edit target (and nothing else).
+//   9. A duplicate row-identity key is rejected at render time (prism_grid's own mandatory
+//      identity-selector guard, threaded through unmodified).
+//  10. The grid renders through BOTH backends (HTML + ANSI) from the same node tree.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_node` / `import prism_ui_grid` resolve.
+//   ./gen3_test.exe _kat_prism_ui_grid.nova
+//   clang -O2 -o _kat_prism_ui_grid.exe _kat_prism_ui_grid.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_ui_grid.exe
+
+import prism_node
+import prism_ui_grid
+import prism_render_html as rh
+import prism_render_ansi as ra
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+// Local test helper: find a column by key within a grid's (public, pin-grouped) column list,
+// using only the module's public accessors -- no private/internal function reached into.
+fn _find_col_width(grid, key: string) -> int
+    for c in prism_ui_grid.prism_grid_columns(grid)
+        if prism_ui_grid.prism_grid_column_key(c) == key
+            return prism_ui_grid.prism_grid_column_width(c)
+    _fail("_find_col_width: no column '" + key + "' in grid")
+    -1
+
+fn main()
+    // ── 1. Column construction + rejections ─────────────────────────────────────────────────
+    let id_col = unwrap(prism_ui_grid.prism_grid_column("id", "ID", fn(r) r["id"], prism_ui_grid.prism_grid_pin_none(), 60, false))
+    let name_col = unwrap(prism_ui_grid.prism_grid_column("name", "Name", fn(r) r["name"], prism_ui_grid.prism_grid_pin_start(), 120, true))
+    let email_col = unwrap(prism_ui_grid.prism_grid_column("email", "Email", fn(r) r["email"], prism_ui_grid.prism_grid_pin_none(), 200, false))
+    let role_col = unwrap(prism_ui_grid.prism_grid_column("role", "Role", fn(r) r["role"], prism_ui_grid.prism_grid_pin_end(), 100, true))
+    let dept_col = unwrap(prism_ui_grid.prism_grid_column("dept", "Department", fn(r) r["dept"], prism_ui_grid.prism_grid_pin_start(), 90, false))
+
+    assert_eq(prism_ui_grid.prism_grid_column_key(name_col), "name")
+    assert_eq(prism_ui_grid.prism_grid_column_header(name_col), "Name")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(name_col), "start")
+    assert_eq(prism_ui_grid.prism_grid_column_width(name_col), 120)
+    assert_eq(prism_ui_grid.prism_grid_column_editable(name_col), true)
+
+    let col_empty_key_r = prism_ui_grid.prism_grid_column("", "Name", fn(r) r["name"], prism_ui_grid.prism_grid_pin_none(), 100, false)
+    if is_ok(col_empty_key_r)
+        _fail("prism_grid_column should reject an empty key, but construction succeeded")
+    let col_empty_header_r = prism_ui_grid.prism_grid_column("name", "", fn(r) r["name"], prism_ui_grid.prism_grid_pin_none(), 100, false)
+    if is_ok(col_empty_header_r)
+        _fail("prism_grid_column should reject an empty header, but construction succeeded")
+    let col_bad_extract_r = prism_ui_grid.prism_grid_column("name", "Name", "not a function", prism_ui_grid.prism_grid_pin_none(), 100, false)
+    if is_ok(col_bad_extract_r)
+        _fail("prism_grid_column should reject a non-callable extract_fn, but construction succeeded")
+    let col_bad_width_r = prism_ui_grid.prism_grid_column("name", "Name", fn(r) r["name"], prism_ui_grid.prism_grid_pin_none(), 0, false)
+    if is_ok(col_bad_width_r)
+        _fail("prism_grid_column should reject a non-positive width, but construction succeeded")
+    print("1. column construction + rejections (empty key / empty header / non-callable extract_fn / non-positive width): OK -- " + unwrap_err(col_empty_key_r) + " / " + unwrap_err(col_empty_header_r) + " / " + unwrap_err(col_bad_extract_r) + " / " + unwrap_err(col_bad_width_r))
+
+    // ── 2. Grid construction + rejections ────────────────────────────────────────────────────
+    let rows = [{"id": "r1", "name": "Alice", "email": "alice@x.com", "role": "Admin", "dept": "Eng"}, {"id": "r2", "name": "Bob", "email": "bob@x.com", "role": "User", "dept": "Sales"}, {"id": "r3", "name": "Carol", "email": "carol@x.com", "role": "User", "dept": "Eng"}, {"id": "r4", "name": "Dave", "email": "dave@x.com", "role": "Admin", "dept": "HR"}]
+    // Declared order deliberately interleaves pin states: id(none), name(start), email(none), role(end), dept(start).
+    let columns = [id_col, name_col, email_col, role_col, dept_col]
+
+    let grid_r = prism_ui_grid.prism_data_grid(columns, rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_single())
+    if is_err(grid_r)
+        _fail("prism_grid construction: " + unwrap_err(grid_r))
+    let grid = unwrap(grid_r)
+    assert_eq(prism_ui_grid.prism_grid_row_count(grid), 4)
+    assert_eq(prism_ui_grid.prism_grid_selection_mode(grid), "single")
+    assert_eq(len(prism_ui_grid.prism_grid_selected_keys(grid)), 0)
+
+    let multi_grid = unwrap(prism_ui_grid.prism_data_grid(columns, rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_multi()))
+    let none_grid = unwrap(prism_ui_grid.prism_data_grid(columns, rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_none()))
+
+    let grid_zero_cols_r = prism_ui_grid.prism_data_grid([], rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_single())
+    if is_ok(grid_zero_cols_r)
+        _fail("prism_grid should reject 0 columns, but construction succeeded")
+    let grid_bad_col_elem_r = prism_ui_grid.prism_data_grid([name_col, "not a column"], rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_single())
+    if is_ok(grid_bad_col_elem_r)
+        _fail("prism_grid should reject a non-PrismGridColumn element, but construction succeeded")
+    let grid_dup_col_key_r = prism_ui_grid.prism_data_grid([name_col, name_col], rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_single())
+    if is_ok(grid_dup_col_key_r)
+        _fail("prism_grid should reject a duplicate column key 'name', but construction succeeded")
+    let grid_bad_row_key_r = prism_ui_grid.prism_data_grid(columns, rows, 42, prism_ui_grid.prism_grid_selection_mode_single())
+    if is_ok(grid_bad_row_key_r)
+        _fail("prism_grid should reject a non-callable row_key_fn, but construction succeeded")
+    let colA = unwrap(prism_ui_grid.prism_grid_column("a", "A", fn(r) r["a"], prism_ui_grid.prism_grid_pin_start(), 50, false))
+    let colB = unwrap(prism_ui_grid.prism_grid_column("b", "B", fn(r) r["b"], prism_ui_grid.prism_grid_pin_end(), 50, false))
+    let grid_all_pinned_r = prism_ui_grid.prism_data_grid([colA, colB], [], fn(r) r["a"], prism_ui_grid.prism_grid_selection_mode_single())
+    if is_ok(grid_all_pinned_r)
+        _fail("prism_grid should reject a grid with 0 unpinned columns (2 of 2 pinned), but construction succeeded")
+    print("2. grid construction + rejections (0 columns / bad column element / duplicate column key / non-callable row_key_fn / all-pinned invariant): OK -- " + unwrap_err(grid_zero_cols_r) + " / " + unwrap_err(grid_bad_col_elem_r) + " / " + unwrap_err(grid_dup_col_key_r) + " / " + unwrap_err(grid_bad_row_key_r) + " / " + unwrap_err(grid_all_pinned_r))
+
+    // ── 3. Pinned column ordering is EXACT ───────────────────────────────────────────────────
+    // Expected: start-pinned in declared order (name, dept) ++ unpinned in declared order
+    // (id, email) ++ end-pinned (role) == [name, dept, id, email, role].
+    let ordered = prism_ui_grid.prism_grid_columns(grid)
+    assert_eq(len(ordered), 5)
+    assert_eq(prism_ui_grid.prism_grid_column_key(ordered[0]), "name")
+    assert_eq(prism_ui_grid.prism_grid_column_key(ordered[1]), "dept")
+    assert_eq(prism_ui_grid.prism_grid_column_key(ordered[2]), "id")
+    assert_eq(prism_ui_grid.prism_grid_column_key(ordered[3]), "email")
+    assert_eq(prism_ui_grid.prism_grid_column_key(ordered[4]), "role")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(ordered[0]), "start")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(ordered[1]), "start")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(ordered[2]), "none")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(ordered[3]), "none")
+    assert_eq(prism_ui_grid.prism_grid_column_pin(ordered[4]), "end")
+    print("3. pinned column ordering exact: [name(start), dept(start), id(none), email(none), role(end)]: OK")
+
+    // ── 4. Row selection: replace / accumulate / none-mode reject / unknown-key reject ──────
+    let sel1_r = prism_ui_grid.prism_grid_select_row(grid, "r1")
+    if is_err(sel1_r)
+        _fail("prism_grid_select_row(single, r1): " + unwrap_err(sel1_r))
+    let sel1 = unwrap(sel1_r)
+    assert_eq(len(prism_ui_grid.prism_grid_selected_keys(sel1)), 1)
+    assert_eq(prism_ui_grid.prism_grid_selected_keys(sel1)[0], "r1")
+    let sel2 = unwrap(prism_ui_grid.prism_grid_select_row(sel1, "r2"))
+    assert_eq(len(prism_ui_grid.prism_grid_selected_keys(sel2)), 1)
+    assert_eq(prism_ui_grid.prism_grid_selected_keys(sel2)[0], "r2")
+    // Original `sel1` untouched by building `sel2` (non-mutating).
+    assert_eq(prism_ui_grid.prism_grid_selected_keys(sel1)[0], "r1")
+
+    let m1 = unwrap(prism_ui_grid.prism_grid_select_row(multi_grid, "r1"))
+    let m2 = unwrap(prism_ui_grid.prism_grid_select_row(m1, "r3"))
+    assert_eq(len(prism_ui_grid.prism_grid_selected_keys(m2)), 2)
+    assert_eq(prism_ui_grid.prism_grid_selected_keys(m2)[0], "r1")
+    assert_eq(prism_ui_grid.prism_grid_selected_keys(m2)[1], "r3")
+    // Re-selecting an already-selected key is idempotent -- still exactly 2, not 3.
+    let m3 = unwrap(prism_ui_grid.prism_grid_select_row(m2, "r1"))
+    assert_eq(len(prism_ui_grid.prism_grid_selected_keys(m3)), 2)
+
+    let sel_none_r = prism_ui_grid.prism_grid_select_row(none_grid, "r1")
+    if is_ok(sel_none_r)
+        _fail("prism_grid_select_row should reject any selection in 'none' mode, but it succeeded")
+    let sel_unknown_r = prism_ui_grid.prism_grid_select_row(grid, "zzz")
+    if is_ok(sel_unknown_r)
+        _fail("prism_grid_select_row should reject an unknown row key 'zzz', but it succeeded")
+    print("4. selection: single replaces, multi accumulates (idempotent on repeat), 'none' mode rejects, unknown key rejects: OK -- " + unwrap_err(sel_none_r) + " / " + unwrap_err(sel_unknown_r))
+
+    // ── 5. Cell edit state ────────────────────────────────────────────────────────────────────
+    let edit_r = prism_ui_grid.prism_grid_begin_edit(grid, "r2", "name")
+    if is_err(edit_r)
+        _fail("prism_grid_begin_edit(r2, name): " + unwrap_err(edit_r))
+    let editing_grid = unwrap(edit_r)
+    match prism_ui_grid.prism_grid_editing_cell(editing_grid)
+        Some(ec) =>
+            assert_eq(prism_ui_grid.prism_grid_edit_cell_row_key(ec), "r2")
+            assert_eq(prism_ui_grid.prism_grid_edit_cell_col_key(ec), "name")
+        None => _fail("prism_grid_editing_cell should be Some after begin_edit")
+    // Original `grid` has no edit target (non-mutating).
+    match prism_ui_grid.prism_grid_editing_cell(grid)
+        Some(_) => _fail("pristine grid should have no editing cell, but it does")
+        None => 0
+
+    let edit_bad_row_r = prism_ui_grid.prism_grid_begin_edit(grid, "zzz", "name")
+    if is_ok(edit_bad_row_r)
+        _fail("prism_grid_begin_edit should reject an unknown row key 'zzz', but it succeeded")
+    let edit_bad_col_r = prism_ui_grid.prism_grid_begin_edit(grid, "r2", "nonexistent")
+    if is_ok(edit_bad_col_r)
+        _fail("prism_grid_begin_edit should reject an unknown column key 'nonexistent', but it succeeded")
+    let edit_noneditable_r = prism_ui_grid.prism_grid_begin_edit(grid, "r2", "dept")
+    if is_ok(edit_noneditable_r)
+        _fail("prism_grid_begin_edit should reject editing non-editable column 'dept', but it succeeded")
+
+    let ended = prism_ui_grid.prism_grid_end_edit(editing_grid)
+    match prism_ui_grid.prism_grid_editing_cell(ended)
+        Some(_) => _fail("prism_grid_end_edit should clear the editing cell, but it is still Some")
+        None => 0
+    print("5. cell edit: begin_edit round-trips, non-mutating, rejects unknown row/column/non-editable column, end_edit clears: OK -- " + unwrap_err(edit_bad_row_r) + " / " + unwrap_err(edit_bad_col_r) + " / " + unwrap_err(edit_noneditable_r))
+
+    // ── 6. Column resize ──────────────────────────────────────────────────────────────────────
+    let resized_r = prism_ui_grid.prism_grid_resize_column(grid, "name", 150)
+    if is_err(resized_r)
+        _fail("prism_grid_resize_column(name, 150): " + unwrap_err(resized_r))
+    let resized_grid = unwrap(resized_r)
+    assert_eq(_find_col_width(resized_grid, "name"), 150)
+    // Pristine `grid`'s "name" column is unchanged (non-mutating).
+    assert_eq(_find_col_width(grid, "name"), 120)
+
+    let resize_bad_width_r = prism_ui_grid.prism_grid_resize_column(grid, "name", 0)
+    if is_ok(resize_bad_width_r)
+        _fail("prism_grid_resize_column should reject a non-positive width, but it succeeded")
+    let resize_bad_key_r = prism_ui_grid.prism_grid_resize_column(grid, "zzz", 100)
+    if is_ok(resize_bad_key_r)
+        _fail("prism_grid_resize_column should reject an unknown column key 'zzz', but it succeeded")
+    print("6. resize: succeeds + round-trips, non-mutating, rejects non-positive width / unknown key: OK -- " + unwrap_err(resize_bad_width_r) + " / " + unwrap_err(resize_bad_key_r))
+
+    // ── 7. Column reorder ─────────────────────────────────────────────────────────────────────
+    // Canonical order: [name(0), dept(1), id(2), email(3), role(4)]. Swap name/dept within the
+    // start-pinned range [0,2): move "dept" to index 0 -> [dept, name, id, email, role].
+    let reordered_r = prism_ui_grid.prism_grid_reorder(grid, "dept", 0)
+    if is_err(reordered_r)
+        _fail("prism_grid_reorder(dept, 0): " + unwrap_err(reordered_r))
+    let reordered_grid = unwrap(reordered_r)
+    let reordered_cols = prism_ui_grid.prism_grid_columns(reordered_grid)
+    assert_eq(prism_ui_grid.prism_grid_column_key(reordered_cols[0]), "dept")
+    assert_eq(prism_ui_grid.prism_grid_column_key(reordered_cols[1]), "name")
+    assert_eq(prism_ui_grid.prism_grid_column_key(reordered_cols[2]), "id")
+    assert_eq(prism_ui_grid.prism_grid_column_key(reordered_cols[3]), "email")
+    assert_eq(prism_ui_grid.prism_grid_column_key(reordered_cols[4]), "role")
+    // Pristine `grid`'s order is unchanged (non-mutating).
+    let pristine_cols = prism_ui_grid.prism_grid_columns(grid)
+    assert_eq(prism_ui_grid.prism_grid_column_key(pristine_cols[0]), "name")
+    assert_eq(prism_ui_grid.prism_grid_column_key(pristine_cols[1]), "dept")
+
+    let reorder_unknown_r = prism_ui_grid.prism_grid_reorder(grid, "zzz", 0)
+    if is_ok(reorder_unknown_r)
+        _fail("prism_grid_reorder should reject an unknown column key 'zzz', but it succeeded")
+    let reorder_oob_r = prism_ui_grid.prism_grid_reorder(grid, "name", 99)
+    if is_ok(reorder_oob_r)
+        _fail("prism_grid_reorder should reject an out-of-range to_index 99, but it succeeded")
+    // "name" is start-pinned, range [0,2) -- index 2 is the first UNPINNED slot, must be rejected,
+    // not silently clamped back into [0,2).
+    let reorder_cross_r = prism_ui_grid.prism_grid_reorder(grid, "name", 2)
+    if is_ok(reorder_cross_r)
+        _fail("prism_grid_reorder should reject moving start-pinned 'name' to index 2 (crosses into the unpinned block), but it succeeded")
+    print("7. reorder: succeeds within a pin group + non-mutating, rejects unknown key / out-of-range / cross-pin-group move: OK -- " + unwrap_err(reorder_unknown_r) + " / " + unwrap_err(reorder_oob_r) + " / " + unwrap_err(reorder_cross_r))
+
+    // ── 8. Render: exact structure, header/cell order, selected + editing attrs ─────────────
+    let render_grid = unwrap(prism_ui_grid.prism_grid_select_row(grid, "r2"))
+    let render_grid2 = unwrap(prism_ui_grid.prism_grid_begin_edit(render_grid, "r2", "name"))
+    let rendered_r = prism_ui_grid.prism_grid_render(render_grid2)
+    if is_err(rendered_r)
+        _fail("prism_grid_render: " + unwrap_err(rendered_r))
+    let rendered = unwrap(rendered_r)
+    assert_eq(prism_node.prism_node_kind_str(rendered), "stack")
+    // header band: 5 labels -> depth=2, count=6. body: 4 rows x 5 cells -> each row depth=2/count=6,
+    // grid node depth=3/count=1+4*6=25. stack depth=max(2,3)+1=4, count=1+6+25=32.
+    assert_eq(prism_node.prism_node_depth(rendered), 4)
+    assert_eq(prism_node.prism_node_count(rendered), 32)
+
+    let top_children = prism_node.prism_node_children(rendered)
+    assert_eq(len(top_children), 2)
+    let header_node = top_children[0]
+    let body_node = top_children[1]
+    assert_eq(prism_node.prism_node_kind_str(header_node), "band")
+    assert_eq(prism_node.prism_node_kind_str(body_node), "grid")
+    assert_eq(prism_node.prism_node_attr_int(body_node, "columns", -1), 5)
+
+    let header_cells = prism_node.prism_node_children(header_node)
+    assert_eq(len(header_cells), 5)
+    assert_eq(prism_node.prism_node_attr_str(header_cells[0], "text", ""), "Name")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[1], "text", ""), "Department")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[2], "text", ""), "ID")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[3], "text", ""), "Email")
+    assert_eq(prism_node.prism_node_attr_str(header_cells[4], "text", ""), "Role")
+
+    let body_rows = prism_node.prism_node_children(body_node)
+    assert_eq(len(body_rows), 4)
+    // r1 = row 0 (not selected, not editing): cell text in canonical column order.
+    let r1_cells = prism_node.prism_node_children(body_rows[0])
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[0], "text", ""), "Alice")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[1], "text", ""), "Eng")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[2], "text", ""), "r1")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[3], "text", ""), "alice@x.com")
+    assert_eq(prism_node.prism_node_attr_str(r1_cells[4], "text", ""), "Admin")
+    assert_eq(prism_node.prism_node_attr_bool(r1_cells[0], "selected", true), false)
+    assert_eq(prism_node.prism_node_attr_bool(r1_cells[0], "editing", true), false)
+
+    // r2 = row 1 (selected; "name" cell is the active edit target, "dept" cell is not).
+    let r2_cells = prism_node.prism_node_children(body_rows[1])
+    assert_eq(prism_node.prism_node_attr_str(r2_cells[0], "text", ""), "Bob")
+    assert_eq(prism_node.prism_node_attr_bool(r2_cells[0], "selected", false), true)
+    assert_eq(prism_node.prism_node_attr_bool(r2_cells[0], "editing", false), true)
+    assert_eq(prism_node.prism_node_attr_bool(r2_cells[1], "selected", false), true)
+    assert_eq(prism_node.prism_node_attr_bool(r2_cells[1], "editing", true), false)
+    print("8. render: exact depth=4/count=32, header + cell text in pin-grouped order, selected/editing attrs exact: OK")
+
+    // ── 9. Duplicate row-identity key rejected at render (prism_grid's own guard, threaded) ───
+    let dup_col = unwrap(prism_ui_grid.prism_grid_column("x", "X", fn(r) r["x"], prism_ui_grid.prism_grid_pin_none(), 50, false))
+    let dup_rows = [{"id": "dup", "x": "a"}, {"id": "dup", "x": "b"}]
+    let dup_grid = unwrap(prism_ui_grid.prism_data_grid([dup_col], dup_rows, fn(r) r["id"], prism_ui_grid.prism_grid_selection_mode_single()))
+    let dup_render_r = prism_ui_grid.prism_grid_render(dup_grid)
+    if is_ok(dup_render_r)
+        _fail("prism_grid_render should reject a duplicate row-identity key 'dup', but it succeeded")
+    print("9. duplicate row-identity key rejected at render (prism_grid's mandatory identity selector, threaded through unmodified): OK -- " + unwrap_err(dup_render_r))
+
+    // ── 10. Renders through BOTH backends ────────────────────────────────────────────────────
+    let html_r = rh.prism_html_render(rendered)
+    if is_err(html_r)
+        _fail("prism_html_render(grid tree): " + unwrap_err(html_r))
+    let html_out = unwrap(html_r)
+    if find(html_out, "Alice") < 0
+        _fail("HTML output missing expected cell text 'Alice'")
+    if find(html_out, "Name") < 0
+        _fail("HTML output missing expected header text 'Name'")
+
+    let ansi_r = ra.prism_ansi_render(rendered)
+    if is_err(ansi_r)
+        _fail("prism_ansi_render(grid tree): " + unwrap_err(ansi_r))
+    let ansi_out = unwrap(ansi_r)
+    if find(ansi_out, "Alice") < 0
+        _fail("ANSI output missing expected cell text 'Alice'")
+    print("10. the same node tree renders through BOTH backends (HTML + ANSI): OK")
+
+    print("KAT prism_ui_grid PASSED: column/grid construction + rejections, exact pin-grouped ordering, selection (replace/accumulate/reject), cell-edit state, resize, reorder (pin-group-aware, non-mutating), exact render structure with selected/editing attrs, duplicate-identity rejection, both-backend render -- all exact")
