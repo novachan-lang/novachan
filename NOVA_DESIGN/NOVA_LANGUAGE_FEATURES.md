@@ -1613,6 +1613,29 @@ BEHAVIOUR DIFF caught it. **Compiling is not passing.**
    any code that emits or parses brace-delimited text: message templates, JSON, code generators,
    format strings. `prism/intl/prism_intl.nova` does exactly this and documents it in-file.
 
+15. **`len()` ON A STRING COUNTS BYTES, NOT CHARACTERS** (verified 2026-08-16 by probe).
+   `len("é") == 2`, `len("中") == 3`, `len("café") == 5`. `ord()` likewise returns the first
+   BYTE (`ord("é") == 195`, i.e. 0xC3), and `chr()` masks to `& 0xFF`. Any code doing column
+   alignment, truncation or wrapping on user text must decode UTF-8 itself — see
+   `prism/text/prism_text.nova`. **`std/text/wcwidth.nova` gets this wrong**: it charges one cell
+   per byte > 127, so CJK measures 3 instead of 2.
+
+16. **A MODULE-LEVEL CONSTANT IS NOT EXPORTED — only functions are** (verified 2026-08-16).
+   `mod.SOME_CONST` fails with `error[E1002]: unknown identifier 'mod'` — the module name itself
+   does not resolve in a value position, only in a call position. A `let` at module scope is
+   private no matter how it is spelled.
+
+   ```nova
+   // mod.nova:  let K_LIMIT = 100000
+   mod.K_LIMIT            // error[E1002]: unknown identifier 'mod'
+   mod.k_limit()          // ok -- wrap it in a function
+   ```
+
+   Together with traps 11 and 12 the rule is simply: **a NOVA module's public surface is its
+   functions.** Types cross by bare name (trap 13's table), everything else needs a wrapper.
+   `prism/obs/prism_obs.nova` mirrors §16's two ceiling constants as local literal-returning
+   functions for exactly this reason.
+
 ---
 
 ## 8. Builtin Data Structures

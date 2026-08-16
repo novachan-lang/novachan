@@ -1,0 +1,594 @@
+// prism_obs -- OBSERVABILITY over a built node tree: size accounting, budget enforcement against
+// PRISM_SPEC.md §16, and a structural diff. Milestone MB.10 (carried over from MB.9, whose agents
+// were lost to a session limit before writing a line of this file -- see PRISM_STATUS.md MB.9x).
+//
+// ── WHY THIS EXISTS ────────────────────────────────────────────────────────────────────────────
+// Prism builds trees of hundreds of nodes (the MB.6 docs page is 571) and today there is no way to
+// see what a tree COSTS or WHY it changed -- no size accounting, no diff, no budget check separate
+// from the hard crash-or-reject enforced inside `prism_node_new` itself. §16 sets hard resource
+// ceilings (tree depth 256, nodes 100,000, ...); this file is what makes those numbers OBSERVABLE
+// on a real tree rather than only enforced at the moment a tree is one node past the edge. Same
+// role `prism_a11y.nova` (MB.9) plays for §13: turning a spec claim into something a KAT proves.
+//
+// ── THREE INDEPENDENT CAPABILITIES, ONE FILE ─────────────────────────────────────────────────────
+//   1. STATS  -- prism_obs_stats(node): total nodes, max depth, a count per EVERY one of the 22
+//      kinds (zeros included -- an omitted zero is indistinguishable from a forgotten kind), total
+//      attribute count, total text bytes.
+//   2. BUDGET -- prism_obs_budget(max_nodes, max_depth) + prism_obs_check(stats, budget): a
+//      caller-chosen ceiling BELOW §16's hard limits (a page that wants to stay under, say, 200
+//      nodes for its own performance budget), with the hard limits themselves as an upper fence a
+//      budget may never exceed -- see "budget above the ceiling is a lie" below.
+//   3. DIFF   -- prism_obs_diff(before, after): typed structural changes between two trees, with
+//      keyed children (§12.6) matched BY KEY rather than by position. This is the one with a real
+//      correctness bar: get it wrong and a single inserted row in an `each`/`grid` list is reported
+//      as the ENTIRE list changing, which silently defeats the entire reason §12.6's identity model
+//      exists. Proven directly in the KAT with exactly that scenario.
+//
+// ── DESIGN DECISION: STATS WALKS VIA `prism_node_walk`; DIFF HAND-ROLLS ITS OWN RECURSION ────────
+// Stats visits ONE tree and needs no relationship between nodes beyond "is a descendant" -- exactly
+// what `prism_node_walk`'s pre-order visitor gives for free, and `_kat_prism_node.nova` already
+// proves a lambda capturing an outer mutable dict/list and mutating it via `push`/index-assignment
+// survives the walk (`visited_kinds.push(...)` inside `fn(n) ...`). Diff visits a MATCHED PAIR of
+// trees at every step -- `prism_node_walk` has no two-tree form and could not express "descend into
+// both children lists together, keyed or positional" -- so it is hand-written recursion, the same
+// call `prism_a11y.nova` made for needing parent context `prism_node_walk` cannot supply.
+//
+// ── DESIGN DECISION: KEYED VS. POSITIONAL CHILD MATCHING IS DECIDED PER NODE, NOT PER KIND ───────
+// The obvious rule would be "kind == each/grid -> match by key". Rejected: it hard-codes exactly
+// two kind names into a file that otherwise never special-cases a kind by name for structural
+// decisions, and it would silently stop working the moment a caller builds a keyed row set through
+// `prism_node.prism_node_keyed` directly (legal, and done in this file's own KAT) without going
+// through the `each`/`grid` widget constructors. The actual rule implemented: a child list is
+// diffed BY KEY when EVERY element on BOTH sides carries a key (`prism_node_has_key`); otherwise it
+// is diffed BY POSITION. An empty list is vacuously "every element has a key" (there are no
+// elements to fail the check), so inserting the FIRST row into a previously-empty keyed container
+// still takes the keyed path. This is a structural property of the data, not a lookup table that
+// can drift from the widget layer.
+//
+// ── DESIGN DECISION: A POSITIONAL DIFF DOES NOT ATTEMPT AN LCS-STYLE ALIGNMENT ────────────────────
+// For UNKEYED children (a `stack`/`band`/... with no per-child identity), position IS identity --
+// that is the entire reason keyed identity exists as a separate, mandatory-for-`each`/`grid`
+// concept (§12.6). Diffing unkeyed children index-by-index and reporting a length change as a
+// trailing add/remove is the honest consequence of that: inserting a node at the FRONT of an
+// unkeyed list cascades into every following index reporting changed. That is not a bug in this
+// file -- it is the exact failure mode §12.6 exists to prevent, and the reason `each`/`grid` make
+// `by <selector>` mandatory rather than optional. A smarter (LCS/Myers) positional diff would hide
+// that lesson instead of teaching it, and is not implemented.
+//
+// ── DESIGN DECISION: "BUDGET ABOVE THE CEILING IS A LIE" ──────────────────────────────────────────
+// `prism_obs_budget` rejects a `max_nodes`/`max_depth` above prism_node's own
+// `PRISM_MAX_NODE_COUNT`/`PRISM_MAX_TREE_DEPTH`. A caller-chosen budget exists to catch a page
+// exceeding ITS OWN performance target long before it threatens the hard §16 ceiling that
+// `prism_node_new` enforces unconditionally; a "budget" set above that ceiling could never possibly
+// fire (the tree would already have failed construction), so accepting one would silently report
+// "within budget" for a distinction that never applies -- worse than no budget at all, because it
+// LOOKS like a check. Non-positive budgets are rejected too: a budget of 0 nodes cannot ever be
+// satisfied (even the empty check would need at least the tree's own state, and no real page has
+// zero nodes), and a negative one is not a resource bound at all.
+//
+// ── DESIGN DECISION: "TOTAL TEXT BYTES" COUNTS EVERY STRING ATTRIBUTE, NOT JUST DISPLAYED TEXT ────
+// `obs_text_bytes` (stats) sums `len(v)` for every attribute value that IS a string, across every
+// node, regardless of which key holds it -- a link's `href` and `kind` count exactly like its
+// `text`. This is a resource-accounting number (the payload §16's "Text run length" budget is
+// ultimately protecting against), not an accessibility or content metric, so it must be complete:
+// an href is exactly as many bytes of payload as a label's caption. The DIFF's separate
+// `text-changed` vs. `attr-changed` classification (below) answers a different question -- "did the
+// human-visible copy change" -- and is deliberately narrower.
+//
+// ── DESIGN DECISION: text-changed VS. attr-changed IN THE DIFF ────────────────────────────────────
+// Every kind's attribute dict is generic, so "did the text change" has no structural meaning by
+// itself -- it is a per-kind convention. `_prism_obs_text_attr` names the ONE attribute per kind
+// that carries the human-visible caption a reader of a diff cares most about seeing called out
+// specifically (`label`/`press`/`link`'s `text`, `entry`'s `prompt`, `flag`/`range`'s `label`).
+// Every other attribute change on any kind -- `gap`'s `size`, `range`'s `min`/`max`/`step`/`value`,
+// `pick`'s `options`, ... -- is reported as the more generic `attr-changed`. This is a legibility
+// choice, not a completeness one: nothing is dropped, `attr-changed` still fires for those keys.
+//
+// ── DESIGN DECISION: NON-COMPARABLE ATTRIBUTE VALUES (A CALLBACK) NEVER CRASH THE DIFF ────────────
+// `draw`'s `paint` attribute is a caller-supplied closure, not data. NOVA's structural `==` is
+// documented as universal, but nothing in this codebase exercises it on a closure value, and there
+// is no verified precedent to lean on here the way there is for strings/ints/lists/dicts. Rather
+// than gamble on an unverified comparison (or an unverified `str()` of a function value) at a
+// chokepoint every diff passes through, `_prism_obs_comparable` allow-lists the types this file
+// will compare or print (string/int/float/bool/list/dict) and treats anything else as always-equal
+// and unprintable (`"<kind>"`), so a `draw` node's paint callback is silently skipped rather than
+// risking a crash or a nonsense message.
+//
+// ── DETERMINISM (PRISM_SPEC.md §15.9) ─────────────────────────────────────────────────────────────
+// Every iteration in this file that can affect OUTPUT ORDER walks a dict or list in its OWN stored
+// order (attribute diffs iterate `b.attrs` then `a.attrs`, both insertion order; keyed-child
+// removed/added/matched passes iterate `bkids`/`akids` in the tree's own child order; the per-kind
+// stats dict is seeded from `prism_node_kind_all()`'s fixed order) -- never a `dict.keys()` pulled
+// through an intermediate set or other order-erasing structure. Same two trees in, byte-identical
+// change list out, every run. Asserted directly in the KAT by running the same diff twice.
+//
+// ── FIELDS ARE PREFIXED `obs_` (grepped project-wide first) ───────────────────────────────────────
+// The field-name -> slot table is GLOBAL and last-registration-wins (PrismNode.kind was read from
+// the wrong slot on 2026-08-16 through exactly this hazard and crashed the HTML renderer -- see
+// prism_a11y.nova's identical note). Every field this file introduces is prefixed `obs_`; grepped
+// against the whole repository (prism/, std/, forge/, nova-compiler/lib/) before writing a single
+// one, and it is a prefix nothing else uses.
+//
+// PUBLIC API
+//   Stats
+//     PrismObsStats                                     total/depth/per-kind/attrs/text-bytes
+//     prism_obs_stats(node)                    -> Result<PrismObsStats>
+//     prism_obs_stats_total_nodes(s)           -> int
+//     prism_obs_stats_max_depth(s)             -> int
+//     prism_obs_stats_kind_count(s, kind_name) -> int      0 for any of the 22 names, never missing
+//     prism_obs_stats_kind_counts(s)           -> dict     all 22 kind names -> count
+//     prism_obs_stats_attr_count(s)            -> int
+//     prism_obs_stats_text_bytes(s)            -> int
+//   Budget
+//     PrismObsBudget
+//     prism_obs_budget(max_nodes, max_depth)   -> Result<PrismObsBudget>   rejects <= 0 and > §16
+//     prism_obs_budget_max_nodes(b) / prism_obs_budget_max_depth(b) -> int
+//     PrismObsViolationKind                     ViolationNodeCount() | ViolationDepth()
+//     prism_obs_violation_kind_name(k)         -> string   EXHAUSTIVE, no wildcard
+//     PrismObsViolation                         { kind, message }
+//     prism_obs_violation_kind(v) / prism_obs_violation_message(v)
+//     prism_obs_check(stats, budget)           -> Result<list>   typed violations, [] = within budget
+//   Diff
+//     PrismObsChangeKind    Added() | Removed() | KindChanged() | AttrChanged() | TextChanged() | Reordered()
+//     prism_obs_change_kind_name(k)            -> string   EXHAUSTIVE, no wildcard
+//     PrismObsChange                            { kind, path, message }
+//     prism_obs_change_kind(c) / prism_obs_change_path(c) / prism_obs_change_message(c)
+//     prism_obs_diff(before, after)            -> Result<list>   [] = identical
+//     prism_obs_diff_text(changes)             -> string   one line per change, for logs
+//   Report
+//     prism_obs_report(stats)                  -> Result<PrismNode>    renders through any backend
+//     prism_obs_report_text(stats)             -> string                plain text, for logs
+
+import prism_node
+import prism_arrange
+import prism_ui_kit
+
+// ── Change vocabulary (diff) ──────────────────────────────────────────────────────────────────
+// Closed, so `prism_obs_change_kind_name` is exhaustive with no wildcard arm -- adding a 7th change
+// kind without naming it here is a compile error, the same payoff `prism_node_kind_name` and
+// `prism_a11y_rule_name` get from the identical shape.
+enum PrismObsChangeKind
+    ChangeAdded()
+    ChangeRemoved()
+    ChangeKindChanged()
+    ChangeAttrChanged()
+    ChangeTextChanged()
+    ChangeReordered()
+
+fn prism_obs_change_kind_added() -> PrismObsChangeKind
+    ChangeAdded()
+fn prism_obs_change_kind_removed() -> PrismObsChangeKind
+    ChangeRemoved()
+fn prism_obs_change_kind_kind_changed() -> PrismObsChangeKind
+    ChangeKindChanged()
+fn prism_obs_change_kind_attr_changed() -> PrismObsChangeKind
+    ChangeAttrChanged()
+fn prism_obs_change_kind_text_changed() -> PrismObsChangeKind
+    ChangeTextChanged()
+fn prism_obs_change_kind_reordered() -> PrismObsChangeKind
+    ChangeReordered()
+
+fn prism_obs_change_kind_name(k: PrismObsChangeKind) -> string
+    match k
+        ChangeAdded() => "added"
+        ChangeRemoved() => "removed"
+        ChangeKindChanged() => "kind_changed"
+        ChangeAttrChanged() => "attr_changed"
+        ChangeTextChanged() => "text_changed"
+        ChangeReordered() => "reordered"
+
+// `obs_change_path` is a slash-separated locator built from each node's own kind name plus either
+// its key (`kind[key]`, keyed children) or its index (`kind[#i]`, positional children), rooted at
+// the top node's own kind name -- e.g. "stack/each[row-3]/label". Not a formal query language, just
+// enough for a human (or a KAT) to see WHERE a change happened without re-walking the tree by hand.
+type PrismObsChange
+    obs_change_kind: PrismObsChangeKind
+    obs_change_path: string
+    obs_change_message: string
+
+fn prism_obs_change(kind: PrismObsChangeKind, path: string, message: string) -> PrismObsChange
+    PrismObsChange(kind, path, message)
+
+fn prism_obs_change_kind(c: PrismObsChange) -> PrismObsChangeKind
+    c.obs_change_kind
+fn prism_obs_change_path(c: PrismObsChange) -> string
+    c.obs_change_path
+fn prism_obs_change_message(c: PrismObsChange) -> string
+    c.obs_change_message
+
+// ── Violation vocabulary (budget) ─────────────────────────────────────────────────────────────
+enum PrismObsViolationKind
+    ViolationNodeCount()
+    ViolationDepth()
+
+fn prism_obs_violation_kind_node_count() -> PrismObsViolationKind
+    ViolationNodeCount()
+fn prism_obs_violation_kind_depth() -> PrismObsViolationKind
+    ViolationDepth()
+
+fn prism_obs_violation_kind_name(k: PrismObsViolationKind) -> string
+    match k
+        ViolationNodeCount() => "node_count"
+        ViolationDepth() => "depth"
+
+type PrismObsViolation
+    obs_violation_kind: PrismObsViolationKind
+    obs_violation_message: string
+
+fn prism_obs_violation(kind: PrismObsViolationKind, message: string) -> PrismObsViolation
+    PrismObsViolation(kind, message)
+
+fn prism_obs_violation_kind(v: PrismObsViolation) -> PrismObsViolationKind
+    v.obs_violation_kind
+fn prism_obs_violation_message(v: PrismObsViolation) -> string
+    v.obs_violation_message
+
+// ── Stats ──────────────────────────────────────────────────────────────────────────────────────
+
+type PrismObsStats
+    obs_total_nodes: int
+    obs_max_depth: int
+    obs_kind_counts: dict
+    obs_attr_count: int
+    obs_text_bytes: int
+
+fn prism_obs_stats_total_nodes(s: PrismObsStats) -> int
+    s.obs_total_nodes
+fn prism_obs_stats_max_depth(s: PrismObsStats) -> int
+    s.obs_max_depth
+fn prism_obs_stats_kind_counts(s: PrismObsStats) -> dict
+    s.obs_kind_counts
+fn prism_obs_stats_attr_count(s: PrismObsStats) -> int
+    s.obs_attr_count
+fn prism_obs_stats_text_bytes(s: PrismObsStats) -> int
+    s.obs_text_bytes
+
+// 0 for a legal kind name never seen in this tree, rather than a missing-key error -- the whole
+// point of seeding every one of the 22 kinds up front (see `_prism_obs_init_kind_counts`) is that
+// "not present" and "present with count 0" must be the same observable state.
+fn prism_obs_stats_kind_count(s: PrismObsStats, kind_name: string) -> int
+    if kind_name in s.obs_kind_counts
+        return s.obs_kind_counts[kind_name]
+    0
+
+// Seeds a count of 0 for all 22 kinds, in `prism_node_kind_all`'s fixed order -- so a kind this
+// tree never uses still reports a zero rather than being silently absent, and iterating the dict
+// afterward is itself deterministic (§15.9).
+fn _prism_obs_init_kind_counts() -> dict
+    let counts = {}
+    for k in prism_node.prism_node_kind_all()
+        counts[prism_node.prism_node_kind_name(k)] = 0
+    counts
+
+// Visits ONE node during the `prism_node_walk` pass: bumps its kind's count, the running node
+// total, the attribute count, and the text-byte total (every STRING-valued attribute on this node,
+// regardless of key -- see header design note on why this is a payload total, not a content one).
+fn _prism_obs_visit_one(n: PrismNode, counts: dict, totals: dict)
+    let kind_name = prism_node.prism_node_kind_str(n)
+    counts[kind_name] = counts[kind_name] + 1
+    totals["nodes"] = totals["nodes"] + 1
+    totals["attrs"] = totals["attrs"] + len(n.attrs)
+    for k, v in n.attrs
+        if is_string(v)
+            totals["text_bytes"] = totals["text_bytes"] + len(v)
+
+// Total nodes, max depth, a count for every one of the 22 kinds (zeros included), total attribute
+// count, and total text bytes across the whole tree. `node.count`/`node.depth` are already cached
+// at construction (O(1) -- see prism_node.nova's header), so this function does not need to
+// recompute them to know their values; it does so ANYWAY via the walk that gathers the other
+// numbers, purely as a cross-check -- if the walked total ever disagreed with the cached one, that
+// would mean the two are out of sync somewhere upstream, which is exactly the class of bug the
+// cache itself exists to make impossible. Cheap (the walk is already O(n) for the per-kind counts)
+// and it converts a silent cache/reality drift into a loud, named error instead of a wrong number.
+fn prism_obs_stats(node: PrismNode) -> Result<PrismObsStats>
+    let counts = _prism_obs_init_kind_counts()
+    let totals = {"nodes": 0, "attrs": 0, "text_bytes": 0}
+    prism_node.prism_node_walk(node, fn(n) _prism_obs_visit_one(n, counts, totals))
+    let walked_count = totals["nodes"]
+    let cached_count = prism_node.prism_node_count(node)
+    if walked_count != cached_count
+        return err("prism_obs_stats: walked node count " + str(walked_count) + " does not match the tree's own cached count " + str(cached_count) + " -- internal inconsistency, not a valid tree")
+    ok(PrismObsStats(cached_count, prism_node.prism_node_depth(node), counts, totals["attrs"], totals["text_bytes"]))
+
+// ── Budget ─────────────────────────────────────────────────────────────────────────────────────
+
+type PrismObsBudget
+    obs_budget_max_nodes: int
+    obs_budget_max_depth: int
+
+fn prism_obs_budget_max_nodes(b: PrismObsBudget) -> int
+    b.obs_budget_max_nodes
+fn prism_obs_budget_max_depth(b: PrismObsBudget) -> int
+    b.obs_budget_max_depth
+
+// PRISM_SPEC.md §16's own hard ceilings, MIRRORED here as literals rather than read cross-module
+// off `prism_node.PRISM_MAX_NODE_COUNT`/`PRISM_MAX_TREE_DEPTH`.
+//
+// ── VERIFIED COMPILER LIMITATION (2026-08-16, this milestone) -- NOT a style choice ──────────────
+// A cross-module QUALIFIED reference to another module's plain top-level `let` scalar does not
+// resolve the way a qualified FUNCTION call does. Probed directly: `prism_node.prism_node_kind_all()`
+// (a function) compiles and runs correctly from an importing file, but `prism_node.PRISM_MAX_NODE_COUNT`
+// (a `let` scalar) in that SAME importing file fails outright with `error[E1002]: unknown identifier
+// 'prism_node'`. Worse, the failure mode is not always a loud compile error: the FIRST version of
+// this function referenced those two constants directly, compiled with exit 0 as part of THIS file
+// (an imported dependency of the KAT, not the entry file), and then produced a WRONG runtime value --
+// `prism_obs_budget(6, 3)`, a call that must succeed, returned `Err` instead, because the ceiling
+// comparison was against something other than 100000/256. Only a standalone probe file that
+// referenced the constant directly from `main()` surfaced the E1002 diagnostic; the identical
+// reference one file away, inside a dependency module, compiled clean and silently miscomputed.
+// `_kat_prism_app_docs.nova` independently hard-codes these same two numbers in its own assertions
+// -- almost certainly for the identical reason, discovered independently. There are exactly two call
+// sites for these values in this file (grepped); if prism_node.nova's ceilings ever change, these
+// two literals are what must change with them, and this comment names the canonical source.
+fn _prism_obs_max_node_ceiling() -> int
+    100000
+fn _prism_obs_max_depth_ceiling() -> int
+    256
+
+// Rejects a non-positive bound (unsatisfiable or meaningless) and a bound ABOVE PRISM_SPEC.md
+// §16's own hard ceiling (see header note: "budget above the ceiling is a lie" -- such a budget
+// could never possibly fire, since `prism_node_new` would already have rejected the tree at
+// construction, so accepting it would report "within budget" for a distinction that never applies).
+// A budget set EXACTLY AT the §16 ceiling is legal -- it is, after all, §16's own default.
+fn prism_obs_budget(max_nodes: int, max_depth: int) -> Result<PrismObsBudget>
+    if max_nodes <= 0
+        return err("prism_obs_budget: max_nodes must be positive, got " + str(max_nodes))
+    if max_depth <= 0
+        return err("prism_obs_budget: max_depth must be positive, got " + str(max_depth))
+    let node_ceiling = _prism_obs_max_node_ceiling()
+    let depth_ceiling = _prism_obs_max_depth_ceiling()
+    if max_nodes > node_ceiling
+        return err("prism_obs_budget: max_nodes " + str(max_nodes) + " exceeds PRISM_SPEC.md §16's own hard ceiling " + str(node_ceiling) + " -- a budget looser than the hard limit can never fire and is a lie")
+    if max_depth > depth_ceiling
+        return err("prism_obs_budget: max_depth " + str(max_depth) + " exceeds PRISM_SPEC.md §16's own hard ceiling " + str(depth_ceiling) + " -- a budget looser than the hard limit can never fire and is a lie")
+    ok(PrismObsBudget(max_nodes, max_depth))
+
+// Strictly-greater-than: a tree exactly AT budget is within it. Always `ok` -- there is no failure
+// mode once `stats`/`budget` are both already-validated values in hand (the same reasoning
+// `prism_a11y_audit` uses for its own always-ok `Result<list>`).
+fn prism_obs_check(stats: PrismObsStats, budget: PrismObsBudget) -> Result<list>
+    let out = []
+    if stats.obs_total_nodes > budget.obs_budget_max_nodes
+        out.push(prism_obs_violation(ViolationNodeCount(), "node count " + str(stats.obs_total_nodes) + " exceeds budget " + str(budget.obs_budget_max_nodes)))
+    if stats.obs_max_depth > budget.obs_budget_max_depth
+        out.push(prism_obs_violation(ViolationDepth(), "tree depth " + str(stats.obs_max_depth) + " exceeds budget " + str(budget.obs_budget_max_depth)))
+    ok(out)
+
+// ── Diff ───────────────────────────────────────────────────────────────────────────────────────
+
+// The one attribute per kind that carries the human-visible caption a diff reader most wants
+// called out specifically as "text changed" rather than the more generic "attr changed" -- see
+// header design note. Kinds not listed here have no designated text attribute; every attribute
+// change on them is reported as `attr-changed`. Not exhaustive on purpose (a plain `_ => ""`
+// fallback, not a compile-enforced match) -- unlike the CLOSED enums above, this is a legibility
+// convention layered over the open, per-kind `attrs` dict, and a 23rd kind with no textual
+// attribute is correctly served by the fallback, not an error.
+fn _prism_obs_text_attr(kind: string) -> string
+    match kind
+        "label" => "text"
+        "press" => "text"
+        "link" => "text"
+        "entry" => "prompt"
+        "flag" => "label"
+        "range" => "label"
+        _ => ""
+
+// Allow-list of attribute-value types this file will compare or print. See header design note:
+// deliberately excludes anything else (chiefly `draw`'s `paint` closure) rather than gambling on
+// an unverified `==`/`str()` over a callback value at a chokepoint every diff passes through.
+fn _prism_obs_comparable(v) -> bool
+    let t = type_name(v)
+    t == "string" or t == "int" or t == "float" or t == "bool" or t == "list" or t == "dict"
+
+// Non-comparable values (see above) are treated as always-equal, so they never spuriously appear
+// as "changed" and are never passed to `==`. Comparable values of DIFFERING types are never equal
+// without invoking cross-type `==` at all (an int 0 and a string "0" are not the same attribute
+// value, full stop). Same-type comparable values use NOVA's universal structural `==`.
+fn _prism_obs_val_eq(bv, av) -> bool
+    if not _prism_obs_comparable(bv) or not _prism_obs_comparable(av)
+        return true
+    if type_name(bv) != type_name(av)
+        return false
+    bv == av
+
+fn _prism_obs_show(v) -> string
+    if _prism_obs_comparable(v)
+        str(v)
+    else
+        "<" + type_name(v) + ">"
+
+fn _prism_obs_all_keyed(xs: list) -> bool
+    for c in xs
+        if not prism_node.prism_node_has_key(c)
+            return false
+    true
+
+fn _prism_obs_key_of(n: PrismNode) -> string
+    match prism_node.prism_node_key(n)
+        Some(k) => k
+        None => ""
+
+fn _prism_obs_str_list_eq(xs: list, ys: list) -> bool
+    if len(xs) != len(ys)
+        return false
+    for i in 0..len(xs)
+        if xs[i] != ys[i]
+            return false
+    true
+
+// Diffs one node's OWN attributes (not children). Iterates `b.attrs` then `a.attrs`, both in
+// their stored insertion order (§15.9) -- never through an intermediate set, so the emitted order
+// is deterministic. A key present on both sides with an unequal value is `text-changed` when it is
+// that kind's designated text attribute, `attr-changed` otherwise; a key present on only one side
+// is always `attr-changed` (added/removed), regardless of the text-attr mapping -- an attribute
+// APPEARING or DISAPPEARING is a structural change, not a copy edit.
+fn _prism_obs_diff_attrs(kind: string, path: string, b: PrismNode, a: PrismNode, out: list)
+    let text_attr = _prism_obs_text_attr(kind)
+    for k, bv in b.attrs
+        if k in a.attrs
+            let av = a.attrs[k]
+            if not _prism_obs_val_eq(bv, av)
+                if k == text_attr
+                    out.push(prism_obs_change(ChangeTextChanged(), path, "text '" + k + "' changed from '" + _prism_obs_show(bv) + "' to '" + _prism_obs_show(av) + "'"))
+                else
+                    out.push(prism_obs_change(ChangeAttrChanged(), path, "attr '" + k + "' changed from '" + _prism_obs_show(bv) + "' to '" + _prism_obs_show(av) + "'"))
+        else
+            out.push(prism_obs_change(ChangeAttrChanged(), path, "attr '" + k + "' removed (was '" + _prism_obs_show(bv) + "')"))
+    for k, av in a.attrs
+        if k not in b.attrs
+            out.push(prism_obs_change(ChangeAttrChanged(), path, "attr '" + k + "' added (now '" + _prism_obs_show(av) + "')"))
+
+// ★ The keyed path -- PRISM_SPEC.md §12.6's runtime identity made observable. Every child on BOTH
+// sides is matched BY KEY, never by position:
+//   - a before-key absent from `a_by_key`   -> ONE `removed` change, nothing else about it
+//   - an after-key absent from `b_by_key`   -> ONE `added` change, nothing else about it
+//   - a key present on both sides           -> recurse into that ONE matched pair (kind/attrs/
+//                                              children of just that row -- everything else in the
+//                                              list is untouched by this row's presence)
+//   - the RELATIVE order of keys common to both sides, if it differs                -> ONE
+//     `reordered` change for the whole list (not one per row)
+// This is exactly what makes "one row inserted at the top of a 1,000-row `each`" cost ONE `added`
+// change instead of 1,000 -- proven directly in the KAT.
+fn _prism_obs_diff_keyed_children(path: string, bkids: list, akids: list, out: list)
+    let b_by_key = {}
+    for c in bkids
+        b_by_key[_prism_obs_key_of(c)] = c
+    let a_by_key = {}
+    for c in akids
+        a_by_key[_prism_obs_key_of(c)] = c
+
+    for c in bkids
+        let k = _prism_obs_key_of(c)
+        if k not in a_by_key
+            let ck = prism_node.prism_node_kind_str(c)
+            out.push(prism_obs_change(ChangeRemoved(), path + "/" + ck + "[" + k + "]", "row '" + k + "' (" + ck + ") removed"))
+
+    for c in akids
+        let k = _prism_obs_key_of(c)
+        if k not in b_by_key
+            let ck = prism_node.prism_node_kind_str(c)
+            out.push(prism_obs_change(ChangeAdded(), path + "/" + ck + "[" + k + "]", "row '" + k + "' (" + ck + ") added"))
+
+    // Matched pairs, recursed in BEFORE's own child order -- deterministic regardless of AFTER's
+    // order (which is what the reordered check below exists to report separately).
+    for c in bkids
+        let k = _prism_obs_key_of(c)
+        if k in a_by_key
+            let ck = prism_node.prism_node_kind_str(c)
+            _prism_obs_diff_node(path + "/" + ck + "[" + k + "]", c, a_by_key[k], out)
+
+    // Reordered: compare the relative order of keys common to BOTH sides, filtered from each
+    // side's OWN order. A pure insertion/removal never trips this (the common-key subsequence is
+    // untouched); only an actual permutation of shared rows does.
+    let b_common = []
+    for c in bkids
+        let k = _prism_obs_key_of(c)
+        if k in a_by_key
+            b_common.push(k)
+    let a_common = []
+    for c in akids
+        let k = _prism_obs_key_of(c)
+        if k in b_by_key
+            a_common.push(k)
+    if not _prism_obs_str_list_eq(b_common, a_common)
+        out.push(prism_obs_change(ChangeReordered(), path, "row order changed from [" + join(b_common, ", ") + "] to [" + join(a_common, ", ") + "]"))
+
+// The positional path -- for children with no identity, where position IS identity (see header
+// design note on why no LCS-style alignment is attempted). Matched index-by-index up to the
+// shorter length; any extra trailing indices on the longer side are added/removed.
+fn _prism_obs_diff_positional_children(path: string, bkids: list, akids: list, out: list)
+    let nb = len(bkids)
+    let na = len(akids)
+    let n = nb
+    if na < n
+        n = na
+    for i in 0..n
+        let ck = prism_node.prism_node_kind_str(bkids[i])
+        _prism_obs_diff_node(path + "/" + ck + "[#" + str(i) + "]", bkids[i], akids[i], out)
+    if na > nb
+        for i in nb..na
+            let ck = prism_node.prism_node_kind_str(akids[i])
+            out.push(prism_obs_change(ChangeAdded(), path + "/" + ck + "[#" + str(i) + "]", "child #" + str(i) + " (" + ck + ") added"))
+    if nb > na
+        for i in na..nb
+            let ck = prism_node.prism_node_kind_str(bkids[i])
+            out.push(prism_obs_change(ChangeRemoved(), path + "/" + ck + "[#" + str(i) + "]", "child #" + str(i) + " (" + ck + ") removed"))
+
+fn _prism_obs_diff_children(path: string, b: PrismNode, a: PrismNode, out: list)
+    let bkids = prism_node.prism_node_children(b)
+    let akids = prism_node.prism_node_children(a)
+    if _prism_obs_all_keyed(bkids) and _prism_obs_all_keyed(akids)
+        _prism_obs_diff_keyed_children(path, bkids, akids, out)
+    else
+        _prism_obs_diff_positional_children(path, bkids, akids, out)
+
+// A kind mismatch is reported as ONE `kind-changed` change and stops there -- the two subtrees have
+// no structurally comparable shape below this point (a `label`'s attrs mean something different
+// from a `grid`'s), so diffing "into" them would produce noise, not signal.
+fn _prism_obs_diff_node(path: string, b: PrismNode, a: PrismNode, out: list)
+    let kb = prism_node.prism_node_kind_str(b)
+    let ka = prism_node.prism_node_kind_str(a)
+    if kb != ka
+        out.push(prism_obs_change(ChangeKindChanged(), path, "kind changed from '" + kb + "' to '" + ka + "'"))
+        return
+    _prism_obs_diff_attrs(kb, path, b, a, out)
+    _prism_obs_diff_children(path, b, a, out)
+
+// Structural diff between two node trees. `[]` means identical (same kinds, same attributes, same
+// children, keyed children in the same relative order). Always `ok` -- both arguments are already
+// well-typed `PrismNode` values (unlike `prism_node_new`'s untyped `children: list`, there is
+// nothing here for a runtime type guard to catch), so there is no failure mode to report.
+fn prism_obs_diff(before: PrismNode, after: PrismNode) -> Result<list>
+    let out = []
+    _prism_obs_diff_node(prism_node.prism_node_kind_str(before), before, after, out)
+    ok(out)
+
+// One line per change, for logs -- the plain-text sibling `prism_obs_report_text` provides for
+// stats. Deterministic whenever `changes` itself is (see `prism_obs_diff`'s own guarantee).
+fn prism_obs_diff_text(changes: list) -> string
+    let lines = []
+    for c in changes
+        lines.push(prism_obs_change_kind_name(c.obs_change_kind) + "  " + c.obs_change_path + "  " + c.obs_change_message)
+    join(lines, "\n")
+
+// ── Report ─────────────────────────────────────────────────────────────────────────────────────
+
+// A renderable summary of `stats`: total/depth/attrs/text-bytes, then every one of the 22 kinds and
+// its count (zeros included, same fixed order as the stats dict itself). Returns `Result<PrismNode>`
+// for the same reason every node-building function in this codebase does (every `prism_ui_kit`/
+// `prism_arrange` constructor is `Result`-returning) -- not because building from an
+// already-validated `PrismObsStats` can realistically fail (`kind_pairs` is always exactly the 22
+// legal kind names), but because matching the convention is what lets a caller `unwrap()` this
+// exactly like any other node constructor without a special case.
+fn prism_obs_report(stats: PrismObsStats) -> Result<PrismNode>
+    let totals_pairs = [["total_nodes", str(stats.obs_total_nodes)], ["max_depth", str(stats.obs_max_depth)], ["attr_count", str(stats.obs_attr_count)], ["text_bytes", str(stats.obs_text_bytes)]]
+    let totals_kv = prism_ui_kit.prism_ui_kv(totals_pairs)
+    if is_err(totals_kv)
+        return err(unwrap_err(totals_kv))
+    let kind_pairs = []
+    for k in prism_node.prism_node_kind_all()
+        let name = prism_node.prism_node_kind_name(k)
+        kind_pairs.push([name, str(prism_obs_stats_kind_count(stats, name))])
+    let kinds_kv = prism_ui_kit.prism_ui_kv(kind_pairs)
+    if is_err(kinds_kv)
+        return err(unwrap_err(kinds_kv))
+    let totals_section = prism_ui_kit.prism_ui_section("Tree Stats", [unwrap(totals_kv)])
+    if is_err(totals_section)
+        return err(unwrap_err(totals_section))
+    let kinds_section = prism_ui_kit.prism_ui_section("Node Kinds", [unwrap(kinds_kv)])
+    if is_err(kinds_section)
+        return err(unwrap_err(kinds_section))
+    prism_arrange.prism_stack([unwrap(totals_section), unwrap(kinds_section)])
+
+// Plain-text twin of `prism_obs_report`, for logs rather than a rendered face. One `key=value` line
+// per stat, then one per kind in the same fixed order.
+fn prism_obs_report_text(stats: PrismObsStats) -> string
+    let lines = []
+    lines.push("total_nodes=" + str(stats.obs_total_nodes))
+    lines.push("max_depth=" + str(stats.obs_max_depth))
+    lines.push("attr_count=" + str(stats.obs_attr_count))
+    lines.push("text_bytes=" + str(stats.obs_text_bytes))
+    for k in prism_node.prism_node_kind_all()
+        let name = prism_node.prism_node_kind_name(k)
+        lines.push(name + "=" + str(prism_obs_stats_kind_count(stats, name)))
+    join(lines, "\n")

@@ -1,0 +1,439 @@
+// prism_text -- Prism's OWN text measurement/wrap/truncate/pad layer. Milestone MB.10.
+//
+// ── WHY THIS FILE EXISTS ───────────────────────────────────────────────────────────────────────
+// Every Prism component renders text, and until now nothing could wrap, truncate, or measure it.
+// `backend/ansi/prism_render_ansi.nova` already takes a `cols` parameter (`prism_ansi_render_width`)
+// it cannot honour -- a label wider than the terminal just overflows. A `grid`/table column has no
+// way to fit a long value into a fixed width. This file is that missing layer.
+//
+// ── WHY PRISM OWNS THIS INSTEAD OF DEFERRING TO A BROWSER/OS TEXT-SHAPING API ─────────────────
+// NOVA_DESIGN/PRISM_STATUS.md F3 records that "inherit the browser's shaping via fillText into a
+// glyph atlas" is IMPOSSIBLE: `TextMetrics` exposes 12 whole-string properties and ZERO per-glyph
+// data, and there is no cross-browser way to know which characters in a string correspond to which
+// rendered glyphs. Flutter's answer was to bundle HarfBuzz+ICU (a 1-2 MB brotli payload) precisely
+// because it could not lean on the browser's shaper either. Prism's answer, for the ANSI/table use
+// case this milestone targets, is smaller and honest: a monospace CELL model (every codepoint is 0,
+// 1, or 2 terminal columns wide, per Unicode's East Asian Width property), not full glyph shaping.
+// That is the right model for a terminal backend and for fixed-width table columns; it is NOT a
+// claim to solve proportional-font text shaping for a future GPU/DOM backend, which is a materially
+// different and much larger problem left to whichever milestone builds that backend.
+//
+// ── PROBE: DOES NOVA'S `len()` COUNT BYTES OR CHARACTERS? ─────────────────────────────────────
+// Answer, established directly (not assumed) from THREE independent sources before writing a
+// single line of the width logic below:
+//   1. `nova_runtime.c`'s `nova_rt_len`/`nova_rt_str_len` return `strlen(s)` (or a cached fat-string
+//      length that is ITSELF the byte count written at construction) -- there is no UTF-8 decoding
+//      anywhere in that path.
+//   2. `nova_rt_chr(n)` masks `n & 0xFF` into a single byte, and `nova_rt_ord(s)` returns
+//      `(unsigned char)s[0]` -- the first BYTE, not a decoded codepoint. Neither function can
+//      produce or consume a multi-byte character; they are byte-level primitives.
+//   3. `std/text/grapheme.nova` (gr_split/gr_len) independently confirms this by NEEDING its own
+//      hand-rolled UTF-8 decoder over `str_to_bytes`/`bytes_get` specifically BECAUSE `len()` and
+//      `ord()`/`chr()` are byte-oriented -- if `len()` already counted characters, that decoder
+//      would be pointless work its own author would not have done.
+// CONCLUSION, stated plainly: **`len()` counts BYTES, not characters.** A 2-byte UTF-8 character
+// (e.g. "e" + combining accent's precomposed form "é") has `len() == 2` but is ONE character
+// occupying ONE terminal cell; a 3-byte CJK character has `len() == 3` but occupies TWO terminal
+// cells. Neither number may be used as a proxy for the other anywhere in this file -- every width
+// computation below decodes real UTF-8 codepoints first (mirroring grapheme.nova's proven
+// `bytes_get`-based scanning, re-implemented here rather than imported: `_gr_char_len`/
+// `_gr_decode_cp` are module-PRIVATE in grapheme.nova, so they are not even reachable from another
+// file, and this module's job per F3 above is to own its OWN text measurement, not borrow another
+// module's private internals).
+//
+// ── WHAT ALREADY EXISTS IN std/, AND WHY IT IS NOT REUSED HERE (CLAUDE.md's reuse rule) ────────
+// Searched by CONCEPT before writing anything: std/text/{wcwidth,wrap,truncate,pad,grapheme,
+// graphemex}.nova and std/textlayout/{wordwrap,truncate_text,textpad,textcenter,reflow,
+// linebreak}.nova all exist and were read in full. Findings:
+//   - `std/text/wcwidth.nova`'s `ww_char_width(cp)` is a correct PER-CODEPOINT classifier (given a
+//     real codepoint, its East-Asian-Width verdict is right) -- but `ww_string_width(s)` DOES NOT
+//     decode UTF-8: it walks `s` one BYTE at a time and charges every byte > 127 as width 1. For a
+//     3-byte CJK character that reports width 3 (one per byte), not the correct 2. This is exactly
+//     the bug this milestone's brief warns against ("a multi-byte character must not count as 2+
+//     cells") -- verified by tracing the code, not assumed, and it disqualifies `ww_string_width`
+//     for this file's `prism_text_width`. (`ww_char_width` alone, if fed a real decoded codepoint,
+//     would have been reusable; NOVA's file-local-only import surface plus the trivial size of a
+//     correct classifier made re-deriving it not worth a cross-module round-trip for one function.)
+//   - `std/text/wrap.nova`, `std/text/truncate.nova`, `std/text/pad.nova` all measure in `len()`,
+//     i.e. BYTES -- correct for ASCII, silently wrong for any accented or CJK content (the exact
+//     failure mode this milestone exists to close). Not reusable for the same reason as above.
+//   - `std/text/grapheme.nova` is the one genuinely reusable IDEA: its byte-scanning algorithm
+//     (`str_to_bytes`/`bytes_get`, validate continuation bytes, decode the codepoint) is the
+//     correct pattern and is re-implemented here (see probe note above for why "re-implemented"
+//     rather than "imported"). Grapheme CLUSTERS (combining marks glued to a base, ZWJ sequences)
+//     are a strictly finer-grained concept than terminal CELL WIDTH and are not needed here: this
+//     file only needs "how many columns does this codepoint occupy", which combining marks answer
+//     as 0 regardless of cluster membership.
+//   - `std/textlayout/*` (6 more modules) were opened and are same-shape variations on the above
+//     (byte-length wrap/truncate/pad/reflow) -- same disqualification, not reproduced in detail here
+//     to avoid repeating the same finding six times.
+// CLAUDE.md also forbids editing anything under std/ for this milestone, so even the one reusable
+// idea (grapheme.nova's scanning pattern) could only be reproduced, never imported and fixed in
+// place.
+//
+// ── DESIGN DECISION: THE ELLIPSIS IS ASCII "...", NOT THE UNICODE "…" GLYPH ────────────────────
+// Exactly the same reasoning `backend/ansi/prism_render_ansi.nova`'s `_ansi_glyph_char` already
+// recorded for icons: this must be legible in a plain VT100 / CI log / Windows console with no font
+// fallback, where a single-codepoint ellipsis can render as a tofu box or a double-width glyph
+// depending on the font. Three ASCII periods are width-3, always render, and their width is
+// self-evidently `len("...")` cells with no decoding needed at all.
+//
+// ── DESIGN DECISION: TRUNCATION CAN PAD BY ONE CELL TO HIT THE TARGET WIDTH EXACTLY ────────────
+// The brief's hard requirement is "the result's measured width is exactly `width`, never
+// `width + 1`" -- but a wide (2-cell) character makes "exactly" sometimes UNREACHABLE by content
+// alone: if the remaining budget after reserving the ellipsis is an odd number of cells and every
+// candidate character is 2 cells wide, the greediest safe prefix undershoots the budget by exactly
+// 1 cell (taking one more character would overshoot it by 1 instead -- both illegal, since the
+// requirement is "exactly", never `+1` and, symmetrically, never `-1` either). The only content-
+// preserving fix is a single trailing pad space absorbing that leftover cell, so the width contract
+// holds unconditionally rather than "usually, except for wide-character content" -- the latter
+// would be exactly the kind of undefined-behaviour-for-CJK gap this milestone exists to close.
+// Proven bounded: since every codepoint here is worth 0, 1, or 2 cells, the shortfall this can ever
+// produce is 0 or 1 cell -- never more.
+//
+// ── DESIGN DECISION: THE WRAP ROUND-TRIP CONTRACT, STATED PRECISELY ────────────────────────────
+// "Preserve every character" is asserted for text whose words are separated by exactly one space,
+// with no leading/trailing whitespace and no run of multiple spaces -- i.e. `join(prism_text_wrap
+// (s, w), " ") == s` whenever `s` needs no hard-break. This matches `std/text/wrap.nova`'s own
+// documented scope (it also collapses whitespace runs), and is the same reason `_ptx_split_words`
+// below drops empty tokens rather than preserving a run of spaces byte-for-byte: preserving both
+// "arbitrary whitespace runs" AND "wrap re-flows text" simultaneously is a different, harder
+// contract (Markdown-style whitespace-significant text) that nothing in this milestone's brief asks
+// for. A word that gets hard-broken is, BY CONSTRUCTION, never split at a space (splitting only
+// ever happens mid-word, at a codepoint boundary that is not a space), so the pieces of one
+// hard-broken word concatenate back together with NO separator -- only distinct words are ever
+// rejoined with a single space.
+//
+// PUBLIC API
+//   prism_text_width(s)                     -> int             monospace terminal cells (0/1/2 per
+//                                                                 codepoint; NOT `len()`, which is
+//                                                                 bytes -- see probe note above)
+//   prism_text_wrap(s, width)                -> Result<list>    greedy word-wrap, hard-breaks a
+//                                                                 single overlong word; rejects
+//                                                                 width < 1
+//   prism_text_truncate(s, width)            -> Result<string>  cuts to EXACTLY `width` cells with
+//                                                                 a trailing "..."; rejects a width
+//                                                                 smaller than the ellipsis itself
+//   prism_text_pad_left(s, width)            -> Result<string>  pad spaces on the LEFT (right-aligns
+//                                                                 content); never truncates
+//   prism_text_pad_right(s, width)           -> Result<string>  pad spaces on the RIGHT (left-aligns
+//                                                                 content); never truncates
+//   prism_text_pad_center(s, width)          -> Result<string>  pad both sides; an odd remainder
+//                                                                 goes on the RIGHT (matches
+//                                                                 std/text/pad.nova's `center`)
+//   prism_text_label_wrapped(s, width)       -> Result<PrismNode>  a `stack` of one `label` per
+//                                                                 wrapped line, so wrapping composes
+//                                                                 with the existing HTML/ANSI
+//                                                                 renderers with NO backend changes
+
+import prism_node
+import prism_arrange
+import prism_ui_kit
+
+// ── UTF-8 decoding (self-contained -- see header on why this is re-derived, not imported) ───────
+// Same validated algorithm shape as std/text/grapheme.nova's private `_gr_char_len`/`_gr_decode_cp`:
+// malformed or truncated sequences degrade to a single raw byte rather than over-reading or
+// panicking, so decoding is always TOTAL.
+
+fn _ptx_char_len(bts, i: int, n: int) -> int
+    let b0 = bytes_get(bts, i)
+    if b0 < 128
+        return 1
+    if b0 >= 192 and b0 < 224 and i + 1 < n
+        let b1 = bytes_get(bts, i + 1)
+        if b1 >= 128 and b1 < 192
+            return 2
+        return 1
+    if b0 >= 224 and b0 < 240 and i + 2 < n
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        if b1 >= 128 and b1 < 192 and b2 >= 128 and b2 < 192
+            return 3
+        return 1
+    if b0 >= 240 and b0 < 248 and i + 3 < n
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        let b3 = bytes_get(bts, i + 3)
+        if b1 >= 128 and b1 < 192 and b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192
+            return 4
+        return 1
+    return 1
+
+fn _ptx_decode_cp(bts, i: int, blen: int) -> int
+    let b0 = bytes_get(bts, i)
+    if blen == 1
+        return b0
+    if blen == 2
+        let b1 = bytes_get(bts, i + 1)
+        return ((b0 - 192) * 64) + (b1 - 128)
+    if blen == 3
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        return ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
+    let b1 = bytes_get(bts, i + 1)
+    let b2 = bytes_get(bts, i + 2)
+    let b3 = bytes_get(bts, i + 3)
+    return ((b0 - 240) * 262144) + ((b1 - 128) * 4096) + ((b2 - 128) * 64) + (b3 - 128)
+
+// ── Cell-width classification (Unicode UAX #11 "East Asian Width") ──────────────────────────────
+// 0  control characters (cp < 32 or cp == 127) and zero-width marks -- combining diacriticals
+//    (U+0300-U+036F) and the zero-width space/non-joiner/joiner (U+200B/U+200C/U+200D). DELIBERATE
+//    DIVERGENCE from std/text/wcwidth.nova's `ww_char_width`, which reports -1 for controls: that
+//    function serves a terminal-CURSOR model (a control character can MOVE the cursor, which is a
+//    different question from "how many cells does this occupy"). This module only ever sums cell
+//    counts for wrap/truncate/pad bookkeeping over text the ANSI backend has already sanitized of
+//    control bytes (`prism_ansi_sanitize` strips them before display) -- charging 0 keeps every sum
+//    here non-negative and total, with no tri-state handling needed at every call site.
+// 2  East Asian WIDE and FULLWIDTH ranges (UAX #11 categories W and F): Hangul Jamo, CJK radicals/
+//    punctuation, Hiragana/Katakana, CJK Unified Ideographs (+ Extension A), Hangul Syllables, CJK
+//    Compatibility Ideographs, and the Fullwidth Forms block. These occupy TWO terminal columns.
+// 1  everything else (ASCII, Latin-1 Supplement incl. precomposed accents like "e" -> U+00E9,
+//    Cyrillic, Greek, Arabic, most punctuation/symbols) -- ONE terminal column.
+fn _ptx_char_width(cp: int) -> int
+    if cp < 32 or cp == 127
+        return 0
+    if cp >= 0x0300 and cp <= 0x036F
+        return 0
+    if cp == 0x200B or cp == 0x200C or cp == 0x200D
+        return 0
+    if cp >= 0x1100 and cp <= 0x115F
+        return 2
+    if cp >= 0x2E80 and cp <= 0x303E
+        return 2
+    if cp >= 0x3041 and cp <= 0x33FF
+        return 2
+    if cp >= 0x3400 and cp <= 0x4DBF
+        return 2
+    if cp >= 0x4E00 and cp <= 0x9FFF
+        return 2
+    if cp >= 0xAC00 and cp <= 0xD7A3
+        return 2
+    if cp >= 0xF900 and cp <= 0xFAFF
+        return 2
+    if cp >= 0xFF00 and cp <= 0xFF60
+        return 2
+    if cp >= 0xFFE0 and cp <= 0xFFE6
+        return 2
+    1
+
+// Monospace cell width of a whole string: decode every codepoint (UTF-8 boundaries only -- never a
+// raw byte split) and sum its classified width. NOT `len(s)`, which is a BYTE count (see the probe
+// note in the file header) -- e.g. `len("e-acute precomposed")` charges 2 bytes for a 1-cell
+// character, and `len("CJK char")` charges 3 bytes for a 2-cell character. Neither number is usable
+// here; this is why this function exists at all.
+fn prism_text_width(s: string) -> int
+    if len(s) == 0
+        return 0
+    let bts = str_to_bytes(s)
+    let n = bytes_len(bts)
+    let acc_w = 0
+    let i = 0
+    while i < n
+        let blen = _ptx_char_len(bts, i, n)
+        let cp = _ptx_decode_cp(bts, i, blen)
+        acc_w += _ptx_char_width(cp)
+        i += blen
+    acc_w
+
+// ── Word splitting (byte-safe even over multi-byte content) ─────────────────────────────────────
+// Splits on literal ASCII space (0x20) only, dropping empty tokens from consecutive spaces (matches
+// std/text/wrap.nova's and std/text/truncate.nova's `_tr_split_words` convention -- see header on
+// the round-trip contract this implies: leading/trailing/doubled whitespace is not preserved).
+// Scanning one BYTE at a time (via `char_at`, not a UTF-8 decode) is still correct in the presence
+// of multi-byte characters: 0x20 can never occur as a lead byte (0xC2-0xF4) or a continuation byte
+// (0x80-0xBF) of a well-formed UTF-8 sequence, so a byte that compares equal to " " is UNAMBIGUOUSLY
+// a real space, and every other byte (including every byte of a multi-byte character) is appended
+// to the current word untouched, so multi-byte content inside a word is never corrupted.
+fn _ptx_split_words(s: string) -> list
+    let words = []
+    let cur = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let ch = char_at(s, i)
+        if ch == " "
+            if len(cur) > 0
+                words.push(cur)
+                cur = ""
+        else
+            cur = cur + ch
+        i += 1
+    if len(cur) > 0
+        words.push(cur)
+    words
+
+// Breaks a single word (one whose OWN width exceeds `width`) into the fewest possible UTF-8-safe
+// chunks, each at most `width` cells wide. Cuts only ever land on codepoint boundaries (the byte
+// offset `i` always advances a whole `blen` at a time, so `word[start:i]` never bisects a multi-byte
+// sequence). A codepoint whose OWN width exceeds `width` (e.g. a 2-cell CJK character requested into
+// a width-1 budget) is still placed alone in its own chunk rather than dropped or split further --
+// there is no narrower unit to cut it into, so total-ness (always terminates, always makes forward
+// progress, never crashes) wins over a strict "never exceeds width" guarantee that is provably
+// impossible to keep for this one input shape.
+fn _ptx_hard_break(word: string, width: int) -> list
+    let chunks = []
+    let bts = str_to_bytes(word)
+    let n = bytes_len(bts)
+    let cur_start = 0
+    let cur_w = 0
+    let i = 0
+    while i < n
+        let blen = _ptx_char_len(bts, i, n)
+        let cp = _ptx_decode_cp(bts, i, blen)
+        let cw = _ptx_char_width(cp)
+        if cur_w > 0 and cur_w + cw > width
+            chunks.push(word[cur_start:i])
+            cur_start = i
+            cur_w = 0
+        cur_w += cw
+        i += blen
+    if cur_start < n
+        chunks.push(word[cur_start:n])
+    chunks
+
+// Greedy word-wrap, breaking on spaces, never mid-word unless a single word's OWN width exceeds
+// `width` (then `_ptx_hard_break` splits it). Line-fit accounting uses `prism_text_width`
+// (cell-width), not `len()` -- a table column full of CJK text must wrap at the right visual point,
+// not the right byte count. See the header for the exact round-trip contract this satisfies.
+fn prism_text_wrap(s: string, width: int) -> Result<list>
+    if width < 1
+        return err("prism_text_wrap: width must be >= 1, got " + str(width))
+    if len(s) == 0
+        return ok([])
+    let words = _ptx_split_words(s)
+    if len(words) == 0
+        return ok([])
+    let lines = []
+    let cur = ""
+    let cur_w = 0
+    for word in words
+        let ww = prism_text_width(word)
+        if ww <= width
+            if cur_w == 0
+                cur = word
+                cur_w = ww
+            else if cur_w + 1 + ww <= width
+                cur = cur + " " + word
+                cur_w = cur_w + 1 + ww
+            else
+                lines.push(cur)
+                cur = word
+                cur_w = ww
+        else
+            // The word alone is wider than the line -- flush whatever is in progress first, then
+            // lay the word's own hard-broken chunks down as full lines, keeping only its LAST
+            // (possibly partial) chunk as the new in-progress line so a following short word can
+            // still share that line if there's room.
+            if cur_w > 0
+                lines.push(cur)
+                cur = ""
+                cur_w = 0
+            let chunks = _ptx_hard_break(word, width)
+            let clen = len(chunks)
+            let ci = 0
+            while ci < clen - 1
+                lines.push(chunks[ci])
+                ci += 1
+            cur = chunks[clen - 1]
+            cur_w = prism_text_width(cur)
+    if len(cur) > 0
+        lines.push(cur)
+    ok(lines)
+
+// The ellipsis is ASCII "..." -- see header design decision. Its own cell width (3) is computed
+// through `prism_text_width` rather than hardcoded so it stays self-consistent if this constant
+// ever changes.
+let PTX_ELLIPSIS = "..."
+
+// Cuts `s` to EXACTLY `width` cells with a trailing "...", never `width + 1` and never `width - 1`
+// either (see header design decision on the one-cell pad that makes "exactly" reachable even when
+// the remaining budget can't be hit precisely by wide-character content alone). Rejects a width
+// smaller than the ellipsis's own width -- there is no way to render "truncated, plus an ellipsis"
+// in less space than the ellipsis itself needs, so this is checked unconditionally up front (not
+// only when a given string would actually need truncating), keeping the contract independent of
+// input content.
+fn prism_text_truncate(s: string, width: int) -> Result<string>
+    let ell_w = prism_text_width(PTX_ELLIPSIS)
+    if width < ell_w
+        return err("prism_text_truncate: width must be >= " + str(ell_w) + " (the ellipsis's own width), got " + str(width))
+    if prism_text_width(s) <= width
+        return ok(s)
+    let budget = width - ell_w
+    let bts = str_to_bytes(s)
+    let n = bytes_len(bts)
+    let i = 0
+    let prefix_w = 0
+    let scanning = true
+    while scanning and i < n
+        let blen = _ptx_char_len(bts, i, n)
+        let cp = _ptx_decode_cp(bts, i, blen)
+        let cw = _ptx_char_width(cp)
+        if prefix_w + cw > budget
+            scanning = false
+        else
+            prefix_w += cw
+            i += blen
+    let prefix = s[0:i]
+    // Bounded 0 or 1: every codepoint here is worth 0, 1, or 2 cells, so the greedy prefix above can
+    // undershoot `budget` by at most 1 (a 2-cell character that didn't fit into a 1-cell remainder).
+    let deficit = budget - prefix_w
+    ok(prefix + PTX_ELLIPSIS + _ptx_rep_space(deficit))
+
+fn _ptx_rep_space(n: int) -> string
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + " "
+        i += 1
+    out
+
+// ── Padding/alignment (cell-width, not byte-length) ──────────────────────────────────────────────
+// Mirrors std/text/pad.nova's ljust/rjust/center semantics (never truncates; a wider-than-target
+// string is returned unchanged, since shrinking it is truncate's job, not pad's) but measured in
+// terminal cells so multi-byte content pads correctly. Rejects a negative width outright; width 0
+// is legal (it simply never needs padding).
+
+fn prism_text_pad_left(s: string, width: int) -> Result<string>
+    if width < 0
+        return err("prism_text_pad_left: width must be >= 0, got " + str(width))
+    let sw = prism_text_width(s)
+    if sw >= width
+        return ok(s)
+    ok(_ptx_rep_space(width - sw) + s)
+
+fn prism_text_pad_right(s: string, width: int) -> Result<string>
+    if width < 0
+        return err("prism_text_pad_right: width must be >= 0, got " + str(width))
+    let sw = prism_text_width(s)
+    if sw >= width
+        return ok(s)
+    ok(s + _ptx_rep_space(width - sw))
+
+// Odd leftover padding goes on the RIGHT -- same tie-break std/text/pad.nova's `center` already
+// established for this codebase; no reason to invent a different convention here.
+fn prism_text_pad_center(s: string, width: int) -> Result<string>
+    if width < 0
+        return err("prism_text_pad_center: width must be >= 0, got " + str(width))
+    let sw = prism_text_width(s)
+    if sw >= width
+        return ok(s)
+    let total_pad = width - sw
+    let left = total_pad / 2
+    let right = total_pad - left
+    ok(_ptx_rep_space(left) + s + _ptx_rep_space(right))
+
+// ── Composition: a wrapped label is a stack of labels, not a backend feature ─────────────────────
+// This is MB.10's real payoff: wrapping composes with the EXISTING renderers (HTML, ANSI) with zero
+// backend changes, because a `stack` of `label`s is already in the closed 22-primitive vocabulary
+// and both renderers already walk `stack` generically. Reuses `prism_arrange.prism_stack` (the
+// vocabulary's own stack constructor) and `prism_ui_kit.prism_ui_labels` (the already-built
+// strings-to-label-nodes-with-error-propagation helper, MB.2) rather than re-deriving either --
+// exactly the reuse CLAUDE.md asks for, and the shortest correct path to this function.
+fn prism_text_label_wrapped(s: string, width: int) -> Result<PrismNode>
+    let wrapped = prism_text_wrap(s, width)
+    if is_err(wrapped)
+        return err(unwrap_err(wrapped))
+    let lbls = prism_ui_kit.prism_ui_labels(unwrap(wrapped))
+    if is_err(lbls)
+        return err(unwrap_err(lbls))
+    prism_arrange.prism_stack(unwrap(lbls))

@@ -1,0 +1,222 @@
+// KAT for prism/text/prism_text.nova (milestone MB.10 -- Prism's text measurement/wrap/truncate/
+// pad layer).
+//
+// ── WHAT THIS PROVES ─────────────────────────────────────────────────────────────────────────
+// 1. `prism_text_width` measures monospace CELLS, not bytes -- verified against three concrete
+//    scripts (ASCII, precomposed accented Latin, CJK), each with its byte length ALSO asserted so
+//    the byte-vs-cell distinction is visible in the test itself, not just asserted as an opaque
+//    number. This is the probe the milestone brief demanded: empirically, `len()` counts BYTES
+//    (`len("é") == 2`, `len("中") == 3`) while `prism_text_width` must not.
+// 2. `prism_text_wrap` breaks on spaces, hard-breaks a single overlong word (verified with both an
+//    ASCII word and a run of CJK characters with no spaces at all), and its round-trip contract
+//    holds: `join(prism_text_wrap(s, w), " ") == s` for ordinary space-separated text.
+// 3. `prism_text_truncate`'s output width is EXACTLY the requested width, never `width + 1` --
+//    checked for ASCII, for a CJK case that needs a 1-cell pad to hit the target exactly (the
+//    reason the pad exists at all), and for a string that already fits (no truncation).
+// 4. Padding is measured in cells, not bytes, verified with multi-byte (CJK) content.
+// 5. `prism_text_label_wrapped` composes wrapping with the EXISTING renderers (HTML + ANSI) with no
+//    backend changes -- this is MB.10's real payoff, so it is proven through BOTH backends here,
+//    not just asserted at the node-tree level.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_text.nova
+//   clang -O2 -o _kat_prism_text.exe _kat_prism_text.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import prism_text as pt
+import prism_node
+import prism_render_html as rh
+import prism_render_ansi as ra
+
+let FAILED = [0]
+
+fn _check_str(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=[" + got + "]  want=[" + want + "]")
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_int(label: string, got: int, want: int)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=" + str(got) + "  want=" + str(want))
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_err(label: string, r)
+    if is_err(r)
+        print("  pass  rejected: " + label)
+    else
+        print("  FAIL  rejected: " + label + " -- was ACCEPTED")
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_ok(label: string, r)
+    if is_err(r)
+        print("  FAIL  " + label + " -- unexpected error: " + unwrap_err(r))
+        FAILED[0] = FAILED[0] + 1
+    else
+        print("  pass  " + label)
+
+fn main()
+    print("== 1. prism_text_width: cells, not bytes (the probe) ==")
+    _check_int("empty string width", pt.prism_text_width(""), 0)
+    _check_int("ASCII width == byte length here", pt.prism_text_width("hello"), 5)
+    _check_int("ASCII byte length (len) for comparison", len("hello"), 5)
+
+    // Precomposed accented Latin: "é" is ONE character, TWO bytes in UTF-8, and must occupy
+    // exactly ONE terminal cell -- the exact "must not count a multi-byte character as 2+ cells"
+    // requirement.
+    _check_int("accented char byte length (len) is 2", len("é"), 2)
+    _check_int("accented char width is 1 cell (NOT 2)", pt.prism_text_width("é"), 1)
+    _check_int("cafe byte length (len) is 5", len("café"), 5)
+    _check_int("cafe width is 4 cells", pt.prism_text_width("café"), 4)
+
+    // CJK: East Asian Wide, occupies 2 cells per character, 3 bytes per character in UTF-8.
+    _check_int("CJK char byte length (len) is 3", len("中"), 3)
+    _check_int("CJK char width is 2 cells (East Asian Wide)", pt.prism_text_width("中"), 2)
+    _check_int("CJK pair byte length (len) is 6", len("中文"), 6)
+    _check_int("CJK pair width is 4 cells", pt.prism_text_width("中文"), 4)
+    _check_int("mixed ASCII+CJK width", pt.prism_text_width("a中b"), 4)
+
+    print("== 2. prism_text_wrap: exact boundaries ==")
+    let w1 = unwrap(pt.prism_text_wrap("hello", 5))
+    _check_int("word fits exactly: 1 line", len(w1), 1)
+    _check_str("word fits exactly: content", w1[0], "hello")
+
+    let w2 = unwrap(pt.prism_text_wrap("hello", 4))
+    _check_int("word one over: hard-broken into 2 lines", len(w2), 2)
+    _check_str("hard-break piece 1", w2[0], "hell")
+    _check_str("hard-break piece 2", w2[1], "o")
+    _check_true("hard-break piece 1 width <= 4", pt.prism_text_width(w2[0]) <= 4)
+
+    print("== 3. prism_text_wrap: round-trip preserves every character ==")
+    let sentence = "the quick brown fox jumps over the lazy dog"
+    let wrapped = unwrap(pt.prism_text_wrap(sentence, 10))
+    _check_str("round-trip: rejoin with single spaces == original", join(wrapped, " "), sentence)
+    _check_true("round-trip produced multiple lines (real wrapping happened)", len(wrapped) > 1)
+    let each_fits = true
+    for ln in wrapped
+        if pt.prism_text_width(ln) > 10
+            each_fits = false
+    _check_true("every wrapped line fits within width 10", each_fits)
+
+    print("== 4. prism_text_wrap: a single word longer than width is hard-broken (CJK) ==")
+    let cjk_word = "中文中文中文"
+    let cw = unwrap(pt.prism_text_wrap(cjk_word, 4))
+    _check_int("CJK hard-break: 3 lines of width 4", len(cw), 3)
+    _check_str("CJK chunk 1", cw[0], "中文")
+    _check_str("CJK chunk 2", cw[1], "中文")
+    _check_str("CJK chunk 3", cw[2], "中文")
+    let cjk_rejoin = cw[0] + cw[1] + cw[2]
+    _check_true("CJK chunks concatenate (no space) back to the original word", cjk_rejoin == cjk_word)
+
+    print("== 5. prism_text_wrap: empty / whitespace-only ==")
+    _check_int("empty string -> zero lines", len(unwrap(pt.prism_text_wrap("", 10))), 0)
+    _check_int("whitespace-only -> zero lines", len(unwrap(pt.prism_text_wrap("   ", 10))), 0)
+
+    print("== 6. prism_text_wrap: rejections (width < 1) ==")
+    _check_err("width 0", pt.prism_text_wrap("test", 0))
+    _check_err("width -1", pt.prism_text_wrap("test", -1))
+    _check_err("width -100", pt.prism_text_wrap("test", -100))
+
+    print("== 7. prism_text_truncate: exact width, never width+1 ==")
+    let t1 = unwrap(pt.prism_text_truncate("abcdefghij", 8))
+    _check_str("ASCII truncation content", t1, "abcde...")
+    _check_int("ASCII truncation width is EXACTLY 8", pt.prism_text_width(t1), 8)
+
+    let t2 = unwrap(pt.prism_text_truncate("hello", 5))
+    _check_str("no truncation needed: unchanged", t2, "hello")
+    _check_int("no truncation needed: width equals requested", pt.prism_text_width(t2), 5)
+
+    // CJK case that needs the 1-cell pad to hit the target EXACTLY (see file header: a 2-cell
+    // character makes an odd remaining budget unreachable by content alone).
+    let t3 = unwrap(pt.prism_text_truncate("中中中中", 6))
+    _check_int("CJK truncation width is EXACTLY 6 (never 5, never 7)", pt.prism_text_width(t3), 6)
+    _check_str("CJK truncation exact content (1-cell pad after the ellipsis)", t3, "中" + "..." + " ")
+
+    // Boundary: width exactly equal to the ellipsis's own width.
+    let t4 = unwrap(pt.prism_text_truncate("hello", 3))
+    _check_str("width == ellipsis width -> bare ellipsis", t4, "...")
+    _check_int("bare ellipsis width is exactly 3", pt.prism_text_width(t4), 3)
+
+    _check_str("empty string needs no truncation", unwrap(pt.prism_text_truncate("", 10)), "")
+
+    print("== 8. prism_text_truncate: rejections (width < ellipsis width) ==")
+    _check_err("width 2", pt.prism_text_truncate("hello world", 2))
+    _check_err("width 1", pt.prism_text_truncate("hello world", 1))
+    _check_err("width 0", pt.prism_text_truncate("hello world", 0))
+    _check_err("width -1", pt.prism_text_truncate("hello world", -1))
+
+    print("== 9. padding/alignment: cells, not bytes ==")
+    let pr = unwrap(pt.prism_text_pad_right("中", 5))
+    _check_int("pad_right CJK: total width exactly 5", pt.prism_text_width(pr), 5)
+    _check_str("pad_right CJK: exact content (3 trailing spaces)", pr, "中" + "   ")
+
+    let pl = unwrap(pt.prism_text_pad_left("中", 5))
+    _check_int("pad_left CJK: total width exactly 5", pt.prism_text_width(pl), 5)
+    _check_str("pad_left CJK: exact content (3 leading spaces)", pl, "   " + "中")
+
+    let pc = unwrap(pt.prism_text_pad_center("中", 5))
+    _check_int("pad_center CJK: total width exactly 5", pt.prism_text_width(pc), 5)
+    _check_str("pad_center CJK: exact content (1 left, 2 right -- odd goes right)", pc, " " + "中" + "  ")
+
+    _check_str("pad_left: already fits, unchanged", unwrap(pt.prism_text_pad_left("hello", 3)), "hello")
+    _check_str("pad_right empty string to width 3", unwrap(pt.prism_text_pad_right("", 3)), "   ")
+    _check_str("pad_left width 0 on empty string", unwrap(pt.prism_text_pad_left("", 0)), "")
+
+    print("== 10. padding: rejections (negative width) ==")
+    _check_err("pad_left width -1", pt.prism_text_pad_left("x", -1))
+    _check_err("pad_right width -1", pt.prism_text_pad_right("x", -1))
+    _check_err("pad_center width -1", pt.prism_text_pad_center("x", -1))
+
+    print("== 11. prism_text_label_wrapped: composes with the node tree ==")
+    let lbl_node = unwrap(pt.prism_text_label_wrapped(sentence, 10))
+    _check_str("wrapped label kind is stack", prism_node.prism_node_kind_str(lbl_node), "stack")
+    _check_int("wrapped label child count matches wrap()", prism_node.prism_node_child_count(lbl_node), len(wrapped))
+    let kids = prism_node.prism_node_children(lbl_node)
+    let all_labels = true
+    let i = 0
+    while i < len(kids)
+        if prism_node.prism_node_kind_str(kids[i]) != "label"
+            all_labels = false
+        if prism_node.prism_node_attr_str(kids[i], "text", "MISSING") != wrapped[i]
+            all_labels = false
+        i += 1
+    _check_true("every child is a label with the matching wrapped line text", all_labels)
+
+    let empty_lbl = unwrap(pt.prism_text_label_wrapped("", 10))
+    _check_str("empty string -> empty stack (kind)", prism_node.prism_node_kind_str(empty_lbl), "stack")
+    _check_int("empty string -> zero children", prism_node.prism_node_child_count(empty_lbl), 0)
+
+    _check_err("prism_text_label_wrapped rejects width 0", pt.prism_text_label_wrapped("hi there", 0))
+
+    print("== 12. prism_text_label_wrapped renders through BOTH existing backends unchanged ==")
+    let html = rh.prism_html_render(lbl_node)
+    _check_ok("HTML render succeeds", html)
+    let html_s = unwrap(html)
+    _check_true("HTML contains first wrapped line", find(html_s, wrapped[0]) >= 0)
+    _check_true("HTML contains last wrapped line", find(html_s, wrapped[len(wrapped) - 1]) >= 0)
+
+    let ansi = ra.prism_ansi_render(lbl_node)
+    _check_ok("ANSI render succeeds", ansi)
+    let ansi_s = unwrap(ansi)
+    _check_true("ANSI contains first wrapped line", find(ansi_s, wrapped[0]) >= 0)
+    _check_true("ANSI contains last wrapped line", find(ansi_s, wrapped[len(wrapped) - 1]) >= 0)
+    // Rendering the SAME node twice is stable -- no hidden mutation from either backend.
+    _check_true("HTML render is deterministic", unwrap(rh.prism_html_render(lbl_node)) == html_s)
+    _check_true("ANSI render is deterministic", unwrap(ra.prism_ansi_render(lbl_node)) == ansi_s)
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_text: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_text: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)
