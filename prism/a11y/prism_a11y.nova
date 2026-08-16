@@ -1,0 +1,251 @@
+// prism_a11y -- a STATIC ACCESSIBILITY AUDIT over a node tree. Milestone MB.9.
+//
+// ── WHY THIS EXISTS: §13 IS CURRENTLY A CLAIM, NOT A CHECK ────────────────────────────────────
+// PRISM_SPEC.md §13 says accessibility is DERIVED rather than annotated, and the Prism mandate
+// promises "full accessibility support built in from day one, not an afterthought". Today that is
+// only half true. Two layers do real work -- the widget constructors require an accessible name
+// (`prism_press` rejects a nameless control, `prism_entry` an empty prompt), and the HTML renderer
+// emits the roles and `aria-*` attributes §17A maps out. But **nothing looks at a finished tree**,
+// so every guarantee is local. A page can be assembled entirely from valid components and still be
+// unusable: a button nested inside a button, a modal with nothing focusable, a link whose only
+// content is a decorative icon. Those are COMPOSITION defects, invisible to any single constructor.
+//
+// This file is the missing check. It walks a built tree and returns typed findings, which turns
+// §13 from a claim into something a KAT can assert -- and the MB.6 dashboard and docs pages are
+// asserted clean, so the claim is tested against real pages rather than toy ones.
+//
+// ── WHAT IT DELIBERATELY DOES *NOT* DO ────────────────────────────────────────────────────────
+// It does not re-check what a constructor already rejects. `prism_each`/`prism_grid` reject
+// duplicate identity keys at construction, so a duplicate key CANNOT exist in a built tree and a
+// rule for it here would be dead code that reads like coverage. Where the constructor owns the
+// guarantee, this file says so and stays out. (The one exception is the interactive-name rule: the
+// constructors enforce it for their own primitive, but a `label`-only `press` built through
+// `prism_node_*` directly would slip past, so it is re-checked at tree level.)
+//
+// ── SEVERITY MEANS SOMETHING ──────────────────────────────────────────────────────────────────
+// `error` = the element is unusable by some input method (a nameless control is invisible to a
+// screen reader; a nested button has no well-defined activation target). `warning` = it works but
+// degrades. Only `error` is worth failing a build over, so the split is not decoration.
+//
+// PUBLIC API
+//   PrismA11yRule                         closed rule vocabulary
+//   prism_a11y_rule_name(rule)     -> string   EXHAUSTIVE, no wildcard
+//   PrismA11ySeverity                     Error() | Warning()
+//   prism_a11y_severity_name(s)    -> string
+//   PrismA11yFinding                      { a11y_kind, a11y_rule, a11y_severity, a11y_message }
+//   prism_a11y_finding_kind/_rule/_severity/_message(f)
+//   prism_a11y_audit(node)         -> Result<list>   every finding, empty = clean
+//   prism_a11y_errors(node)        -> Result<list>   errors only
+//   prism_a11y_assert_clean(node)  -> Result<bool>   err() listing every finding
+
+import prism_node
+
+// ── Rule vocabulary ───────────────────────────────────────────────────────────────────────────
+// Closed, so `prism_a11y_rule_name` below is exhaustive with no wildcard arm: adding a rule
+// without naming it is a COMPILE error rather than a finding that prints blank.
+enum PrismA11yRule
+    RuleNoAccessibleName()
+    RuleArtMissingAlt()
+    RuleLinkNoText()
+    RuleTabsEmpty()
+    RuleTabsSelectionRange()
+    RuleGridEmptyRow()
+    RuleGridRaggedRows()
+    RuleNestedInteractive()
+    RuleModalNotFocusable()
+
+fn prism_a11y_rule_no_accessible_name() -> PrismA11yRule
+    RuleNoAccessibleName()
+fn prism_a11y_rule_art_missing_alt() -> PrismA11yRule
+    RuleArtMissingAlt()
+fn prism_a11y_rule_link_no_text() -> PrismA11yRule
+    RuleLinkNoText()
+fn prism_a11y_rule_tabs_empty() -> PrismA11yRule
+    RuleTabsEmpty()
+fn prism_a11y_rule_tabs_selection_range() -> PrismA11yRule
+    RuleTabsSelectionRange()
+fn prism_a11y_rule_grid_empty_row() -> PrismA11yRule
+    RuleGridEmptyRow()
+fn prism_a11y_rule_grid_ragged_rows() -> PrismA11yRule
+    RuleGridRaggedRows()
+fn prism_a11y_rule_nested_interactive() -> PrismA11yRule
+    RuleNestedInteractive()
+fn prism_a11y_rule_modal_not_focusable() -> PrismA11yRule
+    RuleModalNotFocusable()
+
+fn prism_a11y_rule_name(rule: PrismA11yRule) -> string
+    match rule
+        RuleNoAccessibleName() => "no_accessible_name"
+        RuleArtMissingAlt() => "art_missing_alt"
+        RuleLinkNoText() => "link_no_text"
+        RuleTabsEmpty() => "tabs_empty"
+        RuleTabsSelectionRange() => "tabs_selection_range"
+        RuleGridEmptyRow() => "grid_empty_row"
+        RuleGridRaggedRows() => "grid_ragged_rows"
+        RuleNestedInteractive() => "nested_interactive"
+        RuleModalNotFocusable() => "modal_not_focusable"
+
+enum PrismA11ySeverity
+    SevError()
+    SevWarning()
+
+fn prism_a11y_severity_error() -> PrismA11ySeverity
+    SevError()
+fn prism_a11y_severity_warning() -> PrismA11ySeverity
+    SevWarning()
+
+fn prism_a11y_severity_name(s: PrismA11ySeverity) -> string
+    match s
+        SevError() => "error"
+        SevWarning() => "warning"
+
+// Fields prefixed `a11y_*`: NOVA's field-name -> slot table is GLOBAL and last-registration-wins,
+// and `kind`/`message`/`severity` are exactly the words other structs want. `PrismNode.kind` was
+// read from the wrong slot on 2026-08-16 through this hazard and crashed the HTML renderer.
+type PrismA11yFinding
+    a11y_kind: string
+    a11y_rule: PrismA11yRule
+    a11y_severity: PrismA11ySeverity
+    a11y_message: string
+
+fn prism_a11y_finding(kind: string, rule: PrismA11yRule, severity: PrismA11ySeverity, message: string) -> PrismA11yFinding
+    PrismA11yFinding(kind, rule, severity, message)
+
+fn prism_a11y_finding_kind(f: PrismA11yFinding) -> string
+    f.a11y_kind
+fn prism_a11y_finding_rule(f: PrismA11yFinding) -> PrismA11yRule
+    f.a11y_rule
+fn prism_a11y_finding_severity(f: PrismA11yFinding) -> PrismA11ySeverity
+    f.a11y_severity
+fn prism_a11y_finding_message(f: PrismA11yFinding) -> string
+    f.a11y_message
+
+// ── Which kinds are interactive ───────────────────────────────────────────────────────────────
+// A function returning a fresh literal, not a module-level `let` -- a module-level `let` holding a
+// list is silently EMPTY when the module is imported (verified compiler bug, fixed 2026-08-15 but
+// the habit is kept: a function cannot regress that way and cannot collide by name).
+fn _prism_a11y_interactive_kinds() -> list
+    ["press", "entry", "pick", "flag", "range", "link"]
+
+fn _prism_a11y_is_interactive(kind: string) -> bool
+    list_contains(_prism_a11y_interactive_kinds(), kind)
+
+// The attribute each interactive kind carries its accessible name in. Kept beside the kind list so
+// the two cannot drift apart.
+fn _prism_a11y_name_attr(kind: string) -> string
+    match kind
+        "press" => "text"
+        "entry" => "prompt"
+        "pick" => "selected_value"
+        "flag" => "label"
+        "range" => "label"
+        "link" => "text"
+        _ => ""
+
+// ── The audit ─────────────────────────────────────────────────────────────────────────────────
+// Recursive rather than via prism_node_walk, because several rules need the PARENT relationship
+// (nested-interactive) or a node's own children (ragged grid rows, modal focusability), which a
+// flat visitor cannot see.
+fn prism_a11y_audit(node: PrismNode) -> Result<list>
+    let out = []
+    _prism_a11y_visit(node, false, out)
+    ok(out)
+
+fn prism_a11y_errors(node: PrismNode) -> Result<list>
+    let all = prism_a11y_audit(node)
+    if is_err(all)
+        return err(unwrap_err(all))
+    let out = []
+    for f in unwrap(all)
+        match f.a11y_severity
+            SevError() => out.push(f)
+            SevWarning() => 0
+    ok(out)
+
+fn prism_a11y_assert_clean(node: PrismNode) -> Result<bool>
+    let all = prism_a11y_audit(node)
+    if is_err(all)
+        return err(unwrap_err(all))
+    let fs = unwrap(all)
+    if len(fs) == 0
+        return ok(true)
+    let parts = []
+    for f in fs
+        parts.push(prism_a11y_severity_name(f.a11y_severity) + "/" + prism_a11y_rule_name(f.a11y_rule) + " on " + f.a11y_kind + ": " + f.a11y_message)
+    err("prism_a11y: " + str(len(fs)) + " finding(s): " + join(parts, " | "))
+
+// `inside_interactive` is threaded down so the nested-interactive rule can fire on the INNER
+// element, which is the one that has no activation target.
+fn _prism_a11y_visit(n: PrismNode, inside_interactive: bool, out: list)
+    let kind = prism_node.prism_node_kind_str(n)
+    let interactive = _prism_a11y_is_interactive(kind)
+
+    if interactive
+        // Accessible name. The constructors enforce this for their own primitive, but a tree built
+        // through prism_node_* directly bypasses them entirely -- so it is re-checked here.
+        let attr = _prism_a11y_name_attr(kind)
+        if attr != ""
+            if len(prism_node.prism_node_attr_str(n, attr, "")) == 0
+                out.push(prism_a11y_finding(kind, RuleNoAccessibleName(), SevError(), "interactive element has no accessible name (empty '" + attr + "'); it is unreachable by screen reader and voice control"))
+        // A button inside a button, or a link inside a button, has no well-defined activation
+        // target -- the browser picks one and assistive tech announces both.
+        if inside_interactive
+            out.push(prism_a11y_finding(kind, RuleNestedInteractive(), SevError(), "interactive element nested inside another interactive element; activation target is ambiguous"))
+
+    if kind == "art"
+        // Empty alt is LEGAL and correct for a decorative image -- but only when that was chosen
+        // deliberately. An absent alt attribute is the defect; prism_ui_media's
+        // prism_ui_figure_decorative sets it explicitly to "".
+        if not prism_node.prism_node_has_attr(n, "alt")
+            out.push(prism_a11y_finding(kind, RuleArtMissingAlt(), SevError(), "image has no alt attribute; use the decorative constructor to mark it purely decorative"))
+
+    if kind == "link"
+        // A link whose only content is an icon cannot be targeted by voice control ("click <what>?")
+        // and is announced as an unlabelled link.
+        if len(prism_node.prism_node_attr_str(n, "text", "")) == 0
+            out.push(prism_a11y_finding(kind, RuleLinkNoText(), SevError(), "link has no visible text; icon-only links are unreachable by voice control"))
+
+    if kind == "tabs"
+        let panels = prism_node.prism_node_child_count(n)
+        if panels == 0
+            out.push(prism_a11y_finding(kind, RuleTabsEmpty(), SevError(), "tablist has no panels"))
+        else
+            let sel = prism_node.prism_node_attr_int(n, "selected", 0)
+            if sel < 0 or sel >= panels
+                out.push(prism_a11y_finding(kind, RuleTabsSelectionRange(), SevError(), "selected index " + str(sel) + " is outside 0.." + str(panels - 1) + "; no panel is reachable"))
+
+    if kind == "grid"
+        // Ragged rows break table navigation: a screen reader announces "column 3 of 4" against a
+        // row that has two cells, and cell-by-cell navigation walks off the end.
+        let rows = prism_node.prism_node_children(n)
+        let expect = 0
+        let first = true
+        for r in rows
+            let cells = prism_node.prism_node_child_count(r)
+            if cells == 0
+                out.push(prism_a11y_finding(kind, RuleGridEmptyRow(), SevError(), "grid row has no cells"))
+            if first
+                expect = cells
+                first = false
+            else
+                if cells != expect
+                    out.push(prism_a11y_finding(kind, RuleGridRaggedRows(), SevError(), "grid rows have inconsistent cell counts (" + str(expect) + " vs " + str(cells) + "); table navigation breaks"))
+
+    if kind == "sheet"
+        // A modal that traps focus with nothing focusable inside is a dead end: the user cannot
+        // act and cannot leave. Only checked when exclusive, since a non-modal sheet does not trap.
+        if prism_node.prism_node_attr_bool(n, "exclusive", false)
+            if not _prism_a11y_has_interactive(n)
+                out.push(prism_a11y_finding(kind, RuleModalNotFocusable(), SevError(), "exclusive (modal) sheet contains no interactive element; focus is trapped with nothing to act on"))
+
+    let next_inside = inside_interactive or interactive
+    for c in prism_node.prism_node_children(n)
+        _prism_a11y_visit(c, next_inside, out)
+
+fn _prism_a11y_has_interactive(n: PrismNode) -> bool
+    if _prism_a11y_is_interactive(prism_node.prism_node_kind_str(n))
+        return true
+    for c in prism_node.prism_node_children(n)
+        if _prism_a11y_has_interactive(c)
+            return true
+    false
