@@ -1,0 +1,315 @@
+// prism_ui_color_pick -- COLOR selection components (prism/ui/, milestone MB.18): a single color
+// swatch, a named palette of swatches, a selectable color picker, a two-stop gradient display, and
+// a color value display in hex/rgb/hsl. Every one is a COMPOSITION over the closed 22-primitive
+// vocabulary (widget/), built through prism_ui_kit.nova's helpers wherever they fit -- no new
+// PrismNodeKind (PRISM_SPEC.md axiom A7), the same discipline every prism_ui_*.nova file follows.
+// This is the Ant Design `ColorPicker` family: swatches, palettes, a selectable grid of presets,
+// and the hex/rgb/hsl value readouts every design-token or theme-editor screen needs.
+//
+// ── WHY THIS FILE IMPORTS `prism_node` DIRECTLY ──────────────────────────────────────────────────
+// `prism_cp_swatch` attaches a `cp_hex` attr to its `stack` root, and `prism_cp_picker`'s per-option
+// swatches carry a `cp_hex` attr plus a conditional `cp_selected` attr -- neither `prism_arrange`'s
+// `stack`/`band` thin wrappers accept an attrs parameter (that file's own header: `stack`/`band`/
+// `layer`/`flow` carry NO attrs anywhere in PRISM_SPEC.md Part III). Same move `prism_ui_token.nova`
+// and `prism_ui_tree.nova` already made for their own component-specific attrs (`variant`,
+// `tv_expanded`): go one layer down to `prism_node.prism_node_branch(kind, attrs, children)`,
+// PUBLIC API on `prism_node.nova` for exactly this shape. Still a `Stack`/`Band` (PrismNodeKind
+// untouched, axiom A7 holds), just decorated with metadata `prism_arrange` has no parameter to carry.
+//
+// ── WHY HEX PARSING GOES THROUGH `ord`/`chr`, NOT A BUILT-IN "ascii"/"char" ─────────────────────
+// Grepped the compiler's builtin registry before writing a line of hex-digit code (CLAUDE.md's
+// "does this already exist" discipline): there is no `ascii`/`char` builtin anywhere in
+// nova_compiler.nova's registration table. The real, registered pair is `ord(s) -> int` (the first
+// byte's code point) and `chr(n) -> string` (a single-char string for a code point) -- verified
+// directly against `reg["ord"]`/`reg["chr"]` and their `nova_rt_ord`/`nova_rt_chr` runtime bodies.
+// `forge_charclass.nova` (this codebase's own ASCII character-class library) already uses exactly
+// this `ord`/`chr` pair for its digit/letter/case predicates -- this file follows that proven idiom
+// rather than a name that does not exist in the compiler.
+//
+// ── WHY HEX/GRADIENT/HSL MATH IS ALL-INTEGER, NO FLOAT ANYWHERE ─────────────────────────────────
+// Same discipline `prism_fb_progress` already established for its percentage (prism_ui_feedback.nova
+// header): this codebase has recorded real float-codegen soundness gaps (a geo-bearing float bug, a
+// float/int comparison unsoundness -- both tracked project memory). A gradient step's byte or an HSL
+// channel's value is exactly the "must be deterministic, must round the same way every time" kind of
+// computation float arithmetic makes fragile for no benefit here -- every input (an RGB byte, 0-255)
+// and every output (a step's interpolated byte, an HSL percentage) is already an integer.
+// `prism_cp_gradient`'s own interpolation follows the mandated "multiply before dividing" rule
+// (`r = from_r + (to_r - from_r) * i / (steps - 1)`) to minimize truncation error; `_prism_cp_rgb_to_hsl`
+// follows the identical rule for every one of its ratios. Verified by hand against the textbook
+// float HSL formula for several colors (see the KAT) -- truncating integer division agrees with it
+// exactly at every value checked, because every ratio here is scaled by a whole-number factor
+// (60, 100) before it is ever divided.
+//
+// ── WHY `_prism_cp_rgb_to_hsl`'S SATURATION SPLITS ON `sum <= 255`, NOT ON A FLOAT MIDPOINT ──────
+// The textbook HSL formula compares lightness `L` against `0.5` to choose which of two saturation
+// denominators applies (`max+min` below the midpoint, `2-max-min` above it). Comparing an already-
+// truncated *percentage* against 50 would disagree with the float formula near the boundary (integer
+// truncation can round either side down by up to 1, so a color whose real L sits exactly at the
+// midpoint could land on `l_pct == 49` or `50` depending on which channel's rounding direction wins).
+// Comparing the UNDIVIDED `sum = maxc + minc` (still exact, range 0-510) against `255` (the exact
+// doubled midpoint, no rounding introduced) makes the branch decision exact for every input -- the
+// percentage is only computed AFTER the branch is chosen, never used to drive it.
+//
+// ── WHY THE PICKER'S `cp_selected` MATCH IS "does this option's hex equal the selection", NOT AN
+//    INDEX ──────────────────────────────────────────────────────────────────────────────────────
+// `cp_selected: string?` names a color VALUE, not a position -- consistent with every other
+// value-identity comparison already in this tree (`prism_tk_tag_input`'s duplicate check, `prism_pick`'s
+// own duplicate-value rejection). A caller re-ordering `cp_options` should not silently move which
+// swatch reads as selected; keying by the hex string itself is stable across that reordering. A
+// `cp_selected` that names no option in `cp_options` is not an error -- it simply selects nothing,
+// the same tolerant handling `prism_ui_kit.prism_ui_field_row`'s absent-note case gets for "nothing
+// to show".
+//
+// ── WHY `prism_cp_gradient` ALSO REJECTS AN EMPTY `cp_label` (NOT LISTED AS A REQUIREMENT, ADDED
+//    FOR CONSISTENCY) ────────────────────────────────────────────────────────────────────────────
+// Every other labelled component in this file (`prism_cp_picker`) and every labelled component in
+// every prior `ui/` module (`prism_fb_confirm`, `prism_st_stat`, `prism_tk_tag_input`, ...) rejects
+// an empty label for the identical PRISM_SPEC.md §13 reason: an unlabelled control/section is
+// invisible to a screen reader. Leaving `prism_cp_gradient`'s `cp_label` unchecked would be a silent,
+// arbitrary exception to a rule this very file otherwise follows everywhere -- "silence in a spec is
+// not safety," so it is checked here too rather than left as a gap this one component happens to skip.
+//
+// PUBLIC API
+//   Display format (closed, 3 values)
+//     PrismCpFormat                                     CpHex() | CpRgb() | CpHsl()
+//     prism_cp_hex() / prism_cp_rgb() / prism_cp_hsl()  cross-module ctors
+//     prism_cp_format_name(f) -> string   exhaustive: "hex" | "rgb" | "hsl"
+//   Components (all Result<PrismNode>; every one validates, none fails silently)
+//     prism_cp_swatch(cp_hex, cp_name: string)
+//       -> stack(cp_hex attr)[label(hex), label(name)]; rejects an empty cp_hex/cp_name, a cp_hex
+//       not starting with "#"
+//     prism_cp_palette(cp_title: string, swatches: list)
+//       -> stack[label(title), flow(swatches)]; swatches: bare list<PrismNode> (runtime-checked),
+//       rejects an empty title, an empty list, a non-PrismNode element (named by index and type)
+//     prism_cp_picker(cp_label: string, cp_options: list, cp_selected: string?)
+//       -> stack[label, flow(option swatches)]; cp_options: bare list<string> of hex values
+//       (runtime-checked); the option matching cp_selected (if any) carries attr "cp_selected" =
+//       "true". Rejects an empty cp_label, an empty cp_options, a non-string/empty/non-"#"-prefixed
+//       option (named by index), a duplicate hex.
+//     prism_cp_gradient(cp_label, cp_from, cp_to: string, cp_steps: int)
+//       -> stack[label, band(cp_steps interpolated hex labels)]; rejects an empty cp_label, an
+//       invalid cp_from/cp_to (must be "#" + 6 hex chars), cp_steps < 2.
+//     prism_cp_display(cp_hex: string, cp_format: PrismCpFormat)
+//       -> band[label(hex), label(formatted value)]; CpHex shows cp_hex verbatim, CpRgb shows
+//       "rgb(R, G, B)", CpHsl shows "hsl(H, S%, L%)"; rejects an invalid cp_hex (must be "#" + 6
+//       hex chars).
+//   Internal (private; the KAT exercises these indirectly through the public functions above)
+//     _prism_cp_parse_hex(hex) -> Result<list>        "#RRGGBB" -> [R, G, B] ints, 0-255
+//     _prism_cp_format_hex(r, g, b: int) -> string    [R, G, B] ints -> "#rrggbb" (lowercase)
+//     _prism_cp_rgb_to_hsl(r, g, b: int) -> list       [R, G, B] ints (0-255) -> [H, S, L] ints
+//       (H: 0-359 degrees; S, L: 0-100 percent), all-integer arithmetic (see header)
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_ui_kit
+
+// ── Display format: closed, 3 values (see header) ────────────────────────────────────────────────
+enum PrismCpFormat
+    CpHex()
+    CpRgb()
+    CpHsl()
+
+fn prism_cp_hex() -> PrismCpFormat
+    CpHex()
+fn prism_cp_rgb() -> PrismCpFormat
+    CpRgb()
+fn prism_cp_hsl() -> PrismCpFormat
+    CpHsl()
+
+// Exhaustive, no wildcard arm -- adding a 4th format without a case here is a compile error.
+fn prism_cp_format_name(f: PrismCpFormat) -> string
+    match f
+        CpHex() => "hex"
+        CpRgb() => "rgb"
+        CpHsl() => "hsl"
+
+// ── Hex digit <-> nibble, via `ord`/`chr` (see header: no "ascii"/"char" builtin exists) ─────────
+fn _prism_cp_hex_digit(c: string) -> Result<int>
+    if c >= "0" and c <= "9"
+        return ok(ord(c) - ord("0"))
+    let lc = lower(c)
+    if lc >= "a" and lc <= "f"
+        return ok(ord(lc) - ord("a") + 10)
+    err("_prism_cp_hex_digit: invalid hex digit '" + c + "'")
+
+// Reverse mapping: a 0-15 nibble -> its lowercase hex character.
+fn _prism_cp_hex_char(nibble: int) -> string
+    if nibble < 10
+        return chr(ord("0") + nibble)
+    chr(ord("a") + nibble - 10)
+
+// Defensive clamp: a byte's mathematically-guaranteed 0-255 range (see header on why gradient
+// interpolation never actually leaves it) is enforced anyway before it drives an array-shaped
+// nibble split, so a future caller of this private helper can never make it emit a non-hex char.
+fn _prism_cp_clamp_byte(n: int) -> int
+    if n < 0
+        return 0
+    if n > 255
+        return 255
+    n
+
+// ── "#RRGGBB" -> [R, G, B] ─────────────────────────────────────────────────────────────────────
+// Both format defects (wrong length, missing "#") are checked BEFORE any digit is parsed, so a
+// too-short garbage string is reported once, clearly, rather than as an out-of-range slice deeper in.
+fn _prism_cp_parse_hex(hex: string) -> Result<list>
+    if len(hex) != 7
+        return err("_prism_cp_parse_hex: hex must be '#' + 6 hex chars (7 total), got " + str(len(hex)) + " chars ('" + hex + "')")
+    if slice(hex, 0, 1) != "#"
+        return err("_prism_cp_parse_hex: hex must start with '#', got '" + hex + "'")
+    let r_hi = _prism_cp_hex_digit(slice(hex, 1, 2))?
+    let r_lo = _prism_cp_hex_digit(slice(hex, 2, 3))?
+    let g_hi = _prism_cp_hex_digit(slice(hex, 3, 4))?
+    let g_lo = _prism_cp_hex_digit(slice(hex, 4, 5))?
+    let b_hi = _prism_cp_hex_digit(slice(hex, 5, 6))?
+    let b_lo = _prism_cp_hex_digit(slice(hex, 6, 7))?
+    ok([r_hi * 16 + r_lo, g_hi * 16 + g_lo, b_hi * 16 + b_lo])
+
+// ── [R, G, B] -> "#rrggbb" (lowercase; clamped defensively, see header on why float never enters) ──
+fn _prism_cp_format_hex(r: int, g: int, b: int) -> string
+    let rc = _prism_cp_clamp_byte(r)
+    let gc = _prism_cp_clamp_byte(g)
+    let bc = _prism_cp_clamp_byte(b)
+    "#" + _prism_cp_hex_char(rc / 16) + _prism_cp_hex_char(rc % 16) + _prism_cp_hex_char(gc / 16) + _prism_cp_hex_char(gc % 16) + _prism_cp_hex_char(bc / 16) + _prism_cp_hex_char(bc % 16)
+
+// ── [R, G, B] (0-255) -> [H, S, L] (H: 0-359 degrees; S, L: 0-100 percent) -- see header ─────────
+fn _prism_cp_rgb_to_hsl(r: int, g: int, b: int) -> list
+    let maxc = max(r, max(g, b))
+    let minc = min(r, min(g, b))
+    let sum = maxc + minc
+    let diff = maxc - minc
+    let l_pct = (sum * 100) / 510
+    if diff == 0
+        return [0, 0, l_pct]
+    let mut s_pct = 0
+    if sum <= 255
+        s_pct = (diff * 100) / sum
+    else
+        s_pct = (diff * 100) / (510 - sum)
+    let mut h_raw = 0
+    if maxc == r
+        h_raw = ((g - b) * 60) / diff
+    else if maxc == g
+        h_raw = 120 + ((b - r) * 60) / diff
+    else
+        h_raw = 240 + ((r - g) * 60) / diff
+    let mut h = h_raw
+    if h < 0
+        h = h + 360
+    if h >= 360
+        h = h - 360
+    [h, s_pct, l_pct]
+
+// ── Swatch: a single color, hex above name, hex also on the root's own attr (see header) ─────────
+fn prism_cp_swatch(cp_hex: string, cp_name: string) -> Result<PrismNode>
+    if len(cp_hex) == 0
+        return err("prism_cp_swatch: cp_hex must not be empty")
+    if len(cp_name) == 0
+        return err("prism_cp_swatch: cp_name must not be empty")
+    if slice(cp_hex, 0, 1) != "#"
+        return err("prism_cp_swatch: cp_hex must start with '#', got '" + cp_hex + "'")
+    let hex_node = prism_content.prism_label(cp_hex)?
+    let name_node = prism_content.prism_label(cp_name)?
+    prism_node.prism_node_branch(prism_node.prism_kind_stack(), {"cp_hex": cp_hex}, [hex_node, name_node])
+
+// ── Palette: a named group of already-built swatches ─────────────────────────────────────────────
+// `swatches` is a bare `list` (not `list<PrismNode>` -- mirroring `prism_node.nova`'s own
+// self-referential-generic caution, and every prior `ui/` component's identical choice for the same
+// reason), so every element is guarded with the same `type_name(...) != "PrismNode"` check, naming
+// the offending index and actual type on rejection.
+fn prism_cp_palette(cp_title: string, swatches: list) -> Result<PrismNode>
+    if len(cp_title) == 0
+        return err("prism_cp_palette: cp_title must not be empty")
+    if len(swatches) == 0
+        return err("prism_cp_palette: swatches must not be empty")
+    for idx, s in swatches
+        if type_name(s) != "PrismNode"
+            return err("prism_cp_palette: swatches[" + str(idx) + "] is not a PrismNode (got " + type_name(s) + ")")
+    let title_node = prism_content.prism_label(cp_title)?
+    let flow_node = prism_arrange.prism_flow(swatches)?
+    prism_arrange.prism_stack([title_node, flow_node])
+
+// ── Picker: one selectable swatch per option, keyed by hex value (see header) ────────────────────
+fn _prism_cp_picker_option(hex: string, is_selected: bool) -> Result<PrismNode>
+    let lbl = prism_content.prism_label(hex)?
+    let mut attrs = {"cp_hex": hex}
+    if is_selected
+        attrs = dict_merge(attrs, {"cp_selected": "true"})
+    prism_node.prism_node_branch(prism_node.prism_kind_band(), attrs, [lbl])
+
+// Checked in the order a caller would want to read them: element type first (a wrong element kind
+// makes every later check meaningless -- same reasoning `prism_tk_tag_input`'s header gives for its
+// identical ordering), then emptiness, then hex format, then duplication -- so the FIRST bad option
+// in source order is always what gets named.
+fn prism_cp_picker(cp_label: string, cp_options: list, cp_selected: string?) -> Result<PrismNode>
+    if len(cp_label) == 0
+        return err("prism_cp_picker: cp_label must not be empty")
+    if len(cp_options) == 0
+        return err("prism_cp_picker: cp_options must not be empty")
+    let seen = {}
+    for idx, o in cp_options
+        if not is_string(o)
+            return err("prism_cp_picker: cp_options[" + str(idx) + "] is not a string (got " + type_name(o) + ")")
+        if len(o) == 0
+            return err("prism_cp_picker: cp_options[" + str(idx) + "] must not be empty")
+        if slice(o, 0, 1) != "#"
+            return err("prism_cp_picker: cp_options[" + str(idx) + "] must start with '#', got '" + o + "'")
+        if o in seen
+            return err("prism_cp_picker: duplicate hex '" + o + "' in cp_options")
+        seen[o] = true
+    let sel_hex = match cp_selected
+        None => ""
+        Some(s) => s
+    let label_node = prism_content.prism_label(cp_label)?
+    let mk = fn(hex) _prism_cp_picker_option(hex, hex == sel_hex)
+    let options = prism_ui_kit.prism_ui_collect(cp_options, mk)?
+    let flow_node = prism_arrange.prism_flow(options)?
+    prism_arrange.prism_stack([label_node, flow_node])
+
+// ── Gradient: cp_steps interpolated hex swatches from cp_from to cp_to ────────────────────────────
+// Endpoints are exact: i=0 recovers cp_from's own bytes unchanged (numerator is 0), i=cp_steps-1
+// recovers cp_to's exactly (numerator/denominator are identical, dividing to exactly 1). See header
+// for the multiply-before-divide rule and why this stays all-integer.
+fn prism_cp_gradient(cp_label: string, cp_from: string, cp_to: string, cp_steps: int) -> Result<PrismNode>
+    if len(cp_label) == 0
+        return err("prism_cp_gradient: cp_label must not be empty")
+    let from_rgb = _prism_cp_parse_hex(cp_from)?
+    let to_rgb = _prism_cp_parse_hex(cp_to)?
+    if cp_steps < 2
+        return err("prism_cp_gradient: cp_steps must be >= 2, got " + str(cp_steps))
+    let from_r = from_rgb[0]
+    let from_g = from_rgb[1]
+    let from_b = from_rgb[2]
+    let to_r = to_rgb[0]
+    let to_g = to_rgb[1]
+    let to_b = to_rgb[2]
+    let step_labels = []
+    for i in 0..cp_steps
+        let r = from_r + (to_r - from_r) * i / (cp_steps - 1)
+        let g = from_g + (to_g - from_g) * i / (cp_steps - 1)
+        let b = from_b + (to_b - from_b) * i / (cp_steps - 1)
+        let step_hex = _prism_cp_format_hex(r, g, b)
+        let step_label = prism_content.prism_label(step_hex)?
+        step_labels.push(step_label)
+    let label_node = prism_content.prism_label(cp_label)?
+    let band_node = prism_arrange.prism_band(step_labels)?
+    prism_arrange.prism_stack([label_node, band_node])
+
+// ── Display: one color, in a specified textual format ─────────────────────────────────────────────
+fn _prism_cp_hsl_text(r: int, g: int, b: int) -> string
+    let hsl = _prism_cp_rgb_to_hsl(r, g, b)
+    "hsl(" + str(hsl[0]) + ", " + str(hsl[1]) + "%, " + str(hsl[2]) + "%)"
+
+// Exhaustive, no wildcard arm -- adding a 4th format above without a case here is a compile error.
+fn _prism_cp_format_text(cp_format: PrismCpFormat, cp_hex: string, r: int, g: int, b: int) -> string
+    match cp_format
+        CpHex() => cp_hex
+        CpRgb() => "rgb(" + str(r) + ", " + str(g) + ", " + str(b) + ")"
+        CpHsl() => _prism_cp_hsl_text(r, g, b)
+
+fn prism_cp_display(cp_hex: string, cp_format: PrismCpFormat) -> Result<PrismNode>
+    let rgb = _prism_cp_parse_hex(cp_hex)?
+    let swatch_label = prism_content.prism_label(cp_hex)?
+    let format_text = _prism_cp_format_text(cp_format, cp_hex, rgb[0], rgb[1], rgb[2])
+    let format_label = prism_content.prism_label(format_text)?
+    prism_arrange.prism_band([swatch_label, format_label])
