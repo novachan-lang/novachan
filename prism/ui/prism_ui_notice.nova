@@ -1,0 +1,198 @@
+// prism_ui_notice -- notification badges, dot indicators, and notification feed (prism/ui/,
+// milestone MB.19): badge, dot, item, list, group. Every one is a COMPOSITION over the closed
+// 22-primitive vocabulary (widget/), built through prism_ui_kit.nova's helper wherever it fits --
+// no new PrismNodeKind, the same "this is a composition, not a new primitive" discipline every
+// prism_ui_*.nova file follows (PRISM_SPEC.md axiom A7). This is the Ant Design `Badge` +
+// `Notification` family: a numeric overlay on arbitrary content, a plain "something happened" dot,
+// a single notification card, and the list/group containers a notification center is built from.
+// No struct is introduced anywhere in this file, so the field-slot-collision prefixing question
+// (reference_field_slot_collision_scales_with_imports.md) never arises here -- every function takes
+// only primitives, `PrismNode`, and bare `list`.
+//
+// ── WHY BADGE/DOT ARE BUILT ON `layer`, NOT `stack`/`band` ───────────────────────────────────────
+// PRISM_SPEC.md Part III defines `layer(children)` as an OVERLAY -- later children paint on top of
+// earlier ones, in the same screen position (prism_arrange.nova's own header: "overlay, later
+// children on top"). A numeric badge or a dot indicator is EXACTLY that: the caller's `content`
+// (an icon, a nav item, an avatar) drawn first, the count label or dot glyph drawn on top of its
+// corner. `stack`/`band` were both rejected: they lay children out in SEQUENCE (vertical/inline),
+// which would place the badge NEXT TO the content rather than overlaid on it -- a different widget
+// (that shape already exists, unrelated, as `prism_ui_kit.prism_ui_icon_text`). `layer` is the one
+// primitive in the closed 22 whose documented semantics matches what a badge actually is.
+//
+// ── WHY `nt_count == 0` HIDES THE BADGE OUTRIGHT (RETURNS `content` UNCHANGED, NOT A "0" LAYER) ──
+// Every real notification badge (Ant Design's own `Badge`, GitHub's, Slack's) treats a zero count
+// as "nothing to show", not as "show a badge that says 0" -- a badge announcing zero unread items
+// is a false alarm dressed as reassurance; a screen reader announcing "notifications: 0" on every
+// single nav icon is noise, not information. Returning `content` unchanged (rather than a `layer`
+// wrapping a `label("0")`) also means the hidden case is INDISTINGUISHABLE at the tree level from
+// "this content never had a badge at all" -- exactly the invariant a caller composing badges
+// conditionally wants: `prism_nt_badge(count, none(), nav_icon)` is transparently a no-op at
+// `count == 0` with no dead `layer` node left behind for the renderer or an a11y walk to trip over.
+//
+// ── WHY `nt_max` IS `int?`, NOT A DEFAULT-VALUED INT (E.G. `nt_max: int = 99`) ────────────────────
+// Same reasoning `prism_arrange.prism_gap(size: int?)` and `prism_tk_tag_input(max_tags: int?)`
+// already established for their own optional bounds: "no cap" and "cap defaults to some magic
+// number" are different facts, and a defaulted int can never represent the former. `None` means
+// UNBOUNDED (any count renders as its exact decimal string, however large); `Some(m)` means capped
+// at `m` -- `nt_count > m` renders as `"{m}+"` (Ant Design's own overflow convention, e.g. "99+").
+// The sentinel-int pattern used internally to thread the validated max through
+// (`_prism_nt_badge_check_max` returns `0` for "no max present") mirrors `prism_ui_calendar.nova`'s
+// own `_prism_cal_check_selected`: `0` is a safe sentinel here because a validated `Some(m)` is
+// always `>= 1`, so a real cap can never collide with "absent".
+//
+// ── WHY `prism_nt_item` IMPORTS `prism_node` DIRECTLY (build-then-`dict_merge`-then-reconstruct) ──
+// `nt_read` is state a THEMING layer needs to read back off the finished item (which visual
+// treatment -- bold vs. dimmed -- to paint for read vs. unread), and there is nowhere in
+// `prism_arrange`'s surface to attach it: that file's own header states `stack`/`band`/`layer`/
+// `flow` carry NO attrs anywhere in PRISM_SPEC.md Part III. This file uses the exact
+// `dict_merge(node.attrs, extra)` + `prism_node.prism_node_new(node.kind, merged, node.children,
+// node.key)` reconstruction `prism_ui_calendar.nova` (`_prism_cal_with_attrs`), `prism_ui_grid.nova`,
+// `prism_ui_media.nova`, `prism_ui_nav.nova`, and `prism_ui_overlay.nova` all already use for the
+// identical shape: build the plain node through its normal constructor first, then decorate it.
+// Still a `Stack` (`PrismNodeKind` untouched, axiom A7 holds), just carrying one extra fact.
+//
+// ── WHY `prism_nt_list` VALIDATES `nt_empty_text` UNCONDITIONALLY, EVEN WHEN `items` IS NON-EMPTY ─
+// `nt_empty_text` is only ever RENDERED when `items` is empty, so the cheapest implementation would
+// check it lazily, inside that branch. Rejected: a caller who always passes the same (buggy, empty)
+// template string for `nt_empty_text` would never see the error until the list happened to drain to
+// zero items in production -- a deferred failure that surfaces at the worst possible time, exactly
+// the "no deferred decisions on critical path items" the quality standard forbids. Validating it
+// at the top, unconditionally, means a caller finds the mistake on the FIRST call, not the day the
+// feed goes empty. The KAT proves this directly: `prism_nt_list([one_item], "")` is rejected even
+// though the empty-text path never executes for a non-empty list.
+//
+// ── WHY `nt_time` (item) DEGRADES A BLANK `Some("")` TO "NO TIME", NOT A BLANK ROW ────────────────
+// Same tolerant-degrade rule `prism_fb_alert`'s `detail: string?` and `prism_st_stat`'s
+// `st_prefix`/`st_suffix: string?` already use (see their own headers): "absent" and "present but
+// blank" are different facts, but rendering the latter as a stray blank label helps no one and
+// looks like a bug. `_prism_nt_opt_part` is the one place this degradation happens, mirroring
+// `prism_st_stat`'s own `_prism_st_opt_part` helper exactly (0-or-1-element list, spliced with
+// `...`).
+//
+// PUBLIC API
+//   Components (all Result<PrismNode>; every one validates, none fails silently)
+//     prism_nt_badge(nt_count: int, nt_max: int?, content: PrismNode)
+//       -> layer[content, label(count_text)] when nt_count > 0; bare `content` when nt_count == 0
+//       count_text is str(nt_count), or "{nt_max}+" when nt_count > nt_max (nt_max present)
+//       rejects nt_count < 0, nt_max present and < 1
+//     prism_nt_dot(nt_visible: bool, content: PrismNode)
+//       -> layer[content, glyph(Warning)] when nt_visible; bare `content` when not
+//       never fails (no validation beyond the parameter types themselves)
+//     prism_nt_item(nt_title, nt_message: string, nt_time: string?, nt_read: bool)
+//       -> stack[band[label(title), label(time)?], label(message)], carrying an "nt_read" attr
+//       rejects an empty nt_title/nt_message; a present-but-empty nt_time degrades to absent
+//     prism_nt_list(items: list, nt_empty_text: string)
+//       -> prism_ui_kit.prism_ui_empty(nt_empty_text) when items is empty; stack(items) otherwise
+//       items: list<PrismNode> (bare list, runtime-checked). rejects an empty nt_empty_text
+//       (checked unconditionally -- see header) and a non-PrismNode element
+//     prism_nt_group(nt_title: string, items: list)
+//       -> stack[label(title), gap, stack(items)]
+//       items: list<PrismNode> (bare list, runtime-checked). rejects an empty nt_title, an empty
+//       items list, and a non-PrismNode element
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_ui_kit
+
+// Fixed breathing space between a group's title and its notification stack -- same "named rather
+// than a bare literal" discipline `prism_ui_stat.nova`'s `PRISM_ST_CARD_GAP` and
+// `prism_ui_rating.nova`'s `PRISM_RT_LIST_GAP` already use for the identical shape (a constant
+// visual gap between two stacked sections, not free space to distribute -- a fixed `prism_gap`, not
+// a flexible one).
+let PRISM_NT_GROUP_GAP = 8
+
+// ── Badge ─────────────────────────────────────────────────────────────────────────────────────
+// Validates `nt_max` (if present, must be >= 1) and returns it as a sentinel int: `0` means "no
+// max was given", any real validated max is always `>= 1` so it can never collide with that
+// sentinel. Factored out so `prism_nt_badge` reads as validate-then-compose, matching
+// `prism_ui_calendar.nova`'s `_prism_cal_check_selected` shape exactly.
+fn _prism_nt_badge_check_max(nt_max: int?) -> Result<int>
+    match nt_max
+        None => ok(0)
+        Some(m) =>
+            if m < 1
+                return err("prism_nt_badge: nt_max must be >= 1, got " + str(m))
+            ok(m)
+
+// `max_val`: `0` sentinel for "no max" (see `_prism_nt_badge_check_max`), otherwise the validated
+// cap. Only called once `nt_count > 0` is already established by the caller.
+fn _prism_nt_badge_text(nt_count: int, max_val: int) -> string
+    if max_val > 0 and nt_count > max_val
+        str(max_val) + "+"
+    else
+        str(nt_count)
+
+fn prism_nt_badge(nt_count: int, nt_max: int?, content: PrismNode) -> Result<PrismNode>
+    if nt_count < 0
+        return err("prism_nt_badge: nt_count must be >= 0, got " + str(nt_count))
+    let max_val = _prism_nt_badge_check_max(nt_max)?
+    if nt_count == 0
+        return ok(content)
+    let count_text = _prism_nt_badge_text(nt_count, max_val)
+    let label_node = prism_content.prism_label(count_text)?
+    prism_arrange.prism_layer([content, label_node])
+
+// ── Dot indicator ─────────────────────────────────────────────────────────────────────────────
+// See header for why `layer`. `Warning` is the closed-12-icon-set glyph standing in for "there is
+// something you have not looked at" -- the same icon `prism_fb_severity_icon` maps `FbWarning` to
+// (prism_ui_feedback.nova), reused here for the identical "attention" meaning rather than inventing
+// a second convention for the same idea.
+fn prism_nt_dot(nt_visible: bool, content: PrismNode) -> Result<PrismNode>
+    if not nt_visible
+        return ok(content)
+    let dot_glyph = prism_content.prism_glyph(prism_content.prism_icon_warning())?
+    prism_arrange.prism_layer([content, dot_glyph])
+
+// ── Notification item ─────────────────────────────────────────────────────────────────────────
+// See header for the tolerant `nt_time` degrade.
+fn _prism_nt_opt_part(text: string?) -> Result<list>
+    match text
+        None => ok([])
+        Some(t) =>
+            if len(t) == 0
+                return ok([])
+            let node = prism_content.prism_label(t)?
+            ok([node])
+
+fn prism_nt_item(nt_title: string, nt_message: string, nt_time: string?, nt_read: bool) -> Result<PrismNode>
+    if len(nt_title) == 0
+        return err("prism_nt_item: nt_title must not be empty")
+    if len(nt_message) == 0
+        return err("prism_nt_item: nt_message must not be empty")
+    let title_node = prism_content.prism_label(nt_title)?
+    let time_parts = _prism_nt_opt_part(nt_time)?
+    let head = prism_arrange.prism_band([title_node, ...time_parts])?
+    let msg_node = prism_content.prism_label(nt_message)?
+    let base = prism_arrange.prism_stack([head, msg_node])?
+    let merged = dict_merge(base.attrs, {"nt_read": nt_read})
+    prism_node.prism_node_new(base.kind, merged, base.children, base.key)
+
+// ── Notification list / feed ──────────────────────────────────────────────────────────────────
+// `items` is a bare `list` (not `list<PrismNode>` -- mirroring `prism_node.nova`'s own
+// self-referential-generic caution, and `prism_tk_tag_group`'s/`prism_st_card`'s identical choice
+// for the identical reason), so every element is guarded with the same `type_name(...) !=
+// "PrismNode"` check, naming the offending index and actual type on rejection.
+fn prism_nt_list(items: list, nt_empty_text: string) -> Result<PrismNode>
+    if len(nt_empty_text) == 0
+        return err("prism_nt_list: nt_empty_text must not be empty -- needed for the empty state, and validated unconditionally (see header) so a caller finds the mistake before the feed ever goes empty")
+    if len(items) == 0
+        return prism_ui_kit.prism_ui_empty(nt_empty_text)
+    for idx, it in items
+        if type_name(it) != "PrismNode"
+            return err("prism_nt_list: item " + str(idx) + " is not a PrismNode (got " + type_name(it) + ")")
+    prism_arrange.prism_stack(items)
+
+// ── Notification group (e.g. "Today", "Yesterday") ───────────────────────────────────────────
+fn prism_nt_group(nt_title: string, items: list) -> Result<PrismNode>
+    if len(nt_title) == 0
+        return err("prism_nt_group: nt_title must not be empty")
+    if len(items) == 0
+        return err("prism_nt_group: items must not be empty")
+    for idx, it in items
+        if type_name(it) != "PrismNode"
+            return err("prism_nt_group: item " + str(idx) + " is not a PrismNode (got " + type_name(it) + ")")
+    let title_node = prism_content.prism_label(nt_title)?
+    let gap_node = prism_arrange.prism_gap(some(PRISM_NT_GROUP_GAP))?
+    let items_node = prism_arrange.prism_stack(items)?
+    prism_arrange.prism_stack([title_node, gap_node, items_node])
