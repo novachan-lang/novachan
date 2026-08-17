@@ -1,0 +1,160 @@
+// prism_ui_avatar -- user identity components: a named PrismAvatar value plus circle/card/group/
+// presence renderers built over it.
+//
+// ── NOT A DUPLICATE OF prism_ui_media.prism_ui_avatar (checked before writing this file) ────────
+// prism_ui_media.nova already has a `prism_ui_avatar(name, image_source, size)` that renders ONE
+// circle (image, or initials computed via `upper()`) with a size attr -- and nothing else. This
+// file is a different, richer family: a reusable `PrismAvatar` VALUE (name + image + precomputed
+// initials, so a caller builds it once and hands it to any of circle/card/group/presence rather
+// than re-deriving initials at each call site) plus three renderers `prism_ui_media` has no
+// equivalent for at all -- a name+subtitle card, an overflow-aware group of many avatars, and a
+// presence-status overlay. Distinct struct name (`PrismAvatar`, not reusing anything from
+// `prism_ui_media`) and distinct `prism_av_*` prefix keep both callable side by side with zero
+// ambiguity, same precedent `prism_ui_stat.nova`'s header already recorded for its own overlap
+// with `prism_ui_data.prism_ui_stat`.
+//
+// ── WHY INITIALS ARE UPPERCASED VIA MANUAL ord()/chr(), NOT THE upper() BUILTIN ──────────────────
+// `prism_ui_media._prism_md_initials` already uses `upper(w[0])`. This file deliberately does the
+// ASCII shift itself (`chr(ord(c) - 32)` for `'a'..'z'`) instead of calling the same builtin, so
+// the two modules do not depend on identical machinery for what is otherwise the same idea --
+// keeping this file's only dependency on NOVA's builtin surface at `ord`/`chr`/`split`/`trim`,
+// each already proven elsewhere in this tree (prism_render_ansi.nova's `ord(s[i])`, prism_ansi.nova's
+// `chr(27)`, prism_ui_media.nova's own `split(trim(name), " ")`).
+//
+// ── WHY PrismAvatar IS A VALUE, NOT A BARE (name, image) PAIR RE-DERIVED EVERYWHERE ──────────────
+// `av_initials` is computed ONCE at construction (`prism_av_avatar`) and stored, not recomputed on
+// every `prism_av_circle`/`prism_av_card`/`prism_av_group`/`prism_av_presence` call -- the same
+// "compute once, read many" shape `prism_ui_token.nova`'s `_prism_tk_input_at_capacity` documents
+// for its own repeated-question value. Struct positional constructors are FILE-LOCAL cross-module
+// (prism_ui_kv.nova's `prism_kve_new` header note), so `prism_av_avatar` is the validating wrapper
+// every importing file must go through -- there is no way to build a `PrismAvatar` that skips
+// validation.
+//
+// ── WHY prism_av_group's OVERFLOW LABEL IS "+N", NOT "N more" OR A TRUNCATED LIST ─────────────────
+// "+N" is the shape every avatar-stack UI in the ecosystem this campaign targets (Ant Design's own
+// `Avatar.Group` `maxCount`) already converged on -- compact, unambiguous, and (unlike silently
+// dropping the extra avatars) it tells the viewer HOW MANY were omitted rather than hiding the
+// fact that any were.
+//
+// ── WHY prism_av_presence's status IS A CLOSED 4-STRING SET, VALIDATED, NOT A FREE STRING ─────────
+// Same reasoning `prism_ui_token.nova`'s header gives for `PrismTagVariant` being a closed enum
+// rather than a free-form string: an unvalidated status ("Online", a typo "onlien") would render
+// with no visual treatment and no compile-time signal. This is checked at the STRING level (not
+// promoted to a `PrismAvPresence` enum) because presence status is genuinely open to future values
+// a theming layer might add (e.g. "in a meeting") without a compiler-level closed set forcing a
+// recompile of every caller -- the same tradeoff `prism_ui_kv.nova`'s `kv_note: string?` note
+// documents for staying a plain type rather than an enum when the domain is expected to grow.
+//
+// PUBLIC API
+//   PrismAvatar (value: name + image + precomputed initials)
+//     prism_av_avatar(name, image) -> Result<PrismAvatar>
+//       derives av_initials from the first letters of the first 2 non-blank words of `name`
+//       (uppercased manually, see header); rejects an empty (or all-whitespace) name.
+//     prism_av_avatar_name(a) / prism_av_avatar_image(a) / prism_av_avatar_initials(a) -> string
+//   Renderers (all Result<PrismNode>; every one validates, none fails silently)
+//     prism_av_circle(avatar) -> art(image) if image is non-empty, else label(initials)
+//     prism_av_card(avatar, subtitle) -> band[circle, stack[name_label, subtitle_label?]]
+//       subtitle_label is OMITTED (not a blank label) when subtitle is the empty string
+//     prism_av_group(avatars: list, max_shown: int) -> band of circles, "+N" overflow label
+//       appended when len(avatars) > max_shown; rejects an empty list, a non-PrismAvatar element
+//       (named by index and actual type), and a max_shown <= 0
+//     prism_av_presence(avatar, status) -> layer[circle, status_label]
+//       status must be one of "online"/"offline"/"away"/"busy"; rejects anything else
+
+import prism_arrange
+import prism_content
+
+type PrismAvatar
+    av_name: string
+    av_image: string
+    av_initials: string
+
+// ── Initials: manual ASCII uppercase (see header for why not the upper() builtin) ───────────────
+fn _prism_av_upper_char(c: string) -> string
+    let code = ord(c)
+    if code >= 97 and code <= 122
+        chr(code - 32)
+    else
+        c
+
+// First letter of each of the first two non-blank words, uppercased. A single-word name yields
+// exactly one uppercased character -- the loop's `count < 2` bound simply has nothing left to
+// consume after the first word, so it degrades naturally without a separate single-word branch.
+fn _prism_av_initials(name: string) -> string
+    let words = split(trim(name), " ")
+    let mut out = ""
+    let mut count = 0
+    for w in words
+        if len(w) > 0 and count < 2
+            out = out + _prism_av_upper_char(w[0])
+            count += 1
+    out
+
+// ── Constructor (validating wrapper -- struct ctors are file-local cross-module, see header) ────
+fn prism_av_avatar(name: string, image: string) -> Result<PrismAvatar>
+    if len(trim(name)) == 0
+        return err("prism_av_avatar: name must not be empty (or all whitespace)")
+    let initials = _prism_av_initials(name)
+    ok(PrismAvatar(name, image, initials))
+
+fn prism_av_avatar_name(a: PrismAvatar) -> string
+    a.av_name
+
+fn prism_av_avatar_image(a: PrismAvatar) -> string
+    a.av_image
+
+fn prism_av_avatar_initials(a: PrismAvatar) -> string
+    a.av_initials
+
+// ── Circle: image if present, else the initials label ────────────────────────────────────────────
+fn prism_av_circle(avatar: PrismAvatar) -> Result<PrismNode>
+    if len(avatar.av_image) > 0
+        prism_content.prism_art(avatar.av_image)
+    else
+        prism_content.prism_label(avatar.av_initials)
+
+// ── Card: circle beside a name/subtitle stack (subtitle omitted when blank) ─────────────────────
+fn prism_av_card(avatar: PrismAvatar, subtitle: string) -> Result<PrismNode>
+    let circle = prism_av_circle(avatar)?
+    let name_label = prism_content.prism_label(avatar.av_name)?
+    let info_children = [name_label]
+    if len(subtitle) > 0
+        let subtitle_label = prism_content.prism_label(subtitle)?
+        info_children.push(subtitle_label)
+    let info_stack = prism_arrange.prism_stack(info_children)?
+    prism_arrange.prism_band([circle, info_stack])
+
+// ── Group: circles for up to max_shown avatars, "+N" overflow label beyond that ──────────────────
+// `avatars` is a bare `list` (not `list<PrismAvatar>` -- mirroring prism_node.nova's own
+// self-referential-generic caution, and prism_tk_tag_group's/prism_st_card's identical choice for
+// the identical reason), so every element is guarded with the same `type_name(...) != "PrismAvatar"`
+// check, naming the offending index and actual type on rejection.
+fn prism_av_group(avatars: list, max_shown: int) -> Result<PrismNode>
+    if len(avatars) == 0
+        return err("prism_av_group: avatars must not be empty")
+    if max_shown <= 0
+        return err("prism_av_group: max_shown must be > 0, got " + str(max_shown))
+    for idx, a in avatars
+        if type_name(a) != "PrismAvatar"
+            return err("prism_av_group: element " + str(idx) + " is not a PrismAvatar (got " + type_name(a) + ")")
+    let total = len(avatars)
+    let circles = []
+    for idx, a in avatars
+        if idx < max_shown
+            let c = prism_av_circle(a)?
+            circles.push(c)
+    if total > max_shown
+        let overflow_label = prism_content.prism_label("+" + str(total - max_shown))?
+        circles.push(overflow_label)
+    prism_arrange.prism_band(circles)
+
+// ── Presence: circle layered with a status label (closed 4-value status set, see header) ────────
+fn _prism_av_valid_status(status: string) -> bool
+    status == "online" or status == "offline" or status == "away" or status == "busy"
+
+fn prism_av_presence(avatar: PrismAvatar, status: string) -> Result<PrismNode>
+    if not _prism_av_valid_status(status)
+        return err("prism_av_presence: status must be one of online/offline/away/busy (got '" + status + "')")
+    let circle = prism_av_circle(avatar)?
+    let status_label = prism_content.prism_label(status)?
+    prism_arrange.prism_layer([circle, status_label])
