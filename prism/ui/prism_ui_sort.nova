@@ -1,0 +1,263 @@
+// prism_ui_sort -- sortable / reorderable list components (prism/ui/, milestone MB.21, following
+// MB.20's notification/badge family in file-header numbering): a drag-handle reorder list, a pure
+// list-reorder helper, a numbered ranking list, and a checkable list. Every one is a COMPOSITION
+// over the closed 22-primitive vocabulary (widget/), built through prism_content/prism_arrange
+// directly and prism_ui_kit.nova where it fits -- no new PrismNodeKind (PRISM_SPEC.md axiom A7),
+// the same discipline every prism_ui_*.nova file in this codebase follows. This is the Ant Design
+// `Transfer`-adjacent-but-distinct "draggable list" shape (`react-sortable-hoc`/`dnd-kit`'s
+// `<SortableList>`, Ant's own `Table` `rowDrag`): a vertical list of rows a user can reorder,
+// number, or check off.
+//
+// ── GREPPED BEFORE WRITING A LINE (CLAUDE.md's "does this already exist" discipline) ────────────
+// Searched the whole `prism/` tree for "sortable", "reorder", "drag_handle", "arrayMove" before
+// starting. Two genuine near-neighbors, neither a duplicate:
+//   - `prism_ui_grid.prism_grid_reorder` (prism_ui_grid.nova) reorders GRID COLUMNS by key, with
+//     pin-group range constraints a plain list has no equivalent of. Its private helper
+//     `_prism_grid_move_column` implements the exact "remove at from_index, reinsert at to_index
+//     in the FINAL list" algorithm this file's `prism_so_move` needs for plain-list items -- see
+//     the note below on why that algorithm (not a fresh one) is reused here, file-locally, rather
+//     than imported (ui/*.nova files never cross-import each other in this codebase, verified: every
+//     `import prism_ui_*` in prism/ui/*.nova names only `prism_ui_kit`, never a sibling -- the exact
+//     precedent `prism_ui_rating.nova`'s header already established for its own re-derivation of
+//     `prism_in_rating`'s check/minus loop).
+//   - `prism_ui_transfer.prism_xf_move_right`/`_move_left` (prism_ui_transfer.nova) are PURE,
+//     caller-owns-state list-mutation helpers -- the identical "value in, value out, caller
+//     re-renders" contract `prism_so_move` follows below -- but they move an item between two SETS
+//     (left/right partition by membership), not to a POSITION within one ordered list. Different
+//     problem, same discipline.
+//
+// ── WHY `prism_so_sortable` WRAPS `prism_each`'S RESULT IN A `stack`, UNLIKE prism_ui_data.
+//    prism_ui_list / prism_ui_media.prism_ui_accordion ──────────────────────────────────────────
+// PRISM_SPEC.md §17A.3: "`each` deliberately emits no wrapper element -- a wrapper would break the
+// PARENT's layout contract... the key rides on the row rather than on a container." Read literally,
+// this means `each` carries NO axis of its own (unlike `stack`/`band`, which are block/inline by
+// definition) -- it is a transparent, keyed repetition that inherits whatever axis its PARENT
+// supplies. `prism_ui_list`/`prism_ui_accordion` return the bare `each` node and leave supplying
+// that parent axis to whatever composes them further up the tree. A sortable list is, by definition,
+// a VISIBLE vertical list on its own -- there is no further composition step coming that would
+// supply the missing axis -- so this function supplies it itself: `prism_arrange.prism_stack([the
+// each node])`, one extra layer, so `prism_so_sortable`'s return value is already a fully
+// self-contained vertical arrangement a caller can drop directly into a page.
+//
+// ── WHY THE DRAG HANDLE IS `Menu()`, NOT A DEDICATED "grip"/"drag" ICON ──────────────────────────
+// The task itself specifies "glyph(Menu icon, drag handle)" -- not a guess. `prism_content.PrismIcon`
+// is a closed 12-icon v1 set (Check/Close/Search/Menu/Plus/Minus/4 chevrons/Warning/Info) with no
+// dedicated grip/drag glyph, the identical "closed set has no icon for this exact concept" gap
+// `prism_ui_input.prism_in_rating`'s own header already worked around (no star icon either, reused
+// Check/Minus). `Menu()` (three stacked horizontal lines, the hamburger glyph) is the closest visual
+// match to a drag-grip affordance, and it is the same glyph Ant Design's own drag-handle icon
+// (`MenuOutlined`) uses in its sortable `<Table>` rows -- not a NOVA-specific improvisation.
+//
+// ── WHY `prism_so_move` RETURNS `Result<list>`, NOT `Result<PrismNode>`, AND IS PURE ─────────────
+// Prism has no client-side mutable widget state yet (the reactivity engine is a later milestone) --
+// the same boundary `prism_xf_move_right`/`_move_left` (prism_ui_transfer.nova) and
+// `prism_grid_reorder` (prism_ui_grid.nova) already live inside. The caller owns the current item
+// order, calls this with the drag gesture's `from`/`to`, and re-renders with the returned list fed
+// back into `prism_so_sortable`. The algorithm itself -- remove the element at `so_from`, then
+// re-insert it while walking the shortened list so it lands at `so_to` measured in the FINAL
+// (post-move) list, appending if `so_to` runs past the shortened list's end -- is `_prism_grid_
+// move_column`'s exact algorithm, re-derived here (not imported, see the grep note above) for a bare
+// `list` of items instead of a `PrismGridColumn` list. `so_to` is therefore a FINAL-list index, the
+// identical convention `prism_grid_reorder`'s own doc comment states ("both indices into the FINAL
+// n-length list") -- not an original-list splice-before-removal index, which is a different (and
+// easily confused) convention some other "move" APIs use.
+//
+// ── WHY `so_from == so_to` IS REJECTED, UNLIKE `prism_grid_reorder` (WHICH ALLOWS IT AS A NO-OP) ──
+// The task's own rejection list is explicit here where `prism_grid_reorder`'s is not. A genuine
+// drag-and-drop caller computing `to` from a live pointer position can legitimately drop an item back
+// where it started (a real, harmless no-op) -- `prism_grid_reorder` treats that case as valid input
+// and returns the (unchanged-order) grid. `prism_so_move` instead treats it as a signal the caller's
+// OWN move-target computation produced a degenerate call (why invoke "move" at all with nothing to
+// move?) and surfaces it as a typed error rather than silently succeeding with a byte-identical list
+// -- letting a caller that wants the tolerant behavior check `so_from != so_to` itself before calling,
+// cheaper than every caller re-deriving "was anything actually moved?" from a returned list compare.
+//
+// ── WHY `prism_so_checklist` REJECTS A CHECKED ITEM NOT PRESENT IN `so_items` ────────────────────
+// Same "a caller-visible identifier must denote exactly one REAL thing" rule `prism_ui_transfer`'s
+// duplicate-`xf_key` rejection and `prism_interact.prism_pick`'s duplicate-option rejection already
+// establish in this codebase, applied here as CONTAINMENT rather than uniqueness: a `so_checked`
+// entry naming an item that does not exist in `so_items` is almost always a stale key (an item that
+// was removed/renamed after the checked-set was computed) or a caller typo, and silently ignoring it
+// would make "why isn't X showing as checked" an invisible bug -- exactly the class of silent failure
+// PRISM_SPEC.md §16 and this codebase's own error-message discipline exist to convert into a loud,
+// named rejection instead.
+//
+// ── FIELD-SLOT COLLISION: N/A -- THIS FILE DECLARES NO STRUCTS ───────────────────────────────────
+// Every value this file produces is a `PrismNode` built through `prism_content`/`prism_arrange`/
+// `prism_structure`'s own already-safe constructors, or a plain `list` (for `prism_so_move`). There
+// is no new `type`/`enum` here, so the "prefix every field" discipline
+// (reference_field_slot_collision_scales_with_imports.md) has nothing to apply to.
+//
+// ── `so_key_fn`/`so_items`/`so_checked` ARE TYPED BY CONTRACT, NOT BY THE COMPILER ────────────────
+// `so_key_fn` is documented as `fn(string) -> string` (matching the same informal `row_key_fn:
+// fn(row) -> string` doc-comment convention `prism_ui_table.nova`'s header already uses -- NOVA has
+// no function-type annotation syntax, verified absent in `prism_content.nova`'s own header note), so
+// the actual parameter is untyped, exactly like `prism_structure.prism_each`'s own `key_fn`. This
+// file hands it straight to `prism_each` unmodified and propagates that function's own duplicate-key
+// and non-string-key rejections rather than re-deriving them (the same "propagate, don't reimplement"
+// discipline `prism_ui_data.prism_ui_list`/`prism_ui_media.prism_ui_accordion` already apply to
+// `prism_each`). `so_items`/`so_checked` stay bare `list` (not `list<string>`), mirroring every other
+// bare-list parameter in this codebase's ui/ layer -- every element is checked with `is_string(...)`
+// before use, naming the offending index and actual type on rejection.
+//
+// PUBLIC API
+//   prism_so_sortable(so_items: list, so_key_fn) -> Result<PrismNode>
+//     so_items: bare list of strings (item labels). so_key_fn(item: string) -> string, the identity
+//     key `prism_each` requires. -> stack[each[band[glyph(Menu), label(item)], ...]]. Rejects: an
+//     empty so_items, a non-string element (named by index and type), and (via prism_each,
+//     propagated unchanged) a duplicate key or a so_key_fn that returns a non-string.
+//   prism_so_move(so_items: list, so_from: int, so_to: int) -> Result<list>
+//     Pure: returns a NEW list with the item at so_from moved to end up at so_to (a FINAL-list
+//     index -- see header). Never mutates so_items. Rejects: so_from or so_to out of
+//     [0, len(so_items)), and so_from == so_to.
+//   prism_so_ranked(so_items: list) -> Result<PrismNode>
+//     so_items: bare list of strings. -> stack[band[label("#1"), label(item)], band[label("#2"),
+//     label(item)], ...] (1-based rank). Rejects an empty so_items and a non-string element.
+//   prism_so_checklist(so_items: list, so_checked: list) -> Result<PrismNode>
+//     so_items/so_checked: bare lists of strings; so_checked names which so_items entries are
+//     checked. -> stack[band[glyph(Check if checked else Minus), label(item)], ...] in so_items
+//     order. Rejects an empty so_items, a non-string element in EITHER list (named by index and
+//     type), and a so_checked entry not present in so_items (named by value).
+
+import prism_arrange
+import prism_content
+import prism_structure
+import prism_ui_kit
+
+// ── Sortable: reorderable list with a drag-handle glyph ──────────────────────────────────────────
+
+// One row: `band[glyph(Menu), label(item)]`. `item` arrives already validated as a string by
+// `prism_so_sortable`'s own upfront loop below -- this is called through `prism_each`'s `render_fn`,
+// which passes the raw list element through untouched, so validating it HERE (rather than trusting
+// the caller) would be redundant, not defensive: it can only ever be reached after that loop passed.
+fn _prism_so_row(item) -> Result<PrismNode>
+    let icon = prism_content.prism_glyph(prism_content.prism_icon_menu())?
+    let label_node = prism_content.prism_label(item)?
+    prism_arrange.prism_band([icon, label_node])
+
+// See header for why this wraps `prism_each`'s result in a `stack`, and why `so_key_fn` stays
+// untyped. Every `so_items` element is checked BEFORE `prism_each` ever calls `so_key_fn`/renders a
+// row: `so_key_fn` is a caller-supplied closure that may assume a string argument, so handing it a
+// non-string element first would risk a wild-read inside caller code this file cannot guard --
+// the same "validate the untyped element before an untyped callback ever sees it" discipline
+// `prism_ui_media.prism_ui_accordion` already applies to its own `sections` list.
+fn prism_so_sortable(so_items: list, so_key_fn) -> Result<PrismNode>
+    if len(so_items) == 0
+        return err("prism_so_sortable: so_items must not be empty")
+    let mut idx = 0
+    for it in so_items
+        if not is_string(it)
+            return err("prism_so_sortable: so_items[" + str(idx) + "] must be a string, got " + type_name(it))
+        idx += 1
+    let render_fn = fn(it) _prism_so_row(it)
+    let rows = prism_structure.prism_each(so_items, so_key_fn, render_fn)?
+    prism_arrange.prism_stack([rows])
+
+// ── Move: pure list-reorder helper (no PrismNode involved) ───────────────────────────────────────
+
+// Re-derived from `prism_ui_grid._prism_grid_move_column`'s exact algorithm (see header: not
+// imported -- ui/*.nova files never cross-import each other in this codebase). O(n): one pass to
+// remove the moving element, one pass over the shortened list to reinsert it at `so_to`, appending
+// at the end if `so_to` runs past the shortened list (which can only happen when `so_to` was the
+// ORIGINAL list's last index -- always a valid append position after one element was removed).
+fn _prism_so_move_list(items: list, from_index: int, to_index: int) -> list
+    let moving = items[from_index]
+    let without = []
+    let mut i = 0
+    for it in items
+        if i != from_index
+            without.push(it)
+        i += 1
+    let result = []
+    let mut inserted = false
+    let mut j = 0
+    for it in without
+        if j == to_index
+            result.push(moving)
+            inserted = true
+        result.push(it)
+        j += 1
+    if not inserted
+        result.push(moving)
+    result
+
+// See header for why so_from == so_to is rejected (unlike prism_grid_reorder's tolerant no-op) and
+// why so_to is a FINAL-list index. Checked in the order a caller would want to read the failure:
+// so_from's own bounds first (a bad "to" is meaningless if there's nothing valid to move), then
+// so_to's bounds, then the identity case.
+fn prism_so_move(so_items: list, so_from: int, so_to: int) -> Result<list>
+    let n = len(so_items)
+    if so_from < 0 or so_from >= n
+        return err("prism_so_move: so_from " + str(so_from) + " is out of bounds for " + str(n) + " item(s)")
+    if so_to < 0 or so_to >= n
+        return err("prism_so_move: so_to " + str(so_to) + " is out of bounds for " + str(n) + " item(s)")
+    if so_from == so_to
+        return err("prism_so_move: so_from and so_to are both " + str(so_from) + " -- nothing to move")
+    ok(_prism_so_move_list(so_items, so_from, so_to))
+
+// ── Ranked: a numbered ranking list (no drag affordance, no identity key needed) ──────────────────
+
+// One row: `band[label("#N"), label(item)]`, N is the 1-based rank.
+fn _prism_so_rank_row(rank: int, item) -> Result<PrismNode>
+    let rank_node = prism_content.prism_label("#" + str(rank))?
+    let item_node = prism_content.prism_label(item)?
+    prism_arrange.prism_band([rank_node, item_node])
+
+fn prism_so_ranked(so_items: list) -> Result<PrismNode>
+    if len(so_items) == 0
+        return err("prism_so_ranked: so_items must not be empty")
+    let mut idx = 0
+    for it in so_items
+        if not is_string(it)
+            return err("prism_so_ranked: so_items[" + str(idx) + "] must be a string, got " + type_name(it))
+        idx += 1
+    let rows = []
+    let mut rank = 1
+    for it in so_items
+        let row = _prism_so_rank_row(rank, it)?
+        rows.push(row)
+        rank += 1
+    prism_arrange.prism_stack(rows)
+
+// ── Checklist: a checkable list keyed by membership, not identity ────────────────────────────────
+
+// One row: `band[glyph(Check if checked else Minus), label(item)]`. `checked_set` is a dict built
+// once by `prism_so_checklist` below (an O(1)-membership set, not an O(n) re-scan of so_checked per
+// row -- see reference_set_builtins_not_hash_table.md's identical reasoning for why a dict, not a
+// linear `contains`, is the right tool here).
+fn _prism_so_check_row(item, checked_set: dict) -> Result<PrismNode>
+    let label_node = prism_content.prism_label(item)?
+    if item in checked_set
+        let icon = prism_content.prism_glyph(prism_content.prism_icon_check())?
+        prism_arrange.prism_band([icon, label_node])
+    else
+        let icon = prism_content.prism_glyph(prism_content.prism_icon_minus())?
+        prism_arrange.prism_band([icon, label_node])
+
+// Validates so_items (emptiness + every element a string) before building the membership set, then
+// so_checked (every element a string, AND present in so_items -- see header for why containment,
+// not just type, is enforced) before rendering a single row. Uses `prism_ui_kit.prism_ui_collect`
+// for the row-building loop (the exact map-with-error-propagation helper that file's own header
+// exists to save every later component from re-deriving).
+fn prism_so_checklist(so_items: list, so_checked: list) -> Result<PrismNode>
+    if len(so_items) == 0
+        return err("prism_so_checklist: so_items must not be empty")
+    let items_set = {}
+    let mut idx = 0
+    for it in so_items
+        if not is_string(it)
+            return err("prism_so_checklist: so_items[" + str(idx) + "] must be a string, got " + type_name(it))
+        items_set[it] = true
+        idx += 1
+    let checked_set = {}
+    let mut cidx = 0
+    for c in so_checked
+        if not is_string(c)
+            return err("prism_so_checklist: so_checked[" + str(cidx) + "] must be a string, got " + type_name(c))
+        if not (c in items_set)
+            return err("prism_so_checklist: so_checked[" + str(cidx) + "] ('" + c + "') is not in so_items")
+        checked_set[c] = true
+        cidx += 1
+    let mk = fn(it) _prism_so_check_row(it, checked_set)
+    let rows = prism_ui_kit.prism_ui_collect(so_items, mk)?
+    prism_arrange.prism_stack(rows)
