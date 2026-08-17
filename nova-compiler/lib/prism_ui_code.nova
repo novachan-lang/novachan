@@ -1,0 +1,222 @@
+// prism_ui_code -- code/syntax display components (prism/ui/, milestone MB.24, the next `ui/`
+// composition milestone after MB.23's upload/attachment family -- verified by `git log`, not
+// guessed): a fenced code block, an inline code snippet, a before/after diff, and a titled,
+// optionally line-numbered snippet card. Every one is a COMPOSITION over the closed 22-primitive
+// vocabulary (widget/), built through prism_content/prism_arrange directly and prism_node.nova's
+// own prism_node_branch where a custom root attr is needed -- no new PrismNodeKind (PRISM_SPEC.md
+// axiom A7), the same discipline every prism_ui_*.nova file in this codebase follows. This is the
+// GitHub/VS Code "code fence" family: a `<pre><code>` block, an inline `` `snippet` ``, a unified
+// diff view, and a titled file-preview card with a gutter of line numbers.
+//
+// ── GREPPED FIRST: NOTHING NAMED "code block"/"snippet"/"diff" EXISTS IN prism/ui/ ─────────────
+// `grep -rniE "code.?block|snippet|diff\(|inline.?code"` across prism/ before writing a line here
+// (CLAUDE.md's "does this already exist" discipline) turns up exactly one near-miss:
+// `prism_obs.prism_obs_diff(before: PrismNode, after: PrismNode) -> Result<list>`
+// (prism/obs/prism_obs.nova) -- and it is NOT the same thing. `prism_obs_diff` compares two
+// already-built PrismNode TREES structurally and returns a `list` of typed change records for an
+// observability/devtools consumer; it produces no `PrismNode` and displays nothing. `prism_cd_diff`
+// below takes two plain TEXT blobs and renders them side by side as a `PrismNode` a human reads.
+// Same word, disjoint jobs, no overlap to reuse.
+//
+// ── AXIOM A3 CONSTRAINT: THIS FILE CANNOT SYNTAX-HIGHLIGHT ──────────────────────────────────────
+// PRISM_SPEC.md axiom A3 is "renders as glyphs, never markup -- there is no string->UI evaluation
+// path anywhere in the system" (prism_content.prism_label's own comment restates it). Real syntax
+// highlighting needs per-token color/weight, which is a `look`-layer paint property applied to
+// individual RUNS of a label's text, not a thing `prism_label`'s single `{"text": ...}` leaf can
+// carry today. `cd_lang` is therefore accepted and stored (see below) as metadata for a FUTURE
+// look-layer highlighter to key off of, but this module -- correctly, given what primitives exist
+// -- renders every code body as PLAIN monospaced text, identical in kind to any other label.
+//
+// ── WHY `cd_lang` IS STORED ON THE ROOT EVEN THOUGH IT MAY NOT BE VISIBLY LABELLED ──────────────
+// `prism_cd_block`'s root carries a `"cd_lang"` attr independent of whether a visible lang label
+// was rendered (a blank/absent `cd_lang` still stores `""`, never omits the key) -- the same GOAL
+// `prism_ui_notice.prism_nt_item` (`"nt_read"`), `prism_ui_media._prism_md_with_attrs`
+// (`"avatar_size"`/`"alt"`), and `prism_ui_calendar._prism_cal_with_attrs` already serve: attach
+// caller metadata a renderer or a later look-layer highlighter can read back
+// (`prism_node_attr_str(node, "cd_lang", "")`) without re-parsing rendered label text. Those three
+// build the plain node first and reconstruct it with `dict_merge` + `prism_node_new` afterward;
+// this function instead bakes `cd_lang` into the `attrs` dict from the start via
+// `prism_node.prism_node_branch` directly (the task's own specified mechanism), which is simpler
+// here because there is no pre-existing "plain" node to reconstruct from -- `cd_lang` changes the
+// child list itself (whether the lang label is present at all), not just an attr on an
+// otherwise-identical tree. Because `_prism_cd_opt_part` (below) already degrades a blank
+// `Some("")` to the exact same `""` an absent `None` produces, `lang_attr` and "was a label
+// rendered" are automatically consistent -- no separate branch was needed to keep them in sync.
+//
+// ── KNOWN LIMITATION, STATED PLAINLY: MULTI-LINE CODE IN ONE `label` LOSES ITS LINE BREAKS ──────
+// `prism_cd_block` and `prism_cd_snippet`'s un-numbered path put the caller's ENTIRE, possibly
+// multi-line `cd_code` string into a single label's `"text"` attr, per this task's own explicit
+// shape (`label(code)`, singular). This is NOT the same choice `prism_inspect_tree`
+// (prism/dev/prism_inspect.nova) makes for its own multi-line text -- that function deliberately
+// splits on `"\n"` into ONE `prism_label` PER LINE first, specifically because a single label does
+// not reliably preserve embedded newlines through to the screen. Verified, not assumed: the ANSI
+// backend's own `prism_ansi_sanitize` (prism/backend/ansi/prism_render_ansi.nova) strips every byte
+// `< 32` except tab -- byte 10 (`\n`) included -- so a multi-line string handed to ONE label
+// renders as a single run-on line with the line breaks silently deleted, not preserved and not
+// wrapped. This file does not work around that here (it is a backend gap, not a shape this
+// module's constructors could paper over without inventing per-line splitting the task's own spec
+// for `cd_block` does not ask for) -- it is recorded here as a real, falsifiable, tracked
+// limitation: a caller who needs guaranteed multi-line rendering fidelity today should reach for
+// `prism_cd_snippet` with `cd_line_start` set, whose numbered path already emits one row per line
+// (see below) and therefore never depends on a label surviving an embedded `\n`.
+//
+// ── WHY THE DIFF'S OPTIONAL LABEL DROPS THE WRAPPING `stack` ENTIRELY, NOT JUST THE LABEL ────────
+// Same "absent optional tail omits the wrapper entirely" precedent `prism_rt_review`/
+// `prism_rt_score_badge` (prism_ui_rating.nova) already establish: when `cd_label` is `None` or
+// blank, `prism_cd_diff` returns the bare `band[before, after]` directly rather than wrapping it in
+// a `stack` that would then have exactly one child. The header comment there is reused verbatim in
+// spirit here rather than re-derived from scratch, because it is the same shape of problem: an
+// optional part that, when present, sits ALONGSIDE a mandatory block, not appended after it.
+//
+// ── WHY `_prism_cd_opt_part` IS ONE SHARED HELPER, NOT THREE COPIES ──────────────────────────────
+// `cd_lang` (block), `cd_label` (diff), and `cd_lang` (snippet's header) are three different
+// parameters on three different functions, but all three need the exact same rule: "an absent or
+// blank optional string becomes zero children; a non-blank one becomes exactly one label, spliced
+// in with `...`." That rule is already this codebase's own established idiom for an optional part
+// (`prism_up_dropzone`'s `_prism_up_max_size_part`, `prism_ui_data`'s `_prism_data_timeline_node`
+// base pattern), returning `Result<list>` of 0 or 1 nodes precisely so the call site can splice it
+// with `...parts` into a children list without a separate branch for "was it included." Writing it
+// once here and reusing it three times is strictly better than three near-identical private
+// functions that could silently drift out of sync with each other.
+//
+// ── WHY `cd_line_start` IS `int?`, NOT A DEFAULTED `int` OR A SEPARATE BOOL FLAG ─────────────────
+// A defaulted `int` (e.g. `cd_line_start: int = 0`) cannot survive a cross-module call in this
+// language (reference_nova_default_params_not_cross_module.md -- verified project-wide limitation,
+// not re-probed here since every `ui/` file already avoids it), and a magic sentinel like `0` or
+// `-1` meaning "no numbering" would collide with `0`/`-1` as themselves being rejected inputs,
+// forcing a caller to remember an arbitrary out-of-band value. `Option<int>` says exactly what is
+// true -- "numbering may or may not be requested" -- and every prior optional-int parameter in this
+// codebase's `ui/` layer (`prism_up_dropzone`'s `up_max_size`) already uses the same shape for the
+// same reason.
+//
+// ── FIELD-SLOT COLLISION: N/A -- THIS FILE DECLARES NO STRUCTS OR ENUMS ──────────────────────────
+// Every value this file produces is a `PrismNode` built through `prism_content`/`prism_arrange`'s
+// already-safe constructors or `prism_node.prism_node_branch` directly; there is no new `type` or
+// `enum` here, so the "prefix every field" discipline
+// (reference_field_slot_collision_scales_with_imports.md) has nothing to apply to.
+//
+// PUBLIC API
+//   prism_cd_block(cd_code: string, cd_lang: string?) -> Result<PrismNode>
+//     -> stack[label(lang)?, label(code)], root carries `"cd_lang"` attr (see above; `""` when
+//     `cd_lang` is None or blank, the literal language string otherwise). The lang label is
+//     rendered only when `cd_lang` is `Some` and non-blank. Rejects an empty `cd_code`.
+//   prism_cd_inline(cd_code: string) -> Result<PrismNode>
+//     -> a bare `label`, `"text"` = `cd_code`, plus a `"cd_inline": "true"` attr so a renderer or
+//     look-layer style rule can tell an inline snippet apart from an ordinary label without any
+//     new `PrismNodeKind`. Rejects an empty `cd_code`.
+//   prism_cd_diff(cd_before: string, cd_after: string, cd_label: string?) -> Result<PrismNode>
+//     -> stack[label(label)?, band[label(before), label(after)]], or the bare
+//     `band[label(before), label(after)]` alone when `cd_label` is omitted or blank (see above).
+//     Rejects only when BOTH `cd_before` AND `cd_after` are empty -- either side alone having
+//     content is a valid diff (e.g. a pure addition has an empty `cd_before`).
+//   prism_cd_snippet(cd_title: string, cd_code: string, cd_lang: string?, cd_line_start: int?)
+//                    -> Result<PrismNode>
+//     -> stack[header, numbered_code] where `header` is `band[label(title), label(lang)]` when
+//     `cd_lang` is non-blank, or the bare `label(title)` otherwise (same wrapper-omission rule as
+//     the diff above); `numbered_code` is `label(code)` (whole, unsplit) when `cd_line_start` is
+//     `None`, or `stack` of one `band[label(line_number), label(line_text)]` per line of
+//     `split(cd_code, "\n")` when `cd_line_start` is `Some(n)`, numbered `n, n+1, n+2, ...` in
+//     source order. Rejects an empty `cd_title`, an empty `cd_code`, and `cd_line_start`'s `n < 1`.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_ui_kit
+
+// ── Shared: an optional string as 0-or-1 spliceable label nodes (see header) ─────────────────────
+// Blank-Some degrades identically to None -- the same tolerance every optional-string parameter in
+// this codebase's `ui/` layer already applies (prism_rt_review's `rt_date`,
+// prism_rt_score_badge's `rt_label`), so "no text" and "the empty string" are treated as the same
+// fact here, consistently, in exactly one place.
+fn _prism_cd_opt_part(text: string?) -> Result<list>
+    match text
+        None => ok([])
+        Some(t) =>
+            if len(t) == 0
+                return ok([])
+            let node = prism_content.prism_label(t)?
+            ok([node])
+
+// ── prism_cd_block: fenced code, optional lang label, cd_lang always recorded on the root ────────
+fn prism_cd_block(cd_code: string, cd_lang: string?) -> Result<PrismNode>
+    if len(cd_code) == 0
+        return err("prism_cd_block: cd_code must not be empty")
+    let lang_parts = _prism_cd_opt_part(cd_lang)?
+    let code_node = prism_content.prism_label(cd_code)?
+    let lang_attr = match cd_lang
+        None => ""
+        Some(l) => l
+    prism_node.prism_node_branch(prism_node.prism_kind_stack(), {"cd_lang": lang_attr}, [...lang_parts, code_node])
+
+// ── prism_cd_inline: a single label tagged as inline code ────────────────────────────────────────
+fn prism_cd_inline(cd_code: string) -> Result<PrismNode>
+    if len(cd_code) == 0
+        return err("prism_cd_inline: cd_code must not be empty")
+    prism_node.prism_node_branch(prism_node.prism_kind_label(), {"text": cd_code, "cd_inline": "true"}, [])
+
+// ── prism_cd_diff: before/after side by side, optional heading, wrapper omitted when absent ──────
+// Rejects only the BOTH-empty case: an empty `cd_before` alone is a legitimate pure addition, an
+// empty `cd_after` alone is a legitimate pure deletion. Neither side is otherwise validated --
+// `prism_content.prism_label` already accepts any string, including "", as a legitimate body.
+fn prism_cd_diff(cd_before: string, cd_after: string, cd_label: string?) -> Result<PrismNode>
+    if len(cd_before) == 0 and len(cd_after) == 0
+        return err("prism_cd_diff: at least one of cd_before/cd_after must not be empty")
+    let before_node = prism_content.prism_label(cd_before)?
+    let after_node = prism_content.prism_label(cd_after)?
+    let band_node = prism_arrange.prism_band([before_node, after_node])?
+    let label_parts = _prism_cd_opt_part(cd_label)?
+    if len(label_parts) == 0
+        return ok(band_node)
+    prism_arrange.prism_stack([...label_parts, band_node])
+
+// ── prism_cd_snippet: titled card, optional lang in the header, optional line numbering ──────────
+
+// Header: title + optional lang, wrapper omitted when lang is absent/blank -- the same
+// wrapper-omission rule the diff's optional label uses above, factored into its own function
+// (rather than inlined into `prism_cd_snippet`) because `prism_cd_snippet` needs the finished
+// header as an INTERMEDIATE value (there is a second sibling, `numbered_code`, still to build and
+// combine afterward), not as its own function's tail the way the diff's version gets to be. Here,
+// as this function's OWN tail, the familiar "return early inside the `if`, fall through to the
+// remaining statements otherwise" idiom applies cleanly: `len(lang_parts) == 0` returns the bare
+// title immediately, and the un-returned path falls through to the `band` construction below it.
+fn _prism_cd_header(title_node: PrismNode, cd_lang: string?) -> Result<PrismNode>
+    let lang_parts = _prism_cd_opt_part(cd_lang)?
+    if len(lang_parts) == 0
+        return ok(title_node)
+    prism_arrange.prism_band([title_node, ...lang_parts])
+
+// One numbered row: "N" beside the line's own text, as a `band` (inline pairing, same convention
+// `prism_rt_summary`'s distribution rows and `prism_st_comparison`'s current/previous row use for
+// "two short facts side by side").
+fn _prism_cd_line_row(line_num: int, text: string) -> Result<PrismNode>
+    let num_node = prism_content.prism_label(str(line_num))?
+    let text_node = prism_content.prism_label(text)?
+    prism_arrange.prism_band([num_node, text_node])
+
+// `cd_line_start` validated here (n >= 1) because this is the one place that value is actually
+// used -- `split(cd_code, "\n")` per the task's own required mechanism, numbered
+// `cd_line_start, cd_line_start+1, ...` by walking `idx` upward, matching every 0-based `for idx,
+// x in list` loop already used elsewhere in this codebase's `ui/` layer (`prism_rt_summary`'s
+// distribution rows, `prism_ui_rating.nova`).
+fn _prism_cd_numbered_code(cd_code: string, cd_line_start: int?) -> Result<PrismNode>
+    match cd_line_start
+        None => prism_content.prism_label(cd_code)
+        Some(n) =>
+            if n < 1
+                return err("prism_cd_snippet: cd_line_start must be >= 1, got " + str(n))
+            let lines = split(cd_code, "\n")
+            let rows = []
+            for idx, line in lines
+                let row = _prism_cd_line_row(n + idx, line)?
+                rows.push(row)
+            prism_arrange.prism_stack(rows)
+
+fn prism_cd_snippet(cd_title: string, cd_code: string, cd_lang: string?, cd_line_start: int?) -> Result<PrismNode>
+    if len(cd_title) == 0
+        return err("prism_cd_snippet: cd_title must not be empty")
+    if len(cd_code) == 0
+        return err("prism_cd_snippet: cd_code must not be empty")
+    let title_node = prism_content.prism_label(cd_title)?
+    let header_node = _prism_cd_header(title_node, cd_lang)?
+    let code_node = _prism_cd_numbered_code(cd_code, cd_line_start)?
+    prism_arrange.prism_stack([header_node, code_node])
