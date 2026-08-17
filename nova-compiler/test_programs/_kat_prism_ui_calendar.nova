@@ -1,0 +1,235 @@
+// KAT for prism/ui/prism_ui_calendar.nova -- the month-view calendar component.
+//
+// Proves:
+//   1. Leap year (2024/2000 true, 2023/1900 false) -- verified INDIRECTLY, since
+//      `_prism_cal_is_leap` is private: February's day-count boundary, exercised through the
+//      public `prism_cal_month`'s `selected_day` validation (a day past the real length is
+//      rejected, the real last day is accepted), pins down the leap/non-leap fact exactly.
+//   2. Days in month (Jan=31, Apr=30, plus Feb2024=29/Feb2023=28 reused from #1) -- same
+//      selected_day-boundary technique.
+//   3. Day of week (Sakamoto's algorithm, also private) against all four known dates from the
+//      component's header -- verified INDIRECTLY by rendered structure: for 2026-08-17 (Aug 1 =
+//      Saturday) the first week's first 6 cells are empty padding labels and cell 6 is day 1,
+//      exactly as the task brief specifies; for 2026-01-01, 2000-01-01, and 2024-07-04, the day
+//      in question is found in the rendered tree and its COLUMN index (0=Sun..6=Sat) is asserted
+//      to equal the known weekday number -- the same Sun..Sat column order the day-of-week band
+//      itself renders.
+//   4. Month title formatting for three months (Aug/Jan/Dec), catching an off-by-one in either
+//      the month-name table or its indexing.
+//   5. Month construction: exact 8-child `stack` shape (header band of 3, day-of-week band of 7,
+//      six week bands of 7), with every header/day-of-week child's kind and text asserted exactly.
+//   6. A selected day carries "selected"=true; a non-selected day does not.
+//   7. An event day carries "has_event"=true; a day without an event does not; the event struct's
+//      own wrapper/accessors round-trip correctly.
+//   8. Rejections: year <= 0, month outside 1..12, an event day outside the month's range, and a
+//      non-PrismCalendarEvent element in the events list.
+//   9. Rejections: selected_day <= 0, selected_day past the month's last day, and the exact
+//      boundary (the real last day) still accepted.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_node` / `import prism_ui_calendar` resolve.
+//   ./gen3_test.exe _kat_prism_ui_calendar.nova
+//   clang -O2 -o _kat_prism_ui_calendar.exe _kat_prism_ui_calendar.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_ui_calendar.exe
+
+import prism_node
+import prism_ui_calendar as cal
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=" + got + "  want=" + want)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+// Walks the 6 week bands (root children[2..7]) for the cell whose "day" attr == target_day.
+// Padding cells never carry a "day" attr (default -1 never matches a real day >= 1), so this only
+// ever returns a real `press` cell.
+fn _find_day_cell(root, target_day: int) -> PrismNode
+    let kids = prism_node.prism_node_children(root)
+    let mut wi = 2
+    while wi < 8
+        for c in prism_node.prism_node_children(kids[wi])
+            if prism_node.prism_node_attr_int(c, "day", -1) == target_day
+                return c
+        wi += 1
+    _fail("day " + str(target_day) + " not found in rendered calendar")
+    kids[0]
+
+// Same walk, but returns the cell's COLUMN index (0=Sun..6=Sat) within its week band -- this is
+// exactly the weekday number Sakamoto's algorithm produces for that day, since the day-of-week
+// band above renders the columns in that same Sun..Sat order.
+fn _find_day_col(root, target_day: int) -> int
+    let kids = prism_node.prism_node_children(root)
+    let mut wi = 2
+    while wi < 8
+        let cells = prism_node.prism_node_children(kids[wi])
+        let mut ci = 0
+        while ci < len(cells)
+            if prism_node.prism_node_attr_int(cells[ci], "day", -1) == target_day
+                return ci
+            ci += 1
+        wi += 1
+    _fail("day " + str(target_day) + " not found in rendered calendar (column lookup)")
+    -1
+
+fn main()
+    // ── 1. Leap year, indirect via Feb's day-count boundary ─────────────────────────────────
+    print("== 1. leap year (indirect: Feb day-count boundary via selected_day validation) ==")
+    _check_true("2024 (leap): Feb day 29 accepted", is_ok(cal.prism_cal_month(2024, 2, [], some(29))))
+    _check_true("2024 (leap): Feb day 30 rejected", is_err(cal.prism_cal_month(2024, 2, [], some(30))))
+    _check_true("2023 (non-leap): Feb day 28 accepted", is_ok(cal.prism_cal_month(2023, 2, [], some(28))))
+    _check_true("2023 (non-leap): Feb day 29 rejected", is_err(cal.prism_cal_month(2023, 2, [], some(29))))
+    _check_true("2000 (leap, div400 overrides div100): Feb day 29 accepted", is_ok(cal.prism_cal_month(2000, 2, [], some(29))))
+    _check_true("1900 (non-leap, div100 not div400): Feb day 28 accepted", is_ok(cal.prism_cal_month(1900, 2, [], some(28))))
+    _check_true("1900 (non-leap, div100 not div400): Feb day 29 rejected", is_err(cal.prism_cal_month(1900, 2, [], some(29))))
+
+    // ── 2. Days in month, same boundary technique ────────────────────────────────────────────
+    print("== 2. days in month (Jan=31, Apr=30; Feb2024=29/Feb2023=28 reused from #1) ==")
+    _check_true("Jan: day 31 accepted", is_ok(cal.prism_cal_month(2025, 1, [], some(31))))
+    _check_true("Jan: day 32 rejected", is_err(cal.prism_cal_month(2025, 1, [], some(32))))
+    _check_true("Apr: day 30 accepted", is_ok(cal.prism_cal_month(2025, 4, [], some(30))))
+    _check_true("Apr: day 31 rejected", is_err(cal.prism_cal_month(2025, 4, [], some(31))))
+
+    // ── 3. Day of week (Sakamoto), indirect via rendered structure ───────────────────────────
+    print("== 3. day-of-week (Sakamoto's algorithm), verified indirectly via rendered position ==")
+    // 2026-08-17: Aug 1, 2026 = Saturday. First week's first 6 cells are padding, cell 6 = day 1.
+    let aug26_r = cal.prism_cal_month(2026, 8, [], none())
+    if is_err(aug26_r)
+        _fail("prism_cal_month(2026, 8) construction: " + unwrap_err(aug26_r))
+    let aug26 = unwrap(aug26_r)
+    let aug26_kids = prism_node.prism_node_children(aug26)
+    let aug26_w0 = prism_node.prism_node_children(aug26_kids[2])
+    _check("Aug 2026 week0 cell count", str(len(aug26_w0)), "7")
+    let mut i0 = 0
+    while i0 < 6
+        _check("Aug 2026 week0 cell " + str(i0) + " kind (padding)", prism_node.prism_node_kind_str(aug26_w0[i0]), "label")
+        _check("Aug 2026 week0 cell " + str(i0) + " text (padding, empty)", prism_node.prism_node_attr_str(aug26_w0[i0], "text", "X"), "")
+        i0 += 1
+    _check("Aug 2026 week0 cell 6 kind (day 1)", prism_node.prism_node_kind_str(aug26_w0[6]), "press")
+    _check("Aug 2026 week0 cell 6 day attr", str(prism_node.prism_node_attr_int(aug26_w0[6], "day", -1)), "1")
+    print("   (2026-08-01 = Saturday(6): cells 0-5 padding, cell 6 = day 1 -- proves Sakamoto's start-of-month result)")
+
+    // 2026-01-01 = Thursday(4): day 1 lands in column 4.
+    let jan26_r = cal.prism_cal_month(2026, 1, [], none())
+    if is_err(jan26_r)
+        _fail("prism_cal_month(2026, 1) construction: " + unwrap_err(jan26_r))
+    let jan26 = unwrap(jan26_r)
+    _check("2026-01-01 = Thursday: day 1 in column 4", str(_find_day_col(jan26, 1)), "4")
+
+    // 2000-01-01 = Saturday(6): day 1 lands in column 6.
+    let jan2000_r = cal.prism_cal_month(2000, 1, [], none())
+    if is_err(jan2000_r)
+        _fail("prism_cal_month(2000, 1) construction: " + unwrap_err(jan2000_r))
+    let jan2000 = unwrap(jan2000_r)
+    _check("2000-01-01 = Saturday: day 1 in column 6", str(_find_day_col(jan2000, 1)), "6")
+
+    // 2024-07-04 = Thursday(4): day 4 (not day 1 -- a mid-month date) lands in column 4.
+    let jul24_r = cal.prism_cal_month(2024, 7, [], none())
+    if is_err(jul24_r)
+        _fail("prism_cal_month(2024, 7) construction: " + unwrap_err(jul24_r))
+    let jul24 = unwrap(jul24_r)
+    _check("2024-07-04 = Thursday: day 4 in column 4", str(_find_day_col(jul24, 4)), "4")
+
+    // ── 4. Month title ────────────────────────────────────────────────────────────────────────
+    print("== 4. month title ==")
+    _check("title(2026, 8)", cal.prism_cal_month_title(2026, 8), "August 2026")
+    _check("title(2026, 1)", cal.prism_cal_month_title(2026, 1), "January 2026")
+    _check("title(1999, 12)", cal.prism_cal_month_title(1999, 12), "December 1999")
+
+    // ── 5. Month construction: exact structure (reusing aug26 from #3) ───────────────────────
+    print("== 5. month construction: exact 8-child structure ==")
+    _check("root kind", prism_node.prism_node_kind_str(aug26), "stack")
+    _check("root child count", str(len(aug26_kids)), "8")
+    let header = aug26_kids[0]
+    _check("header kind", prism_node.prism_node_kind_str(header), "band")
+    let header_kids = prism_node.prism_node_children(header)
+    _check("header child count", str(len(header_kids)), "3")
+    _check("header[0] kind (prev)", prism_node.prism_node_kind_str(header_kids[0]), "press")
+    _check("header[0] text (prev)", prism_node.prism_node_attr_str(header_kids[0], "text", ""), "<")
+    _check("header[1] kind (title)", prism_node.prism_node_kind_str(header_kids[1]), "label")
+    _check("header[1] text (title)", prism_node.prism_node_attr_str(header_kids[1], "text", ""), "August 2026")
+    _check("header[2] kind (next)", prism_node.prism_node_kind_str(header_kids[2]), "press")
+    _check("header[2] text (next)", prism_node.prism_node_attr_str(header_kids[2], "text", ""), ">")
+
+    let dow = aug26_kids[1]
+    _check("day-of-week band kind", prism_node.prism_node_kind_str(dow), "band")
+    let dow_kids = prism_node.prism_node_children(dow)
+    _check("day-of-week child count", str(len(dow_kids)), "7")
+    _check("day-of-week[0] text", prism_node.prism_node_attr_str(dow_kids[0], "text", ""), "Sun")
+    _check("day-of-week[1] text", prism_node.prism_node_attr_str(dow_kids[1], "text", ""), "Mon")
+    _check("day-of-week[6] text", prism_node.prism_node_attr_str(dow_kids[6], "text", ""), "Sat")
+
+    let mut wi5 = 2
+    while wi5 < 8
+        let wk = aug26_kids[wi5]
+        _check("week " + str(wi5 - 2) + " kind", prism_node.prism_node_kind_str(wk), "band")
+        _check("week " + str(wi5 - 2) + " cell count", str(len(prism_node.prism_node_children(wk))), "7")
+        wi5 += 1
+
+    // ── 6. Selected day carries "selected" ───────────────────────────────────────────────────
+    print("== 6. selected day carries the 'selected' attr ==")
+    let sel_r = cal.prism_cal_month(2026, 8, [], some(15))
+    if is_err(sel_r)
+        _fail("prism_cal_month(2026, 8, [], some(15)) construction: " + unwrap_err(sel_r))
+    let sel_root = unwrap(sel_r)
+    let sel_cell = _find_day_cell(sel_root, 15)
+    _check("day 15 kind", prism_node.prism_node_kind_str(sel_cell), "press")
+    _check_true("day 15 has selected=true", prism_node.prism_node_attr_bool(sel_cell, "selected", false))
+    _check_true("day 15 has has_event=false (no events given)", not prism_node.prism_node_attr_bool(sel_cell, "has_event", false))
+    let unsel_cell = _find_day_cell(sel_root, 1)
+    _check_true("day 1 (not selected) has selected=false", not prism_node.prism_node_attr_bool(unsel_cell, "selected", false))
+
+    // ── 7. Event day carries "has_event" ─────────────────────────────────────────────────────
+    print("== 7. event day carries the 'has_event' attr ==")
+    let ev = cal.prism_cal_event(10, "Team meeting")
+    _check("prism_cal_event_day accessor", str(cal.prism_cal_event_day(ev)), "10")
+    _check("prism_cal_event_label accessor", cal.prism_cal_event_label(ev), "Team meeting")
+    let ev_r = cal.prism_cal_month(2026, 8, [ev], none())
+    if is_err(ev_r)
+        _fail("prism_cal_month with one event construction: " + unwrap_err(ev_r))
+    let ev_root = unwrap(ev_r)
+    let ev_cell = _find_day_cell(ev_root, 10)
+    _check_true("day 10 has has_event=true", prism_node.prism_node_attr_bool(ev_cell, "has_event", false))
+    _check_true("day 10 has selected=false (no selection given)", not prism_node.prism_node_attr_bool(ev_cell, "selected", false))
+    let no_ev_cell = _find_day_cell(ev_root, 11)
+    _check_true("day 11 (no event) has has_event=false", not prism_node.prism_node_attr_bool(no_ev_cell, "has_event", false))
+
+    // ── 8. Invalid month/year/events rejected ────────────────────────────────────────────────
+    print("== 8. invalid month/year/events rejected ==")
+    _check_true("year 0 rejected", is_err(cal.prism_cal_month(0, 8, [], none())))
+    _check_true("year -5 rejected", is_err(cal.prism_cal_month(-5, 8, [], none())))
+    _check_true("month 0 rejected", is_err(cal.prism_cal_month(2026, 0, [], none())))
+    _check_true("month 13 rejected", is_err(cal.prism_cal_month(2026, 13, [], none())))
+    let bad_event = cal.prism_cal_event(32, "Ghost day")
+    _check_true("event day out of range (32 in a 31-day Aug) rejected", is_err(cal.prism_cal_month(2026, 8, [bad_event], none())))
+    _check_true("non-PrismCalendarEvent element rejected", is_err(cal.prism_cal_month(2026, 8, [42], none())))
+
+    // ── 9. Invalid selected_day rejected ──────────────────────────────────────────────────────
+    print("== 9. invalid selected_day rejected ==")
+    _check_true("selected_day 0 rejected", is_err(cal.prism_cal_month(2026, 8, [], some(0))))
+    _check_true("selected_day -1 rejected", is_err(cal.prism_cal_month(2026, 8, [], some(-1))))
+    _check_true("selected_day 32 (Aug has 31 days) rejected", is_err(cal.prism_cal_month(2026, 8, [], some(32))))
+    _check_true("selected_day 31 (Aug's exact last day) accepted", is_ok(cal.prism_cal_month(2026, 8, [], some(31))))
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_ui_calendar: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_ui_calendar: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)

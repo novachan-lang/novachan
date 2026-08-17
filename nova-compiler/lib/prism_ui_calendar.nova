@@ -1,0 +1,281 @@
+// prism_ui_calendar -- month-view calendar component (prism/ui/ composition layer).
+//
+// ── WHY THE DATE MATH LIVES HERE, PRIVATE, RATHER THAN BEING IMPORTED ─────────────────────────
+// `nova-compiler/lib/fdold.nova` already has a proven civil-calendar implementation (Howard
+// Hinnant's days_from_civil), but this milestone's import list is closed to exactly five modules
+// (prism_node, prism_arrange, prism_content, prism_interact, prism_ui_kit) -- no date library is
+// on it. Rather than smuggle a sixth import in, the handful of pure integer functions a MONTH VIEW
+// actually needs (leap-year test, days-in-month, day-of-week of the 1st) are re-derived here from
+// scratch using Tomohiko Sakamoto's algorithm, which needs no lookup table beyond one 12-entry
+// array and no floor-division sign correction (Hinnant's algorithm shifts the epoch and needs a
+// negative-`z` branch specifically because it supports the full proleptic range and negative day
+// offsets -- machinery this component, which only ever asks "what weekday is day 1 of THIS
+// month", does not need). All three helpers are `_prism_cal_`-private -- nothing outside this file
+// may call them, which is also why the KAT proves them only INDIRECTLY, through the public
+// `prism_cal_month` render (see that file's header for the exact technique).
+//
+// Verified by hand against four real dates before being trusted (the KAT re-verifies all four
+// through the rendered tree, not by re-running the formula):
+//   2026-08-17 -> Monday(1)     2024-07-04 -> Thursday(4)
+//   2000-01-01 -> Saturday(6)   2026-01-01 -> Thursday(4)
+//
+// ── WHY EVERY MONTH RENDERS EXACTLY 6 WEEK ROWS, NEVER 4/5/6 DEPENDING ON LAYOUT ──────────────
+// A month needs anywhere from 4 rows (28-day Feb starting on Sunday) to 6 rows (31-day month
+// starting on Friday/Saturday) to show every day without truncation. Making the row count
+// conditional on the specific (year, month) pair would mean `prism_cal_month`'s OWN shape --
+// `root child_count`, which week band index d holds which day -- changes from one call to the
+// next, which is exactly the kind of caller-visible instability PRISM_SPEC.md's fixed-vocabulary
+// discipline (axiom A7) exists to prevent one level up: a month picker that has to ask "how many
+// rows did THIS particular month render" before it can lay out a fixed-height grid around the
+// calendar is a worse contract than "always 8 children, always 6 week rows of 7 cells." The unused
+// trailing cells in a short month are the exact same `label("")` padding this file already uses
+// for the leading gap before day 1 -- one mechanism, not two.
+//
+// ── ATTR COMPOSITION: THE PROVEN dict_merge + prism_node_new RECONSTRUCTION ───────────────────
+// A day cell needs THREE pieces of caller-invisible-until-now metadata bolted onto an ordinary
+// `press` node -- "day" (always), "selected" (sometimes), "has_event" (sometimes) -- without
+// inventing a 23rd `PrismNodeKind`. `prism_ui_grid.nova`'s `_prism_grid_cell` (selected/editing)
+// and `prism_ui_media.nova`'s `_prism_md_with_attrs` already solved this exact shape: build the
+// plain node through its normal constructor, then `dict_merge(node.attrs, extra)` and
+// re-construct via `prism_node.prism_node_new` with the merged dict, same kind/children/key.
+// `_prism_cal_with_attrs` below is that same one-line technique, not a new idea.
+//
+// ── WHY EVERY FIELD ON PrismCalendarEvent IS PREFIXED ─────────────────────────────────────────
+// Same reproduced compiler defect this codebase's memory tracks as "field-slot collision scales
+// with imports": a bare `day`/`label` field would share a global name->slot index with any other
+// struct in the whole program that also declares `day`/`label`, and an un-inferred receiver then
+// resolves the WRONG slot. `cal_ev_day` / `cal_ev_label` cannot collide with anything else in the
+// program, by construction.
+//
+// ── selected_day: int? -- validated through the same `Result<int>`-with-sentinel technique
+// `prism_arrange.prism_gap(size: int?)` uses (`None` -> flexible/no-op, `Some(n)` -> validate then
+// use `n`) -- `_prism_cal_check_selected` returns `ok(-1)` for "no selection" (a value no real day
+// number, which starts at 1, can ever equal) and `ok(sd)` for a validated selection, so the day-
+// building loop below compares against one plain int rather than re-matching an Option per cell.
+//
+// PUBLIC API
+//   PrismCalendarEvent { cal_ev_day, cal_ev_label } + prism_cal_event(day, label)
+//     prism_cal_event_day(e) -> int / prism_cal_event_label(e) -> string
+//   prism_cal_month_title(year, month) -> string          "August 2026"; best-effort (bare string,
+//     not Result) -- an out-of-1..12 month returns an empty month-name half rather than failing,
+//     since there is no error channel; `prism_cal_month` is where an invalid month is REJECTED.
+//   prism_cal_month(year, month, events, selected_day) -> Result<PrismNode>
+//     Rejects: year < 1; month outside 1..12; any events element that is not a PrismCalendarEvent
+//     or whose day is outside 1..days_in_month; a selected_day outside 1..days_in_month.
+//     Renders a `stack` of exactly 8 children:
+//       [0] header `band`: [press("<"), label(month title), press(">")]
+//       [1] day-of-week `band`: 7 labels, Sun..Sat
+//       [2..7] six week `band`s of 7 cells each -- a real day is a `press` (text = day number,
+//         attrs "day"/"selected"/"has_event"); a cell with no day in this month (before day 1 or
+//         after the last day) is a plain empty `label("")`, same position, never omitted (mirrors
+//         prism_ui_nav.nova's "present but not a control" discipline for the padding case).
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// ── Private date math (pure integer arithmetic; LEAF within this file's own vocabulary -- calls
+// nothing outside this section) ────────────────────────────────────────────────────────────────
+
+fn _prism_cal_is_leap(year: int) -> bool
+    if year % 4 != 0
+        return false
+    if year % 100 != 0
+        return true
+    year % 400 == 0
+
+fn _prism_cal_feb_days(year: int) -> int
+    if _prism_cal_is_leap(year)
+        return 29
+    28
+
+fn _prism_cal_days_in_month(year: int, month: int) -> int
+    if month == 2
+        return _prism_cal_feb_days(year)
+    if contains([1, 3, 5, 7, 8, 10, 12], month)
+        return 31
+    30
+
+// Tomohiko Sakamoto's algorithm. 0=Sunday .. 6=Saturday. `t` holds each month's fixed offset
+// (Jan=index0..Dec=index11); months before March borrow a day from the previous year's leap
+// bookkeeping, which is why `y` shifts down by one for Jan/Feb specifically (Sakamoto's own
+// derivation, not an ad hoc fix). See this file's header for the four dates this was checked
+// against by hand.
+fn _prism_cal_day_of_week(year: int, month: int, day: int) -> int
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    let mut y = year
+    if month < 3
+        y = year - 1
+    (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7
+
+// Month names as a LOCAL function, never a module-level `let` -- a module-level `let` holding a
+// list/dict is silently EMPTY when this module is imported (verified compiler defect tracked
+// elsewhere in this codebase; prism_node.nova's `prism_node_kind_all` carries the same note). A
+// fresh literal returned by a function has no such hazard.
+fn _prism_cal_month_name(month: int) -> string
+    match month
+        1 => "January"
+        2 => "February"
+        3 => "March"
+        4 => "April"
+        5 => "May"
+        6 => "June"
+        7 => "July"
+        8 => "August"
+        9 => "September"
+        10 => "October"
+        11 => "November"
+        12 => "December"
+        _ => ""
+
+fn _prism_cal_weekday_names() -> list
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+// ── Event data type ────────────────────────────────────────────────────────────────────────────
+
+// Fields are `cal_ev_`-prefixed -- see header note on the struct-field-name-collision defect.
+type PrismCalendarEvent
+    cal_ev_day: int
+    cal_ev_label: string
+
+// A struct's positional constructor is file-local cross-module (this codebase's tracked defect
+// for both enum variants and plain structs) -- this wrapper is what every OTHER file must use.
+fn prism_cal_event(day: int, label: string) -> PrismCalendarEvent
+    PrismCalendarEvent(day, label)
+
+fn prism_cal_event_day(e: PrismCalendarEvent) -> int
+    e.cal_ev_day
+
+fn prism_cal_event_label(e: PrismCalendarEvent) -> string
+    e.cal_ev_label
+
+// ── Title ──────────────────────────────────────────────────────────────────────────────────────
+
+// Bare `string`, not `Result<string>` -- see header. `prism_cal_month` is the checked gate; this
+// is a convenience formatter for a month/year pair the caller already knows is valid (or, for an
+// out-of-range month, one that degrades to a merely-odd-looking title rather than crashing).
+fn prism_cal_month_title(year: int, month: int) -> string
+    _prism_cal_month_name(month) + " " + str(year)
+
+// ── Shared helper: attach extra attrs onto an already-built node ───────────────────────────────
+// Same dict_merge + prism_node_new re-construction prism_ui_grid.nova / prism_ui_media.nova /
+// prism_ui_nav.nova all already use to attach caller metadata without inventing a new
+// PrismNodeKind (see header).
+fn _prism_cal_with_attrs(n: PrismNode, extra: dict) -> Result<PrismNode>
+    let merged = dict_merge(n.attrs, extra)
+    prism_node.prism_node_new(n.kind, merged, n.children, n.key)
+
+// `None` -> no selection, encoded as sentinel -1 (no real day number is ever <= 0). `Some(sd)` is
+// validated against the month's actual day count before being trusted -- same
+// validate-then-return-the-value shape `prism_arrange.prism_gap(size: int?)` uses for its `int?`.
+fn _prism_cal_check_selected(selected_day: int?, days_in: int) -> Result<int>
+    match selected_day
+        None => ok(-1)
+        Some(sd) =>
+            if sd < 1 or sd > days_in
+                return err("prism_cal_month: selected_day " + str(sd) + " must be 1-" + str(days_in))
+            ok(sd)
+
+// Every event's day, as string keys in a lookup dict -- string-keyed, matching this codebase's
+// only verified dict-membership idiom (`prism_ui_nav.nova`'s `seen_routes`, `prism_obs.nova`'s
+// `counts`); an int-keyed dict has no verified precedent anywhere in prism/, so this file does not
+// introduce one. Called only AFTER `prism_cal_month` has validated every event's day is in range.
+fn _prism_cal_event_days(events: list) -> dict
+    let out = {}
+    for e in events
+        out[str(e.cal_ev_day)] = true
+    out
+
+// One real day cell: a `press` named by the day number, decorated with "day" (always),
+// "selected" (only when true), "has_event" (only when true) -- an absent attr reads back as its
+// documented default via `prism_node_attr_bool`, so there is no need to ever write `false`
+// explicitly.
+fn _prism_cal_day_cell(day_num: int, is_selected: bool, has_event: bool) -> Result<PrismNode>
+    let base_r = prism_interact.prism_press(str(day_num), [])
+    if is_err(base_r)
+        return err(unwrap_err(base_r))
+    let mut extra = {"day": day_num}
+    if is_selected
+        extra = dict_merge(extra, {"selected": true})
+    if has_event
+        extra = dict_merge(extra, {"has_event": true})
+    _prism_cal_with_attrs(unwrap(base_r), extra)
+
+// ── The component ──────────────────────────────────────────────────────────────────────────────
+
+// Rejects: year < 1; month outside 1..12; any events element that is not a PrismCalendarEvent, or
+// whose day is outside 1..days_in_month; a selected_day outside 1..days_in_month. See header for
+// the exact 8-child render shape (header band, day-of-week band, 6 fixed week bands).
+fn prism_cal_month(year: int, month: int, events: list, selected_day: int?) -> Result<PrismNode>
+    if year < 1
+        return err("prism_cal_month: year must be >= 1, got " + str(year))
+    if month < 1 or month > 12
+        return err("prism_cal_month: month must be 1-12, got " + str(month))
+    let days_in = _prism_cal_days_in_month(year, month)
+    for idx, e in events
+        if type_name(e) != "PrismCalendarEvent"
+            return err("prism_cal_month: event " + str(idx) + " is not a PrismCalendarEvent (got " + type_name(e) + ")")
+        if e.cal_ev_day < 1 or e.cal_ev_day > days_in
+            return err("prism_cal_month: event " + str(idx) + " has day " + str(e.cal_ev_day) + ", must be 1-" + str(days_in))
+    let sel_r = _prism_cal_check_selected(selected_day, days_in)
+    if is_err(sel_r)
+        return err(unwrap_err(sel_r))
+    let sel = unwrap(sel_r)
+    let event_days = _prism_cal_event_days(events)
+
+    // Header: prev / title / next.
+    let prev_r = prism_interact.prism_press("<", [])
+    if is_err(prev_r)
+        return err(unwrap_err(prev_r))
+    let title_r = prism_content.prism_label(prism_cal_month_title(year, month))
+    if is_err(title_r)
+        return err(unwrap_err(title_r))
+    let next_r = prism_interact.prism_press(">", [])
+    if is_err(next_r)
+        return err(unwrap_err(next_r))
+    let header_r = prism_arrange.prism_band([unwrap(prev_r), unwrap(title_r), unwrap(next_r)])
+    if is_err(header_r)
+        return err(unwrap_err(header_r))
+    let header = unwrap(header_r)
+
+    // Day-of-week band.
+    let dow_labels_r = prism_ui_kit.prism_ui_labels(_prism_cal_weekday_names())
+    if is_err(dow_labels_r)
+        return err(unwrap_err(dow_labels_r))
+    let dow_band_r = prism_arrange.prism_band(unwrap(dow_labels_r))
+    if is_err(dow_band_r)
+        return err(unwrap_err(dow_band_r))
+    let dow_band = unwrap(dow_band_r)
+
+    // Six fixed week rows of 7 cells (see header on why the count is never conditional).
+    let start_dow = _prism_cal_day_of_week(year, month, 1)
+    let weeks = []
+    let mut w = 0
+    while w < 6
+        let cells = []
+        let mut d = 0
+        while d < 7
+            let cell_idx = w * 7 + d
+            let day_num = cell_idx - start_dow + 1
+            if day_num < 1 or day_num > days_in
+                let pad_r = prism_content.prism_label("")
+                if is_err(pad_r)
+                    return err(unwrap_err(pad_r))
+                cells.push(unwrap(pad_r))
+            else
+                let is_sel = day_num == sel
+                let has_ev = str(day_num) in event_days
+                let cell_r = _prism_cal_day_cell(day_num, is_sel, has_ev)
+                if is_err(cell_r)
+                    return err(unwrap_err(cell_r))
+                cells.push(unwrap(cell_r))
+            d += 1
+        let week_r = prism_arrange.prism_band(cells)
+        if is_err(week_r)
+            return err(unwrap_err(week_r))
+        weeks.push(unwrap(week_r))
+        w += 1
+
+    prism_arrange.prism_stack([header, dow_band, ...weeks])
