@@ -1,0 +1,347 @@
+// prism_ui_tree -- the tree view component (prism/ui/ composition layer, milestone MB.12b): leaf,
+// collapsible branch, tree container, a file-explorer convenience builder, and a label-substring
+// search filter. Every one is a COMPOSITION over the closed 22-primitive vocabulary (widget/),
+// built through prism_arrange/prism_content/prism_ui_kit wherever they fit -- no new
+// PrismNodeKind (PRISM_SPEC.md axiom A7), the same discipline prism_ui_feedback.nova and
+// prism_ui_token.nova already established for their own component families.
+//
+// ── WHY A LEAF IS `band` AND A BRANCH IS `stack` -- TWO DIFFERENT KINDS, ON PURPOSE ───────────
+// A leaf's content (icon + label) is inherently INLINE -- exactly what `band` already means
+// (PRISM_SPEC.md §7: inline axis). A branch's content is a header ABOVE zero or more nested rows
+// -- exactly what `stack` already means (block axis). Using two different kinds is not an
+// inconsistency to paper over; it is the same "pick the arrangement primitive whose own axis
+// matches the content's real shape" reasoning prism_ui_token.nova's header gives for choosing
+// `flow` over `band` for a tag group. It also has a second, load-bearing payoff: it gives
+// `prism_tv_search_tree` a FREE, zero-cost way to tell "this is a branch" from "this is a leaf"
+// without a sentinel field -- see the discriminator note below.
+//
+// ── THE DISCRIMINATOR: `kind == "stack"` PLUS `has_attr("tv_expanded")` ───────────────────────
+// Every branch this file builds is a `stack` carrying a `tv_expanded` attr; no leaf, and no OTHER
+// `stack` in this codebase's own vocabulary (`prism_tv_tree`'s own container is a bare
+// `prism_arrange.prism_stack`, which carries no attrs at all), has both facts true at once. This
+// is exactly the same "narrow on the combination of kind + a component-specific attr" idiom
+// `prism_ui_nav.nova`'s `step_state` attr already uses to distinguish a step from a plain label --
+// reused here as a working DISCRIMINATOR for a recursive tree walk, not just a queryable fact.
+//
+// ── ATTRS CARRY QUERYABLE STATE; CHILDREN CARRY RENDERABLE CONTENT -- BOTH, NOT EITHER/OR ──────
+// Both a leaf and a branch store `"text"` (and `"icon"` when present) directly in `attrs`, AND
+// separately carry the visual glyph+label as real children. This is not redundant data: `attrs`
+// is what `prism_tv_label_of`/`prism_tv_is_expanded` read back WITHOUT knowing whether the node
+// is a leaf or a branch or what its children look like (an O(1) typed read, same contract as
+// every other `prism_node_attr_*` accessor in this codebase); `children` is what a renderer walks
+// to actually draw pixels/ANSI/HTML. `prism_ui_token.nova`'s tag already keeps this exact
+// duality (`"variant"` in attrs, the label node itself still a child) for the identical reason.
+//
+// ── WHY COLLAPSING A BRANCH DISCARDS ITS CHILDREN OUTRIGHT, NOT JUST A "HIDDEN" FLAG ───────────
+// The brief is explicit: "when false, children hidden (empty list rendered)". An alternative
+// design -- always keep the full subtree in `children` and let a THEME/reactivity layer decide
+// what to paint from the `tv_expanded` flag -- was considered and rejected for this milestone:
+// that layer does not exist yet (PRISM_SPEC.md defers bound-cell state to the reactivity engine,
+// the same reason `prism_ui_nav.nova`'s header gives for why a disabled control can't carry a
+// `disabled` attr today), so "the renderer will sort it out" would be exactly the unspecified
+// mechanism CLAUDE.md's quality bar forbids. Discarding is also literally true to what "collapsed"
+// means in every tree view this component is modeled on (Ant Design's Tree included): a collapsed
+// node's subtree is not rendered, so a tree of PrismNodes that mirrors what would actually be
+// drawn should not carry that subtree either.
+//
+// ── HONEST LIMITATION: SEARCH CANNOT SEE WHAT COLLAPSE ALREADY THREW AWAY ───────────────────────
+// A direct, load-bearing consequence of the design above: `prism_tv_search_tree` walks the
+// CONSTRUCTED node tree, not the caller's original data. If a branch was built with
+// `tv_expanded=false`, its real children are already gone by the time search sees it -- there is
+// nothing left to recurse into, so a match three levels down an unexpanded branch is invisible to
+// search, exactly as it would be invisible to a renderer painting that same collapsed tree. This
+// is not a bug to route around quietly; it is why `prism_tv_file_tree` always auto-expands every
+// directory (`tv_expanded=true`, unconditionally) -- a file tree meant to be searched must be
+// built fully expanded, or search degrades to "whatever happened to already be visible".
+//
+// ── WHY SEARCH FORCE-EXPANDS EVERY BRANCH IT KEEPS ──────────────────────────────────────────────
+// A branch is kept when its own label matches OR any descendant (recursively) matches --
+// "ancestor preservation", the brief's own term, and the standard behaviour of every tree-view
+// search this component is modeled on (Ant Design's Tree, VS Code's file explorer). Keeping the
+// ancestor but leaving `tv_expanded` at whatever the caller originally chose would make the very
+// match the filter just proved exists invisible again the instant a caller reads `tv_expanded`
+// back off the result (see the limitation above: a `false` here would mean the child that WAS
+// kept still doesn't get painted next time this same tree is fed to a renderer). Forcing
+// `tv_expanded=true` on every kept branch is therefore not a cosmetic touch, it is the only choice
+// that keeps the returned tree's `children`/`tv_expanded` pair internally consistent with what
+// this same file's own leaf/branch constructors promise elsewhere in this module.
+//
+// ── WHY A KEPT BRANCH'S CHILD LIST IS THE FILTERED SET, NOT THE ORIGINAL FULL SET ───────────────
+// When a branch's OWN label matches but none of its children do, the result still keeps only the
+// header (no children) rather than restoring the full original subtree. The alternative --
+// "if the folder name matches, show everything inside it unfiltered" -- is a real, different, and
+// equally defensible UX choice some tools make; it was not picked here because it makes the
+// function's output depend on WHICH node matched (self vs. descendant) in a way that is not
+// expressible as one uniform recursive rule, and a filter whose behaviour forks on "who matched"
+// is a harder contract to reason about and test than "the result is always exactly the recursive
+// filter of this node" -- the same "one obvious way, not two" preference the rest of this
+// codebase's design decisions already lean on. Documented here as a conscious choice, not an
+// oversight, and pinned down exactly in the KAT.
+//
+// ── WHY PrismTvEntry's TWO CONSTRUCTORS VALIDATE `tve_name` UP FRONT, RETURNING `Result` ────────
+// Unlike `prism_ui_nav.nova`'s `PrismMenuEntry`/`PrismBreadcrumbItem` (bare, non-`Result`
+// constructors that defer ALL validation to the consumer that later renders them), this file's
+// brief explicitly specifies `prism_tve_file`/`prism_tve_dir` themselves return `Result<PrismTvEntry>`
+// and reject an empty name -- a stronger, earlier contract than the nav precedent, followed
+// exactly as specified rather than silently loosened to match an older file's weaker one. One
+// concrete, tested consequence: because a struct's positional constructor is file-local
+// cross-module (the same limitation `prism_node.nova`'s header documents for enum variants, and
+// confirmed here to apply equally to plain `type`s), this file's OWN internal recursive
+// entry-to-node conversion (`_prism_tv_entry_to_node`) can never actually observe an empty-named
+// `PrismTvEntry` -- the only two ways to obtain one from outside this file both already refuse it.
+// Re-checking name emptiness there would be dead code masquerading as a safety net; instead it
+// re-checks only `type_name(e) != "PrismTvEntry"` (a real, reachable failure: any bare `list`
+// element that is not actually a `PrismTvEntry`, e.g. a stray int or string) and lets emptiness
+// stay caught exactly once, at the two constructors the brief names.
+//
+// ── WHY EVERY FIELD ON PrismTvEntry IS `tve_`-PREFIXED ──────────────────────────────────────────
+// The same reproduced compiler defect `prism_ui_nav.nova`'s header documents at length (and
+// `std/core/tree.nova`'s `Tree` type works around identically for `tree_children`): a field access
+// through a receiver whose concrete type the compiler cannot statically pin resolves the field's
+// storage OFFSET from one GLOBAL name table, last-registration-wins across the whole program.
+// `tve_name`/`tve_is_dir`/`tve_children` cannot collide with another struct's field anywhere else
+// in this codebase, at any slot index, because no other struct anywhere uses this prefix.
+//
+// PUBLIC API
+//   File-tree data (a plain recursive value type, no PrismNode involved yet)
+//     PrismTvEntry { tve_name: string, tve_is_dir: bool, tve_children: list }
+//       tve_children: bare list of PrismTvEntry (self-referential, same untyped-list precedent
+//       prism_node.nova's own `children` field and std/core/tree.nova's `Tree.tree_children` use)
+//     prism_tve_file(name: string) -> Result<PrismTvEntry>          rejects an empty name
+//     prism_tve_dir(name: string, children: list) -> Result<PrismTvEntry>
+//       rejects an empty name; validates every child is a PrismTvEntry
+//   Components (all Result<PrismNode>; every one validates, none fails silently)
+//     prism_tv_leaf(label, tv_icon: PrismIcon?) -> band({"text","icon"?}, [glyph?, label])
+//       rejects an empty label
+//     prism_tv_branch(label, children: list, tv_expanded: bool, tv_icon: PrismIcon?)
+//       -> stack({"text","tv_expanded","icon"?}, [header, ...(children if tv_expanded else [])])
+//       children: bare list (runtime-checked PrismNode elements). rejects an empty label, an
+//       empty children list, and a non-PrismNode element
+//     prism_tv_tree(roots: list) -> stack(roots)
+//       roots: bare list (runtime-checked PrismNode elements). rejects an empty list and a
+//       non-PrismNode element
+//     prism_tv_file_tree(entries: list) -> prism_tv_tree(...) over `entries` converted recursively
+//       dirs -> auto-expanded prism_tv_branch (icon = folder/menu); files -> prism_tv_leaf
+//       (icon = document/info). rejects an empty entries list; a non-PrismTvEntry element; an
+//       empty-children dir propagates prism_tv_branch's own "children must not be empty" rejection
+//       (see header: an empty directory has no valid tree-view representation in this design)
+//     prism_tv_search_tree(roots: list, query: string) -> stack(kept roots)
+//       case-insensitive substring match via `lower()`; a branch is kept (with tv_expanded forced
+//       true) if its own label matches OR any descendant matches, filtered to only the kept
+//       descendants (see header for why NOT the unfiltered original subtree). rejects an empty
+//       roots list, a non-PrismNode root, an empty query, and a query that matches nothing
+//   Accessors
+//     prism_tv_is_expanded(node: PrismNode) -> bool     the stored "tv_expanded" attr (false if absent)
+//     prism_tv_label_of(node: PrismNode) -> string      the stored "text" attr ("" if absent)
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_ui_kit
+
+// ── File-tree data: a plain recursive value, independent of PrismNode ───────────────────────────
+// Fields are `tve_`-prefixed -- see header. `tve_children` stays a bare `list` (never
+// `list<PrismTvEntry>`) for the same self-referential-generic caution `prism_node.nova` and
+// `std/core/tree.nova` both document for their own recursive `children` fields.
+type PrismTvEntry
+    tve_name: string
+    tve_is_dir: bool
+    tve_children: list
+
+// A file entry always has zero children -- the only two sanctioned constructors are these,
+// so `tve_is_dir=false` paired with a non-empty `tve_children` is structurally unreachable from
+// outside this file, never merely a convention a caller has to honour.
+fn prism_tve_file(name: string) -> Result<PrismTvEntry>
+    if len(name) == 0
+        return err("prism_tve_file: name must not be empty")
+    ok(PrismTvEntry(name, false, []))
+
+// A directory entry. `children` is bare (runtime-checked) for the identical reason
+// `prism_tv_branch`'s own `children: list` parameter is -- see that function.
+fn prism_tve_dir(name: string, children: list) -> Result<PrismTvEntry>
+    if len(name) == 0
+        return err("prism_tve_dir: name must not be empty")
+    for idx, c in children
+        if type_name(c) != "PrismTvEntry"
+            return err("prism_tve_dir: child " + str(idx) + " is not a PrismTvEntry (got " + type_name(c) + ")")
+    ok(PrismTvEntry(name, true, children))
+
+// ── Shared content builders (leaf's own visual body, and a branch's header row) ─────────────────
+// Factored to one place so leaf and branch cannot drift on how an icon is attached, matching the
+// exact discipline `prism_ui_token.nova`'s `_prism_tk_tag_band` factoring gives its own two
+// constructors.
+
+// The flattened glyph+label parts (icon optional). Built directly rather than through
+// `prism_ui_kit.prism_ui_icon_text` because that helper wraps its own `band` around the two
+// nodes -- exactly right for a STANDALONE icon+text control, but a needless extra nesting level
+// here, where the caller (`prism_tv_leaf`) already supplies its own outer `band` (carrying the
+// `text`/`icon` attrs an icon_text node does not) and (`_prism_tv_header` below) its own inline
+// wrapper. Same reasoning `prism_ui_token.nova`'s `prism_tk_tag_closable` gives for building its
+// close icon directly rather than through `prism_ui_icon_text`.
+fn _prism_tv_content_children(label: string, tv_icon: PrismIcon?) -> Result<list>
+    match tv_icon
+        None =>
+            let lbl = prism_content.prism_label(label)?
+            ok([lbl])
+        Some(icon) =>
+            let g = prism_content.prism_glyph(icon)?
+            let lbl = prism_content.prism_label(label)?
+            ok([g, lbl])
+
+// Queryable attrs every leaf/branch carries directly on itself (see header: attrs = state,
+// children = render content, both at once, not either/or).
+fn _prism_tv_attrs(label: string, tv_icon: PrismIcon?) -> dict
+    match tv_icon
+        None => {"text": label}
+        Some(icon) => {"text": label, "icon": prism_content.prism_icon_name(icon)}
+
+// A branch's header row: the same glyph+label parts as a leaf's body, wrapped ONE level so icon
+// and label render on the SAME inline row rather than as two stacked rows once this becomes
+// `children[0]` of the branch's own `stack` (see header on why leaf is `band` and branch is
+// `stack`).
+fn _prism_tv_header(label: string, tv_icon: PrismIcon?) -> Result<PrismNode>
+    let content_children = _prism_tv_content_children(label, tv_icon)?
+    prism_arrange.prism_band(content_children)
+
+// ── Leaf: a terminal tree node ────────────────────────────────────────────────────────────────
+fn prism_tv_leaf(label: string, tv_icon: PrismIcon?) -> Result<PrismNode>
+    if len(label) == 0
+        return err("prism_tv_leaf: label must not be empty")
+    let content_children = _prism_tv_content_children(label, tv_icon)?
+    let attrs = _prism_tv_attrs(label, tv_icon)
+    prism_node.prism_node_branch(prism_node.prism_kind_band(), attrs, content_children)
+
+// ── Branch: a collapsible tree node ───────────────────────────────────────────────────────────
+// See header for: why this is `stack` not `band`; why collapsing discards `children` outright;
+// why `tv_expanded` lives directly in attrs via `prism_node.prism_node_branch` (custom-attr
+// construction, the one thing `prism_arrange`'s own thin wrappers have no parameter to carry --
+// the identical justification `prism_ui_token.nova`'s header gives for importing `prism_node`
+// directly).
+fn prism_tv_branch(label: string, children: list, tv_expanded: bool, tv_icon: PrismIcon?) -> Result<PrismNode>
+    if len(label) == 0
+        return err("prism_tv_branch: label must not be empty")
+    if len(children) == 0
+        return err("prism_tv_branch: children must not be empty")
+    for idx, c in children
+        if type_name(c) != "PrismNode"
+            return err("prism_tv_branch: child " + str(idx) + " is not a PrismNode (got " + type_name(c) + ")")
+    let header = _prism_tv_header(label, tv_icon)?
+    let base_attrs = _prism_tv_attrs(label, tv_icon)
+    let attrs = dict_merge(base_attrs, {"tv_expanded": tv_expanded})
+    let mut visible = []
+    if tv_expanded
+        visible = children
+    let all_children = [header, ...visible]
+    prism_node.prism_node_branch(prism_node.prism_kind_stack(), attrs, all_children)
+
+// ── Tree container: wraps root nodes ─────────────────────────────────────────────────────────
+// `roots` is a bare `list` (not `list<PrismNode>`, mirroring `prism_node.nova`'s own caution for
+// its `children` field), so every element is guarded with the same `type_name(...) != "PrismNode"`
+// check every other bare-list-of-nodes constructor in this codebase tree uses
+// (`prism_tk_tag_group`, `prism_tv_branch` above).
+fn prism_tv_tree(roots: list) -> Result<PrismNode>
+    if len(roots) == 0
+        return err("prism_tv_tree: roots must not be empty")
+    for idx, r in roots
+        if type_name(r) != "PrismNode"
+            return err("prism_tv_tree: root " + str(idx) + " is not a PrismNode (got " + type_name(r) + ")")
+    prism_arrange.prism_stack(roots)
+
+// ── File tree: PrismTvEntry data -> a rendered tree ──────────────────────────────────────────
+// Recursive by construction (same idiom `std/core/tree.nova`'s own `t_map`/`t_count` use): a
+// directory becomes an auto-expanded branch whose children are this same conversion applied to
+// each nested entry; a file becomes a leaf. See header on why the `tve_name` emptiness check
+// here would be unreachable dead code -- kept out, `type_name` kept in (a real, reachable failure
+// for a hostile bare-list element).
+//
+// `e` is DELIBERATELY untyped, not `e: PrismTvEntry` -- verified the hard way (a segfault, not a
+// guess): `entries: list` at the public boundary (`prism_tv_file_tree`) is bare and
+// runtime-checked precisely because a caller can put anything in it, and this function is what
+// `prism_ui_kit.prism_ui_collect` calls on every element BEFORE any type has been confirmed. A
+// statically `PrismTvEntry`-typed parameter forces the callee to interpret its argument's memory
+// as that struct's layout at the CALL BOUNDARY itself, before this function's own first line
+// runs -- so a hostile non-PrismTvEntry element (a bare string, in the KAT that caught this)
+// crashed with a wild read instead of reaching the `type_name` guard at all. This is the exact
+// failure class `prism_node.nova`'s header documents for `prism_node_new`'s own children loop,
+// and the fix is the identical one that file already uses: keep the parameter untyped so
+// `type_name(e)` runs on a genuinely unconstrained value first, and only field-access `e` as a
+// `PrismTvEntry` once that check has passed (NOVA's `any`-narrows-at-first-typed-use behaviour,
+// the same guarantee `prism_node.nova`'s header verifies for its own `for c in children` loop).
+fn _prism_tv_entry_to_node(e) -> Result<PrismNode>
+    if type_name(e) != "PrismTvEntry"
+        return err("prism_tv_file_tree: entry is not a PrismTvEntry (got " + type_name(e) + ")")
+    if e.tve_is_dir
+        let mk = fn(child) _prism_tv_entry_to_node(child)
+        let child_nodes = prism_ui_kit.prism_ui_collect(e.tve_children, mk)?
+        return prism_tv_branch(e.tve_name, child_nodes, true, some(prism_content.prism_icon_menu()))
+    prism_tv_leaf(e.tve_name, some(prism_content.prism_icon_info()))
+
+fn prism_tv_file_tree(entries: list) -> Result<PrismNode>
+    if len(entries) == 0
+        return err("prism_tv_file_tree: entries must not be empty")
+    let mk = fn(e) _prism_tv_entry_to_node(e)
+    let nodes = prism_ui_kit.prism_ui_collect(entries, mk)?
+    prism_tv_tree(nodes)
+
+// ── Search filter ─────────────────────────────────────────────────────────────────────────────
+// See header for: the kind+attr discriminator, why a kept branch is force-expanded, and why a
+// kept branch's children are the filtered set rather than the original unfiltered one.
+//
+// Returns a `list` of 0 or 1 elements (never `PrismNode?`): 0 means "this node, and everything
+// beneath it, does not match and is dropped"; 1 means "keep this (possibly rebuilt) node". A
+// list-of-0-or-1 composes with `...spread` directly at every recursive call site with no
+// Option-unwrapping machinery, the same reason this codebase already prefers a plain list return
+// over threading `Option`/`Result` through a fold in `prism_ui_kit.prism_ui_collect`'s own design.
+fn _prism_tv_search_filter(node: PrismNode, query_lower: string) -> Result<list>
+    let kind = prism_node.prism_node_kind_str(node)
+    let is_branch = kind == "stack" and prism_node.prism_node_has_attr(node, "tv_expanded")
+    if not is_branch
+        let text = prism_node.prism_node_attr_str(node, "text", "")
+        if find(lower(text), query_lower) >= 0
+            return ok([node])
+        return ok([])
+    let own_text = prism_node.prism_node_attr_str(node, "text", "")
+    let own_match = find(lower(own_text), query_lower) >= 0
+    let kids = prism_node.prism_node_children(node)
+    let header = kids[0]
+    let filtered_subtree = []
+    for idx, k in kids
+        if idx > 0
+            let matched = _prism_tv_search_filter(k, query_lower)?
+            for m in matched
+                filtered_subtree.push(m)
+    if own_match or len(filtered_subtree) > 0
+        let new_attrs = dict_merge(node.attrs, {"tv_expanded": true})
+        let new_children = [header, ...filtered_subtree]
+        let rebuilt = prism_node.prism_node_new(node.kind, new_attrs, new_children, node.key)?
+        return ok([rebuilt])
+    ok([])
+
+// Rejects an empty roots list, a non-PrismNode root, an empty query, and a query that matches
+// nothing anywhere in the forest (an empty result has no valid tree-view representation, the
+// same "reject the unrepresentable empty case" rule `prism_tv_tree` already applies to its own
+// `roots`).
+fn prism_tv_search_tree(roots: list, query: string) -> Result<PrismNode>
+    if len(query) == 0
+        return err("prism_tv_search_tree: query must not be empty")
+    if len(roots) == 0
+        return err("prism_tv_search_tree: roots must not be empty")
+    for idx, r in roots
+        if type_name(r) != "PrismNode"
+            return err("prism_tv_search_tree: root " + str(idx) + " is not a PrismNode (got " + type_name(r) + ")")
+    let query_lower = lower(query)
+    let kept = []
+    for r in roots
+        let matched = _prism_tv_search_filter(r, query_lower)?
+        for m in matched
+            kept.push(m)
+    if len(kept) == 0
+        return err("prism_tv_search_tree: query '" + query + "' matched nothing")
+    prism_tv_tree(kept)
+
+// ── Accessors ─────────────────────────────────────────────────────────────────────────────────
+fn prism_tv_is_expanded(node: PrismNode) -> bool
+    prism_node.prism_node_attr_bool(node, "tv_expanded", false)
+
+fn prism_tv_label_of(node: PrismNode) -> string
+    prism_node.prism_node_attr_str(node, "text", "")
