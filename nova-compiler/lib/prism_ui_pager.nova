@@ -1,0 +1,244 @@
+// prism_ui_pager -- pagination components (prism/ui/ composition layer): windowed page nav bar,
+// page-size selector, item-range info line, compact prev/label/next, and an infinite-scroll
+// "load more" affordance. Every one is a COMPOSITION over the closed 22-primitive vocabulary
+// (widget/), built through prism_arrange/prism_content/prism_interact plus prism_ui_kit.nova's
+// `prism_ui_collect` -- no new PrismNodeKind, matching prism_ui_feedback.nova / prism_ui_nav.nova's
+// own "this is a composition, not a new primitive" discipline (PRISM_SPEC.md axiom A7).
+//
+// ── NOT A DUPLICATE OF `prism_ui_nav.prism_nav_pages` -- A DIFFERENT SHAPE FOR A DIFFERENT SCALE ──
+// prism_ui_nav.nova already ships a page nav bar (`prism_nav_pages(current, total)`): a `band` of
+// EVERY page 1..total plus prev/next, each non-current page a `press`. That is the right shape
+// when `total` is small (a filtered table with 6 pages), but it is O(total) nodes -- a 500-page
+// result set would build a 502-node band, which is both a rendering cost (PRISM_SPEC.md §16's
+// tree-size budget) and a genuinely unusable control (no human scans 500 page buttons).
+// `prism_pg_pager` below is the WINDOWED alternative this brief asks for: first page, last page,
+// and `pg_window` pages either side of current, with an ellipsis label standing in for the
+// collapsed run in between -- O(window) node count regardless of `pg_total`. It also differs in a
+// second, deliberate way: `prism_nav_pages`'s page buttons are `press` (a same-page client-side
+// action); this module's are `prism_link` (a real, validated href), because this brief specifies
+// deep-linkable pages. Both components are correct for their own scale; neither replaces the
+// other, so both stay.
+//
+// ── WHY THE WINDOW ALGORITHM NEEDS NO SPECIAL CASE FOR "pg_total FITS INSIDE THE WINDOW" ─────────
+// The naive approach writes "if total <= 2*window+3, show every page, else show the windowed
+// form" -- two code paths that can silently disagree at the boundary. There is only one path here:
+// compute `win_lo = max(1, current - window)` and `win_hi = min(total, current + window)`, emit
+// page 1 before the window ONLY IF `win_lo > 1` (with an ellipsis only when the gap is > 1 page),
+// emit `total` after the window ONLY IF `win_hi < total` (same ellipsis rule), and emit
+// `win_lo..win_hi` in between. When the window already reaches both edges (`win_lo == 1` and
+// `win_hi == total`), both "emit edge" branches are skipped by their own guard and the walk
+// degenerates to exactly the unwindowed page list -- the small-`total` case falls out of the
+// general rule instead of needing to be recognized as a distinct case up front. The KAT proves
+// both the "gap" and "adjacent, no ellipsis" branches at both edges independently (4 shapes).
+//
+// ── WHY THE ELLIPSIS IS ENCODED AS THE INT `0` IN THE SAME LIST, NOT A SECOND LIST OR VARIANT ────
+// `pg_current`/`pg_total` are validated `>= 1` before any page number is computed, and every page
+// number this function ever pushes is drawn from `[1, pg_total]` -- so `0` can never collide with
+// a real page number. Reusing `prism_ui_kit.prism_ui_collect`'s single `list<int> ->
+// Result<list<PrismNode>>` map over one sentinel-carrying list is simpler than a second list of
+// "is this a gap" flags kept in lockstep with the page numbers (two lists that must stay the same
+// length is its own bug class), and does not require inventing a tiny closed type for one boolean
+// fact used in exactly one function.
+//
+// ── WHY EVERY LINK HREF IS "/#page-N" / "/#size-N", NOT THE BARE "#page-N" A CALLER MIGHT EXPECT ──
+// prism_interact.prism_link's only two constructors are `prism_link_target_url` (external,
+// {http,https}-only) and `prism_link_target_route` (in-app, PRISM_SPEC.md §15.1: allowlist, never
+// a denylist). `_prism_link_valid_route` (prism_interact.nova) requires the path's FIRST byte to
+// be "/" -- a bare fragment like "#page-3" is not a legal shape for either constructor, and there
+// is deliberately no third, unvalidated constructor to smuggle it through (see prism_interact.nova's
+// own header). Prefixing a single "/" preserves the fragment-anchor destination ("#page-3" is
+// still the suffix a browser jumps to) while handing the already-hardened route validator a shape
+// it accepts; "/#" as the first two bytes is deliberately neither "//" nor "/\\", so it also clears
+// that validator's own open-redirect guard with no special-casing needed here. This is an
+// adaptation of the requested destination shape to the existing validated surface, not a new,
+// weaker path around it.
+//
+// ── WHY CURRENT-PAGE / DISABLED-PREV-NEXT ARE `label`, NEVER `link`/`press` WITH A "DISABLED" FLAG ──
+// Same principle prism_ui_nav.nova's own header states for its pagination: "a control whose action
+// is 'go to where you already are' (or 'go nowhere, because there is nowhere to go') is not a real
+// affordance" -- and neither `link` nor `press` carries a disabled attr at this layer (deferred to
+// the reactivity engine). The current page and an out-of-range prev/next therefore render as a
+// plain `label` in the SAME position -- never omitted, never a non-functional link.
+//
+// ── WHY `prism_pg_info`'s "pg_total_items=0 implies start=end=0" NEEDS NO SEPARATE CHECK ─────────
+// The three checks the brief lists -- start>=0, end>=start, end<=total -- already force this
+// exactly: if total=0, `end<=total` forces `end<=0`; combined with `end>=start>=0` that forces
+// `start=end=0`. A caller cannot construct start=5,end=5,total=0 (rejected by end<=total: 5>0) or
+// need a bypass for start=0,end=0,total=0 (it already satisfies all three checks as written).
+// Adding a fourth, redundant "if total==0 then require 0-0" branch would be dead code that could
+// drift out of sync with the other three if any one of them changes later -- proven equivalent
+// here once, instead, and the KAT exercises the 0-0-0 shape directly to demonstrate it.
+//
+// ── WHY `prism_pg_size_select`'s DUPLICATE CHECK KEYS ON `str(size)`, NOT THE INT DIRECTLY ────────
+// Every dict-keyed duplicate/membership check elsewhere in this codebase (`prism_pick`'s
+// `pick_value`, `prism_xf_index`'s `xf_key`, `prism_nav_menu`'s routes) keys a dict on a STRING;
+// there is no verified precedent anywhere in prism/ for an int-keyed dict, so this reuses the
+// proven idiom (`str(n)` as the dict key) instead of being the first call site to try a new one.
+//
+// PUBLIC API (all Result<PrismNode>; every one validates, none fails silently)
+//   prism_pg_pager(pg_current, pg_total, pg_window: int) -> Result<PrismNode>
+//     band [prev, page_1, (ellipsis)?, win_lo..win_hi, (ellipsis)?, page_total, next].
+//     prev/next are a `link` when usable, a `label` at the boundary (never omitted, see header).
+//     the current page is a `label`; every other shown page is a `link` to "/#page-N".
+//     rejects: pg_total < 1, pg_window < 0, pg_current < 1, pg_current > pg_total.
+//   prism_pg_size_select(pg_label, pg_sizes: list, pg_selected: int) -> Result<PrismNode>
+//     band [label(pg_label), flow(size items)]; the selected size is a `label`, every other size
+//     is a `link` to "/#size-N".
+//     rejects: empty pg_label, empty pg_sizes, a non-int / non-positive / duplicate element of
+//     pg_sizes, a pg_selected that names no element of pg_sizes.
+//   prism_pg_info(pg_start, pg_end, pg_total_items: int) -> Result<PrismNode>
+//     a single label: "Showing {start}-{end} of {total} items".
+//     rejects: pg_total_items < 0, pg_start < 0, pg_end < pg_start, pg_end > pg_total_items
+//     (see header note: this alone also enforces "pg_total_items=0 implies start=end=0").
+//   prism_pg_compact(pg_current, pg_total: int) -> Result<PrismNode>
+//     band [prev, label("Page {current} of {total}"), next]; prev/next use the same disabled
+//     rule as prism_pg_pager.
+//     rejects: pg_total < 1, pg_current < 1, pg_current > pg_total.
+//   prism_pg_load_more(pg_label, pg_loaded, pg_total_items: int) -> Result<PrismNode>
+//     pg_loaded < pg_total_items  -> stack [press(pg_label), label("{loaded} of {total} loaded")]
+//     pg_loaded >= pg_total_items -> label("All items loaded")
+//     rejects: empty pg_label, pg_loaded < 0, pg_total_items < 1.
+
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// ── Shared: prev/next control, same disabled rule for both prism_pg_pager and prism_pg_compact ──
+// `text` is always "Previous"/"Next" (non-empty) and, when enabled, the constructed route is
+// always "/#page-<positive int>" (always a legal AppRoute shape -- see header), so this can never
+// actually fail. `?`-propagated anyway rather than assumed -- this codebase never treats a
+// Result as Ok without checking, even when the call is provably safe (prism_fb_* does the
+// identical thing for its own always-valid internal calls).
+fn _prism_pg_control(text: string, target_page: int, enabled: bool) -> Result<PrismNode>
+    if not enabled
+        return prism_content.prism_label(text)
+    prism_interact.prism_link(text, prism_interact.prism_link_target_route("/#page-" + str(target_page)))
+
+// One page indicator. `0` is the ellipsis sentinel (see header) -- checked first since it is not a
+// real page number and must never be compared against `current` or turned into a link.
+fn _prism_pg_page_item(n: int, current: int) -> Result<PrismNode>
+    if n == 0
+        return prism_content.prism_label("...")
+    if n == current
+        return prism_content.prism_label(str(n))
+    prism_interact.prism_link(str(n), prism_interact.prism_link_target_route("/#page-" + str(n)))
+
+// ── 1. Windowed page nav bar ──────────────────────────────────────────────────────────────────
+// Rejects: pg_total < 1, pg_window < 0, pg_current < 1, pg_current > pg_total (checked in that
+// order: pg_total and pg_window are checked before pg_current is checked against pg_total, since
+// a bad total or window makes the current-vs-total comparison meaningless).
+fn prism_pg_pager(pg_current: int, pg_total: int, pg_window: int) -> Result<PrismNode>
+    if pg_total < 1
+        return err("prism_pg_pager: pg_total must be >= 1, got " + str(pg_total))
+    if pg_window < 0
+        return err("prism_pg_pager: pg_window must be >= 0, got " + str(pg_window))
+    if pg_current < 1
+        return err("prism_pg_pager: pg_current must be >= 1, got " + str(pg_current))
+    if pg_current > pg_total
+        return err("prism_pg_pager: pg_current (" + str(pg_current) + ") must be <= pg_total (" + str(pg_total) + ")")
+    let prev_node = _prism_pg_control("Previous", pg_current - 1, pg_current > 1)?
+    let next_node = _prism_pg_control("Next", pg_current + 1, pg_current < pg_total)?
+    let mut win_lo = pg_current - pg_window
+    if win_lo < 1
+        win_lo = 1
+    let mut win_hi = pg_current + pg_window
+    if win_hi > pg_total
+        win_hi = pg_total
+    let nums = []
+    if win_lo > 1
+        nums.push(1)
+        if win_lo > 2
+            nums.push(0)
+    let mut p = win_lo
+    while p <= win_hi
+        nums.push(p)
+        p += 1
+    if win_hi < pg_total
+        if win_hi < pg_total - 1
+            nums.push(0)
+        nums.push(pg_total)
+    let mk = fn(n) _prism_pg_page_item(n, pg_current)
+    let items = prism_ui_kit.prism_ui_collect(nums, mk)?
+    prism_arrange.prism_band([prev_node, ...items, next_node])
+
+// ── 2. Page-size selector ────────────────────────────────────────────────────────────────────
+fn _prism_pg_size_item(size: int, selected: int) -> Result<PrismNode>
+    if size == selected
+        return prism_content.prism_label(str(size))
+    prism_interact.prism_link(str(size), prism_interact.prism_link_target_route("/#size-" + str(size)))
+
+// Rejects: an empty pg_label or pg_sizes, a non-int / non-positive / duplicate element of
+// pg_sizes (checked per-element, in that order, before the whole list is trusted), and a
+// pg_selected that names no element of pg_sizes.
+fn prism_pg_size_select(pg_label: string, pg_sizes: list, pg_selected: int) -> Result<PrismNode>
+    if len(pg_label) == 0
+        return err("prism_pg_size_select: pg_label must not be empty")
+    if len(pg_sizes) == 0
+        return err("prism_pg_size_select: pg_sizes must not be empty")
+    let seen = {}
+    for idx, s in pg_sizes
+        if not is_int(s)
+            return err("prism_pg_size_select: pg_sizes[" + str(idx) + "] must be an int, got " + type_name(s))
+        if s <= 0
+            return err("prism_pg_size_select: pg_sizes[" + str(idx) + "] must be > 0, got " + str(s))
+        let key = str(s)
+        if key in seen
+            return err("prism_pg_size_select: duplicate size " + str(s))
+        seen[key] = true
+    if str(pg_selected) not in seen
+        return err("prism_pg_size_select: pg_selected (" + str(pg_selected) + ") is not one of pg_sizes")
+    let label_node = prism_content.prism_label(pg_label)?
+    let mk = fn(s) _prism_pg_size_item(s, pg_selected)
+    let items = prism_ui_kit.prism_ui_collect(pg_sizes, mk)?
+    let flow_node = prism_arrange.prism_flow(items)?
+    prism_arrange.prism_band([label_node, flow_node])
+
+// ── 3. Item-range info line ──────────────────────────────────────────────────────────────────
+// Rejects: pg_total_items < 0, pg_start < 0, pg_end < pg_start, pg_end > pg_total_items. See
+// header for why the "pg_total_items=0 implies start=end=0" rule needs no separate branch.
+fn prism_pg_info(pg_start: int, pg_end: int, pg_total_items: int) -> Result<PrismNode>
+    if pg_total_items < 0
+        return err("prism_pg_info: pg_total_items must be >= 0, got " + str(pg_total_items))
+    if pg_start < 0
+        return err("prism_pg_info: pg_start must be >= 0, got " + str(pg_start))
+    if pg_end < pg_start
+        return err("prism_pg_info: pg_end (" + str(pg_end) + ") must be >= pg_start (" + str(pg_start) + ")")
+    if pg_end > pg_total_items
+        return err("prism_pg_info: pg_end (" + str(pg_end) + ") must be <= pg_total_items (" + str(pg_total_items) + ")")
+    let text = "Showing " + str(pg_start) + "-" + str(pg_end) + " of " + str(pg_total_items) + " items"
+    prism_content.prism_label(text)
+
+// ── 4. Compact prev/label/next ───────────────────────────────────────────────────────────────
+// Rejects: pg_total < 1, pg_current < 1, pg_current > pg_total -- the same three-check shape as
+// prism_pg_pager (minus pg_window, which this component does not take), so "boundaries" in the
+// brief's one-line description is well-defined rather than left to whatever `_prism_pg_control`
+// happens to do with an out-of-range input.
+fn prism_pg_compact(pg_current: int, pg_total: int) -> Result<PrismNode>
+    if pg_total < 1
+        return err("prism_pg_compact: pg_total must be >= 1, got " + str(pg_total))
+    if pg_current < 1
+        return err("prism_pg_compact: pg_current must be >= 1, got " + str(pg_current))
+    if pg_current > pg_total
+        return err("prism_pg_compact: pg_current (" + str(pg_current) + ") must be <= pg_total (" + str(pg_total) + ")")
+    let prev_node = _prism_pg_control("Previous", pg_current - 1, pg_current > 1)?
+    let next_node = _prism_pg_control("Next", pg_current + 1, pg_current < pg_total)?
+    let label_node = prism_content.prism_label("Page " + str(pg_current) + " of " + str(pg_total))?
+    prism_arrange.prism_band([prev_node, label_node, next_node])
+
+// ── 5. Load more ──────────────────────────────────────────────────────────────────────────────
+// Rejects: empty pg_label, pg_loaded < 0, pg_total_items < 1. `pg_loaded >= pg_total_items`
+// (not just `==`) renders the finished state -- a loaded count that overshot the total by a
+// stale read is still "nothing left to load", not an error this function needs to police.
+fn prism_pg_load_more(pg_label: string, pg_loaded: int, pg_total_items: int) -> Result<PrismNode>
+    if len(pg_label) == 0
+        return err("prism_pg_load_more: pg_label must not be empty")
+    if pg_loaded < 0
+        return err("prism_pg_load_more: pg_loaded must be >= 0, got " + str(pg_loaded))
+    if pg_total_items < 1
+        return err("prism_pg_load_more: pg_total_items must be >= 1, got " + str(pg_total_items))
+    if pg_loaded >= pg_total_items
+        return prism_content.prism_label("All items loaded")
+    let btn = prism_interact.prism_press(pg_label, [])?
+    let progress = prism_content.prism_label(str(pg_loaded) + " of " + str(pg_total_items) + " loaded")?
+    prism_arrange.prism_stack([btn, progress])
