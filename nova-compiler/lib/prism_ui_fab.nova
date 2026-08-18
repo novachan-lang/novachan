@@ -1,0 +1,135 @@
+// prism_ui_fab -- Floating Action Button / Speed Dial component family (prism/ui/ composition
+// layer): a single FAB, a stacked group of FABs, an expandable speed dial (main + actions), a
+// FAB pinned to a screen corner, and a FAB carrying a numeric badge. Composition over the closed
+// 22-primitive vocabulary (widget/), per PRISM_SPEC.md axiom A7.
+//
+// ── A FAB IS NOT A NEW PRIMITIVE -- IT IS prism_press WEARING ONE GLYPH ────────────────────────
+// prism_node.nova's 22-primitive vocabulary already has an activatable control (`press`, a11y role
+// `button`, PRISM_SPEC.md §9) and a text leaf (`label`). A floating action button is exactly that
+// pair -- `press(accessible_name, [glyph_label])` -- with no new PrismNodeKind and no new attr
+// channel. Every function below is built out of `prism_fab_button`, the same "one core, everything
+// composes over it" shape prism_ui_switch.nova uses for switch/checkbox/radio.
+//
+// ── CORNER PLACEMENT: ONE AXIS IS STRUCTURE, BOTH AXES ARE TEXT ─────────────────────────────────
+// prism_node.nova has no absolute-position or alignment attr anywhere in the vocabulary, so
+// `prism_fab_positioned` cannot place a FAB in 2D. What it CAN do is the same trick
+// prism_spl_collapsed uses for its side-pinned indicator: pick the ONE axis `stack` can express
+// (vertical order -- tag-before vs tag-after) to carry the top/bottom half of the corner, and put
+// the FULL corner name ("top-left", not just "top") in the tag label's own text, so the horizontal
+// half is never discarded even though no primitive can render it structurally. A reader who only
+// sees node kinds still gets the vertical intent right; a reader of the tag's text gets the exact
+// corner.
+//
+// ── SPEED DIAL: prism_ui_collect FOR THE ACTIONS, A TERNARY FOR THE SHAPE ───────────────────────
+// `prism_fab_speed_dial` must never let a `?` run inside the lambda passed to a collection helper
+// (that swallows the error and leaks a garbage node -- see prism_ui_kit.nova's own caution), so the
+// action buttons are built with `prism_ui_kit.prism_ui_collect`, exactly like every other component
+// in this layer. Once built, `open` selects the SHAPE, not the content: `[...actions, main_btn]`
+// when open, `[main_btn]` when closed -- one `prism_arrange.prism_stack` call either way, so a
+// caller diffing the two states sees the same node kind and only the child count changes.
+//
+// ── BADGE: THE MISSING BADGE IS A MISSING CHILD, NOT A "0" LABEL ────────────────────────────────
+// `prism_fab_badge_button` never renders a badge text of "0" -- a badge is either the second child
+// of the returned `band`, or it does not exist. This matches PRISM_SPEC.md's empty-state honesty
+// stance elsewhere in prism/ui/ (prism_ui_kit.prism_ui_empty's header note): a badge showing "0"
+// looks identical to a genuinely broken counter, so "no badge" must be a structural absence.
+// `count` is capped for DISPLAY at "99+" (never "100", "1000", ...) but the raw count is not
+// bounds-checked upward -- only `count < 0` is rejected, since a negative count can never legally
+// occur and is certainly caller error, while an unbounded positive count is exactly what a real
+// notification counter looks like.
+//
+// PUBLIC API (all Result<PrismNode>; every one validates, none fails silently)
+//   prism_fab_button(accessible_name, glyph)                     -> press[label(glyph)]
+//     rejects an empty accessible_name or an empty glyph.
+//   prism_fab_group(names, glyphs)                                -> stack[fab, fab, ...]
+//     driven by names.zip(glyphs); rejects unequal lengths, an empty list, and any non-string or
+//     empty element in either list.
+//   prism_fab_speed_dial(main_name, main_glyph, action_names, action_glyphs, open)
+//                                                                  -> stack[actions..., main] or
+//                                                                     stack[main] when closed
+//     rejects action_names/action_glyphs of unequal length, or any non-string/empty element in
+//     either (when non-empty); the main button's own validation covers main_name/main_glyph.
+//   prism_fab_positioned(accessible_name, glyph, corner)          -> stack[tag, fab] or
+//                                                                     stack[fab, tag]
+//     rejects any corner outside {top-left, top-right, bottom-left, bottom-right}, naming the
+//     allowed set.
+//   prism_fab_badge_button(accessible_name, glyph, count)         -> band[fab] (count == 0) or
+//                                                                     band[fab, badge]
+//     renders "{count}" for 1-99, "99+" above that; rejects a negative count.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// The closed set of corners a positioned FAB can be pinned to -- see header note on why the full
+// name (both axes) lives in this list even though only the top/bottom half drives the arrangement.
+let PRISM_FAB_CORNERS = ["top-left", "top-right", "bottom-left", "bottom-right"]
+
+// Above this, a badge stops counting and starts just meaning "a lot" -- see header note.
+let PRISM_FAB_BADGE_MAX = 99
+
+// ── Shared validation (mirrors prism_ui_switch.nova's _prism_swt_check_labels shape) ────────────
+fn _prism_fab_check_labels(fn_name: string, arg_name: string, items: list) -> Result<int>
+    for i, s in items
+        if not is_string(s)
+            return err("{fn_name}: {arg_name}[{i}] must be a string, got {type_name(s)}")
+        if len(s) == 0
+            return err("{fn_name}: {arg_name}[{i}] must not be empty")
+    ok(0)
+
+// ── 1. Single FAB ─────────────────────────────────────────────────────────────────────────────
+fn prism_fab_button(accessible_name: string, glyph: string) -> Result<PrismNode>
+    if len(accessible_name) == 0
+        return err("prism_fab_button: accessible_name must not be empty -- a button named only by its glyph is invisible to a screen reader")
+    if len(glyph) == 0
+        return err("prism_fab_button: glyph must not be empty")
+    let g = prism_content.prism_label(glyph)?
+    prism_interact.prism_press(accessible_name, [g])
+
+// ── 2. FAB group ──────────────────────────────────────────────────────────────────────────────
+fn prism_fab_group(names: list, glyphs: list) -> Result<PrismNode>
+    if len(names) != len(glyphs)
+        return err("prism_fab_group: names ({len(names)}) and glyphs ({len(glyphs)}) must be the same length")
+    if len(names) == 0
+        return err("prism_fab_group: needs at least one FAB")
+    _prism_fab_check_labels("prism_fab_group", "names", names)?
+    _prism_fab_check_labels("prism_fab_group", "glyphs", glyphs)?
+    let mk = fn(p) prism_fab_button(p[0], p[1])
+    let buttons = prism_ui_kit.prism_ui_collect(names.zip(glyphs), mk)?
+    prism_arrange.prism_stack(buttons)
+
+// ── 3. Speed dial: main button, plus actions revealed when open ─────────────────────────────────
+fn prism_fab_speed_dial(main_name: string, main_glyph: string, action_names: list, action_glyphs: list, open: bool) -> Result<PrismNode>
+    if len(action_names) != len(action_glyphs)
+        return err("prism_fab_speed_dial: action_names ({len(action_names)}) and action_glyphs ({len(action_glyphs)}) must be the same length")
+    _prism_fab_check_labels("prism_fab_speed_dial", "action_names", action_names)?
+    _prism_fab_check_labels("prism_fab_speed_dial", "action_glyphs", action_glyphs)?
+    let main_btn = prism_fab_button(main_name, main_glyph)?
+    let mk = fn(p) prism_fab_button(p[0], p[1])
+    let actions = prism_ui_kit.prism_ui_collect(action_names.zip(action_glyphs), mk)?
+    let children = [...actions, main_btn] if open else [main_btn]
+    prism_arrange.prism_stack(children)
+
+// ── 4. Positioned FAB: tagged with a screen corner ───────────────────────────────────────────────
+fn prism_fab_positioned(accessible_name: string, glyph: string, corner: string) -> Result<PrismNode>
+    if corner not in PRISM_FAB_CORNERS
+        let allowed = join(PRISM_FAB_CORNERS, ", ")
+        return err("prism_fab_positioned: corner must be one of {allowed}, got '{corner}'")
+    let btn = prism_fab_button(accessible_name, glyph)?
+    let tag = prism_content.prism_label(corner)?
+    let top = corner == "top-left" or corner == "top-right"
+    let children = [tag, btn] if top else [btn, tag]
+    prism_arrange.prism_stack(children)
+
+// ── 5. Badge FAB: a numeric counter, or nothing at all ───────────────────────────────────────────
+fn prism_fab_badge_button(accessible_name: string, glyph: string, count: int) -> Result<PrismNode>
+    if count < 0
+        return err("prism_fab_badge_button: count ({count}) must not be negative")
+    let btn = prism_fab_button(accessible_name, glyph)?
+    if count == 0
+        return prism_arrange.prism_band([btn])
+    let badge_text = "{count}" if count <= PRISM_FAB_BADGE_MAX else "99+"
+    let badge = prism_content.prism_label(badge_text)?
+    prism_arrange.prism_band([btn, badge])
