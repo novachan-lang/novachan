@@ -1,0 +1,158 @@
+// prism_ui_slider -- Slider / range component family (prism/ui/ composition layer): a single-thumb
+// slider, a dual-thumb range, a stepped slider with tick marks, a vertical/rotated slider, and a
+// convenience 0-100 percent slider. Composition over the closed 22-primitive vocabulary (widget/),
+// per PRISM_SPEC.md axiom A7.
+//
+// prism_node.nova has no thumb-position/tick-mark attrs anywhere in the 22-primitive vocabulary,
+// so a slider's thumb is rendered as TEXT (a `label`'s own string) -- exactly the same trick
+// prism_ui_tabs.nova uses for "the active tab is bracketed text, not a boolean flag." The vocabulary
+// stays closed; the position lives in the string content a `label` already legally carries.
+//
+// ── WHY A FIXED TRACK WIDTH, NOT A CALLER-SUPPLIED ONE ────────────────────────────────────────
+// Every track here is exactly `PRISM_SLD_TRACK_WIDTH` (10) characters, the same fixed-width
+// convention prism_ui_chart.nova's `PRISM_CH_BAR_TRACK` already establishes for its bar charts.
+// A caller-supplied width would need its own validation (>0, some sane upper bound) for no real
+// benefit -- the text rendering is already an approximation of a continuous control, and a second
+// free parameter only widens the space of malformed input without adding expressive power.
+//
+// ── THE DUAL-THUMB BAR (prism_sld_range): ONE FORMULA, NOT A SPECIAL CASE FUNCTION ────────────
+// `lo <= hi` is validated, but `lo == hi` is still legal (a zero-width range), which maps both
+// thumbs onto the SAME character position. Rather than a separate code path for "thumbs overlap",
+// the middle segment's length and the choice of one-`o`-vs-two-`o` template are both driven by a
+// single ternary on `pos_hi > pos_lo` -- the overlap case falls out as the degenerate case of the
+// general formula instead of needing to be detected and handled specially.
+//
+// ── STEPPED TICKS: A CHARACTER LIST + join, NOT STRING CONCATENATION ──────────────────────────
+// A stepped track needs a tick mark at every step boundary PLUS a thumb that can coincide with
+// any of them. Building this by concatenating segments (as the single/dual-thumb bars do) would
+// need one segment per tick, a variable count depending on `step`. Instead each of the 10
+// positions is independently classified (thumb > tick > plain) via a comprehension, then joined --
+// O(width) with no segment-counting arithmetic at all.
+//
+// PUBLIC API (all Result<PrismNode>; every one validates, none fails silently)
+//   prism_sld_slider(label, value, min_val, max_val)        -> stack[label, band[bar, value]]
+//     rejects empty label, min_val >= max_val, value outside [min_val, max_val].
+//   prism_sld_range(label, lo, hi, min_val, max_val)         -> stack[label, band[bar, "lo-hi"]]
+//     rejects empty label, min_val >= max_val, lo > hi, lo/hi outside [min_val, max_val].
+//   prism_sld_stepped(label, value, min_val, max_val, step)  -> stack[label, band[bar, value]]
+//     same rejects as slider, plus step <= 0 or value not on a step boundary.
+//   prism_sld_vertical(label, value, min_val, max_val)       -> stack[label, stack[row...]]
+//     same rejects as slider; rows run top (max_val) to bottom (min_val).
+//   prism_sld_percent(label, pct)                            -> stack[label, band[bar, "NNN%"]]
+//     rejects empty label, pct outside [0, 100].
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_ui_kit
+
+// Fixed text-track width shared by every slider shape here -- see header.
+let PRISM_SLD_TRACK_WIDTH = 10
+
+// ── Shared validation ──────────────────────────────────────────────────────────────────────────
+fn _prism_sld_check_label(fn_name: string, label: string) -> Result<int>
+    if len(label) == 0
+        return err("{fn_name}: label must not be empty")
+    ok(0)
+
+fn _prism_sld_check_bounds(fn_name: string, min_val: int, max_val: int) -> Result<int>
+    if min_val >= max_val
+        return err("{fn_name}: min_val ({min_val}) must be < max_val ({max_val})")
+    ok(0)
+
+fn _prism_sld_check_value(fn_name: string, value: int, min_val: int, max_val: int) -> Result<int>
+    if value < min_val or value > max_val
+        return err("{fn_name}: value ({value}) must be in [{min_val}, {max_val}]")
+    ok(0)
+
+// Linear map: value in [min_val, max_val] -> a character index in [0, width-1]. Truncating
+// integer division -- text is already an approximation, the same tradeoff prism_ui_chart.nova's
+// `(value * PRISM_CH_BAR_TRACK) / max_value` makes for its bars.
+fn _prism_sld_pos(value: int, min_val: int, max_val: int, width: int) -> int
+    (value - min_val) * (width - 1) / (max_val - min_val)
+
+// ── 1. Single-thumb slider ─────────────────────────────────────────────────────────────────────
+// Shared by prism_sld_slider and prism_sld_percent (percent is just 0-100 with a differently
+// formatted value label) -- one builder, two thin validated entry points, rather than duplicating
+// the bar/track assembly.
+fn _prism_sld_core(label: string, value: int, min_val: int, max_val: int, val_text: string) -> Result<PrismNode>
+    let pos = _prism_sld_pos(value, min_val, max_val, PRISM_SLD_TRACK_WIDTH)
+    let left = str_repeat("-", pos)
+    let right = str_repeat("-", PRISM_SLD_TRACK_WIDTH - 1 - pos)
+    let lbl = prism_content.prism_label(label)?
+    let bar = prism_content.prism_label("{left}o{right}")?
+    let val_node = prism_content.prism_label(val_text)?
+    let track = prism_arrange.prism_band([bar, val_node])?
+    prism_arrange.prism_stack([lbl, track])
+
+fn prism_sld_slider(label: string, value: int, min_val: int, max_val: int) -> Result<PrismNode>
+    _prism_sld_check_label("prism_sld_slider", label)?
+    _prism_sld_check_bounds("prism_sld_slider", min_val, max_val)?
+    _prism_sld_check_value("prism_sld_slider", value, min_val, max_val)?
+    _prism_sld_core(label, value, min_val, max_val, "{value}")
+
+// ── 2. Dual-thumb range ────────────────────────────────────────────────────────────────────────
+fn prism_sld_range(label: string, lo: int, hi: int, min_val: int, max_val: int) -> Result<PrismNode>
+    _prism_sld_check_label("prism_sld_range", label)?
+    _prism_sld_check_bounds("prism_sld_range", min_val, max_val)?
+    if lo > hi
+        return err("prism_sld_range: lo ({lo}) must be <= hi ({hi})")
+    _prism_sld_check_value("prism_sld_range", lo, min_val, max_val)?
+    _prism_sld_check_value("prism_sld_range", hi, min_val, max_val)?
+    let pos_lo = _prism_sld_pos(lo, min_val, max_val, PRISM_SLD_TRACK_WIDTH)
+    let pos_hi = _prism_sld_pos(hi, min_val, max_val, PRISM_SLD_TRACK_WIDTH)
+    let left = str_repeat("-", pos_lo)
+    let right = str_repeat("-", PRISM_SLD_TRACK_WIDTH - 1 - pos_hi)
+    let mid = str_repeat("-", pos_hi - pos_lo - 1) if pos_hi > pos_lo else ""
+    let bar_str = "{left}o{mid}o{right}" if pos_hi > pos_lo else "{left}o{right}"
+    let lbl = prism_content.prism_label(label)?
+    let bar = prism_content.prism_label(bar_str)?
+    let val_node = prism_content.prism_label("{lo}-{hi}")?
+    let track = prism_arrange.prism_band([bar, val_node])?
+    prism_arrange.prism_stack([lbl, track])
+
+// ── 3. Stepped slider with tick marks ─────────────────────────────────────────────────────────
+fn prism_sld_stepped(label: string, value: int, min_val: int, max_val: int, step: int) -> Result<PrismNode>
+    _prism_sld_check_label("prism_sld_stepped", label)?
+    _prism_sld_check_bounds("prism_sld_stepped", min_val, max_val)?
+    _prism_sld_check_value("prism_sld_stepped", value, min_val, max_val)?
+    if step <= 0
+        return err("prism_sld_stepped: step ({step}) must be > 0")
+    if (value - min_val) % step != 0
+        return err("prism_sld_stepped: value ({value}) is not on a step boundary (step={step}, min_val={min_val})")
+    let thumb_pos = _prism_sld_pos(value, min_val, max_val, PRISM_SLD_TRACK_WIDTH)
+    let tick_count = (max_val - min_val) / step + 1
+    let tick_positions = [_prism_sld_pos(min_val + k * step, min_val, max_val, PRISM_SLD_TRACK_WIDTH) for k in 0..tick_count if min_val + k * step <= max_val]
+    let chars = [("o" if i == thumb_pos else ("|" if i in tick_positions else "-")) for i in 0..PRISM_SLD_TRACK_WIDTH]
+    let bar_str = join(chars, "")
+    let lbl = prism_content.prism_label(label)?
+    let bar = prism_content.prism_label(bar_str)?
+    let val_node = prism_content.prism_label("{value}")?
+    let track = prism_arrange.prism_band([bar, val_node])?
+    prism_arrange.prism_stack([lbl, track])
+
+// ── 4. Vertical slider ─────────────────────────────────────────────────────────────────────────
+// One row per track position, rendered top-to-bottom as max_val-to-min_val (the usual vertical
+// slider convention). `_prism_sld_vrow` closes over `thumb_row`/`value` -- proven pattern,
+// mirroring prism_ui_chart.nova's `fn(p) _prism_ch_spark_glyph(p, min_v, max_v)`.
+fn _prism_sld_vrow(i: int, thumb_row: int, value: int) -> Result<PrismNode>
+    prism_content.prism_label("o {value}") if i == thumb_row else prism_content.prism_label("|")
+
+fn prism_sld_vertical(label: string, value: int, min_val: int, max_val: int) -> Result<PrismNode>
+    _prism_sld_check_label("prism_sld_vertical", label)?
+    _prism_sld_check_bounds("prism_sld_vertical", min_val, max_val)?
+    _prism_sld_check_value("prism_sld_vertical", value, min_val, max_val)?
+    let pos = _prism_sld_pos(value, min_val, max_val, PRISM_SLD_TRACK_WIDTH)
+    let thumb_row = PRISM_SLD_TRACK_WIDTH - 1 - pos
+    let mk = fn(i) _prism_sld_vrow(i, thumb_row, value)
+    let rows = prism_ui_kit.prism_ui_collect([i for i in 0..PRISM_SLD_TRACK_WIDTH], mk)?
+    let lbl = prism_content.prism_label(label)?
+    let track = prism_arrange.prism_stack(rows)?
+    prism_arrange.prism_stack([lbl, track])
+
+// ── 5. Percent convenience ─────────────────────────────────────────────────────────────────────
+fn prism_sld_percent(label: string, pct: int) -> Result<PrismNode>
+    _prism_sld_check_label("prism_sld_percent", label)?
+    if pct < 0 or pct > 100
+        return err("prism_sld_percent: pct ({pct}) must be in [0, 100]")
+    _prism_sld_core(label, pct, 0, 100, "{pct:03d}%")
