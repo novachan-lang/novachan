@@ -1,0 +1,123 @@
+// prism_ui_mention -- @-mention / autocomplete component family (prism/ui/ composition layer):
+// the text entry mentions attach to, a filtered candidate stack, the combined input+dropdown
+// (open/closed), highlighting already-typed mentions inside rendered text, and a trigger hint.
+// Composition over the closed 22-primitive vocabulary (widget/), per PRISM_SPEC.md axiom A7.
+//
+// ── A MENTION BOX IS NOT A NEW PRIMITIVE -- IT IS prism_entry PLUS A LABEL STACK ───────────────
+// prism_node.nova's 22-primitive vocabulary already has a text field (`entry`, PRISM_SPEC.md §9)
+// and a text leaf (`label`). An @-mention input with a suggestion dropdown is exactly that pair --
+// `entry(prompt, value)` above a `stack` of matching `label`s -- with no new PrismNodeKind and no
+// new attr channel. Every function below composes `prism_interact.prism_entry` and
+// `prism_content.prism_label` through `prism_ui_kit.prism_ui_collect`, the same "one core,
+// everything composes over it" shape prism_ui_fab.nova and prism_ui_switch.nova use.
+//
+// ── SUGGESTIONS: PLAIN-VALUE FILTER, CASE-SENSITIVE SUBSTRING ──────────────────────────────────
+// `prism_mnt_suggestions` filters `candidates` (plain strings) with `xs.filter(fn(c) ...)` -- the
+// high-level form is correct here because the predicate never returns a `Result` (no `?` inside
+// the lambda, no TRAP). Matching is case-sensitive substring containment (`c.contains(query)`),
+// not prefix-only: a caller typing "li" should still find "alice". This also makes the empty-query
+// case fall out for free rather than needing a special branch -- `strstr(haystack, "")` is defined
+// to match every string, so `c.contains("")` is `true` for every non-empty candidate and an empty
+// `query` naturally shows all of them. Zero matches is NOT an error (a real search that finds
+// nothing is not a broken search) -- it renders an explicit "no matches for '{query}'" label,
+// matching the empty-state honesty stance elsewhere in prism/ui/ (prism_ui_kit.prism_ui_empty's
+// header note): silence is indistinguishable from broken, so "no matches" must be a real node.
+//
+// ── MENTION BOX: SUGGESTIONS ARE ALWAYS BUILT, `open` PICKS THE SHAPE ──────────────────────────
+// Exactly the convention prism_fab_speed_dial uses: `open` selects the SHAPE, not whether the
+// content is validated. `prism_mnt_mention_box` always builds (and therefore always validates)
+// the suggestions stack, then a ternary over two `Result`-returning calls -- `stack[input,
+// suggestions]` vs `stack[input]` -- picks which one is returned. This keeps behavior consistent:
+// invalid `candidates` is always an error, whether or not the dropdown happens to be visible right
+// now, so toggling `open` alone can never turn a bad call into a silently-accepted one.
+//
+// ── HIGHLIGHT: THE @ PREFIX IS STRIPPED FOR THE MEMBERSHIP CHECK, KEPT IN THE MARKED TEXT ──────
+// `prism_mnt_highlight` splits `text` on single spaces (empty tokens from repeated spaces are
+// dropped -- they carry no information and would otherwise render as blank labels) and marks a
+// token as a mention when it starts with "@" AND its bare form (the token with that "@" sliced
+// off, `token[1:]`) appears in `handles`. `handles` is therefore expected to hold BARE names
+// ("alice", not "@alice") -- the same convention a caller already has when `handles` comes from a
+// user directory or an ORM column of usernames. A marked token renders as "[@alice]" (brackets
+// around the FULL original token, "@" included) so the marker is visible even in a backend that
+// strips all other styling (the ANSI/HTML renderers both pass label text through unchanged).
+//
+// PUBLIC API (all Result<PrismNode>; every one validates, none fails silently)
+//   prism_mnt_input(prompt, value)                    -> entry(prompt, text, value)
+//     rejects an empty prompt.
+//   prism_mnt_suggestions(candidates, query)          -> stack[label, label, ...] or
+//                                                         stack[label("no matches for '...'")]
+//     rejects empty candidates, and any non-string/empty element in candidates. Case-sensitive
+//     substring match; an empty query matches every candidate.
+//   prism_mnt_mention_box(prompt, value, candidates, query, open)
+//                                                       -> stack[input, suggestions] (open) or
+//                                                          stack[input] (closed)
+//     rejects whatever prism_mnt_input/prism_mnt_suggestions reject, regardless of `open`.
+//   prism_mnt_highlight(text, handles)                 -> band[label, label, ...]
+//     rejects empty text, and any non-string/empty element in handles (handles itself may be
+//     empty -- that just means no token can ever match).
+//   prism_mnt_trigger_hint(trigger, count)             -> label("type {trigger} to mention
+//                                                          ({count} available)")
+//     rejects an empty trigger or a negative count.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+
+// ── Shared validation (mirrors prism_ui_fab.nova's _prism_fab_check_labels shape) ───────────────
+fn _prism_mnt_check_strings(fn_name: string, arg_name: string, items: list) -> Result<int>
+    for i, s in items
+        if not is_string(s)
+            return err("{fn_name}: {arg_name}[{i}] must be a string, got {type_name(s)}")
+        if len(s) == 0
+            return err("{fn_name}: {arg_name}[{i}] must not be empty")
+    ok(0)
+
+// ── 1. Mention input: the entry mentions attach to ──────────────────────────────────────────────
+fn prism_mnt_input(prompt: string, value: string) -> Result<PrismNode>
+    if len(prompt) == 0
+        return err("prism_mnt_input: prompt must not be empty -- an unlabelled entry is invisible to a screen reader")
+    prism_interact.prism_entry(prompt, prism_interact.prism_entry_kind_text(), value)
+
+// ── 2. Suggestions: candidates filtered by query, or an explicit no-matches label ───────────────
+fn prism_mnt_suggestions(candidates: list, query: string) -> Result<PrismNode>
+    if len(candidates) == 0
+        return err("prism_mnt_suggestions: candidates must not be empty")
+    _prism_mnt_check_strings("prism_mnt_suggestions", "candidates", candidates)?
+    let matches = candidates.filter(fn(c) c.contains(query))
+    if len(matches) == 0
+        let none_label = prism_content.prism_label("no matches for '{query}'")?
+        return prism_arrange.prism_stack([none_label])
+    let nodes = prism_ui_kit.prism_ui_labels(matches)?
+    prism_arrange.prism_stack(nodes)
+
+// ── 3. Mention box: input, plus the suggestion stack while open ─────────────────────────────────
+fn prism_mnt_mention_box(prompt: string, value: string, candidates: list, query: string, open: bool) -> Result<PrismNode>
+    let input = prism_mnt_input(prompt, value)?
+    let suggestions = prism_mnt_suggestions(candidates, query)?
+    prism_arrange.prism_stack([input, suggestions]) if open else prism_arrange.prism_stack([input])
+
+// ── 4. Highlight: mark already-typed @handles inside rendered text ──────────────────────────────
+fn _prism_mnt_mark(token: string, handles: list) -> string
+    if not token.starts_with("@")
+        return token
+    let bare = token[1:]
+    "[{token}]" if bare in handles else token
+
+fn prism_mnt_highlight(text: string, handles: list) -> Result<PrismNode>
+    if len(text) == 0
+        return err("prism_mnt_highlight: text must not be empty")
+    _prism_mnt_check_strings("prism_mnt_highlight", "handles", handles)?
+    let tokens = split(text, " ").filter(fn(t) len(t) > 0)
+    let marked = [_prism_mnt_mark(t, handles) for t in tokens]
+    let nodes = prism_ui_kit.prism_ui_labels(marked)?
+    prism_arrange.prism_band(nodes)
+
+// ── 5. Trigger hint: how many mentions are available right now ──────────────────────────────────
+fn prism_mnt_trigger_hint(trigger: string, count: int) -> Result<PrismNode>
+    if len(trigger) == 0
+        return err("prism_mnt_trigger_hint: trigger must not be empty")
+    if count < 0
+        return err("prism_mnt_trigger_hint: count ({count}) must not be negative")
+    prism_content.prism_label("type {trigger} to mention ({count} available)")

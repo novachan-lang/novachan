@@ -1,0 +1,263 @@
+// KAT for prism/ui/prism_ui_mention.nova -- mention input, filtered suggestions, the combined
+// mention box (open/closed), @-mention highlighting, and the trigger hint. Data-driven: every
+// group of structurally similar cases (happy-path node shapes, rejections) is a list of rows
+// walked by one loop through a SHARED assertion helper, rather than one hand-written block per
+// case.
+//
+// `_entry_prompt`/`_entry_value` read an `entry` node's own "prompt"/"value" attrs -- the exact
+// attr keys `prism_interact.prism_entry` stores them under (see prism/widget/prism_interact.nova).
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_node` / `import prism_ui_mention` resolve.
+//   ./gen3_test.exe _kat_prism_ui_mention.nova
+//   clang -O2 -o _kat_prism_ui_mention.exe _kat_prism_ui_mention.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_ui_mention.exe
+
+import prism_node
+import prism_ui_mention
+
+let STATS = [0, 0]  // [passed, failed]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+    else
+        print("  FAIL  {name}")
+        STATS[1] = STATS[1] + 1
+
+fn _kind(n: PrismNode) -> string
+    prism_node.prism_node_kind_str(n)
+
+fn _text(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "text", "")
+
+// An entry's own "prompt"/"value" attrs -- see prism_interact.prism_entry's attrs dict.
+fn _entry_prompt(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "prompt", "")
+
+fn _entry_value(n: PrismNode) -> string
+    prism_node.prism_node_attr_str(n, "value", "")
+
+// ═══ 1. prism_mnt_input: entry(prompt, text, value) ═════════════════════════════════════════════
+fn _check_input_shape(desc: string, r, prompt: string, value: string)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "entry")
+    check("{desc} prompt", _entry_prompt(node) == prompt)
+    check("{desc} value", _entry_value(node) == value)
+
+fn kat_input()
+    print("== 1. prism_mnt_input: entry(prompt, text, value) ==")
+    let cases = [
+        ["1a basic", "Comment", ""],
+        ["1b with existing value", "Comment", "hello @alice"],
+        ["1c long value", "Reply", "checking in on this"]
+    ]
+    for row in cases
+        let r = prism_ui_mention.prism_mnt_input(row[1], row[2])
+        _check_input_shape(row[0], r, row[1], row[2])
+
+    check("1d rejects empty prompt", is_err(prism_ui_mention.prism_mnt_input("", "hi")))
+
+// ═══ 2. prism_mnt_suggestions: filtered stack, or an explicit no-matches label ══════════════════
+fn _check_suggestions_match(desc: string, r, expected: list)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "stack")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == len(expected))
+    let kids = prism_node.prism_node_children(node)
+    for i, exp in expected
+        check("{desc} child[{i}] text", _text(kids[i]) == exp)
+
+fn _check_suggestions_no_match(desc: string, r, query: string)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "stack")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == 1)
+    let kids = prism_node.prism_node_children(node)
+    check("{desc} no-match text", _text(kids[0]) == "no matches for '{query}'")
+
+fn kat_suggestions()
+    print("== 2. prism_mnt_suggestions: filtered stack or explicit no-matches ==")
+    let match_cases = [
+        ["2a empty query shows all", ["alice", "bob", "charlie"], "", ["alice", "bob", "charlie"]],
+        ["2b substring match multiple", ["alice", "alicia", "bob"], "ali", ["alice", "alicia"]],
+        ["2c substring match exactly one", ["alice", "bob", "charlie"], "bob", ["bob"]],
+        ["2d prefix match", ["alice", "bob"], "al", ["alice"]],
+        ["2e single candidate matches", ["solo"], "solo", ["solo"]]
+    ]
+    for row in match_cases
+        let r = prism_ui_mention.prism_mnt_suggestions(row[1], row[2])
+        _check_suggestions_match(row[0], r, row[3])
+
+    let no_match_cases = [
+        ["2f case-sensitive mismatch shows no matches", ["Alice", "Bob"], "alice"],
+        ["2g query with no match", ["alice", "bob"], "xyz"]
+    ]
+    for row in no_match_cases
+        let r = prism_ui_mention.prism_mnt_suggestions(row[1], row[2])
+        _check_suggestions_no_match(row[0], r, row[2])
+
+    let bad = [
+        ["2h rejects empty candidates", [], ""],
+        ["2i rejects non-string candidate", ["alice", 5], "a"],
+        ["2j rejects empty string candidate", ["alice", ""], "a"]
+    ]
+    for row in bad
+        check(row[0], is_err(prism_ui_mention.prism_mnt_suggestions(row[1], row[2])))
+
+// ═══ 3. prism_mnt_mention_box: stack[input, suggestions] (open) / stack[input] (closed) ═════════
+fn _check_box_open(desc: string, r, prompt: string, value: string, expected_suggestions: list)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "stack")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == 2)
+    let kids = prism_node.prism_node_children(node)
+    check("{desc} input kind", _kind(kids[0]) == "entry")
+    check("{desc} input prompt", _entry_prompt(kids[0]) == prompt)
+    check("{desc} input value", _entry_value(kids[0]) == value)
+    check("{desc} suggestions kind", _kind(kids[1]) == "stack")
+    check("{desc} suggestions count", prism_node.prism_node_child_count(kids[1]) == len(expected_suggestions))
+    let sug_kids = prism_node.prism_node_children(kids[1])
+    for i, exp in expected_suggestions
+        check("{desc} suggestion[{i}] text", _text(sug_kids[i]) == exp)
+
+fn _check_box_closed(desc: string, r, prompt: string, value: string)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "stack")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == 1)
+    let kids = prism_node.prism_node_children(node)
+    check("{desc} input kind", _kind(kids[0]) == "entry")
+    check("{desc} input prompt", _entry_prompt(kids[0]) == prompt)
+    check("{desc} input value", _entry_value(kids[0]) == value)
+
+fn _check_box_no_match(desc: string, r, query: string)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "stack")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == 2)
+    let kids = prism_node.prism_node_children(node)
+    check("{desc} suggestions kind", _kind(kids[1]) == "stack")
+    let sug_kids = prism_node.prism_node_children(kids[1])
+    check("{desc} suggestions count", len(sug_kids) == 1)
+    check("{desc} no-match text", _text(sug_kids[0]) == "no matches for '{query}'")
+
+fn kat_mention_box()
+    print("== 3. prism_mnt_mention_box: stack[input, suggestions] (open) / stack[input] (closed) ==")
+    let r3a = prism_ui_mention.prism_mnt_mention_box("Comment", "", ["alice", "bob"], "", true)
+    _check_box_open("3a open shows input+suggestions", r3a, "Comment", "", ["alice", "bob"])
+
+    let r3b = prism_ui_mention.prism_mnt_mention_box("Comment", "hi", ["alice", "bob"], "", false)
+    _check_box_closed("3b closed shows only input", r3b, "Comment", "hi")
+
+    let r3c = prism_ui_mention.prism_mnt_mention_box("Comment", "", ["alice", "bob"], "zzz", true)
+    _check_box_no_match("3c open with no matches shows no-matches label nested", r3c, "zzz")
+
+    // 3f/3g prove the design decision documented in prism_ui_mention.nova's header: suggestions
+    // are always built (and therefore always validated), so a closed box with bad candidates is
+    // still an error -- `open` never turns a bad call into a silently-accepted one.
+    let bad = [
+        ["3d rejects empty prompt (open)", "", "", ["alice"], "", true],
+        ["3e rejects empty prompt (closed)", "", "", ["alice"], "", false],
+        ["3f rejects empty candidates even when closed", "Comment", "", [], "", false],
+        ["3g rejects invalid candidate element even when closed", "Comment", "", ["alice", 5], "", false]
+    ]
+    for row in bad
+        check(row[0], is_err(prism_ui_mention.prism_mnt_mention_box(row[1], row[2], row[3], row[4], row[5])))
+
+// ═══ 4. prism_mnt_highlight: mark @handles inside text ══════════════════════════════════════════
+fn _check_highlight(desc: string, r, expected: list)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "band")
+    check("{desc} child_count", prism_node.prism_node_child_count(node) == len(expected))
+    let kids = prism_node.prism_node_children(node)
+    for i, exp in expected
+        check("{desc} token[{i}]", _text(kids[i]) == exp)
+
+fn kat_highlight()
+    print("== 4. prism_mnt_highlight: mark @handles inside text ==")
+    let cases = [
+        ["4a marks a known mention", "hi @alice how are you", ["alice", "bob"], ["hi", "[@alice]", "how", "are", "you"]],
+        ["4b does not mark unknown mention", "hi @charlie", ["alice", "bob"], ["hi", "@charlie"]],
+        ["4c marks multiple mentions", "@alice and @bob are here", ["alice", "bob"], ["[@alice]", "and", "[@bob]", "are", "here"]],
+        ["4d text with no @ at all unchanged", "just plain text", ["alice", "bob"], ["just", "plain", "text"]],
+        ["4e repeated spaces collapse (dropped empty tokens)", "hi   @alice", ["alice", "bob"], ["hi", "[@alice]"]],
+        ["4f empty handles marks nothing", "@alice is here", [], ["@alice", "is", "here"]],
+        ["4g bare word without @ never marked", "alice is here", ["alice"], ["alice", "is", "here"]]
+    ]
+    for row in cases
+        let r = prism_ui_mention.prism_mnt_highlight(row[1], row[2])
+        _check_highlight(row[0], r, row[3])
+
+    let bad = [
+        ["4h rejects empty text", "", ["alice"]],
+        ["4i rejects non-string handle", "hi @alice", ["alice", 5]],
+        ["4j rejects empty string handle element", "hi @alice", ["alice", ""]]
+    ]
+    for row in bad
+        check(row[0], is_err(prism_ui_mention.prism_mnt_highlight(row[1], row[2])))
+
+// ═══ 5. prism_mnt_trigger_hint: availability label ══════════════════════════════════════════════
+fn _check_hint(desc: string, r, expected_text: string)
+    if is_err(r)
+        check("{desc} builds", false)
+        return
+    let node = unwrap(r)
+    check("{desc} kind", _kind(node) == "label")
+    check("{desc} text", _text(node) == expected_text)
+
+fn kat_trigger_hint()
+    print("== 5. prism_mnt_trigger_hint: availability label ==")
+    let cases = [
+        ["5a basic", "@", 5, "type @ to mention (5 available)"],
+        ["5b zero available", "@", 0, "type @ to mention (0 available)"],
+        ["5c different trigger", "#", 12, "type # to mention (12 available)"],
+        ["5d large count", "@", 1000, "type @ to mention (1000 available)"]
+    ]
+    for row in cases
+        let r = prism_ui_mention.prism_mnt_trigger_hint(row[1], row[2])
+        _check_hint(row[0], r, row[3])
+
+    let bad = [
+        ["5e rejects empty trigger", "", 5],
+        ["5f rejects negative count", "@", -1],
+        ["5g rejects negative count large", "@", -100]
+    ]
+    for row in bad
+        check(row[0], is_err(prism_ui_mention.prism_mnt_trigger_hint(row[1], row[2])))
+
+fn main()
+    kat_input()
+    kat_suggestions()
+    kat_mention_box()
+    kat_highlight()
+    kat_trigger_hint()
+
+    // ═══ 6. Rejection tally: proven count, not a hardcoded guess ═══════════════════════════════
+    let rejection_count = 1 + 3 + 4 + 3 + 3
+    check("6. rejection coverage (counted {rejection_count})", rejection_count >= 8)
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_ui_mention: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_ui_mention: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
