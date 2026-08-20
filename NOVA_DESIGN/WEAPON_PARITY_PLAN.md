@@ -14,7 +14,7 @@
 | 1.2a | Cross-module **enum variant** constructors | Rust | S | **✅ DONE 2026-08-20** |
 | 1.2b | Cross-module **plain struct** constructors | Rust | S | **✅ DONE 2026-08-20** |
 | 1.3 | Cross-module default params | Rust/Python | M | **✅ DONE 2026-08-20** |
-| 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | **✅ DONE 2026-08-20** (2 refinements noted) |
+| 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | **✅ DONE 2026-08-20** + both refinements applied `3a8e64a1` |
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
 | 1.6 | null ≠ 0 (indistinguishable) | All | L | TODO |
 | 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | DESIGNED |
