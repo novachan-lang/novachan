@@ -116,6 +116,14 @@ Write-Host "`n[CI 2k/3] Negative type-error gate (Tier 1.5 - wrong programs MUST
 # check must immediately follow its own invocation; nothing may run in between.
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k (negative type-error soundness) ==="; exit 1 }
 
+# Phase 1.1-1.3 cross-module soundness. The negative half (E1009 across the module boundary) lives
+# in stage 2k above; this is the POSITIVE half and it asserts every output VALUE, not just the exit
+# code -- the first cut of the default-param fix compiled and ran clean while printing ", World" and
+# 1 instead of "Hello, World" and 111. Check sits immediately below its own invocation (stage-2k note).
+Write-Host "`n[CI 2k2/3] Cross-module soundness gate (imported enum ctor + default params, value-asserted)..."
+& .\_xm_soundness_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k2 (cross-module soundness) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }

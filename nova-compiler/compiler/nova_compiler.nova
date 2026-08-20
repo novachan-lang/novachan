@@ -12380,6 +12380,25 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                     while ai < len(children)
                                         push(arg_regs, ir_lower_expr(b, children[ai]))
                                         ai = ai + 1
+                                    // DEFAULT PARAMS ACROSS THE MODULE BOUNDARY -- IR side.
+                                    // The same-file call path (~12152) pads the actuals with each
+                                    // omitted param's LOWERED default expression; this path did not.
+                                    // Once the type checker was taught to accept the short call, the
+                                    // omitted slot silently arrived as 0/null -- `mod.greet("World")`
+                                    // printed ", World" and `mod.add(1)` returned 1 instead of 111.
+                                    // A loud E1003 had become a silent wrong answer, so the TI-side
+                                    // fix is only sound TOGETHER with this one.
+                                    if contains(b.ir_fn_defaults, value)
+                                        let _mqd_params = b.ir_fn_defaults[value]
+                                        let _mqd_i = len(arg_regs)
+                                        while _mqd_i < len(_mqd_params)
+                                            match _mqd_params[_mqd_i]
+                                                Param(_mqd_pn, _mqd_pt, _mqd_pd) =>
+                                                    match _mqd_pd
+                                                        Expr(_mqd_dt, _mqd_dv, _mqd_dn, _mqd_dc, _mqd_df, _mqd_dl) =>
+                                                            if _mqd_dt != "null"
+                                                                push(arg_regs, ir_lower_expr(b, _mqd_pd))
+                                            _mqd_i = _mqd_i + 1
                                     let dest = ir_fresh_reg(b)
                                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
                                     return dest
@@ -17927,6 +17946,33 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                     while mai < len(children)
                                         push(arg_types, ti_infer_expr(st, children[mai]))
                                         mai = mai + 1
+                                    // DEFAULT PARAMS ACROSS THE MODULE BOUNDARY. The bare-call path
+                                    // (~17827) pads the actuals with fresh vars up to the callee's FULL
+                                    // arity so an omitted defaulted arg still unifies; this path did not,
+                                    // so `mod.f("x")` on `fn f(a, b = "d")` unified (string)->? against
+                                    // (string,string)->string and raised E1003. Defaults were therefore
+                                    // usable only within the declaring file -- the single biggest reason
+                                    // a NOVA module could not present an ergonomic API to its importers.
+                                    // full_ar comes from the MODULE's own fn type, so it is always right;
+                                    // min_ar comes from the module-qualified key written in the import
+                                    // scan, counting only params with NO default.
+                                    let _mq_key = rval + "." + value
+                                    if contains(st.ti_min_arity, _mq_key)
+                                        let _mq_full = 0
+                                        match mfn_t
+                                            NType(_mqk, _mqn, _mqp, _mqi) =>
+                                                if _mqk == "fn"
+                                                    _mq_full = len(_mqp) - 1
+                                                else if _mqk == "scheme"
+                                                    match _mqp[0]
+                                                        NType(_mqsk, _mqsn, _mqsp, _mqsi) =>
+                                                            if _mqsk == "fn"
+                                                                _mq_full = len(_mqsp) - 1
+                                        let _mq_min = st.ti_min_arity[_mq_key]
+                                        if len(arg_types) < _mq_min
+                                            ti_error(st, "function expects " + str(_mq_min) + " arguments, but got " + str(len(arg_types)), eline)
+                                        while len(arg_types) < _mq_full
+                                            push(arg_types, ti_fresh(st))
                                     let ret_var = ti_fresh(st)
                                     ti_constrain(st, mfn_t, nt_fn(arg_types, ret_var), eline)
                                     return ret_var
@@ -19415,7 +19461,24 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                                 ti_define(st, mname, ti_generalize(st, mod_resolved))
                                             else
                                                 ti_define(st, mname, ti_mono(fn_type))
-                                            st.ti_min_arity[mname] = len(mparams)
+                                            let _im_min_ar = 0
+                                            for _im_mp in mparams
+                                                match _im_mp
+                                                    Param(_im_mpn, _im_mpt, _im_mpd) =>
+                                                        match _im_mpd
+                                                            Expr(_im_mdt, _im_mdv, _im_mdn, _im_mdc, _im_mdf, _im_mdl) =>
+                                                                if _im_mdt == "null"
+                                                                    _im_min_ar = _im_min_ar + 1
+                                            st.ti_min_arity[mname] = _im_min_ar
+                                            // ALSO record under the MODULE-QUALIFIED key. The bare key above is
+                                            // shared with same-file fns, so a main-file `fn f(a, b=1)` and an
+                                            // imported `fn f(a, b, c=2)` would fight over one slot and the
+                                            // `mod.f(...)` arity gate would use the wrong minimum -- either a
+                                            // false E1003 or (worse) a MISSED one, which then pads the missing
+                                            // arg with a fresh var and lets an argument-less call through to
+                                            // codegen. A `.` cannot occur in an identifier, so this key can
+                                            // never collide with a bare fn name.
+                                            st.ti_min_arity[mod_alias + "." + mname] = _im_min_ar
                                             mod_fn_types[mname] = fn_type
                                             // L11/finding-#2: an imported `Type__method` fn must ALSO register in
                                             // ti_type_methods, exactly like a main-file method (~14507), so the
@@ -19431,6 +19494,41 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                                     st.ti_type_methods[_im_type] = []
                                                 if not list_contains(st.ti_type_methods[_im_type], _im_method)
                                                     push(st.ti_type_methods[_im_type], _im_method)
+                                        if mtag == "enum"
+                                            let _ie_vnames = []
+                                            for _ie_v in mbody
+                                                match _ie_v
+                                                    Stmt(_ievt, _ievn, _ieve, _ievb, _ievp, _ieveb, _ievan, _ievln) =>
+                                                        if _ievt == "type"
+                                                            push(_ie_vnames, _ievn)
+                                                            st.ti_variant_enum[_ievn] = mname
+                                                            let _ie_vpts = []
+                                                            for _ie_vp in _ievp
+                                                                match _ie_vp
+                                                                    Param(_ie_vpn, _ie_vpt, _ie_vpd) =>
+                                                                        push(_ie_vpts, _ie_vpt)
+                                                            st.ti_variant_ptypes[_ievn] = _ie_vpts
+                                                            let _ie_vfm = {}
+                                                            for _ie_vfp in _ievp
+                                                                match _ie_vfp
+                                                                    Param(_ie_vfn, _ie_vft, _ie_vfd) =>
+                                                                        _ie_vfm[_ie_vfn] = ti_ann_to_type_g(st, _ie_vft, {})
+                                                            st.ti_structs[_ievn] = _ie_vfm
+                                                            let _ie_vftypes = []
+                                                            for _ie_vctp in _ievp
+                                                                match _ie_vctp
+                                                                    Param(_ie_vcn, _ie_vct, _ie_vcd) =>
+                                                                        push(_ie_vftypes, ti_ann_to_type_g(st, _ie_vct, {}))
+                                                            let _ie_vctor = nt_fn(_ie_vftypes, nt_struct(mname))
+                                                            ti_define(st, _ievn, ti_mono(_ie_vctor))
+                                            st.ti_enum_variants[mname] = _ie_vnames
+                                        if mtag == "type" and len(mname) > 0 and mname[0] != "_"
+                                            let _is_fmap = {}
+                                            for _is_p in mparams
+                                                match _is_p
+                                                    Param(_is_pn, _is_pt, _is_pd) =>
+                                                        _is_fmap[_is_pn] = ti_ann_to_type_g(st, _is_pt, {})
+                                            st.ti_structs[mname] = _is_fmap
                             st.ti_modules[mod_alias] = mod_fn_types
                 if tag == "fn"
                     if contains(seen_fns, name)
@@ -27575,6 +27673,7 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                     push(mod_fns, s)
                     push(b.ir_fnames, name)
                     b.ir_fn_arity[name] = len(params)
+                    b.ir_fn_defaults[name] = params
                     // ── Register an imported module's METHODS, exactly as the main module does (~24714).
                     // Its absence here is the root cause of the long-standing `@nova_rt_sql` LINK
                     // failures. `fn OrmQuery.sql()` lowers to the flat name `OrmQuery__sql`; the main

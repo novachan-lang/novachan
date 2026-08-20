@@ -799,6 +799,45 @@ HTTP server, which is throttled by the same quantum. Full detail in memory
 
 ---
 
+## Current focus — UPDATED 2026-08-20 (WEAPON PARITY Phase 1: cross-module soundness)
+
+**Where we are:** New campaign — [`WEAPON_PARITY_PLAN.md`](WEAPON_PARITY_PLAN.md), closing every
+capability gap vs C/C++/Rust/Go/Erlang/Python/JS in 7 phases (ecosystem scale explicitly out of
+scope — decade-scale, not soloable). **That file is the tracker for this campaign; this section is
+the pointer. Do not fork a competing tracker.** Phase 1 (soundness) gates everything after it: the
+"zero annotations, it just works" claim is NOVA's sharpest weapon, and every cross-module hole is a
+place where Rust-style friction sneaks back in through a *bug*, precisely where NOVA claims there
+is none.
+
+**LANDED — 1.1 cross-module exhaustiveness, 1.2 cross-module enum ctors, 1.3 cross-module default
+params.** One root cause: `ti_infer_program_named`'s import scan processed **only** `mtag == "fn"`,
+so everything an imported module declared that was not a function was invisible to the type
+checker. Five separate registration gaps closed in `nova_compiler.nova` (TI import scan, TI
+module-call path, IR `compile_module_ir`, IR module-call path). Per-fix detail + exact sites in
+`WEAPON_PARITY_PLAN.md`.
+
+**The lesson worth carrying forward.** The first cut of 1.3 fixed only the type checker. The
+program then compiled, linked, ran and exited 0 — while printing `", World"` for `greet("World")`
+and `1` for `add(1)` (correct: `"Hello, World"`, `111`), because IR still passed 0/null for every
+omitted argument. **A loud E1003 had become a silent wrong answer** — strictly worse than the
+original bug, and invisible to any exit-code-only gate. Both halves of a TI+IR feature must land
+together, and the gate must assert VALUES.
+
+**Gates:** reconverge gen5.ll == gen6.ll byte-identical · new CI stage 2k2
+`_xm_soundness_gate.ps1` (7 exact value assertions) · `_xm_exhaustive_neg.nova` added to stage 2k
+`_neg_type_tests.ps1` (29/0) · full regression both modes.
+
+**NEXT — 1.4 field-slot collision.** Re-rated S → M after measurement: `ir_fmap` is a flat
+`field_name → slot` map, and a static audit found **15 genuinely ambiguous field names** across
+`forge/`+`prism/`+`std/` (166 struct blocks) — `body` alone resolves to 4 different slots
+(`Response`@3, `Request`@7, `MpPart`@4, `PgMsg`@2). The compiler itself has 8 but is immune because
+it destructures via `match Stmt(tag, name, ...)` (positional, never consults `ir_fmap`) — **so
+reconverge, our deepest gate, structurally cannot see this bug.** The read path can use the
+existing name-based `nova_rt_field_get`; the write path needs a NEW `nova_rt_field_set_by_name` in
+`nova_runtime.c`, which makes it RED-tier with its own full arc. Design recorded in the plan.
+
+---
+
 ## Current focus — UPDATED 2026-08-15 (PRISM PHASE A: the presentation layer becomes real code)
 
 **Where we are:** Prism — Framework #5, v0.1 shipped long ago as 140 lines of ANSI helpers — is now

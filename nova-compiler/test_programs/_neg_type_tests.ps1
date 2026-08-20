@@ -80,6 +80,18 @@ Test-ShouldReject "_trait_sig_bad_ret_test.nova"   "incompatible method signatur
 Test-ShouldReject "_trait_sig_bad_param_test.nova" "incompatible method signature"
 Test-ShouldReject "_enum_payload_bad_test.nova"    "type mismatch"
 
+# CROSS-MODULE exhaustiveness (Phase 1.1). `_negty_exhaustive.nova` above only ever proved the
+# SAME-FILE case: the TI import scan processed `mtag=="fn"` and nothing else, so an IMPORTED enum
+# never populated ti_enum_variants/ti_variant_enum and E1009 could not fire across the module
+# boundary. A missing arm then compiled clean and the match silently yielded "". This is the
+# variant of the check that actually guards the module boundary -- keep BOTH.
+Test-ShouldReject "_xm_exhaustive_neg.nova"        "non-exhaustive"
+
+# `?` inside a lambda (Phase 1.5). The diagnostic existed but NOTHING gated it -- a refactor of the
+# lambda inference path could have dropped it silently and restored the original silent corruption
+# (the error struct ends up as a list ELEMENT because `?` returns from the lambda, not the caller).
+Test-ShouldReject "_negty_qmark_lambda.nova"        "silently swallows"
+
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 } else { exit 0 }
