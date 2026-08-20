@@ -131,6 +131,13 @@ Write-Host "`n[CI 2k3/3] Field-slot collision gate (ambiguous field name + untyp
 & .\_xm_slot_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k3 (field-slot collision) ==="; exit 1 }
 
+# Phase 2.1/2.2 pattern matching. Nested ctor patterns need a runtime tag test PER nesting level,
+# so a depth-3 case and a built-in-sum case (a different ti_infer_pattern branch) are both asserted.
+# Guards were already implemented but untested -- gated now. Check follows its own invocation.
+Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, value-asserted)..."
+& .\_p2_pattern_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }

@@ -306,31 +306,116 @@ Runs periodically or on suspected cycles. Deferred — needs careful implementat
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 2.1 | Nested pattern matching `Ok(Some(x))` | Rust/Haskell | M | TODO |
-| 2.2 | Pattern guards `x if x > 0` | Rust/Haskell | S | TODO |
-| 2.3 | Operator overloading (trait-based) | C++/Rust/Swift/Kotlin | M | TODO |
-| 2.4 | RAII / drop trait (scope-exit cleanup) | C++/Rust | M | TODO |
+| 2.1 | Nested pattern matching `Ok(Some(x))` | Rust/Haskell | M | **✅ DONE 2026-08-20** |
+| 2.2 | Pattern guards `x if x > 0` | Rust/Haskell | S | **✅ ALREADY EXISTED — verified + gated** |
+| 2.3 | Operator overloading | C++/Rust/Swift/Kotlin | M | **✅ ALREADY EXISTED — verified + gated** |
+| 2.4 | RAII / drop trait (scope-exit cleanup) | C++/Rust | M | **✅ ALREADY EXISTS** (`<Type>__drop`) — gated via `_chan_drop_test` |
 | 2.5 | Extended @comptime (full language at compile time) | Zig/C++ | L | TODO |
 | 2.6 | Generics proven in framework code | C++/Rust/Swift | M | TODO |
 | 2.7 | Error message suggestions ("did you mean X?") | Python/Rust/Elm | S | TODO |
 | 2.8 | Move semantics / move(x) builtin | C++/Rust | M | TODO |
+| 2.9 | Nested-pattern exhaustiveness (usefulness algorithm) | Rust/Haskell | L | FOUND 2026-08-20 (2.1 covers runtime only) |
 
-### 2.1 Nested patterns
-Parser: recursive `parse_pattern` that handles `Ctor(pattern)` not just `Ctor(var)`.
-Codegen: nested destructuring — extract outer, then extract inner.
+### ✅ 2.1 Nested patterns — landed
 
-### 2.2 Pattern guards
-Parser: after pattern, accept `if <expr>`. Codegen: emit guard condition check, fall to next arm if false.
+**The gap was in the parser, one line deep.** `parse_pattern`'s `pat_ctor` branch read exactly ONE
+token per field and always wrapped it as a binder:
 
-### 2.3 Operator overloading
-Define operator traits: `trait Add<T> { fn add(self, other: T) -> T }` etc.
-Type inferrer: on `a + b`, check if type(a) conforms to `Add<type(b)>`.
-Codegen: emit method call instead of builtin op.
-~200-300 lines compiler.
+```
+push(fields, Expr("pat_var", tv(tokens, p), 0, [], [], ln))
+p = p + 1
+```
 
-### 2.4 Drop trait
-Compiler pass: at scope exits, for values whose type declares `fn drop(self)`, emit the call.
-This replaces/extends `defer` for resource cleanup.
+So `Wrap(IntVal(n))` read `IntVal` as a *variable name* and then met `(` where it expected `,` or
+`)`. Downstream, both `ti_infer_pattern` pat_ctor branches iterated `children` acting only on
+`ct == "pat_var"`, so a nested child would have been silently ignored — no binding, no check.
+
+**Three parts, all required:**
+1. **Parser** — recurse into `parse_pattern` for each field. Because that function already handles
+   `pat_var`/`pat_wild`/`pat_lit`/`pat_str`/`pat_tuple`/`pat_ctor`, nesting composes to any depth for
+   free, and a bare identifier still parses to `pat_var` so every existing flat pattern is unchanged.
+2. **TI** — recurse for non-`pat_var` children in *both* pat_ctor branches, passing the payload's
+   declared type as `expected` (from `ti_variant_ptypes` for user enums, from the sum's payload type
+   for built-in `Ok`/`Err`/`Some`/`None`). Two separate branches, so two separate fixes.
+3. **IR** — nesting needs an extra *runtime test*, not just an extra binding. New
+   `ir_destructure_ctor` extracts the payload, compares its own slot-0 type hash against the inner
+   ctor's tag, and branches to **the arm's existing mismatch label** on failure — so no new control
+   flow is introduced — then recurses inside the success block.
+
+**One helper, three call sites** (`ir_lower_expr`, `ir_lower_stmt`, `ir_lower_last_stmt`) which each
+had their own inline copy of the flat destructuring loop. Extracting it *before* adding the feature
+is the 1.9 lesson applied: a fourth divergent copy is how 1.3 became four separate bugs.
+
+Two supporting helpers keep the emitted IR honest: `ir_variant_field_name` recovers the payload's
+**declared** field name from `ir_sdefs` (a nested extraction names a field the source never wrote,
+and `ir_infer_one` keys resolved field types on `"@sf@<recv>.<value>"` and special-cases
+`"__type_hash"` — a synthetic label would poison type inference), and `ir_ctor_expected_tag`
+centralises the tag rule that was duplicated at all three sites.
+
+Label uniqueness needs no counter: `ir_fresh_label` already bumps `ir_lc` and appends it. A first
+cut threaded a `nest_id` *and* wrote it back to `b.ir_lc`, which could have **regressed** the counter
+and produced colliding labels — removed.
+
+**Verified:** depth-3 `L1(L2(L3(n)))` → 7 · nested inside built-in `Result` (`Ok(IntVal(n))`, the
+`is_sum_match` branch) → correct · sibling inner ctors dispatch to the right arm · zero-payload outer
+ctors unaffected. Gate `_p2_pattern_gate.ps1`, CI stage **2k4**, 16 assertions across both probes.
+
+### ⚠ 2.1 KNOWN LIMITATION — exhaustiveness stays OUTER-level only
+
+`ti_check_exhaustive` collects outer ctor names, so `Wrap(IntVal(n))` + `Wrap(StrVal(s))` +
+`Empty()` reports `{Wrap, Empty}` = exhaustive and is correctly accepted. But a match covering only
+`Wrap(IntVal(n))` + `Empty()` is **also** accepted, and a `Wrap(StrVal(…))` subject falls through to
+the match's fall label, yielding `""` — the same silent behaviour a missing arm has always had.
+Pinned deliberately by the gate as `n8=[]`, so if it ever becomes a hard error that is a conscious
+change, not a silent one.
+
+Real nested exhaustiveness needs Rust's usefulness/witness algorithm over a pattern matrix
+(specialize by constructor, recurse on the residual matrix). That is a genuine piece of work and is
+tracked as **2.9** below, not hand-waved as done.
+
+### ✅ 2.2 Pattern guards — already existed; the gap was that nothing tested them
+
+The plan listed this TODO, but the live code already had it: parsed in `parse_match_stmt` (~3688,
+guard stored in `annotations[0]`) and in `parse_match_expr` (~2101, as a third arm child), and
+lowered at **all three** match sites (`~13103` match-expr, `~14144` match-stmt, `~14434`
+result-match). Verified by probe rather than taken on trust: guards on the first/middle/last arm, on
+literal and binder patterns, and on constructor patterns with the payload binder in scope inside the
+guard — all correct. Now gated, because an implemented-but-untested feature is one refactor away
+from being un-implemented (the same finding as 1.5).
+
+*This is the second time in this campaign that "TODO" in a plan turned out to mean "done but
+ungated". Grep the live code before scheduling work.*
+
+### ✅ 2.3 Operator overloading — already existed; verified + gated
+
+No trait plumbing was needed because NOVA resolves operators by **method name**, not by a declared
+trait. `ir_resolve_op_overload` (~11693) maps `+ - * / % == != < <= > >= **` to
+`add sub mul div rem eq neq lt le gt ge pow` and the binary-op lowering (~11953) dispatches to
+`<Type>__<method>` when the left operand's struct type defines it. Declaration syntax is just a
+method: `fn Vec2.add(other: Vec2) -> Vec2`.
+
+Two special cases are already handled: `*` on a string falls back to `nova_rt_repeat`, and `**` on
+an int keeps the integer power path — so overloading never shadows a builtin for primitives.
+
+`phase75_opoverload_test.nova` already covered it thoroughly (Vec2 add/sub/mul/neg/eq/show plus
+Complex add/mul with float fields, all `assert`-ed) — **but it was not in the regression manifest.**
+Verified passing in NORMAL *and* FULLRC, then added to `_orphan_coverage_manifest.txt`.
+
+Not "trait-based" as the original plan assumed. That is a deliberate design difference worth
+keeping: Rust needs `impl Add for T` because coherence/orphan rules demand a nameable trait; NOVA
+has one flat method namespace per type, so the method name *is* the contract. Simpler, and it costs
+nothing here.
+
+### ✅ 2.4 Drop trait — already exists
+
+A struct declaring `fn <Type>.drop()` gets its address registered at startup via
+`nova_rt_register_struct_drop(type_hash, ptr)` (emitted at ~27734), stored in the struct's RTTI
+metadata as `drop_fn`, and **called by `rc_free` BEFORE the fields are released** — the same order
+Rust uses, so a destructor can still read its own fields. Gated by `_chan_drop_test` (already in the
+manifest).
+
+This is genuine RAII, not `defer`: it is keyed on the value's lifetime, not on a lexical scope exit.
+`defer` remains available and complementary (see the crash-safe shadow-stack work).
 
 ---
 

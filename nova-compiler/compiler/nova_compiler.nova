@@ -2137,8 +2137,16 @@ fn parse_pattern(tokens: list, pos: int, pe: list) -> ParseResult
                     p = expect(tokens, p, ",", pe)
                     if tk(tokens, p) == "EOF"
                         break
-                push(fields, Expr("pat_var", tv(tokens, p), 0, [], [], ln))
-                p = p + 1
+                // 2.1 NESTED PATTERNS. This used to read exactly ONE token per field and
+                // always wrap it as a binder, so `Wrap(IntVal(n))` read `IntVal` as a
+                // variable name and then met `(` where it expected `,` or `)`. Recursing
+                // into parse_pattern makes every pattern form legal in a field position --
+                // pat_var, pat_wild, pat_lit, pat_str, pat_tuple and pat_ctor itself -- so
+                // nesting composes to any depth for free. A bare identifier still parses to
+                // pat_var, so every existing flat pattern is unchanged.
+                let _fp_r = parse_pattern(tokens, p, pe)
+                push(fields, _fp_r.expr)
+                p = _fp_r.pos
             p = expect(tokens, p, ")", pe)
             ParseResult(Expr("pat_ctor", name, 0, fields, [], ln), p)
         else if val == "_"
@@ -12975,21 +12983,10 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                             m_next = m_check_labels[m_arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [m_cmp, m_next], m_arm_labels[m_arm_idx], 0, "pure", b.ir_cur_line))
                                         ir_start_block(b, m_arm_labels[m_arm_idx])
-                                        let m_fi = 1
-                                        for m_fp in m_pchildren
-                                            match m_fp
-                                                Expr(m_fpt, m_fpv, m_fpn, m_fpc, m_fpf, m_fpln) =>
-                                                    if m_fpv != "_"
-                                                        let m_pstype = ir_match_ok_payload_stype(b, children[0], m_pv)
-                                                        let m_fld_ty = ir_type_any()
-                                                        if m_pstype != ""
-                                                            b.ir_locals[m_fpv] = m_pstype
-                                                        else
-                                                            m_fld_ty = ir_bind_variant_payload_type(b, m_pv, m_fi - 1, m_fpv)
-                                                        let m_fd = ir_fresh_reg(b)
-                                                        ir_emit_inst(b, "field_get", m_fd, m_fld_ty, [m_subject], m_fpv, m_fi)
-                                                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [m_fd], m_fpv, 0)
-                                            m_fi = m_fi + 1
+                                        // 2.1: shared with the two match-statement sites. Handles flat
+                                        // binders identically to the old inline loop and adds a runtime
+                                        // tag test for any field pattern that is itself a ctor.
+                                        ir_destructure_ctor(b, m_subject, m_pv, m_pchildren, m_next, children[0])
                                     else if m_pt == "pat_lit"
                                         if m_arm_idx > 0
                                             ir_start_block(b, m_check_labels[m_arm_idx - 1])
@@ -13145,6 +13142,82 @@ fn get_ir_field_index_for(b: IrBuilder, stype: string, field_name: string) -> in
                         return sfi
             sfi = sfi + 1
     get_ir_field_index(b, field_name)
+
+// 2.1 support: the DECLARED field name of variant/struct `sname` at 0-based position `idx`.
+// A nested pattern extracts a payload the source never named, but the emitted `field_get`
+// must still carry the real field name: ir_infer_one keys the resolved field type on
+// "@sf@<recv>.<value>" and special-cases "__type_hash", so a synthetic label would poison
+// type inference. Falls back to a positional name only if the layout is unknown.
+fn ir_variant_field_name(b: IrBuilder, sname: string, idx: int) -> string
+    if contains(b.ir_sdefs, sname)
+        let _vfn_ps = b.ir_sdefs[sname]
+        if idx >= 0 and idx < len(_vfn_ps)
+            match _vfn_ps[idx]
+                Param(_vfn_pn, _vfn_pt, _vfn_pd) =>
+                    return _vfn_pn
+    "__f" + str(idx)
+
+// 2.1: the runtime tag a ctor pattern must match. Mirrors the per-site logic exactly:
+// `pn == 1` means inference marked this a built-in sum match (compare the NovaResult TAG:
+// Ok/Some = 0, Err/None = 1); otherwise a user enum variant compares its type-name hash,
+// except that a bare Ok/Err/Some/None on an un-inferred (`any`) subject still uses the
+// fixed sum tag rather than a bogus hash.
+fn ir_ctor_expected_tag(pv: string, pn: int) -> int
+    if pn == 1
+        if pv == "Ok" or pv == "Some"
+            return 0
+        return 1
+    if pv == "Ok" or pv == "Some"
+        return 0
+    if pv == "Err" or pv == "None"
+        return 1
+    type_name_hash(pv)
+
+// 2.1 NESTED CONSTRUCTOR PATTERNS — bind a ctor pattern's payload fields off `subj`.
+//
+// A flat binder is stored to its slot exactly as the three inline copies did before (this is
+// a pure code move for them, so existing programs emit identical IR). A field whose pattern
+// is ITSELF a ctor needs something the old code could not express: an extra runtime TEST.
+// We extract the payload, compare its own slot-0 type hash against the inner ctor's tag, and
+// branch to `next_label` on mismatch -- the very label the outer test would have jumped to,
+// so no new control flow is introduced -- then recurse inside the success block.
+//
+// Label uniqueness needs no counter of its own: ir_fresh_label already bumps b.ir_lc and
+// appends it, so sibling and deeper nested patterns cannot collide. Depth is unbounded.
+//
+// Literal/string/wildcard sub-patterns are treated as binders/ignored here, matching the
+// pre-2.1 behaviour for a field position; only ctor nesting adds a test.
+fn ir_destructure_ctor(b: IrBuilder, subj: string, pv: string, pfields: list, next_label: string, subj_expr: Expr)
+    let _dc_fi = 1
+    for _dc_fp in pfields
+        match _dc_fp
+            Expr(_dc_ft, _dc_fv, _dc_fn, _dc_fc, _dc_ff, _dc_fl) =>
+                if _dc_ft == "pat_ctor"
+                    let _dc_nm = ir_variant_field_name(b, pv, _dc_fi - 1)
+                    let _dc_fd = ir_fresh_reg(b)
+                    ir_emit_inst(b, "field_get", _dc_fd, ir_type_any(), [subj], _dc_nm, _dc_fi)
+                    let _dc_h = ir_fresh_reg(b)
+                    ir_emit_inst(b, "field_get", _dc_h, ir_type_int(), [_dc_fd], "__type_hash", 0)
+                    let _dc_exp = ir_ctor_expected_tag(_dc_fv, _dc_fn)
+                    let _dc_er = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", _dc_er, ir_type_int(), [], str(_dc_exp), _dc_exp)
+                    let _dc_cmp = ir_fresh_reg(b)
+                    ir_emit_inst(b, "eq", _dc_cmp, ir_type_int(), [_dc_h, _dc_er], "==", 0)
+                    let _dc_ok = ir_fresh_label(b, "pnest_ok_")
+                    ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_dc_cmp, next_label], _dc_ok, 0, "pure", b.ir_cur_line))
+                    ir_start_block(b, _dc_ok)
+                    ir_destructure_ctor(b, _dc_fd, _dc_fv, _dc_fc, next_label, subj_expr)
+                else if _dc_fv != "_"
+                    let _dc_ps = ir_match_ok_payload_stype(b, subj_expr, pv)
+                    let _dc_ty = ir_type_any()
+                    if _dc_ps != ""
+                        b.ir_locals[_dc_fv] = _dc_ps
+                    else
+                        _dc_ty = ir_bind_variant_payload_type(b, pv, _dc_fi - 1, _dc_fv)
+                    let _dc_bd = ir_fresh_reg(b)
+                    ir_emit_inst(b, "field_get", _dc_bd, _dc_ty, [subj], _dc_fv, _dc_fi)
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [_dc_bd], _dc_fv, 0)
+        _dc_fi = _dc_fi + 1
 
 fn _is_builtin_type_name(n)
     n == "int" or n == "float" or n == "string" or n == "list" or n == "dict" or n == "bool"
@@ -14017,21 +14090,9 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                             next_label = check_labels[arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
                                         ir_start_block(b, arm_labels[arm_idx])
-                                        let fi = 1
-                                        for field_pat in pchildren
-                                            match field_pat
-                                                Expr(fpt, fpv, fpn, fpc, fpf, fpln) =>
-                                                    if fpv != "_"
-                                                        let s_pstype = ir_match_ok_payload_stype(b, expr, pv)
-                                                        let s_fld_ty = ir_type_any()
-                                                        if s_pstype != ""
-                                                            b.ir_locals[fpv] = s_pstype
-                                                        else
-                                                            s_fld_ty = ir_bind_variant_payload_type(b, pv, fi - 1, fpv)
-                                                        let fd = ir_fresh_reg(b)
-                                                        ir_emit_inst(b, "field_get", fd, s_fld_ty, [subject], fpv, fi)
-                                                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
-                                            fi = fi + 1
+                                        // 2.1: see ir_destructure_ctor -- flat binders unchanged, a
+                                        // nested ctor field gets its own tag test branching to next_label.
+                                        ir_destructure_ctor(b, subject, pv, pchildren, next_label, expr)
                                     else if pt == "pat_lit"
                                         if arm_idx > 0
                                             ir_start_block(b, check_labels[arm_idx - 1])
@@ -14306,21 +14367,8 @@ fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
                                             next_label = rcheck_labels[arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
                                         ir_start_block(b, arm_labels[arm_idx])
-                                        let fi = 1
-                                        for field_pat in pchildren
-                                            match field_pat
-                                                Expr(fpt, fpv, fpn, fpc, fpf, fpln) =>
-                                                    if fpv != "_"
-                                                        let r_pstype = ir_match_ok_payload_stype(b, expr, pv)
-                                                        let r_fld_ty = ir_type_any()
-                                                        if r_pstype != ""
-                                                            b.ir_locals[fpv] = r_pstype
-                                                        else
-                                                            r_fld_ty = ir_bind_variant_payload_type(b, pv, fi - 1, fpv)
-                                                        let fd = ir_fresh_reg(b)
-                                                        ir_emit_inst(b, "field_get", fd, r_fld_ty, [subject], fpv, fi)
-                                                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
-                                            fi = fi + 1
+                                        // 2.1: shared destructuring (see ir_destructure_ctor).
+                                        ir_destructure_ctor(b, subject, pv, pchildren, next_label, expr)
                                     else if pt == "pat_lit"
                                         if arm_idx > 0
                                             ir_start_block(b, rcheck_labels[arm_idx - 1])
@@ -19187,6 +19235,11 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
                             Expr(ct, cv, cn, cc, cf, cln) =>
                                 if ct == "pat_var"
                                     ti_define(st, cv, ti_mono(payload_t))
+                                else if ct == "pat_ctor" or ct == "pat_tuple"
+                                    // 2.1: `Ok(Some(x))` / `Err(MyErr(code))` -- recurse with the
+                                    // sum's payload type so the inner pattern is checked and its
+                                    // binders typed, rather than being silently ignored.
+                                    ti_infer_pattern(st, child, payload_t)
                 else
                     if contains(st.ti_variant_enum, value)
                         match pc_w
@@ -19212,6 +19265,17 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
                                                 if _dk != "var"
                                                     _bind_t = _decl_t
                                     ti_define(st, cv, ti_mono(_bind_t))
+                                else if ct == "pat_ctor" or ct == "pat_tuple"
+                                    // 2.1: a NESTED pattern in a payload position. Recurse with the
+                                    // payload's DECLARED type as `expected`, so the inner ctor is
+                                    // checked against the right enum and its own binders are typed.
+                                    // Previously any non-pat_var child was silently skipped -- no
+                                    // binding, no check -- which is why nesting had to be rejected at
+                                    // the parser rather than merely being unsupported downstream.
+                                    let _nest_t = nt_any()
+                                    if _pl_i < len(_pl_types) and _pl_types[_pl_i] != ""
+                                        _nest_t = ti_ann_to_type_g(st, _pl_types[_pl_i], {})
+                                    ti_infer_pattern(st, child, _nest_t)
                         _pl_i = _pl_i + 1
 
 // ── Match exhaustiveness check ───────────────────────────────────────────────
