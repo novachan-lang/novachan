@@ -12,7 +12,7 @@
 |---|---------|------|--------|--------|
 | 1.1 | Cross-module exhaustiveness (E1009) | Rust | S | **✅ DONE 2026-08-20** |
 | 1.2a | Cross-module **enum variant** constructors | Rust | S | **✅ DONE 2026-08-20** |
-| 1.2b | Cross-module **plain struct** constructors | Rust | S | ⏳ NEXT — same root cause, one missing `ti_define` |
+| 1.2b | Cross-module **plain struct** constructors | Rust | S | **✅ DONE 2026-08-20** |
 | 1.3 | Cross-module default params | Rust/Python | M | **✅ DONE 2026-08-20** |
 | 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | MEASURED + DESIGNED, not implemented |
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
@@ -78,23 +78,39 @@ wrong answer** — strictly worse than the original bug. An exit-code-only gate 
 Gated by `_xm_soundness_gate.ps1` (CI stage 2k2), which asserts all 7 output values exactly, plus
 `_xm_exhaustive_neg.nova` in `_neg_type_tests.ps1` (stage 2k) for the E1009 rejection.
 
-### 1.2b Cross-module plain-struct constructors — still open, and here is exactly why
+### ✅ 1.2b Cross-module plain-struct constructors — landed
 
-The import scan's new `mtag == "type"` branch registers the struct's **field map**
-(`ti_structs[name]`) but not a **constructor**. The same-file path (~18590) does both:
+The import scan's `mtag == "type"` branch registered the struct's **field map** but not a
+**constructor**. The same-file path (~18590) does both:
 
 ```
-st.ti_structs[name] = field_map                                  // <- import scan does this
+st.ti_structs[name] = field_map                                  // <- import scan did this
 let ctor_type = nt_fn(field_types, nt_struct(name))              // <- and NOT this
 ti_define(st, name, ti_generalize(st, ti_zonk(st, ctor_type)))
 ```
 
-So `mod.make_point(1,2)` (wrapper fn) works and `XmRed(7)` (enum variant) now works, but a bare
-`Point(1,2)` on an imported struct is still `E1002`. The probe that verified 1.2 exercised an enum
-variant only — a reminder that "the fix works" is scoped to exactly what the probe covered.
-Fix is the mirror of the three lines above, in the same branch. Kept OUT of the 1.1–1.3 commit
-because that commit is CI-green as-is; this gets its own reconverge + CI rather than being
-retro-fitted into a verified state.
+So `mod.make_point(1,2)` (wrapper) and `XmRed(7)` (enum variant) worked, but a bare `Point(1,2)` on
+an imported struct was `E1002`. **Fixed** by mirroring those lines, with generic type params
+threaded through a `ti_extract_generics(man)` map so `type Box<T>` gets a polymorphic ctor
+(`ti_generalize`) and a plain struct stays monomorphic (`ti_mono`).
+
+**IR needed no change** — `compile_module_ir` already registered `ir_sdefs` for imported types, so
+construction lowered correctly the moment TI stopped rejecting it. That matches the diagnosis:
+`E1002 unknown identifier` is a *type-checker* error, so TI was the only blocker. Verified by
+value: `struct=11/22` (bare ctor + field reads) and `wrapper=11/22` (existing route unchanged).
+
+**Deliberately did NOT add `ti_min_arity` for ctors.** A first cut set
+`ti_min_arity[name] = len(mparams)`. Removed: the same-file handler sets none, so a wrong-arity ctor
+call is reported by unification in both cases. Adding one would give imported ctors a *different
+diagnostic* than same-file ones, and would be outright wrong if struct fields ever gain defaults.
+**Parity with the same-file path is the fix** — every divergence is a future bug, which is the whole
+lesson of 1.1–1.3.
+
+**Consequence worth noting:** the long-standing rule "one wrapper fn per constructor, in the
+declaring file" is now obsolete for both enums and structs. `prism_node.nova` alone ships 22 such
+wrappers, and `prism_arrange`/`prism_content`/`prism_interact`/`prism_structure` each ship their
+own. They still work and are not worth a mass deletion, but new multi-module types no longer need
+them — which removes the single biggest piece of ceremony in Prism's module layer.
 
 ### 1.4 Field-slot collision — measured, and it is NOT the small fix it looked like
 
@@ -133,7 +149,28 @@ fallback (12523 and 12607 pass a known struct type):
 - **Write** (~14429, `mstype == ""`): `nova_rt_field_set(val, **slot**, ...)` is slot-based, so this
   needs a NEW `nova_rt_field_set_by_name` in `nova_runtime.c` — a runtime ABI addition, hence RED
   tier and its own full arc. This is what re-rated 1.4 from S to M and why it is not in the 1.1–1.3
-  commit.
+  commit. It must **delegate** to `nova_rt_field_set` after resolving the name, never re-implement
+  it: that function carries the managed-slot bitmap check, the arena-bit bypass, and the inc-NEW-only
+  rule (it deliberately does *not* dec the old value, because NOVA field reads are borrow-based and
+  dec'ing would free a live un-counted borrow in the `saved = obj.f; obj.f = new; obj.f = saved`
+  idiom — the self-compile reconverge caught exactly that). A second copy is a second place to drift.
+
+**Design dead-end, recorded so it is not re-attempted.** The tempting minimal fix is a *sentinel
+slot*: have `get_ir_field_index_for` return `-1` when ambiguous, and let both backends' `field_get`/
+`field_set` handlers emit the by-name runtime call on `-1`. That would leave all four call sites
+untouched and auto-cover future ones. **It does not work:** the by-name call needs the field name as
+an i64 string pointer, and string literals are interned into `ir_strlits`/`ir_strmap` during IR
+*lowering* — the backend cannot mint a new constant at emit time. So the change must happen at the
+two lowering sites, materializing the name with `ir_lower_expr(b, Expr("str", value, 0, [], [], 0))`
+— exactly the pattern already used at ~12538 for the un-inferrable closure-field call.
+
+**Perf note, and the staged answer.** An immediate-slot `field_get` is one load; `nova_rt_field_get`
+is a call plus a `strcmp` walk over the field list — call it 20–50× for that access. Acceptable,
+because it fires *only* where the current code is silently wrong, and "slower and right" beats "fast
+and wrong". If the perf gate ever flags it, the faster fix is available without changing semantics:
+the compiler knows every candidate struct for an ambiguous field name, so it can emit an inline
+slot-0 type-hash dispatch (compare hash, then use that struct's immediate slot) instead of a runtime
+string walk. Ship the correct version first; optimize only on evidence.
 
 ### 1.1 Cross-module exhaustiveness
 **Root cause:** `ti_infer_program_named` import scan (19357–19434) only processes `mtag=="fn"`.

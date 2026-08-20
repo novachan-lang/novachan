@@ -65,7 +65,9 @@ $expected = @(
     'Hi, World',          # 1.3  explicit arg still overrides the default
     'add1=111',           # 1.3  both defaults applied  (1 + 10 + 100)
     'add2=103',           # 1.3  one default applied    (1 +  2 + 100)
-    'add3=6'              # 1.3  no defaults applied    (1 +  2 +   3)
+    'add3=6',             # 1.3  no defaults applied    (1 +  2 +   3)
+    'struct=11/22',       # 1.2b bare ctor of an imported PLAIN STRUCT + field reads
+    'wrapper=11/22'       # 1.2b the wrapper-fn route still works, unchanged
 )
 
 $got = @($r.StdOut -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
