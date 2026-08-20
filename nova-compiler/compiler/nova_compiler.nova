@@ -11542,6 +11542,7 @@ type IrBuilder
     ir_sdefs: dict
     ir_fmap: dict
     ir_fmap_collision: dict     // 1.4: field name -> 1 when two structs put it at DIFFERENT slots. ir_fmap is flat + last-writer-wins, so an UNTYPED access to such a name is a guess; these route to the by-name runtime helpers instead.
+    ir_fmap_reprc: dict         // 1.4: field name -> 1 when ANY @repr(C) struct declares it. Such a struct numbers fields from 0 (no type-hash slot) and is not NOVA_STRUCT_HASHED, so nova_rt_field_get/_set_by_name would no-op on it -- these names must NEVER route by name, even when ambiguous.
     ir_loop_hdr: string
     ir_loop_exit: string
     ir_lambdas: list
@@ -11580,7 +11581,7 @@ type IrBuilder
     ir_sredact: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
 
 // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
 // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
@@ -12377,10 +12378,79 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                 let mod_fns = b.ir_modules[rval]
                                 if list_contains(mod_fns, value)
                                     let arg_regs = []
-                                    let ai = 1
-                                    while ai < len(children)
-                                        push(arg_regs, ir_lower_expr(b, children[ai]))
-                                        ai = ai + 1
+                                    // 1.9 NAMED ARGS ACROSS THE MODULE BOUNDARY. The same-file path
+                                    // (~12073) reorders `f(b: 2, a: 1)` into declaration order BEFORE
+                                    // lowering; this path did not, so a named call to `mod.f` lowered
+                                    // the args positionally -- silently binding the wrong values when
+                                    // the params share a type, and a bogus mismatch when they do not.
+                                    // Slice off children[0] (the module receiver) first, then reorder
+                                    // exactly as the same-file path does.
+                                    let _mq_args = []
+                                    let _mq_si = 1
+                                    while _mq_si < len(children)
+                                        push(_mq_args, children[_mq_si])
+                                        _mq_si = _mq_si + 1
+                                    let _mq_has_na = false
+                                    for _mq_c in _mq_args
+                                        match _mq_c
+                                            Expr(_mq_ct, _, _, _, _, _) =>
+                                                if _mq_ct == "named_arg"
+                                                    _mq_has_na = true
+                                    if _mq_has_na and contains(b.ir_fn_defaults, value)
+                                        let _mq_np = b.ir_fn_defaults[value]
+                                        let _mq_pos = []
+                                        let _mq_map = {}
+                                        for _mq_c2 in _mq_args
+                                            match _mq_c2
+                                                Expr(_mq_ct2, _mq_cv2, _, _mq_cch2, _, _) =>
+                                                    if _mq_ct2 == "named_arg"
+                                                        _mq_map[_mq_cv2] = _mq_cch2[0]
+                                                    else
+                                                        push(_mq_pos, _mq_c2)
+                                        let _mq_out = []
+                                        let _mq_pi = 0
+                                        for _mq_p in _mq_np
+                                            match _mq_p
+                                                Param(_mq_pn, _mq_pt, _mq_pd) =>
+                                                    if contains(_mq_map, _mq_pn)
+                                                        push(_mq_out, _mq_map[_mq_pn])
+                                                    else if _mq_pi < len(_mq_pos)
+                                                        push(_mq_out, _mq_pos[_mq_pi])
+                                                        _mq_pi = _mq_pi + 1
+                                        _mq_args = _mq_out
+                                    for _mq_a in _mq_args
+                                        push(arg_regs, ir_lower_expr(b, _mq_a))
+                                    // 1.9 VARIADIC ACROSS THE MODULE BOUNDARY. Mirrors ~12126: if the
+                                    // callee's last param is a rest param (`T...`), pack the trailing
+                                    // actuals into one list so the call matches the callee's real
+                                    // (fixed + 1) arity. Without this a variadic `mod.f(1, 2, 3)`
+                                    // passed 3 flat args to a 2-arity function.
+                                    if contains(b.ir_fn_defaults, value)
+                                        let _mqv_p = b.ir_fn_defaults[value]
+                                        let _mqv_n = len(_mqv_p)
+                                        if _mqv_n > 0
+                                            let _mqv_is = false
+                                            match _mqv_p[_mqv_n - 1]
+                                                Param(_mqv_pn, _mqv_pt, _mqv_pd) =>
+                                                    if ends_with(_mqv_pt, "...")
+                                                        _mqv_is = true
+                                            if _mqv_is
+                                                let _mqv_fix = _mqv_n - 1
+                                                if len(arg_regs) >= _mqv_fix
+                                                    let _mqv_packed = []
+                                                    let _mqv_i = 0
+                                                    while _mqv_i < _mqv_fix
+                                                        push(_mqv_packed, arg_regs[_mqv_i])
+                                                        _mqv_i = _mqv_i + 1
+                                                    let _mqv_rest = []
+                                                    let _mqv_r = _mqv_fix
+                                                    while _mqv_r < len(arg_regs)
+                                                        push(_mqv_rest, arg_regs[_mqv_r])
+                                                        _mqv_r = _mqv_r + 1
+                                                    let _mqv_lr = ir_fresh_reg(b)
+                                                    ir_emit_inst(b, "make_list", _mqv_lr, ir_type_list(), _mqv_rest, "", len(_mqv_rest))
+                                                    push(_mqv_packed, _mqv_lr)
+                                                    arg_regs = _mqv_packed
                                     // DEFAULT PARAMS ACROSS THE MODULE BOUNDARY -- IR side.
                                     // The same-file call path (~12152) pads the actuals with each
                                     // omitted param's LOWERED default expression; this path did not.
@@ -12692,7 +12762,14 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 // that are currently WRONG. Same choice the un-inferrable closure-field call already
                 // makes just above (~12533) -- name lookup beats a fabricated guess.
                 // NOT applied when recv_stype is known: that path reads ir_sdefs per-struct and is exact.
-                if recv_stype == "" and contains(b.ir_fmap_collision, value)
+                // The guard must be exactly "the TYPED lookup cannot resolve", not just
+                // recv_stype == "": get_ir_field_index_for also falls through to the flat-map
+                // guess when recv_stype is non-empty but absent from ir_sdefs (e.g. the inferrer
+                // returned a builtin name like "list"). Both cases are a guess, so both route
+                // by name. ir_fmap_reprc excludes names any @repr(C) struct declares -- those
+                // number fields from 0 and are not NOVA_STRUCT_HASHED, so the by-name runtime
+                // helpers would no-op on them; they keep the flat-map behaviour.
+                if (recv_stype == "" or not contains(b.ir_sdefs, recv_stype)) and contains(b.ir_fmap_collision, value) and not contains(b.ir_fmap_reprc, value)
                     let _amb_name = ir_lower_expr(b, Expr("str", value, 0, [], [], 0))
                     let _amb_dest = ir_fresh_reg(b)
                     ir_emit_side(b, "call", _amb_dest, ir_type_any(), [obj, _amb_name], "nova_rt_field_get", 0)
@@ -14451,7 +14528,7 @@ fn ir_lower_assign_target(b: IrBuilder, target: Expr, val_reg: string)
                 // it), always-0 frees a value the source slot still holds -> use-after-free. Keeping the
                 // instruction lets the emitter apply its own rule unchanged; only the slot differs.
                 // -1 is unambiguous as a sentinel: real slots are >= 0 (@repr(C) starts at 0).
-                if mstype == "" and contains(b.ir_fmap_collision, value)
+                if mstype == "" and contains(b.ir_fmap_collision, value) and not contains(b.ir_fmap_reprc, value)
                     fi = 0 - 1
                 let ptr_reg = ir_fresh_reg(b)
                 // CORE_GAP 0.8: thread the field's declared type (kind slot of typ) so the emitter can
@@ -17970,11 +18047,65 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                     // polymorphic imported fn (now carrying generic vars) is NOT pinned
                                     // by the first mod.func call. Non-generic types generalize to [] = no-op.
                                     let mfn_t = ti_instantiate(st, ti_generalize(st, mod_fns[value]))
+                                    // 1.9 NAMED ARGS (TI side). ti_fn_pnames records the callee's
+                                    // declared param ORDER; the same-file path reorders an
+                                    // out-of-order call BEFORE unification, this one did not -- so
+                                    // `mod.f(b: 2, a: 1)` was type-checked POSITIONALLY and reported
+                                    // a bogus mismatch whenever the two params had different types
+                                    // (and type-checked but ran wrong when they matched).
+                                    let _mq_ch = []
+                                    let _mq_ci = 1
+                                    while _mq_ci < len(children)
+                                        push(_mq_ch, children[_mq_ci])
+                                        _mq_ci = _mq_ci + 1
+                                    let _mq_tna = false
+                                    for _mq_tc in _mq_ch
+                                        match _mq_tc
+                                            Expr(_mq_tct, _, _, _, _, _) =>
+                                                if _mq_tct == "named_arg"
+                                                    _mq_tna = true
+                                    if _mq_tna and contains(st.ti_fn_pnames, value)
+                                        let _mq_tpn = st.ti_fn_pnames[value]
+                                        let _mq_tpos = []
+                                        let _mq_tmap = {}
+                                        for _mq_tc2 in _mq_ch
+                                            match _mq_tc2
+                                                Expr(_mq_tct2, _mq_tcv2, _, _mq_tcc2, _, _) =>
+                                                    if _mq_tct2 == "named_arg"
+                                                        _mq_tmap[_mq_tcv2] = _mq_tcc2[0]
+                                                    else
+                                                        push(_mq_tpos, _mq_tc2)
+                                        let _mq_tout = []
+                                        let _mq_tpi = 0
+                                        for _mq_tp in _mq_tpn
+                                            if contains(_mq_tmap, _mq_tp)
+                                                push(_mq_tout, _mq_tmap[_mq_tp])
+                                            else if _mq_tpi < len(_mq_tpos)
+                                                push(_mq_tout, _mq_tpos[_mq_tpi])
+                                                _mq_tpi = _mq_tpi + 1
+                                        _mq_ch = _mq_tout
                                     let arg_types = []
-                                    let mai = 1
-                                    while mai < len(children)
-                                        push(arg_types, ti_infer_expr(st, children[mai]))
-                                        mai = mai + 1
+                                    for _mq_a in _mq_ch
+                                        push(arg_types, ti_infer_expr(st, _mq_a))
+                                    // 1.9 VARIADIC (TI side). Mirrors ~17812: collapse the trailing
+                                    // actuals into the rest param's list<T>, each unified with the
+                                    // element type, so a (fixed+1)-param fn type unifies against the
+                                    // call. Without it a variadic `mod.f(1,2,3)` raised E1003.
+                                    if contains(st.ti_variadic, value)
+                                        let _mqv_fx = st.ti_variadic[value]
+                                        if len(arg_types) >= _mqv_fx
+                                            let _mqv_rt = ti_fresh(st)
+                                            let _mqv_col = []
+                                            let _mqv_k = 0
+                                            while _mqv_k < _mqv_fx
+                                                push(_mqv_col, arg_types[_mqv_k])
+                                                _mqv_k = _mqv_k + 1
+                                            let _mqv_j = _mqv_fx
+                                            while _mqv_j < len(arg_types)
+                                                ti_constrain(st, _mqv_rt, arg_types[_mqv_j], eline)
+                                                _mqv_j = _mqv_j + 1
+                                            push(_mqv_col, nt_list(_mqv_rt))
+                                            arg_types = _mqv_col
                                     // DEFAULT PARAMS ACROSS THE MODULE BOUNDARY. The bare-call path
                                     // (~17827) pads the actuals with fresh vars up to the callee's FULL
                                     // arity so an omitted defaulted arg still unifies; this path did not,
@@ -18580,6 +18711,14 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 st.ti_fn_types[fn_name] = ti_to_ir_kind(ti_apply(st, ret_var))
                 st.ti_fn_defer[name] = [fn_type, ret_var, fn_name]
                 let min_ar = 0
+                // 1.8: defaults MUST be trailing. The arity logic counts params with no default, so
+                // `fn f(a, b = 5, c)` yields min_arity 2 and a call `f(x, y)` passes the check -- but
+                // `y` binds POSITIONALLY to `b` and `c` is padded with a fresh type var that no
+                // default can fill. Nothing rejected this; Python raises SyntaxError at def time and
+                // C++ rejects it at declaration. Fail closed here, once, at registration. Variadic
+                // rest params (`T...`) are exempt: a rest param is legitimately last and optional.
+                let _da_seen_default = false
+                let _da_bad = ""
                 for mp in params
                     match mp
                         Param(mpn, mpt, mpd) =>
@@ -18587,6 +18726,12 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 Expr(mdt, mdv, mdn, mdc, mdf, mdl) =>
                                     if mdt == "null"
                                         min_ar = min_ar + 1
+                                        if _da_seen_default and not ends_with(mpt, "...") and _da_bad == ""
+                                            _da_bad = mpn
+                                    else
+                                        _da_seen_default = true
+                if _da_bad != ""
+                    ti_error(st, "parameter '" + _da_bad + "' has no default but follows a parameter that does; every defaulted parameter must come last", sline)
                 st.ti_min_arity[name] = min_ar
                 // NAMED ARGS: record the declared parameter ORDER so an out-of-order
                 // call can be reordered BEFORE unification. The IR lowering already
@@ -19508,6 +19653,26 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                             // codegen. A `.` cannot occur in an identifier, so this key can
                                             // never collide with a bare fn name.
                                             st.ti_min_arity[mod_alias + "." + mname] = _im_min_ar
+                                            // 1.9: an imported fn must also publish its declared param
+                                            // ORDER and its variadic shape -- the module-call path needs
+                                            // ti_fn_pnames to reorder a named-arg call before unifying,
+                                            // and ti_variadic to collapse the trailing actuals into the
+                                            // rest param's list. Neither was registered for imports, so
+                                            // both features silently worked same-file only.
+                                            let _im_pn = []
+                                            for _im_pp in mparams
+                                                match _im_pp
+                                                    Param(_im_ppn, _im_ppt, _im_ppd) =>
+                                                        push(_im_pn, _im_ppn)
+                                            st.ti_fn_pnames[mname] = _im_pn
+                                            if len(mparams) > 0
+                                                match mparams[len(mparams) - 1]
+                                                    Param(_im_vpn, _im_vpt, _im_vpd) =>
+                                                        if ends_with(_im_vpt, "...")
+                                                            let _im_fix = len(mparams) - 1
+                                                            st.ti_variadic[mname] = _im_fix
+                                                            st.ti_min_arity[mname] = _im_fix
+                                                            st.ti_min_arity[mod_alias + "." + mname] = _im_fix
                                             mod_fn_types[mname] = fn_type
                                             // L11/finding-#2: an imported `Type__method` fn must ALSO register in
                                             // ti_type_methods, exactly like a main-file method (~14507), so the
@@ -25015,9 +25180,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                                     b.ir_repr_align[name] = aval
                     b.ir_sdefs[name] = params
                     let fi = 1
+                    let _fm_isc = contains(b.ir_repr_c_types, name)
                     for p in params
                         match p
                             Param(pname, ptype, pdefault) =>
+                                if _fm_isc
+                                    b.ir_fmap_reprc[pname] = 1
                                 if contains(b.ir_fmap, pname) and b.ir_fmap[pname] != fi
                                     b.ir_fmap_collision[pname] = 1
                                 b.ir_fmap[pname] = fi
@@ -27880,9 +28048,12 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                                                 b.ir_repr_packed[name] = 1
                     b.ir_sdefs[name] = params
                     let fi = 1
+                    let _fm_isc = contains(b.ir_repr_c_types, name)
                     for p in params
                         match p
                             Param(pname, ptype, pdefault) =>
+                                if _fm_isc
+                                    b.ir_fmap_reprc[pname] = 1
                                 if contains(b.ir_fmap, pname) and b.ir_fmap[pname] != fi
                                     b.ir_fmap_collision[pname] = 1
                                 b.ir_fmap[pname] = fi

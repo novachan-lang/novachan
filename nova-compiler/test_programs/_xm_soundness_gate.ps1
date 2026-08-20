@@ -67,7 +67,12 @@ $expected = @(
     'add2=103',           # 1.3  one default applied    (1 +  2 + 100)
     'add3=6',             # 1.3  no defaults applied    (1 +  2 +   3)
     'struct=11/22',       # 1.2b bare ctor of an imported PLAIN STRUCT + field reads
-    'wrapper=11/22'       # 1.2b the wrapper-fn route still works, unchanged
+    'wrapper=11/22',      # 1.2b the wrapper-fn route still works, unchanged
+    'var0=5',             # 1.9  variadic across the boundary: no rest args
+    'var1=15',            # 1.9  one rest arg   (5 + 10)
+    'var3=65',            # 1.9  three rest args (5 + 10 + 20 + 30)
+    'named_ord=ord#7',    # 1.9  named args in declaration order
+    'named_rev=rev#9'     # 1.9  named args OUT of order -> must be reordered, not positional
 )
 
 $got = @($r.StdOut -split "`r?`n" | Where-Object { $_.Trim() -ne "" })

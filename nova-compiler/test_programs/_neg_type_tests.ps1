@@ -92,6 +92,11 @@ Test-ShouldReject "_xm_exhaustive_neg.nova"        "non-exhaustive"
 # (the error struct ends up as a list ELEMENT because `?` returns from the lambda, not the caller).
 Test-ShouldReject "_negty_qmark_lambda.nova"        "silently swallows"
 
+# 1.8: defaults must be TRAILING. `f(a, b = 5, c)` used to be accepted, and then `f(1, 2)` bound 2
+# to `b` positionally while `c` got a fresh type var no default could fill. Python rejects this at
+# def time, C++ at declaration; NOVA now rejects it at fn registration.
+Test-ShouldReject "_negty_default_order.nova"       "must come last"
+
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 } else { exit 0 }
