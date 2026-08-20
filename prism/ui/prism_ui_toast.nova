@@ -1,0 +1,154 @@
+// prism_ui_toast -- Toast / snackbar notification component family (prism/ui/ composition layer):
+// a single toast, a toast with a dismiss/undo action, a vertical stack of toasts, a toast tagged
+// with an auto-dismiss duration, and a toast carrying a text progress bar. Milestone MB.67.
+// Composition over the closed 22-primitive vocabulary (widget/), per PRISM_SPEC.md axiom A7.
+//
+// ── A TOAST IS NOT A NEW PRIMITIVE -- IT IS prism_band WEARING AN ICON AND A LABEL ─────────────
+// prism_node.nova's 22-primitive vocabulary already has a content leaf for an icon (`glyph`) and
+// one for text (`label`), and an inline container for a short horizontal run of them (`band`,
+// PRISM_SPEC.md §7). A toast is exactly that triple -- `band[glyph(icon), label(message)]`, with a
+// third `press` child when it carries a dismiss/undo action -- no new PrismNodeKind and no new
+// attr channel beyond the one this file adds for the timed variant (see below). Same "one core,
+// everything composes over it" shape prism_ui_fab.nova's FAB family and prism_ui_switch.nova's
+// switch/checkbox/radio family use.
+//
+// ── tst_type IS A VALIDATED STRING, NOT A NEW ENUM -- MATCHING prism_fab_positioned's CORNER ────
+// A toast's severity is one of exactly four values ("info"/"success"/"warning"/"error"). This
+// could be a closed enum like `PrismIcon`, but enum variant constructors are FILE-LOCAL in this
+// codebase (a cross-module `Ctor()` call is a compile error) -- exactly the trap PrismIcon avoids
+// only because prism_content.nova exports a wrapper function per variant. Introducing a whole new
+// enum plus four wrapper functions for a single closed string set this file alone consumes is not
+// worth the ceremony; `prism_fab_positioned`'s `corner` argument already established the pattern
+// this file follows instead -- a plain string validated by list membership (`in`/`not in`), with
+// the allowed set named in one place (`PRISM_TST_TYPES`) so every error message can enumerate it.
+//
+// ── ICON MAPPING: NO AlertTriangle IN THE CLOSED 12-ICON SET -- error REUSES Close(), NOT Warning() ──
+// prism_content.nova's `PrismIcon` enum is a deliberately closed, additively-extended 12-icon set
+// (Check/Close/Search/Menu/Plus/Minus/ChevronUp/Down/Left/Right/Warning/Info) -- verified by grep,
+// there is no `AlertTriangle` variant. Extending that enum is prism_content.nova's call to make
+// (it owns the vocabulary, per its own header note on additive extension), not something this
+// composition-layer file should do unilaterally for one component. Two substitutes were possible:
+// reuse `Warning()` for "error" too (loses the info/warning-vs-error visual distinction entirely),
+// or reuse `Close()` (an X-mark, the conventional "something failed / dismiss the failure" glyph
+// used by Ant Design's and Material's own error-toast icon, and the CHOICE THIS CODEBASE ALREADY
+// MADE: `prism_ui_alert.nova`'s `_prism_al_icon_for_level` maps "error" to `prism_icon_close()`
+// today). This file follows that existing precedent rather than inventing a second, inconsistent
+// answer to the same already-decided question. success/warning/info map to the icons the spec's
+// names actually suggest: Check/Warning/Info respectively -- all three exist in the closed set.
+//
+// ── toast_action REUSES toast's OWN VALIDATION -- IT DOES NOT RE-VALIDATE message/tst_type ──────
+// `prism_tst_toast_action` calls `prism_tst_toast(message, tst_type)` and appends a `press` child
+// to that band's own children (via `prism_node.prism_node_children`) rather than re-deriving the
+// icon and re-checking `message`/`tst_type` itself. One validation path for those two arguments,
+// not two that could silently drift apart.
+//
+// ── toast_timed: THE DURATION IS A RE-TAGGED ATTR, NOT A NEW CONSTRUCTOR PATH ────────────────────
+// There is no `prism_node_set_attr`/`with_attr` mutator in prism_node.nova (nodes are built once,
+// not mutated in place) -- the established idiom for "the same node, plus one more attr" used
+// throughout prism/ui/ (prism_ui_notice.prism_nt_item, prism_ui_card, prism_ui_calendar,
+// prism_ui_tooltip, prism_ui_tree, ...) is `dict_merge(node.attrs, extra)` followed by
+// `prism_node.prism_node_new(node.kind, merged, node.children, node.key)`. `prism_tst_toast_timed`
+// follows that exact idiom: build the toast, then re-tag it with one new attr, `tst_duration`
+// (prefixed per this file's field-collision discipline -- PRISM.md's field-slot-collision defect
+// scales with import count, so every attr key this file introduces is `tst_`-prefixed).
+//
+// ── toast_progress: ONE BRACKETED LABEL, NOT prism_ui_progress.nova's TWO-NODE BAND ─────────────
+// prism_ui_progress.nova already owns a `[filled][empty]` progress-bar family (`prism_pg_bar`
+// renders `band[label("==="), label("---")]`, two separate leaves). A toast is a compact, single-
+// line notification, not a dedicated progress widget, so `prism_tst_toast_progress` deliberately
+// renders the bar as ONE label -- `"[====------] 40%"` -- built from `str_repeat`, matching the
+// bracket-plus-percent shape `prism_ui_slider.nova`'s track rendering already uses. This is a
+// distinct rendering choice for a distinct context, not an accidental duplicate of prism_pg_bar.
+//
+// PUBLIC API (all Result<PrismNode>; every one validates, none fails silently)
+//   prism_tst_toast(message, tst_type)                    -> band[glyph, label(message)]
+//     rejects an empty message; rejects tst_type outside {info, success, warning, error}.
+//   prism_tst_toast_action(message, tst_type, action_label) -> band[glyph, label, press]
+//     rejects an empty action_label; message/tst_type validation delegates to prism_tst_toast.
+//   prism_tst_toast_stack(toasts)                          -> stack[toast, toast, ...]
+//     rejects an empty list and any element that is not a PrismNode (type_name-checked).
+//   prism_tst_toast_timed(message, tst_type, duration_ms)  -> band[glyph, label] + tst_duration attr
+//     rejects duration_ms <= 0; message/tst_type validation delegates to prism_tst_toast.
+//   prism_tst_toast_progress(message, progress)            -> stack[label(message), label(bar)]
+//     bar renders "[====------] 40%" (10-char bracketed bar); rejects an empty message and a
+//     progress value outside [0, 100].
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+
+// The closed set of toast severities -- see header note on why this is a validated string, not
+// a new enum with file-local constructors.
+let PRISM_TST_TYPES = ["info", "success", "warning", "error"]
+
+// The bar's fixed character width for `prism_tst_toast_progress` -- 10 characters means each
+// filled/empty cell represents exactly 10 percentage points, so `progress` (already bounds-
+// checked to [0, 100]) divides evenly with no remainder to round away.
+let PRISM_TST_BAR_WIDTH = 10
+
+// ── Icon mapping -- see header note on the Close()-for-error decision ───────────────────────────
+// Called only after `tst_type in PRISM_TST_TYPES` has already passed, so the final branch is
+// reached exactly when tst_type == "error" -- not an unchecked wildcard over arbitrary input.
+fn _prism_tst_icon_for(tst_type: string) -> PrismIcon
+    if tst_type == "info"
+        prism_content.prism_icon_info()
+    else if tst_type == "success"
+        prism_content.prism_icon_check()
+    else if tst_type == "warning"
+        prism_content.prism_icon_warning()
+    else
+        prism_content.prism_icon_close()
+
+// ── 1. Single toast ───────────────────────────────────────────────────────────────────────────
+fn prism_tst_toast(message: string, tst_type: string) -> Result<PrismNode>
+    if len(message) == 0
+        return err("prism_tst_toast: message must not be empty")
+    if tst_type not in PRISM_TST_TYPES
+        let allowed = join(PRISM_TST_TYPES, ", ")
+        return err("prism_tst_toast: tst_type must be one of {allowed}, got '{tst_type}'")
+    let icon = _prism_tst_icon_for(tst_type)
+    let glyph = prism_content.prism_glyph(icon)?
+    let msg = prism_content.prism_label(message)?
+    prism_arrange.prism_band([glyph, msg])
+
+// ── 2. Toast with a dismiss/undo action ──────────────────────────────────────────────────────
+fn prism_tst_toast_action(message: string, tst_type: string, action_label: string) -> Result<PrismNode>
+    if len(action_label) == 0
+        return err("prism_tst_toast_action: action_label must not be empty")
+    let base = prism_tst_toast(message, tst_type)?
+    let btn = prism_interact.prism_press(action_label, [])?
+    let base_children = prism_node.prism_node_children(base)
+    prism_arrange.prism_band([...base_children, btn])
+
+// ── 3. Vertical stack of toasts ──────────────────────────────────────────────────────────────
+fn prism_tst_toast_stack(toasts: list) -> Result<PrismNode>
+    if len(toasts) == 0
+        return err("prism_tst_toast_stack: needs at least one toast")
+    for i, t in toasts
+        if type_name(t) != "PrismNode"
+            return err("prism_tst_toast_stack: toasts[{i}] must be a PrismNode, got {type_name(t)}")
+    prism_arrange.prism_stack(toasts)
+
+// ── 4. Toast tagged with an auto-dismiss duration ────────────────────────────────────────────
+fn prism_tst_toast_timed(message: string, tst_type: string, duration_ms: int) -> Result<PrismNode>
+    if duration_ms <= 0
+        return err("prism_tst_toast_timed: duration_ms ({duration_ms}) must be positive")
+    let base = prism_tst_toast(message, tst_type)?
+    let merged = dict_merge(base.attrs, {"tst_duration": duration_ms})
+    prism_node.prism_node_new(base.kind, merged, base.children, base.key)
+
+// ── 5. Toast with a text progress bar ────────────────────────────────────────────────────────
+fn prism_tst_toast_progress(message: string, progress: int) -> Result<PrismNode>
+    if len(message) == 0
+        return err("prism_tst_toast_progress: message must not be empty")
+    if progress < 0 or progress > 100
+        return err("prism_tst_toast_progress: progress ({progress}) must be in [0, 100]")
+    let filled = (progress * PRISM_TST_BAR_WIDTH) / 100
+    let empty = PRISM_TST_BAR_WIDTH - filled
+    let filled_str = str_repeat("=", filled)
+    let empty_str = str_repeat("-", empty)
+    let bar_text = "[{filled_str}{empty_str}] {progress}%"
+    let msg_node = prism_content.prism_label(message)?
+    let bar_node = prism_content.prism_label(bar_text)?
+    prism_arrange.prism_stack([msg_node, bar_node])
