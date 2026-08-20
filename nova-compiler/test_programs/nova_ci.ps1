@@ -143,6 +143,14 @@ Write-Host "`n[CI 2b2/3] Parallel scaling (strong scaling at NOVA_CARRIERS=1/2/4
 & .\_par_scale_bench.ps1 -Repeat 3 -AsGate
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b2 (parallel scaling regression) ==="; exit 1 }
 
+# 4.2b pmap threshold. Forcing parallelism on a short list switches pmap from list_map to threaded
+# chunking, so the two paths must agree EXACTLY (order included -- pmap writes an indexed output
+# array, and a chunking bug would silently reorder or drop results). Correctness only; the measured
+# 2.6-2.7x speedup is recorded in the plan, since a timing gate would flake on this host.
+Write-Host "`n[CI 2b3/3] pmap threshold gate (serial path == threaded path, order-exact)..."
+& .\_pmap_threshold_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b3 (pmap threshold) ==="; exit 1 }
+
 Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, value-asserted)..."
 & .\_p2_pattern_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }

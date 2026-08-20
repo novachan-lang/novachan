@@ -632,7 +632,56 @@ should be split into many small tasks rather than a few large ones. Tracked as *
 afternoon of measurement showed the cheap alternative is strictly better AND safer. Measure the
 alternative before building the sophisticated thing.*
 
-| 4.2b | `parallel_map` decomposition helper (~4× carriers) | — | S | TODO |
+| 4.2b | Decomposition helper | — | S | **✅ ALREADY EXISTED (`pmap`/`pfilter`/`pfor`) — found a silent threshold trap and fixed it** |
+
+### ✅ 4.2b — the helper already existed, and measuring it found a real trap
+
+Grepped before building (fourth time this saved rebuilding something): **`pmap`, `pfilter` and
+`pfor` are already builtins** with proper generic signatures —
+`pmap(list<T>, fn(T) -> U) -> list<U>` — so no new helper was needed. What *was* needed was
+measuring them, which surfaced two facts that decide when they help.
+
+**Fact 1 — `nova_pmap_threshold = 256` is a hard cliff, and it counts ELEMENTS, not WORK.**
+Total work held constant (24M iterations either way), uniform per-element cost:
+
+| elements | 32 | 255 | **256** |
+|---|---|---|---|
+| time | 228 ms | 212 ms | **82 ms** |
+
+255 elements runs entirely serial; 256 runs parallel. **A 2.7x difference decided by one element** —
+and below the threshold a short list of expensive items gets *no parallelism and no diagnostic*.
+`nova_pmap_thread_count` returns 1, so `pmap` quietly falls back to `list_map`.
+
+**Fix: `NOVA_PMAP_THRESHOLD`** (all three builtins share `nova_pmap_thread_count`, so one change
+covers them). There is no sound way to auto-detect per-element cost — you would have to run the
+closure to find out — so rather than guess, the threshold is now settable. Unset ⇒ 256 ⇒
+byte-identical to before. Measured with `NOVA_PMAP_THRESHOLD=1`:
+
+| elements | 32 | 255 | 256 |
+|---|---|---|---|
+| default | 228 ms | 212 ms | 82 ms |
+| threshold=1 | **87 ms** | **77 ms** | 65 ms |
+
+**2.6–2.7x unlocked** for small-but-expensive lists, with byte-identical checksums in every
+configuration. Gated by `_pmap_threshold_gate.ps1` (CI stage **2b3**), which asserts the serial and
+threaded paths agree **order-exactly** — `pmap` writes an indexed output array, so a chunking bug
+would silently reorder or drop results, and a length-or-sum check would miss it. Correctness only:
+the speedup lives in this document because a timing gate would flake on this host.
+
+**Fact 2 — `pmap` uses static contiguous chunking, so it does NOT fix skew.** With all the work in
+one element the skewed case stays at serial speed (~210–234 ms) at every element count and threshold
+setting, because one chunk pins one thread. That is consistent with the 4.2 finding and completes the
+guidance:
+
+| your workload | use |
+|---|---|
+| many elements, **uniform** cost | `pmap`/`pfilter`/`pfor` (2.7x; already parallel above 256) |
+| **few** elements, expensive, uniform | same, plus `NOVA_PMAP_THRESHOLD=1` (2.6x) |
+| **skewed** per-element cost | `spawn` + channel fan-in, decomposed into many small tasks (2.71x) |
+
+*Note: `pmap` runs on the OS thread pool, NOT the green carriers — so it is orthogonal to the
+`NOVA_CARRIERS` scaling in 4.1, and the 4.2 rejection of green-scheduler work-stealing does not
+apply to it.*
 
 ## PHASE 5 — PLATFORM REACH (run everywhere)
 

@@ -11859,10 +11859,40 @@ static void* nova_pfilter_worker(void* arg) {
 
 static int64_t nova_pmap_threshold = 256;
 
+/* NOVA_PMAP_THRESHOLD: element count below which pmap/pfilter/pfor run SERIALLY.
+   The default 256 is a good guard against spawning threads for trivial work, but it
+   counts ELEMENTS, not WORK — so a short list of expensive items silently gets no
+   parallelism at all. Measured on a 4-physical/8-logical host with total work held
+   constant (24M iterations either way):
+
+       elements   255      256
+       time       215 ms   81 ms      <- 2.7x, decided by ONE element
+
+   Below the threshold, 255 items of 94k iterations each ran entirely serial with no
+   diagnostic. There is no sound way to auto-detect per-element cost (you would have
+   to run the closure to find out), so instead of guessing, make the threshold
+   settable: a caller who KNOWS their elements are expensive can opt in with
+   NOVA_PMAP_THRESHOLD=1, and anyone wanting the old guard can raise it.
+
+   Read once and cached. The unsynchronised init is benign: concurrent callers all
+   compute the same value from the same environment, so a race can only duplicate
+   identical work — never produce a torn or differing result. Unset => 256, i.e.
+   byte-identical behaviour to before. */
 static int nova_pmap_thread_count(int64_t n) {
     int64_t cpus = nova_rt_cpu_count();
     if (cpus < 1) cpus = 1;
     if (cpus > 16) cpus = 16;
+#ifndef NOVA_NO_SYSHEADERS
+    static int _pmap_thr_init = 0;
+    if (!_pmap_thr_init) {
+        const char* _pt = getenv("NOVA_PMAP_THRESHOLD");
+        if (_pt && _pt[0]) {
+            long long _v = atoll(_pt);
+            if (_v >= 1) nova_pmap_threshold = (int64_t)_v;
+        }
+        _pmap_thr_init = 1;
+    }
+#endif
     if (n < nova_pmap_threshold) return 1;
     if (cpus > n) cpus = n;
     return (int)cpus;
