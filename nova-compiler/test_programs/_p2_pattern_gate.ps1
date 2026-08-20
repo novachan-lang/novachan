@@ -21,10 +21,10 @@
 #   - depth 3 (L1(L2(L3(n)))), proving the recursion is not special-cased to 2
 #   - nesting inside a built-in Result sum, which takes the is_sum_match branch in
 #     ti_infer_pattern -- a DIFFERENT code path from user enums
-#   - the documented limitation pinned: exhaustiveness is OUTER-level only, so a
-#     match missing an inner case compiles and falls through to "" (n8=[]). If
-#     that ever becomes a hard error, this line is the intentional record of the
-#     old behaviour and should be updated deliberately, not silently.
+#   - NOTE: the old n7/n8 pair pinned the outer-level-only limitation (a match
+#     missing an inner case compiled and fell through to ""). Item 2.9 turned that
+#     into a compile error, so those two assertions were deliberately REMOVED and
+#     the case now lives in _neg_type_tests.ps1 as _negty_nested_exhaustive.nova.
 # ─────────────────────────────────────────────────────────────────────────────
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
@@ -50,9 +50,7 @@ $cases = @(
         'n3=empty',          # zero-payload outer ctor unaffected
         'n4=7',              # THREE levels deep
         'n5=ok-int:5',       # nested inside built-in Result (is_sum_match path)
-        'n6=err:bad',        # Err arm of the same match
-        'n7=int:3',          # partial match, covered case
-        'n8=[]'              # partial match, UNCOVERED inner -> falls through to ""
+        'n6=err:bad'         # Err arm of the same match
     )}
 )
 

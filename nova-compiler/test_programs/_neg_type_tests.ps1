@@ -97,6 +97,12 @@ Test-ShouldReject "_negty_qmark_lambda.nova"        "silently swallows"
 # def time, C++ at declaration; NOVA now rejects it at fn registration.
 Test-ShouldReject "_negty_default_order.nova"       "must come last"
 
+# 2.9: NESTED-pattern exhaustiveness. 2.1 made nested ctor patterns work at runtime, but the
+# exhaustiveness check remained OUTER-level only -- Wrap(IntVal(n)) + Empty() names both Outer
+# variants so it passed, while a Wrap(StrVal(...)) value matched no arm and fell through to "".
+# Adding a feature had added a soundness hole; this is the check that closes it.
+Test-ShouldReject "_negty_nested_exhaustive.nova"  "non-exhaustive nested match"
+
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 } else { exit 0 }

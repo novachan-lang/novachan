@@ -289,16 +289,56 @@ f(x)?)` short-circuiting and yielding `Result<list>`, which would beat Rust's ma
 legitimately hold error values, and NOVA cannot distinguish `null` from `0`; see 1.6), so it is
 deliberately NOT bundled here. Tracked as a Phase 2 candidate.
 
-### 1.6 null ≠ 0
-**Root cause:** NOVA represents null as integer 0. `null == 0` is true. Type-tag check can't
-distinguish. Fundamental representation issue.
-**Fix:** Reserve a sentinel value (e.g., a specific tagged pointer or a dedicated null tag bit)
-that is distinct from integer 0. This affects the entire runtime. Deferred — needs careful design.
+### 1.6 null ≠ 0 — the cheap shortcut was investigated and REJECTED
 
-### 1.7 RC cycle collector
-**Root cause:** Circular references (A→B→A) leak. Confirmed Tier 4.7.
-**Fix:** Epoch-based cycle detector (designed in CORE_GAPS). Trial-deletion algorithm.
-Runs periodically or on suspected cycles. Deferred — needs careful implementation.
+**Root cause:** NOVA represents null as integer 0, so `null == 0` is true and no type-tag check can
+separate them.
+
+**The tempting shortcut — reject `x == null` when `x`'s static type is not optional — does not
+survive contact with the codebase.** Measured usage of `== null` / `!= null`:
+
+| tree | uses |
+|---|---|
+| `std/` | 157 |
+| `nova-compiler/test_programs/` | 322 |
+| `forge/` | 23 |
+| `nova-compiler/compiler/` | 8 |
+| **total** | **510** |
+
+Turning that into an error breaks 510 call sites; turning it into a warning produces noise at a
+volume nobody will read, which trains people to ignore warnings. Neither is a fix.
+
+**So 1.6 stays a representation problem, and the honest options are:**
+1. **Type-driven optionals** (recommended): the checker already distinguishes `T?` from `T`, so only
+   `T?` needs a distinguishable representation (tag bit or box) while plain `T` stays unboxed —
+   the same shape as Rust's `Option<T>` with niche optimisation. Bounded blast radius (only
+   optional-typed values), but it touches every `T?` in `std`/`forge`/`prism` and `orm_null()`.
+2. NaN-boxing / tagged pointers everywhere — touches every value operation. Rejected as
+   disproportionate.
+3. A distinct non-zero null sentinel — merely moves the collision to whichever integer is chosen.
+
+This needs its own `design-decision` pass, not a patch bolted onto a soundness sweep. **Do not
+attempt it piecemeal** — a half-migrated optional representation is worse than the current honest
+limitation, because today at least the rule ("null is 0, use `orm_null()`") is simple and known.
+
+### 1.7 RC cycle collector — the leak COUNT already exists; attribution is the gap
+
+`A → B → A` still leaks. What is already there, and it is more than the plan implied: with
+`NOVA_HEAP_PROFILE` set, `nova_rt_cleanup` prints a per-tag allocation breakdown plus
+**`still-live objects=N`** at exit. For a program that should have released everything, a non-zero N
+*is* the leak signal, and once total-RC (`NOVA_T8_FULLRC`) is on, cycles are the dominant cause.
+
+What is missing is **attribution**: which objects, and proof they form a cycle rather than being
+legitimately reachable. That needs (a) a registry of live RC objects — a doubly-linked list threaded
+through every allocation, i.e. a hot-path cost that must be compiled out when off — and (b)
+Bacon–Rajan synchronous cycle collection (trial deletion: decrement internal edges, see what
+reaches zero, restore what does not).
+
+**Staging, so this can land safely:** a *detector* first (opt-in env flag, reports suspected cycles
+at exit with type names), and only then a *collector*. The detector is diagnostic-only and cannot
+corrupt memory; the collector touches the RC hot path and needs the full RED-tier arc. For a
+language that prizes predictability, being *told* about a cycle may well be better than having it
+silently collected — so the detector may be most of the value.
 
 ---
 
@@ -314,7 +354,7 @@ Runs periodically or on suspected cycles. Deferred — needs careful implementat
 | 2.6 | Generics proven in framework code | C++/Rust/Swift | M | **✅ TRUE — 74 in `std/`, 9 in `forge/`** (0 in `prism/`) |
 | 2.7 | Error message suggestions ("did you mean X?") | Python/Rust/Elm | S | **✅ ALREADY EXISTS** (edit-distance) |
 | 2.8 | Move semantics / move(x) builtin | C++/Rust | M | PARTIAL — use-after-move enforced for `send()`; no general `move()` |
-| 2.9 | Nested-pattern exhaustiveness (usefulness algorithm) | Rust/Haskell | L | FOUND 2026-08-20 (2.1 covers runtime only) |
+| 2.9 | Nested-pattern exhaustiveness | Rust/Haskell | L→M | **✅ DONE 2026-08-21** |
 
 ### ✅ 2.1 Nested patterns — landed
 
@@ -360,7 +400,44 @@ and produced colliding labels — removed.
 `is_sum_match` branch) → correct · sibling inner ctors dispatch to the right arm · zero-payload outer
 ctors unaffected. Gate `_p2_pattern_gate.ps1`, CI stage **2k4**, 16 assertions across both probes.
 
-### ⚠ 2.1 KNOWN LIMITATION — exhaustiveness stays OUTER-level only
+### ✅ 2.9 Nested-pattern exhaustiveness — CLOSED (supersedes the 2.1 limitation below)
+
+2.1 made nested patterns run correctly and, in doing so, **added a soundness hole**: the
+exhaustiveness check only verified that every variant of the scrutinee enum was *named* by some arm.
+`Wrap(IntVal(n))` + `Empty()` names both `Outer` variants, so it passed — while a
+`Wrap(StrVal(…))` value matched no arm and fell through to `""`. Adding a feature created exactly
+the silent-fallthrough class this campaign exists to remove.
+
+`ti_check_nested_exhaustive` closes it. Rather than a full Maranget pattern matrix, it groups arms
+by outer constructor and, for any constructor whose arms *all* destructure their payload with a
+nested ctor, requires those inner ctors to cover the payload enum:
+
+```
+error[E1000]: non-exhaustive nested match: 'Wrap' is only matched with IntVal(...),
+so a 'Wrap' holding StrVal(...) matches no arm and would fall through
+```
+
+**Sound by construction — it can report a missing variant but never rejects a valid match.** Every
+bail-out is deliberate: a payload bound by a binder or `_` covers everything; a **guarded** arm is
+treated as covering everything (a guard may not fire, so counting it as *not* covering would produce
+false rejections); a variant with more than one payload field needs the genuine cross-product of
+positions, so multi-field payloads are skipped rather than guessed; inner ctors from mixed or unknown
+enums are skipped.
+
+**Zero risk to existing code, by construction:** nested ctor patterns were a *parse error* before
+2.1 landed earlier the same day, so no pre-existing source can trigger this check. The only code it
+can fire on is code written against the new feature.
+
+Guard information had to be threaded in — the arm's guard lives in `annotations[0]` for the
+statement form and as the third child for the expression form — so `ti_check_exhaustive_g` now takes
+a parallel `guarded` list. Gated by `_negty_nested_exhaustive.nova` in `_neg_type_tests.ps1`.
+
+**The `n8=[]` assertion in the pattern gate was deliberately removed**, which is precisely what its
+own comment demanded ("if that ever becomes a hard error, this line is the intentional record of the
+old behaviour and should be updated deliberately, not silently"). Pinning a known limitation in a
+gate worked exactly as intended: the limitation could not be fixed *quietly*.
+
+### ⚠ 2.1's ORIGINAL limitation (now fixed by 2.9 above — kept for the record)
 
 `ti_check_exhaustive` collects outer ctor names, so `Wrap(IntVal(n))` + `Wrap(StrVal(s))` +
 `Empty()` reports `{Wrap, Empty}` = exhaustive and is correctly accepted. But a match covering only
@@ -462,7 +539,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
 | 4.1 | N>1 concurrency scaling | Go | L | **✅ MEASURED GOOD 2026-08-20 — 1.95x at 4 carriers** |
-| 4.2 | Work-stealing between carriers | Go/Java FJP | L | TODO |
+| 4.2 | Work-stealing between carriers | Go/Java FJP | L | **❌ REJECTED 2026-08-21 — measured strictly worse than decomposition** |
 | 4.3 | Preemptive scheduling (yield at loop back-edges) | Erlang | M | TODO |
 | 4.4 | Supervision trees (library) | Erlang | S | TODO |
 | 4.5 | Small fiber stacks (4KB initial, grow on demand) | Erlang | M | TODO |
@@ -512,6 +589,50 @@ returned its seed untouched, because `let PER = TOTAL / WORKERS` at module level
 to **0** (a genuine compiler bug, found and fixed because of this). Without the checksum, "60 ms"
 would have been recorded as an excellent result. **Every benchmark must assert that the work
 happened.** A number measured against a silently-empty loop is worse than no number.
+
+### ❌ 4.2 Work-stealing — REJECTED on evidence, not deferred
+
+Three measurements, total work held constant, 4 carriers, best-of-3 (`_par_grain_probe.nova`,
+`_par_skew_probe.nova`):
+
+**1. On a BALANCED load, speedup is flat across granularity** — so the loss is not uneven initial
+claim, which finer tasks would average out:
+
+| equal tasks | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|
+| speedup | 2.68x | 2.58x | **2.72x** | 2.45x | 1.93x (spawn overhead) |
+
+**2. Skew is where it hurts** — and the N=1 times confirm identical total work:
+
+| shape | N=1 | N=4 | speedup |
+|---|---|---|---|
+| balanced, 8 × 2 units | 366.4 ms | 181.1 ms | 2.02x |
+| skewed, 7 × 1 + 1 × 9 units | 370.2 ms | 272.3 ms | **1.36x** |
+| **split, 16 × 1 units** (same work as skewed) | 363.7 ms | **134.1 ms** | **2.71x** |
+
+**3. Why stealing loses to decomposition, structurally.** Work-stealing can only relocate *whole
+tasks*, so on the skewed shape its best possible result is bounded by the single longest task:
+9/16 × 370 ms ≈ 208 ms ≈ 1.78x. Decomposition measured **134 ms / 2.71x** — better than *perfect*
+stealing could ever be, because it removes the bound rather than routing around it.
+
+**4. And stealing is the one thing this scheduler must not do.** Green tasks are pinned to a home
+carrier on first claim, immutable thereafter (`71a651d`). That pinning was not a convenience — it was
+the *fix* for the carrier-wedge hang (a migrated fiber wedges its carrier inside `SwitchToFiber`, so
+`park_committed` never advances and the waker spins forever). Three separate wake-side fixes
+(deferred-wake, per-park epoch, rescue sweep) all failed; only eliminating migration worked.
+**Work-stealing IS migration.** Re-introducing it would restore the precondition of a bug that took
+multiple sessions and two independent investigations to kill.
+
+**Conclusion:** worse payoff, higher ceiling already beaten by a safe technique, and it reopens the
+worst bug in the runtime's history. The correct deliverable is a **decomposition helper** —
+a `parallel_map`-style chunker targeting ~4× carrier count — plus the guidance that a parallel job
+should be split into many small tasks rather than a few large ones. Tracked as **4.2b**.
+
+*Generalisable: "add work-stealing" was in the plan as an obvious-sounding L-effort item. One
+afternoon of measurement showed the cheap alternative is strictly better AND safer. Measure the
+alternative before building the sophisticated thing.*
+
+| 4.2b | `parallel_map` decomposition helper (~4× carriers) | — | S | TODO |
 
 ## PHASE 5 — PLATFORM REACH (run everywhere)
 

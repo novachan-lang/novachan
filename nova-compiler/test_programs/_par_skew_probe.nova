@@ -1,0 +1,69 @@
+// 4.2 DECISIVE DIAGNOSTIC: does the absence of WORK-STEALING actually cost us?
+//
+// The grain sweep (_par_grain_probe) showed speedup is FLAT at ~2.7x from 4 to 16
+// equal tasks on 4 carriers, which rules out uneven initial claim as the main loss
+// on a BALANCED load. But work-stealing exists for UNBALANCED loads, and NOVA's
+// green tasks are pinned to a home carrier on first claim with no stealing after
+// (commit 71a651d) -- so a skewed workload is where that should hurt.
+//
+// Same total work in both modes, only its DISTRIBUTION differs:
+//   balanced : 8 tasks x N iterations each
+//   skewed   : 8 tasks whose sizes are 1,1,1,1,1,1,1,9 units (same total)
+//
+// With 4 carriers and no stealing, the carrier that claims the 9-unit task runs
+// long after the others go idle. Perfect stealing would rebalance and approach the
+// balanced time; pinning cannot. So:
+//   skew_time ~= balanced_time      -> stealing would buy little; deprioritise 4.2
+//   skew_time >> balanced_time      -> stealing (or size-aware placement) is a real win
+//
+// The theoretical floor for the skewed case is set by the single 9-unit task: with
+// 16 units total over 4 carriers, a perfect scheduler finishes in max(9, 16/4) = 9
+// units, vs 4 units balanced. So even ideal stealing cannot beat 9/4 = 2.25x the
+// balanced time -- that ratio is the yardstick to compare against.
+
+let UNIT = 3000000        // iterations per "unit" of work
+
+fn crunch(seed: int, iters: int) -> int
+    let acc = seed
+    let i = 0
+    while i < iters
+        acc = acc + (i * 2654435761) % 1000003
+        acc = acc % 4294967291
+        i = i + 1
+    acc
+
+fn main()
+    let mode = env("PAR_MODE")
+    // sizes in UNITs; both lists sum to 16
+    let sizes = [2, 2, 2, 2, 2, 2, 2, 2]
+    if mode == "skew"
+        sizes = [1, 1, 1, 1, 1, 1, 1, 9]
+    if mode == "split"
+        // The SAME skewed workload, but the one 9-unit task decomposed into nine
+        // 1-unit tasks. Still 16 units total. If this recovers balanced timing, then
+        // finer decomposition is the safe answer to skew and work-stealing (which
+        // would mean re-introducing task MIGRATION -- the precondition of the
+        // carrier-wedge hang that pinning was introduced to eliminate) is not needed.
+        sizes = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+    let hub = channel()
+    let w = 0
+    while w < len(sizes)
+        let my_seed = w + 1
+        let my_iters = sizes[w] * UNIT
+        spawn fn()
+            send(hub, crunch(my_seed, my_iters))
+        w = w + 1
+
+    let total = 0
+    let got = 0
+    while got < len(sizes)
+        total = total + receive(hub)
+        got = got + 1
+
+    // Proves the work ran, and that both modes really did the same total.
+    let units = 0
+    for s in sizes
+        units = units + s
+    print("mode=" + mode + " tasks=" + str(len(sizes)) + " units=" + str(units) + " checksum=" + str(total))
+    print("PAR_SKEW_OK")

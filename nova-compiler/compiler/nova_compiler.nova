@@ -18450,6 +18450,7 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     // patterns (ti_constrain only defers; ti_solve binds + clears).
                     ti_solve(st)
                 let ex_pats = []
+                let ex_guarded = []
                 let m_result = nt_any()
                 let m_first = true
                 let mci = 1
@@ -18458,6 +18459,16 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                         Expr(xat, xav, xan, xac, xaf, xal) =>
                             if xat == "arm" and len(xac) > 0
                                 push(ex_pats, xac[0])
+                                // 2.9: guard is the arm's THIRD child in the match-EXPRESSION
+                                // form (parse_match_expr ~2101); a guarded arm may not fire so it
+                                // cannot count as covering its variant's payload.
+                                let _exg2 = 0
+                                if len(xac) > 2
+                                    match xac[2]
+                                        Expr(_eg2t, _eg2v, _eg2n, _eg2c, _eg2f, _eg2l) =>
+                                            if _eg2t != "null"
+                                                _exg2 = 1
+                                push(ex_guarded, _exg2)
                                 ti_push_scope(st)
                                 ti_infer_pattern(st, xac[0], m_subj)
                                 let m_armt = nt_any()
@@ -18470,7 +18481,7 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                 else
                                     ti_unify_arms(st, m_result, m_armt, xal)
                     mci = mci + 1
-                ti_check_exhaustive(st, ex_pats, eline)
+                ti_check_exhaustive_g(st, ex_pats, ex_guarded, eline)
                 return m_result
             if tag == "for"
                 return nt_any()
@@ -19193,11 +19204,22 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 let match_t = nt_unit()
                 let match_first = true
                 let ex_pats = []
+                let ex_guarded = []
                 for arm in body
                     match arm
                         Stmt(at, an, ae, abody, ap, aeb, aann, asln) =>
                             if at == "arm"
                                 push(ex_pats, ae)
+                                // 2.9: a GUARDED arm may not fire, so it cannot be counted as
+                                // covering its variant's payload. The guard lives in
+                                // annotations[0] (null_expr() when absent).
+                                let _exg = 0
+                                if len(aann) > 0
+                                    match aann[0]
+                                        Expr(_egt, _egv, _egn, _egc, _egf, _egl) =>
+                                            if _egt != "null"
+                                                _exg = 1
+                                push(ex_guarded, _exg)
                                 ti_push_scope(st)
                                 ti_infer_pattern(st, ae, subj)
                                 let arm_t = nt_unit()
@@ -19209,7 +19231,7 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                     match_first = false
                                 else
                                     ti_unify_arms(st, match_t, arm_t, asln)
-                ti_check_exhaustive(st, ex_pats, sline)
+                ti_check_exhaustive_g(st, ex_pats, ex_guarded, sline)
                 // A match used as a function's last expression yields the
                 // value of its arms; report the first arm's value type.
                 return match_t
@@ -19354,6 +19376,107 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
                         _pl_i = _pl_i + 1
 
 // ── Match exhaustiveness check ───────────────────────────────────────────────
+
+// ── 2.9: INNER exhaustiveness for NESTED constructor patterns ────────────────
+//
+// The outer check below verifies every variant of the scrutinee's enum is named by some
+// arm. With 2.1 nested patterns that is no longer sufficient: `Wrap(IntVal(n))` and
+// `Empty()` names both outer variants, so the outer check passes -- yet a
+// `Wrap(StrVal(...))` value matches NO arm and falls through to "" silently, which is
+// exactly the class of bug this campaign exists to remove.
+//
+// This is a focused version of Rust's usefulness algorithm rather than the full pattern
+// matrix: group the arms by outer constructor, and for any constructor whose arms ALL
+// destructure their payload with a nested ctor, require those nested ctors to cover the
+// payload enum. That handles the shape real ADT code actually has (single-payload
+// wrappers: Result-of-X, tree nodes, protocol frames).
+//
+// SOUND BY CONSTRUCTION -- it declines to check anything it cannot decide, so it can
+// report a MISSING variant but never rejects a valid match. Every bail-out below is
+// deliberate:
+//   * a payload bound by a plain binder or `_` covers the whole payload -> nothing to check
+//   * a GUARDED arm may not fire, so it is treated as covering everything (conservative;
+//     the guard-vs-exhaustiveness hole is pre-existing and noted in the plan, not widened here)
+//   * a variant with more than one payload field needs the cross-product of positions --
+//     a real matrix -- so multi-field payloads are skipped rather than guessed
+//   * inner ctors from different enums, or ones not in ti_variant_enum, are skipped
+fn ti_check_nested_exhaustive(st: TiState, patterns: list, guarded: list, line: int)
+    // outer ctor name -> the inner ctor names seen in its arms
+    let nx_inner = {}
+    // outer ctor name -> 1 when some arm covers that variant's payload wholesale
+    let nx_open = {}
+    let nx_names = []
+    let nx_i = 0
+    for pat in patterns
+        match pat
+            Expr(pt, pv, pn, pc, pf, pl) =>
+                if pt == "pat_ctor"
+                    if not contains(nx_inner, pv)
+                        nx_inner[pv] = []
+                        push(nx_names, pv)
+                    let nx_g = false
+                    if nx_i < len(guarded)
+                        if guarded[nx_i] == 1
+                            nx_g = true
+                    if nx_g
+                        nx_open[pv] = 1
+                    else if len(pc) != 1
+                        // 0 fields: nothing nested to check. >1 field: needs a real
+                        // pattern matrix over positions -- decline.
+                        nx_open[pv] = 1
+                    else
+                        match pc[0]
+                            Expr(st0, sv0, sn0, sc0, sf0, sl0) =>
+                                if st0 == "pat_ctor"
+                                    push(nx_inner[pv], sv0)
+                                else
+                                    // binder / wildcard / literal in payload position
+                                    nx_open[pv] = 1
+        nx_i = nx_i + 1
+    for nx_o in nx_names
+        if not contains(nx_open, nx_o)
+            let nx_list = nx_inner[nx_o]
+            if len(nx_list) > 0
+                // Every inner ctor must belong to ONE enum for the comparison to mean
+                // anything; a mixed or unknown set is not decidable here.
+                let nx_enum = ""
+                let nx_ok = true
+                for nx_c in nx_list
+                    if contains(st.ti_variant_enum, nx_c)
+                        let nx_e = st.ti_variant_enum[nx_c]
+                        if nx_enum == ""
+                            nx_enum = nx_e
+                        else if nx_enum != nx_e
+                            nx_ok = false
+                    else
+                        nx_ok = false
+                if nx_ok and nx_enum != "" and contains(st.ti_enum_variants, nx_enum)
+                    let nx_all = st.ti_enum_variants[nx_enum]
+                    let nx_missing = []
+                    for nx_v in nx_all
+                        if not list_contains(nx_list, nx_v)
+                            push(nx_missing, nx_v)
+                    if len(nx_missing) > 0
+                        let nx_msg = "non-exhaustive nested match: '" + nx_o + "' is only matched with "
+                        let nx_j = 0
+                        while nx_j < len(nx_list)
+                            if nx_j > 0
+                                nx_msg = nx_msg + ", "
+                            nx_msg = nx_msg + nx_list[nx_j] + "(...)"
+                            nx_j = nx_j + 1
+                        nx_msg = nx_msg + ", so a '" + nx_o + "' holding "
+                        let nx_k = 0
+                        while nx_k < len(nx_missing)
+                            if nx_k > 0
+                                nx_msg = nx_msg + " or "
+                            nx_msg = nx_msg + nx_missing[nx_k] + "(...)"
+                            nx_k = nx_k + 1
+                        nx_msg = nx_msg + " matches no arm and would fall through"
+                        ti_error(st, nx_msg, line)
+
+fn ti_check_exhaustive_g(st: TiState, patterns: list, guarded: list, line: int)
+    ti_check_exhaustive(st, patterns, line)
+    ti_check_nested_exhaustive(st, patterns, guarded, line)
 
 fn ti_check_exhaustive(st: TiState, patterns: list, line: int)
     let ex_catchall = false
@@ -25364,6 +25487,26 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     // it would otherwise get. Built once in the nova_main prologue (19864).
                     b.ir_const_baked[name] = len(b.ir_const_build_order)
                     push(b.ir_const_build_order, [name, expr])
+                // ── A module-level `let X = some_fn()` (non-foldable SCALAR) still reads back as 0
+                // inside a function, and BAKING IT HERE DOES NOT WORK. Attempted 2026-08-21 and
+                // reverted after 17 regression failures including segfaults. The reason is
+                // fundamental, so it is recorded here rather than re-derived:
+                //
+                // A NOVA file with no `main` is a SCRIPT -- its top level IS the program body, and
+                // those `let`s are SEQUENTIAL STATEMENTS whose initializers routinely depend on
+                // earlier top-level state (`let s = "..."` then `let up = upper(s)`, or
+                // `let out = csv_write(table)`). The const-store prologue runs BEFORE top_stmts, so
+                // hoisting such an initializer evaluates it while every slot it reads is still
+                // zero -- `upper(0)` -> access violation. And inline_module_consts substitutes
+                // literals into FUNCTION BODIES only, never into a hoisted initializer, so the
+                // "operands are already literals" assumption that made hoisting look safe is false.
+                //
+                // A real fix must give module-level `let`s genuine GLOBAL storage written in
+                // program order (not a prologue that runs first) -- i.e. emit them as module
+                // globals and have nova_user_main read those globals, rather than relocating the
+                // initializer. That is a storage-model change, not a hoist. Until then the
+                // foldable cases are handled by _fold_module_scalar and the rest should use
+                // `const` (which has ce_try_fold_const).
                 else if tag != "import" and tag != "trait" and tag != "type_alias"
                     push(top_stmts, s)
 
