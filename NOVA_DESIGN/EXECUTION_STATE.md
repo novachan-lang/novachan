@@ -852,9 +852,42 @@ printed `untyped_a=300` instead of `1` — proving the probe detects the defect,
 was live, and that the other struct's access was already right *by luck* (which is what killed the
 tempting "fall back to slot 0" shortcut: it would have broken the working half).
 
-**NEXT:** Phase 2 expressiveness (nested patterns `Ok(Some(x))`, pattern guards, operator
-overloading) per `WEAPON_PARITY_PLAN.md`, or the two 1.4 refinements + 1.8/1.9 as a cheap
-soundness sweep first.
+**Phase 1 CLOSED** (`3a8e64a1` finished 1.8 defaults-must-be-trailing and 1.9 variadic/named-args
+across the module boundary, plus two hardening fixes to my own 1.4). Only 1.6 (`null`≠`0`) and 1.7
+(RC cycles) remain, both deferred by design.
+
+**Phase 2 CLOSED** (`fa4d77ef`) — and the headline is a process finding: **of 8 items, 5 were
+already implemented, 2 partial, and exactly 1 needed building.** Only 2.1 nested constructor
+patterns was real work (parser recursion + TI recursion in both pat_ctor branches + a shared
+`ir_destructure_ctor` emitting a runtime tag test per nesting level, replacing three inline copies).
+Pattern guards, operator overloading, the drop trait, generics-in-framework (74 uses in `std/`) and
+did-you-mean suggestions all already existed. **Three of them had no test at all** — so the standing
+rule is now: grep the live code before scheduling an item, and gate whatever you find.
+
+**4.1 N>1 scaling — MEASURED, and the "regression" was a myth** (`b4d340f9`). The
+0.76–0.82×-single-core figure had **no live measurement anywhere**: stage 2b proves correctness at
+4/8 carriers and says nothing about speed, and all six `bench/programs` are single-threaded. Real
+strong-scaling numbers on this 4-physical/8-logical host: **1.00x / 1.26x / 1.95x / 2.23x** at
+NOVA_CARRIERS=1/2/4/8 (2.16x in-CI). That **exceeds the 1.8x bar** in the compiler-architecture
+rules, and makes the un-copyable claim available: Rust's async is colored at the language level
+forever, so a `spawn` that scales without coloring is something it cannot retrofit. Gated at stage
+2b2 at a deliberately loose 1.30x — the gate catches a return to <1.0x, not a few percent of host
+noise.
+
+**⚠ Two lessons from that measurement, both worth more than the number:**
+1. It exposed a real compiler bug: `let PER = TOTAL / WORKERS` at module level silently evaluated to
+   **0** (even `let X = 24000000 / 8`), because a scalar *expression* fell through both
+   module-scope mechanisms — literal propagation and const-store baking. Top-level code runs in
+   `nova_main` while user `main` is `nova_user_main`, so the surviving `slot_load` read a foreign,
+   zero-initialised frame. Fixed with a conservative compile-time folder that **declines to fold**
+   rather than guess.
+2. The benchmark's first run looked *great* — 60 ms — with a checksum of exactly `1+2+…+8`, because
+   every worker's loop count was 0. **Every benchmark must assert a checksum proving the work
+   happened.** A number measured against a silently-empty loop is worse than no number.
+
+**NEXT:** 2.9 nested-pattern exhaustiveness (needs Rust's usefulness/witness algorithm over a
+pattern matrix), 4.2 work-stealing between carriers (the ~49% parallel efficiency at 4 cores says
+fan-in/scheduling overhead is real), then Phase 5 platform reach.
 
 ---
 
