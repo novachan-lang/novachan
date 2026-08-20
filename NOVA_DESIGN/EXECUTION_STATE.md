@@ -827,14 +827,34 @@ together, and the gate must assert VALUES.
 `_xm_soundness_gate.ps1` (7 exact value assertions) · `_xm_exhaustive_neg.nova` added to stage 2k
 `_neg_type_tests.ps1` (29/0) · full regression both modes.
 
-**NEXT — 1.4 field-slot collision.** Re-rated S → M after measurement: `ir_fmap` is a flat
-`field_name → slot` map, and a static audit found **15 genuinely ambiguous field names** across
-`forge/`+`prism/`+`std/` (166 struct blocks) — `body` alone resolves to 4 different slots
-(`Response`@3, `Request`@7, `MpPart`@4, `PgMsg`@2). The compiler itself has 8 but is immune because
-it destructures via `match Stmt(tag, name, ...)` (positional, never consults `ir_fmap`) — **so
-reconverge, our deepest gate, structurally cannot see this bug.** The read path can use the
-existing name-based `nova_rt_field_get`; the write path needs a NEW `nova_rt_field_set_by_name` in
-`nova_runtime.c`, which makes it RED-tier with its own full arc. Design recorded in the plan.
+**ALSO LANDED — 1.2b imported struct ctors (`741c55a2`), 1.4 field-slot collision (`aa08ca45`),
+1.5 `?`-in-lambda gated.** Phase 1 is now closed except for two items deferred by design (1.6
+`null`≠`0`, 1.7 RC cycles) and two pre-existing holes found en route and recorded (1.8 a
+non-defaulted param after a defaulted one is accepted; 1.9 variadic/named-args don't cross the
+module boundary).
+
+**1.4 is the one to re-read before touching field access.** `ir_fmap` is a flat `field_name → slot`
+map; a static audit found **15 genuinely ambiguous field names** across `forge/`+`prism/`+`std/`
+(166 struct blocks) — `body` alone resolves to 4 different slots (`Response`@3, `Request`@7,
+`MpPart`@4, `PgMsg`@2). Ambiguous + un-inferrable receiver now resolves BY NAME against the object's
+slot-0 type hash: `nova_rt_field_get` on reads, new `nova_rt_field_set_by_name` on writes via a slot
+`-1` sentinel (the write must stay an *instruction* because `do_inc` is an emit-time decision;
+guessing it leaks on every fresh temp or causes a UAF).
+
+**⚠ The gate lesson worth carrying: reconverge is STRUCTURALLY BLIND to this bug class.** The
+compiler has 8 ambiguous field names of its own yet is immune, because it destructures via
+`match Stmt(tag, name, ...)` — positional, never consulting `ir_fmap`. Our deepest correctness gate
+cannot see a defect that corrupts every dot-access in Forge/Prism. When a subsystem is exercised
+differently by the compiler than by user code, reconverge proves nothing about it.
+
+**Also: reproduce before fixing.** The 1.4 probe was run against the *unfixed* compiler first and
+printed `untyped_a=300` instead of `1` — proving the probe detects the defect, that the corruption
+was live, and that the other struct's access was already right *by luck* (which is what killed the
+tempting "fall back to slot 0" shortcut: it would have broken the working half).
+
+**NEXT:** Phase 2 expressiveness (nested patterns `Ok(Some(x))`, pattern guards, operator
+overloading) per `WEAPON_PARITY_PLAN.md`, or the two 1.4 refinements + 1.8/1.9 as a cheap
+soundness sweep first.
 
 ---
 
