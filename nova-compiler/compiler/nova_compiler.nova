@@ -5931,6 +5931,77 @@ fn _subst_stmt_ident(s: Stmt, old_name: string, new_e: Expr) -> Stmt
             return Stmt(tag, name, nexpr, nbody, params, neb, nann, sl)
     return s
 
+// A module-level `let` whose initializer is a scalar EXPRESSION rather than a bare literal
+// used to read back as 0 from inside every function. inline_module_consts propagated only
+// `_is_scalar_literal` initializers, and `_is_module_state_init` bakes only list/dict/
+// channel() -- so `let PER = TOTAL / WORKERS` fell through BOTH. The identifier survived to
+// codegen as a slot_load, and top-level statements execute in nova_main whose locals the
+// user's `main` (nova_user_main) cannot see, so the load hit an uninitialised slot. Silent
+// wrong answer -- 0 -- on a completely ordinary declaration. Even `let X = 24000000 / 8`,
+// with no identifiers at all, was 0.
+//
+// Baking (the list/dict route) does NOT work here: the const-store prologue runs BEFORE
+// top_stmts (see the note at ~5884), so a baked `B / A` would read A and B while their
+// slots are still zero -- the same bug with more machinery. Fold at COMPILE TIME instead,
+// in source order, over the scalars already known. Forward references are rejected by
+// inference (E1002), so source order IS dependency order and one pass suffices.
+//
+// Deliberately CONSERVATIVE: integers only, operators + - * / %. The expression is returned
+// UNCHANGED unless every leaf is a known integer -- an unknown identifier, a float, a
+// string, a call, or a division by zero all decline to fold, leaving prior behaviour exactly
+// as it was. A folder must never invent a value; that is how this bug class starts.
+fn _fold_module_scalar(e: Expr, cmap: dict) -> Expr
+    match e
+        Expr(t, v, n, ch, f, ln) =>
+            if t == "int"
+                return e
+            if t == "ident"
+                if contains(cmap, v)
+                    let _fm_c = cmap[v]
+                    match _fm_c
+                        Expr(_ct, _cv, _cn, _cch, _cf, _cl) =>
+                            if _ct == "int"
+                                return _fm_c
+                return e
+            if t == "binop" and len(ch) == 2
+                let _fm_l = _fold_module_scalar(ch[0], cmap)
+                let _fm_r = _fold_module_scalar(ch[1], cmap)
+                let _fm_lv = 0
+                let _fm_rv = 0
+                let _fm_ok = 0
+                match _fm_l
+                    Expr(_lt, _lv2, _ln2, _lch, _lf, _ll) =>
+                        if _lt == "int"
+                            _fm_lv = _ln2
+                            _fm_ok = _fm_ok + 1
+                match _fm_r
+                    Expr(_rt, _rv2, _rn2, _rch, _rf, _rl) =>
+                        if _rt == "int"
+                            _fm_rv = _rn2
+                            _fm_ok = _fm_ok + 1
+                if _fm_ok == 2
+                    let _fm_res = 0
+                    let _fm_have = 0
+                    if v == "+"
+                        _fm_res = _fm_lv + _fm_rv
+                        _fm_have = 1
+                    else if v == "-"
+                        _fm_res = _fm_lv - _fm_rv
+                        _fm_have = 1
+                    else if v == "*"
+                        _fm_res = _fm_lv * _fm_rv
+                        _fm_have = 1
+                    else if v == "/" and _fm_rv != 0
+                        _fm_res = _fm_lv / _fm_rv
+                        _fm_have = 1
+                    else if v == "%" and _fm_rv != 0
+                        _fm_res = _fm_lv % _fm_rv
+                        _fm_have = 1
+                    if _fm_have == 1
+                        return Expr("int", str(_fm_res), _fm_res, [], [], ln)
+                return e
+    e
+
 fn inline_module_consts(stmts: list) -> list
     let cmap = {}
     let cnames = []
@@ -5938,9 +6009,13 @@ fn inline_module_consts(stmts: list) -> list
         match s
             Stmt(tag, name, expr, body, params, eb, ann, sl) =>
                 if tag == "assign" and name != "" and len(ann) == 0
-                    if _is_scalar_literal(expr) == 1
+                    // Fold first, so a COMPUTED scalar (`let PER = TOTAL / WORKERS`) becomes a
+                    // literal and is then propagated exactly like a written-out one. A literal
+                    // initializer folds to itself, so existing behaviour is bit-for-bit unchanged.
+                    let _imc_folded = _fold_module_scalar(expr, cmap)
+                    if _is_scalar_literal(_imc_folded) == 1
                         if not contains(cmap, name)
-                            cmap[name] = expr
+                            cmap[name] = _imc_folded
                             push(cnames, name)
     if len(cnames) == 0
         return stmts

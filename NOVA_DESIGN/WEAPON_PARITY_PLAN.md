@@ -310,10 +310,10 @@ Runs periodically or on suspected cycles. Deferred — needs careful implementat
 | 2.2 | Pattern guards `x if x > 0` | Rust/Haskell | S | **✅ ALREADY EXISTED — verified + gated** |
 | 2.3 | Operator overloading | C++/Rust/Swift/Kotlin | M | **✅ ALREADY EXISTED — verified + gated** |
 | 2.4 | RAII / drop trait (scope-exit cleanup) | C++/Rust | M | **✅ ALREADY EXISTS** (`<Type>__drop`) — gated via `_chan_drop_test` |
-| 2.5 | Extended @comptime (full language at compile time) | Zig/C++ | L | TODO |
-| 2.6 | Generics proven in framework code | C++/Rust/Swift | M | TODO |
-| 2.7 | Error message suggestions ("did you mean X?") | Python/Rust/Elm | S | TODO |
-| 2.8 | Move semantics / move(x) builtin | C++/Rust | M | TODO |
+| 2.5 | Extended @comptime (full language at compile time) | Zig/C++ | L | PARTIAL — `@comptime` + const-fn fold exist |
+| 2.6 | Generics proven in framework code | C++/Rust/Swift | M | **✅ TRUE — 74 in `std/`, 9 in `forge/`** (0 in `prism/`) |
+| 2.7 | Error message suggestions ("did you mean X?") | Python/Rust/Elm | S | **✅ ALREADY EXISTS** (edit-distance) |
+| 2.8 | Move semantics / move(x) builtin | C++/Rust | M | PARTIAL — use-after-move enforced for `send()`; no general `move()` |
 | 2.9 | Nested-pattern exhaustiveness (usefulness algorithm) | Rust/Haskell | L | FOUND 2026-08-20 (2.1 covers runtime only) |
 
 ### ✅ 2.1 Nested patterns — landed
@@ -419,6 +419,31 @@ This is genuine RAII, not `defer`: it is keyed on the value's lifetime, not on a
 
 ---
 
+### 2.5–2.8 audited against live code 2026-08-20 — the plan was badly stale
+
+- **2.6 generics in framework code: the earlier "ZERO in forge/prism" claim is WRONG.** Counting
+  `^(fn|type) <T…>` declarations (generics go BEFORE the name in NOVA — `fn <T> name(...)`, which is
+  why an `fn name<T>` grep finds nothing): **`std/` 74, `forge/` 9**, `prism/` 0,
+  `test_programs/` 36, compiler 0. So generics *are* load-bearing in the standard library. The real
+  remaining gap is narrower and worth stating precisely: **Prism uses none**, and the self-hosted
+  compiler uses none.
+- **2.7 did-you-mean: exists.** Edit-distance suggestion machinery at ~17405, wired into unknown-
+  identifier errors (~17487) and ORM column errors (E1013, ~18549 — "the struct IS the schema").
+- **2.8 move semantics: partial, and the partial half is the important half.** Use-after-move is
+  *enforced* — `send()` moves its argument and a later use is `E1003 value 'x' used after move`,
+  with the line of the move reported. There is no general user-facing `move(x)` builtin. Since NOVA's
+  ownership story is "channel boundaries ARE the transfer points", enforcing it exactly at `send()`
+  is arguably the whole feature; a general `move()` would be a second, weaker mechanism. Needs a
+  design decision before implementing, not just code.
+- **2.5 @comptime: partial.** `@comptime` exists and 16 uses appear across the trees, plus
+  `ce_try_fold_const` folds pure call-rooted `const` initializers (e.g. `const X = fib(10)`) at
+  compile time and fails closed to runtime. "Full language at compile time" (Zig parity) is the part
+  still open.
+
+**Score-keeping correction.** Of the 8 original Phase 2 items, 5 were already implemented (2.2, 2.3,
+2.4, 2.6, 2.7), 2 are partial (2.5, 2.8), and exactly 1 needed building (2.1). The plan was written
+from assumption rather than measurement. Every future item gets grepped before it gets scheduled.
+
 ## PHASE 3 — PERFORMANCE (match C, beat Python 100x)
 
 | # | Feature | From | Effort | Status |
@@ -436,7 +461,7 @@ This is genuine RAII, not `defer`: it is keyed on the value's lifetime, not on a
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 4.1 | N>1 concurrency fix (scheduler lock) | Go | L | REGRESSED |
+| 4.1 | N>1 concurrency scaling | Go | L | **✅ MEASURED GOOD 2026-08-20 — 1.95x at 4 carriers** |
 | 4.2 | Work-stealing between carriers | Go/Java FJP | L | TODO |
 | 4.3 | Preemptive scheduling (yield at loop back-edges) | Erlang | M | TODO |
 | 4.4 | Supervision trees (library) | Erlang | S | TODO |
@@ -445,6 +470,48 @@ This is genuine RAII, not `defer`: it is keyed on the value's lifetime, not on a
 | 4.7 | Distributed channels (network transport) | Erlang | XL | TODO |
 
 ---
+
+### ✅ 4.1 N>1 scaling — the "regression" was never measured, and it isn't one
+
+This item was carrying the label *"the one fix worth more than everything else combined"*, on the
+strength of a **0.76–0.82× single-core** figure. That figure had **no live measurement anywhere**:
+`_n_carriers_ci` (CI stage 2b) proves *correctness* at 4/8 carriers and says nothing about speed,
+and all six `bench/programs` are single-threaded. Nothing in the repo measured parallel speedup.
+
+Built `_par_scale_bench.nova` + `_par_scale_bench.ps1` — strong scaling (total work held constant,
+per-worker slice shrinks), CPU-bound allocation-free inner loop, one channel fan-in, best-of-3 per
+carrier count, and a **carrier-independent checksum** so a run that lost or duplicated work is
+rejected instead of timed.
+
+| NOVA_CARRIERS | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| best of 3 | 287.9 ms | 227.8 ms | 147.3 ms | 129.4 ms |
+| speedup | 1.00x | 1.26x | **1.95x** | 2.23x |
+
+Host is 4 physical / 8 logical cores, so 1.95x at N=4 is ~49% parallel efficiency and 2.23x at N=8
+is hyperthreading behaving as expected. **1.95x exceeds the 1.8x four-worker bar** in
+`.claude/rules/compiler-architecture.md`.
+
+**Why this matters competitively.** Rust's async is *colored*, permanently, at the language level;
+its core team has been publicly stuck on effect-polymorphism/keyword-generics for years. A `spawn`
+that scales positively with cores and needs no `async`/`await` coloring is an advantage Rust cannot
+retrofit. That claim was previously unavailable because the number said the opposite. It is now
+available and measured.
+
+**Gated** at CI stage **2b2**, threshold 1.30x at N=4 — deliberately well below the measured 1.95x,
+because the gate's job is to catch a return to <1.0x, not to police a few percent on a
+memory-pressured host. The real speedup prints on every run, so erosion is visible early.
+
+**Honest remaining headroom:** there is still **no work-stealing** between carriers, so an unbalanced
+workload can leave carriers idle; ~49% efficiency at 4 cores says fan-in and scheduling overhead are
+real. That is item 4.2, and it is now an *optimization* rather than a rescue.
+
+**⚠ The measurement trap this exposed — worth more than the number.** The benchmark's first run
+reported a healthy 60 ms and a checksum of `36`, which is exactly `1+2+…+8`: every worker had
+returned its seed untouched, because `let PER = TOTAL / WORKERS` at module level silently evaluated
+to **0** (a genuine compiler bug, found and fixed because of this). Without the checksum, "60 ms"
+would have been recorded as an excellent result. **Every benchmark must assert that the work
+happened.** A number measured against a silently-empty loop is worse than no number.
 
 ## PHASE 5 — PLATFORM REACH (run everywhere)
 

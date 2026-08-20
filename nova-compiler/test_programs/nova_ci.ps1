@@ -134,6 +134,15 @@ if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k3 (field-slot 
 # Phase 2.1/2.2 pattern matching. Nested ctor patterns need a runtime tag test PER nesting level,
 # so a depth-3 case and a built-in-sum case (a different ti_infer_pattern branch) are both asserted.
 # Guards were already implemented but untested -- gated now. Check follows its own invocation.
+# 4.1 PARALLEL SCALING. The N>1 gate above (2b) proves CORRECTNESS at 4/8 carriers but says nothing
+# about speed, and all six bench/programs are single-threaded -- so the long-standing "N>1 runs at
+# 0.76-0.82x single-core" claim had NO live measurement anywhere. This measures strong scaling
+# (constant total work) at 1/2/4/8 carriers and fails only on a real regression; the actual speedup
+# is printed every run. Check follows its own invocation.
+Write-Host "`n[CI 2b2/3] Parallel scaling (strong scaling at NOVA_CARRIERS=1/2/4/8)..."
+& .\_par_scale_bench.ps1 -Repeat 3 -AsGate
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b2 (parallel scaling regression) ==="; exit 1 }
+
 Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, value-asserted)..."
 & .\_p2_pattern_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }
