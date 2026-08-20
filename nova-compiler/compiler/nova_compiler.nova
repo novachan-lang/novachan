@@ -11541,6 +11541,7 @@ type IrBuilder
     ir_fnames: list
     ir_sdefs: dict
     ir_fmap: dict
+    ir_fmap_collision: dict     // 1.4: field name -> 1 when two structs put it at DIFFERENT slots. ir_fmap is flat + last-writer-wins, so an UNTYPED access to such a name is a guess; these route to the by-name runtime helpers instead.
     ir_loop_hdr: string
     ir_loop_exit: string
     ir_lambdas: list
@@ -11579,7 +11580,7 @@ type IrBuilder
     ir_sredact: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
 
 // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
 // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
@@ -12680,6 +12681,22 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     else if ft == "string"
                         fld_type = ir_type_str()
                 let obj = ir_lower_expr(b, children[0])
+                // 1.4: AMBIGUOUS FIELD NAME + UN-INFERRABLE RECEIVER -> resolve BY NAME at runtime.
+                // ir_fmap is a flat field_name -> slot map (last writer wins), so when recv_stype is
+                // "" the slot below is a GUESS. Measured: 15 field names across forge/prism/std sit at
+                // DIFFERENT slots in different structs -- `body` at 4 of them (Response@3, MpPart@4,
+                // Request@7, PgMsg@2). Guessing reads a foreign field: silent corruption for a scalar,
+                // a wild pointer read for a struct-typed field (this is what crashed the HTML renderer
+                // via PrismNode.kind). nova_rt_field_get resolves against the object's OWN slot-0 type
+                // hash, so it is always right; it costs a call + a name walk, paid only on the accesses
+                // that are currently WRONG. Same choice the un-inferrable closure-field call already
+                // makes just above (~12533) -- name lookup beats a fabricated guess.
+                // NOT applied when recv_stype is known: that path reads ir_sdefs per-struct and is exact.
+                if recv_stype == "" and contains(b.ir_fmap_collision, value)
+                    let _amb_name = ir_lower_expr(b, Expr("str", value, 0, [], [], 0))
+                    let _amb_dest = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", _amb_dest, ir_type_any(), [obj, _amb_name], "nova_rt_field_get", 0)
+                    return _amb_dest
                 let dest = ir_fresh_reg(b)
                 let fi = get_ir_field_index_for(b, recv_stype, value)
                 ir_emit_inst(b, "field_get", dest, fld_type, [obj], value, fi)
@@ -14424,6 +14441,18 @@ fn ir_lower_assign_target(b: IrBuilder, target: Expr, val_reg: string)
                         else if mc0t == "call" and contains(b.ir_sdefs, mc0v)
                             mstype = mc0v
                 let fi = get_ir_field_index_for(b, mstype, value)
+                // 1.4 (write side): an AMBIGUOUS field name written through an UN-INFERRABLE receiver
+                // gets slot -1, the "resolve by name at runtime" sentinel that ire_emit_inst turns into
+                // nova_rt_field_set_by_name. Unlike the read side -- which lowers a direct call here --
+                // this MUST stay a `field_set` instruction, because `do_inc` is decided at EMIT time
+                // (from ire_load_origin: 1 when the new value is slot-sourced/may-alias, 0 for a fresh
+                // temp that is MOVEd). Lowering a call here would have to guess do_inc, and neither
+                // constant is safe: always-1 leaks a reference on every fresh temp (FULLRC would flag
+                // it), always-0 frees a value the source slot still holds -> use-after-free. Keeping the
+                // instruction lets the emitter apply its own rule unchanged; only the slot differs.
+                // -1 is unambiguous as a sentinel: real slots are >= 0 (@repr(C) starts at 0).
+                if mstype == "" and contains(b.ir_fmap_collision, value)
+                    fi = 0 - 1
                 let ptr_reg = ir_fresh_reg(b)
                 // CORE_GAP 0.8: thread the field's declared type (kind slot of typ) so the emitter can
                 // keep scalar writes inline and route managed/unknown writes through nova_rt_field_set.
@@ -23769,7 +23798,23 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     if len(args) >= 2 and contains(e.ire_load_origin, args[1])
                         _fs_do_inc = "1"
                     let _fs_r = ire_fresh_tmp(e, "_fs.r")
-                    ire_indent(e, _fs_r + " = call i64 @nova_rt_field_set(i64 " + args[0] + ", i64 " + str(num) + ", i64 " + args[1] + ", i64 " + _fs_do_inc + ")")
+                    if num < 0
+                        // 1.4 sentinel: the slot was AMBIGUOUS (this field name sits at different
+                        // slots in different structs) and the receiver's type was not inferable, so
+                        // there is no correct compile-time slot. Resolve by NAME against the object's
+                        // own slot-0 type hash instead. The name is already on the instruction, and
+                        // ire_intern_string mints the global here at emit time -- which is why the
+                        // lowering side only had to pass -1. do_inc is the emitter's own value above,
+                        // so ownership behaviour is IDENTICAL to the slot-based path.
+                        let _fsn_g = ire_intern_string(e, value)
+                        let _fsn_len = len(value) + 1
+                        let _fsn_p = ire_fresh_tmp(e, "_fs.n")
+                        ire_indent(e, _fsn_p + " = getelementptr inbounds [" + str(_fsn_len) + " x i8], ptr " + _fsn_g + ", i64 0, i64 0")
+                        let _fsn_i = ire_fresh_tmp(e, "_fs.ni")
+                        ire_indent(e, _fsn_i + " = ptrtoint ptr " + _fsn_p + " to i64")
+                        ire_indent(e, _fs_r + " = call i64 @nova_rt_field_set_by_name(i64 " + args[0] + ", i64 " + _fsn_i + ", i64 " + args[1] + ", i64 " + _fs_do_inc + ")")
+                    else
+                        ire_indent(e, _fs_r + " = call i64 @nova_rt_field_set(i64 " + args[0] + ", i64 " + str(num) + ", i64 " + args[1] + ", i64 " + _fs_do_inc + ")")
                 // W5b soundness: a struct field now holds a pointer to args[1].
                 // If args[1] came from a local slot, dropping that slot at fn
                 // return would dangle the struct's field. Skip drop.
@@ -24973,6 +25018,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     for p in params
                         match p
                             Param(pname, ptype, pdefault) =>
+                                if contains(b.ir_fmap, pname) and b.ir_fmap[pname] != fi
+                                    b.ir_fmap_collision[pname] = 1
                                 b.ir_fmap[pname] = fi
                                 b.ir_field_types[name + "." + pname] = ptype
                         fi = fi + 1
@@ -24986,6 +25033,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                     for vp in vparams
                                         match vp
                                             Param(vpname, vptype, vpdefault) =>
+                                                if contains(b.ir_fmap, vpname) and b.ir_fmap[vpname] != vfi
+                                                    b.ir_fmap_collision[vpname] = 1
                                                 b.ir_fmap[vpname] = vfi
                                                 b.ir_field_types[vname + "." + vpname] = vptype
                                         vfi = vfi + 1
@@ -25221,6 +25270,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare ptr @nova_rt_hashed_struct_alloc(i64) nounwind")
     ire_line(e, "declare void @nova_rc_inc(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_field_set(i64, i64, i64, i64) nounwind")
+    // 1.4: by-NAME field write, for an ambiguous field name on an un-inferrable receiver.
+    ire_line(e, "declare i64 @nova_rt_field_set_by_name(i64, i64, i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_register_struct_bitmap(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_register_struct_redact(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_register_struct_drop(i64, i64) nounwind")
@@ -27832,6 +27883,8 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                     for p in params
                         match p
                             Param(pname, ptype, pdefault) =>
+                                if contains(b.ir_fmap, pname) and b.ir_fmap[pname] != fi
+                                    b.ir_fmap_collision[pname] = 1
                                 b.ir_fmap[pname] = fi
                                 b.ir_field_types[name + "." + pname] = ptype
                         fi = fi + 1
@@ -27845,6 +27898,8 @@ fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited
                                     for vp in vparams
                                         match vp
                                             Param(vpname, vptype, vpdefault) =>
+                                                if contains(b.ir_fmap, vpname) and b.ir_fmap[vpname] != vfi
+                                                    b.ir_fmap_collision[vpname] = 1
                                                 b.ir_fmap[vpname] = vfi
                                                 b.ir_field_types[vname + "." + vpname] = vptype
                                         vfi = vfi + 1

@@ -14,7 +14,7 @@
 | 1.2a | Cross-module **enum variant** constructors | Rust | S | **✅ DONE 2026-08-20** |
 | 1.2b | Cross-module **plain struct** constructors | Rust | S | **✅ DONE 2026-08-20** |
 | 1.3 | Cross-module default params | Rust/Python | M | **✅ DONE 2026-08-20** |
-| 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | MEASURED + DESIGNED, not implemented |
+| 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | **✅ DONE 2026-08-20** (2 refinements noted) |
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
 | 1.6 | null ≠ 0 (indistinguishable) | All | L | TODO |
 | 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | DESIGNED |
@@ -112,7 +112,46 @@ wrappers, and `prism_arrange`/`prism_content`/`prism_interact`/`prism_structure`
 own. They still work and are not worth a mass deletion, but new multi-module types no longer need
 them — which removes the single biggest piece of ceremony in Prism's module layer.
 
-### 1.4 Field-slot collision — measured, and it is NOT the small fix it looked like
+### ✅ 1.4 Field-slot collision — LANDED. Reproduced first, then fixed, reads and writes
+
+**Reproduced before fixing** (`_xm_slot_probe.nova`, two modules, `xs_shared` at slot 1 in `XsAlpha`
+and slot 3 in `XsBeta`):
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `typed_a` / `typed_b` | 1 / 3 ✓ | 1 / 3 ✓ (control — receiver type known) |
+| `untyped_a` | **300** ✗ read `xs_a_three` | **1** ✓ |
+| `untyped_b` | 3 ✓ **by luck** (XsBeta registered last) | 3 ✓ still right |
+| `wrote_a` / `wrote_b` | — | 91 / 93 ✓ |
+| `intact_a` / `intact_b` | — | 300 / 10 ✓ neighbours not clobbered |
+
+Compiled clean, exited 0, wrong data — exactly the `body`→4-slots situation in forge. The asymmetry
+(`untyped_b` correct, `untyped_a` not) is the concrete proof that the rejected "fall back to slot 0"
+shortcut would have *broken the currently-working half*.
+
+**What landed:**
+- `nova_rt_field_set_by_name` in `nova_runtime.c` — resolves the name against the object's slot-0
+  type hash (identical resolution to `nova_rt_field_get`, so a read and a write of the same name can
+  never disagree), then **delegates** to `nova_rt_field_set` so the managed-slot bitmap, arena bypass
+  and inc-NEW-only rule are inherited rather than duplicated.
+- `ir_fmap_collision` on `IrBuilder`, marked at all 4 `ir_fmap` write sites when a name lands on a
+  different slot than previously recorded.
+- **Read** (`ir_lower_expr` ~12685): ambiguous + `recv_stype == ""` lowers a direct
+  `nova_rt_field_get(obj, "name")`, materializing the name via `Expr("str", …)`.
+- **Write** (`ir_lower_assign_target` ~14426): sets slot `-1`, and `ire_emit_inst`'s `field_set`
+  turns `num < 0` into `nova_rt_field_set_by_name`, interning the name with `ire_intern_string`.
+  It stays an *instruction* rather than a lowered call **because `do_inc` is decided at emit time**
+  (from `ire_load_origin`): guessing it would either leak on every fresh temp (`do_inc=1`, and FULLRC
+  would flag it) or free a value the source slot still holds (`do_inc=0` → use-after-free).
+- Gate `_xm_slot_gate.ps1` at CI stage **2k3**, 8 exact value assertions.
+
+Only `ire_emit_inst` needed touching — 21599/21915/22125 are inference/rewrite passes, not emitters.
+Note the rewrite pass at ~21915 rebuilds `field_set` with only 2 args, which is why a "pass the name
+as a 3rd operand" variant was avoided; the sentinel carries no extra operand to lose.
+
+**Verified:** reconverge byte-identical, 2858/0 both modes (FULLRC = leak-checked), gates 8/8 + 9/9.
+
+### 1.4 background — the measurement that re-scoped this from S to M
 
 `ir_fmap` is a flat `field_name → slot` map with no struct qualification. Last writer wins, so any
 **untyped** `.field` access reads whatever slot that name last resolved to.
@@ -163,6 +202,26 @@ an i64 string pointer, and string literals are interned into `ir_strlits`/`ir_st
 *lowering* — the backend cannot mint a new constant at emit time. So the change must happen at the
 two lowering sites, materializing the name with `ir_lower_expr(b, Expr("str", value, 0, [], [], 0))`
 — exactly the pattern already used at ~12538 for the un-inferrable closure-field call.
+
+**Two refinements identified while implementing — apply in a follow-up cycle, not urgent:**
+
+1. **The read guard is narrower than the condition it protects.** I gate on `recv_stype == ""`, but
+   `get_ir_field_index_for` also falls through to the guessing path when `recv_stype != ""` and
+   `not contains(b.ir_sdefs, recv_stype)` — e.g. the inferrer returns a builtin name like `"list"`.
+   The guard should be exactly *"the typed lookup cannot resolve"*:
+   `(recv_stype == "" or not contains(b.ir_sdefs, recv_stype)) and contains(b.ir_fmap_collision, value)`.
+   The write side needs no such change: `mstype` is only ever set after a `contains(b.ir_sdefs, ...)`
+   check, so it is already either `""` or a valid key.
+
+2. **`@repr(C)` structs must be excluded from collision marking.** `get_ir_field_index_for` numbers
+   `@repr(C)` fields from **0** (no type-hash slot) while every `ir_fmap` write site numbers from
+   **1** unconditionally — a pre-existing inconsistency. Worse, the by-name runtime helpers both
+   guard on `nova_rt_is_struct_value` / `NOVA_STRUCT_HASHED`, which a `@repr(C)` FFI struct is not,
+   so routing such a field by name would return 0 / no-op: a *regression* for repr(C) code. Fix:
+   skip `ir_fmap_collision` marking when the owning struct is in `ir_repr_c_types`, so those names
+   keep their existing (guessing) behaviour rather than silently becoming no-ops. Narrow — it needs a
+   repr(C) struct to share a field name at a differing slot AND an un-inferrable receiver — but it is
+   a correctness hole in the fix, not in the original bug.
 
 **Perf note, and the staged answer.** An immediate-slot `field_get` is one load; `nova_rt_field_get`
 is a call plus a `strcmp` walk over the field list — call it 20–50× for that access. Acceptable,

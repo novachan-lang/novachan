@@ -20113,6 +20113,42 @@ int64_t nova_rt_field_set(int64_t struct_val, int64_t slot, int64_t newv, int64_
     return 0;
 }
 
+/* Write a field by NAME, resolved against the object's OWN slot-0 type hash.
+   The read-side twin of this is nova_rt_field_get (~6848); the two use identical
+   resolution so a read and a write of the same name can never disagree about which
+   slot it is.
+
+   WHY THIS EXISTS: the compiler's ir_fmap is a FLAT field_name -> slot map with no
+   struct qualification, so when a receiver's struct type cannot be inferred
+   statically the slot is a GUESS -- last registration wins. 15 field names across
+   forge/prism/std are genuinely ambiguous (`body` alone resolves to 4 different
+   slots: Response@3, MpPart@4, Request@7, PgMsg@2), and a wrong-slot access is
+   silent data corruption, or a wild pointer read when the field is struct-typed.
+   Resolving against the object's actual type removes the guess entirely.
+
+   WHY IT DELEGATES instead of storing directly: nova_rt_field_set above carries
+   semantics that must not be duplicated -- the managed-slot bitmap test, the
+   arena-bit bypass, and above all inc-NEW-only. It deliberately does NOT dec the
+   old value, because NOVA field reads are BORROW-based (field_get returns without
+   an rc_inc), so the ubiquitous `saved = obj.f; obj.f = new; ...; obj.f = saved`
+   idiom holds a live un-counted borrow that a dec here would free out from under
+   -- the self-compile reconverge caught exactly that. A second copy of that
+   reasoning is a second place for it to drift, so: resolve the name, hand off. */
+int64_t nova_rt_field_set_by_name(int64_t struct_val, int64_t name,
+                                  int64_t newv, int64_t do_inc) {
+    if (!nova_rt_is_struct_value(struct_val)) return 0;   /* null / non-struct: no-op */
+    if ((uint64_t)name <= 0x10000ULL) return 0;           /* not a real string pointer */
+    const char* want = (const char*)(uintptr_t)name;      /* NOVA string: NUL-terminated */
+    int64_t h = ((const int64_t*)(uintptr_t)struct_val)[0];
+    int fc = nova_rt_field_count(struct_val, h);
+    for (int i = 0; i < fc; i++) {
+        const char* fn = nova_struct_meta_fname(h, i);
+        if (fn && strcmp(want, fn) == 0)
+            return nova_rt_field_set(struct_val, (int64_t)(i + 1), newv, do_inc);
+    }
+    return 0;   /* unknown field -> no-op, mirroring field_get's "unknown -> null" */
+}
+
 /* Hash-keyed struct field metadata (RTTI). Recovers a struct's field names/types
    through the `any` boundary for json/show/from_json. Keyed on the SAME slot-0 DJB2
    type hash as the name registry above — deep_copy/channel-send copy slot-0, so a

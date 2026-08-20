@@ -124,6 +124,13 @@ Write-Host "`n[CI 2k2/3] Cross-module soundness gate (imported enum ctor + defau
 & .\_xm_soundness_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k2 (cross-module soundness) ==="; exit 1 }
 
+# Phase 1.4 field-slot collision. Reconverge is structurally BLIND to this class of bug (the compiler
+# destructures via `match Stmt(...)`, positionally, so it never consults ir_fmap), which is exactly
+# why an explicit value-asserting probe is required. Check sits immediately below its own invocation.
+Write-Host "`n[CI 2k3/3] Field-slot collision gate (ambiguous field name + untyped receiver, read+write)..."
+& .\_xm_slot_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k3 (field-slot collision) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }
