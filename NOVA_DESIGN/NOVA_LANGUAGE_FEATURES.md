@@ -1320,9 +1320,18 @@ buffer_push(rb, v) else Error("buffer full")             // as a bare expression
 
 ### 6.2 `-> T or E` fallible return type
 ```nova
-fn push(rb: RingBuffer, val: byte) -> bool or Error
+fn push(rb: RingBuffer, val: byte) -> bool or RingError
 ```
 Desugars to `Result<T, E>`; keeps the failure type visible without generic-bracket ceremony.
+
+**Important:** `E` must be a declared struct type (`type RingError` with fields). Writing `-> int or Error` requires a `type Error` to exist in scope — the compiler does NOT provide a built-in `Error` type. If your error is just a string, either declare a simple error struct, or omit the return type and let inference handle it (recommended for most code):
+```nova
+// Recommended — let inference handle Result<int, string>:
+fn safe_div(a: int, b: int)
+    if b == 0
+        return err("division by zero")
+    ok(a / b)
+```
 
 ### 6.3 Inline if-expression as a function body
 ```nova
@@ -1967,7 +1976,7 @@ Use case: custom protocol servers, raw network programming, building higher-leve
 Gotcha: `tcp_recv` may return partial data — production code must loop and accumulate until a delimiter or expected byte count is reached. `tcp_connect` returns fd <= 0 on failure; always check before sending.
 
 ### Low-level UDP
-Syntax: `udp_bind(port)` -> fd · `udp_send(fd, host, port, data)` · `udp_recv(fd, bufsize)` -> data · `udp_recv_from(fd, bufsize)` -> [data, addr, port]
+Syntax: `udp_bind(port)` -> fd · `udp_send(fd, host, port, data)` · `udp_recv(fd)` -> data · `udp_recv_from(fd)` -> [data, addr, port]
 ```nova
 let sock = udp_bind(9000)
 udp_send(sock, "127.0.0.1", 9001, "ping")
@@ -2170,12 +2179,12 @@ Use case: test coverage tracking, CI quality gates ("fail if coverage < 80%"), f
 Note: coverage is manual instrumentation — the compiler does not auto-insert `cov_mark` calls. Use it in test harnesses or inject via `@test` hooks.
 
 ### Debug Adapter Protocol (DAP)
-Syntax: `dap_log(category, msg)` · `dap_breakpoint(file, line)` · `dap_send(msg)` — DAP wire protocol helpers. `dbg_set_bp(file, line)` -> id · `dbg_remove_bp(id)` · `dbg_list_bps()` — programmatic breakpoint management. `dbg_push_frame(name, file, line)` · `dbg_pop_frame()` · `dbg_backtrace()` — call stack tracking. `dbg_hook(fn)` · `dbg_enable()` · `dbg_disable()` — step-through debugging control.
+Syntax: `dap_log(category, msg)` · `dap_breakpoint(file, line)` · `dap_send(msg)` — DAP wire protocol helpers. `dbg_set_bp(file, line)` -> id · `dbg_remove_bp(id)` · `dbg_list_bps()` — programmatic breakpoint management. `dbg_push_frame(name, file, line, locals)` · `dbg_pop_frame()` · `dbg_backtrace()` — call stack tracking (4th arg `locals` is a dict of local variable bindings, pass `{}` if unused). `dbg_hook(fn)` · `dbg_enable()` · `dbg_disable()` — step-through debugging control.
 ```nova
 dbg_enable()
 dbg_set_bp("main.nova", 10)
 
-dbg_push_frame("process_request", "server.nova", 42)
+dbg_push_frame("process_request", "server.nova", 42, {})
 // ... function body ...
 dbg_pop_frame()
 
@@ -2392,20 +2401,21 @@ Use case: user input parsing, config file loading, CSV processing — anywhere f
 Gotcha: these return `Result`, not a raw value. Use `match` or `unwrap_or` to extract. The `err` payload is a string describing why parsing failed.
 
 ### Structural type cast
-Syntax: `form_as<T>(value)` -> Result<T, string> — attempt a runtime structural cast of `value` (typically a dict) into struct `T`, matching by field name.
+Syntax: `form_as(value)` -> Result — attempt a runtime structural cast of `value` (typically a dict) into a struct, matching by field name. Drive the target type via a LHS type annotation (turbofish `form_as<T>(v)` does NOT parse — the parser treats `<T>` as a comparison operator).
 ```nova
 type User
     name: string
     age: int
 
 let raw = {"name": "Alice", "age": "30"}
-match form_as<User>(raw)
+let r: Result<User> = form_as(raw)      // LHS annotation drives inference
+match r
     Ok(u) => print("welcome, {u.name}")
     Err(e) => print("bad form: {e}")
 ```
 Use case: JSON-to-struct conversion, HTTP form body parsing, database row mapping.
 
-Gotcha: `form_as` expects a dict with string keys. Integer fields are parsed from their string representation internally.
+Gotcha: `form_as` expects a dict with string keys. Integer fields are parsed from their string representation internally. Turbofish syntax (`form_as<User>(raw)`) is **not supported** — use `let r: Result<User> = form_as(raw)` instead.
 
 ---
 
@@ -2480,7 +2490,7 @@ Use case: complex struct construction with optional fields, configuration object
 
 These annotations generate companion `__name` functions that return metadata at runtime. They do NOT modify the annotated function/type's behavior.
 
-**`@entity` / `@entity("table_name")`** — ORM entity metadata. Generates `__table_name`, `__primary_key`, `__insert_sql`, `__create_table_sql`.
+**`@entity` / `@entity("table_name")`** — ORM entity metadata. Generates `__table_name`, `__primary_key`, `__columns`.
 ```nova
 @entity("users")
 type User
@@ -2488,10 +2498,11 @@ type User
     name: string
     email: string
 
-let sql = User__create_table_sql()       // CREATE TABLE users (id INTEGER, name TEXT, ...)
-let insert = User__insert_sql()          // INSERT INTO users (id, name, email) VALUES (?, ?, ?)
+let tbl = User__table_name()             // "users"
+let pk  = User__primary_key()            // "id"
+let cols = User__columns()               // "id, name, email"
 ```
-Use case: database ORM, schema generation, query building.
+Use case: database ORM, schema generation, query building. For SQL generation (`CREATE TABLE`, `INSERT`), use the `forge_orm` module which builds queries from these metadata methods.
 
 **`@service` / `@service("name")`** — Service registry. Generates `__service_name`, `__is_service`, `__dependencies`.
 Use case: microservice architecture, dependency injection, service discovery.
@@ -2665,10 +2676,12 @@ fn <T: Comparable> sort(xs: list<T>)   // constrained — T must be Comparable
 Unlike the items above, `ok(value)` is **required** in Result-returning functions. There is no auto-wrapping. You must write `ok(value)` and `err(reason)` explicitly.
 
 ```nova
-fn safe_divide(a: int, b: int) -> int or Error
+fn safe_divide(a: int, b: int)
     if b == 0
         return err("division by zero")
     ok(a / b)                    // ok() is REQUIRED — no auto-wrap
+// NOTE: omit the return type annotation — inference handles Result<int, string>.
+// If you write `-> int or Error`, you need a declared `type Error` struct in scope.
 ```
 
 ---
