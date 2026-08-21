@@ -12310,6 +12310,41 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                         return dest
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, "nova_rt_field_names", 0)
                     return dest
+                // 7.1 INLINE ASM. Not a runtime call -- the template becomes part of the
+                // emitted module, so it is intercepted here and carried on the instruction
+                // rather than lowered as arguments. Both operands MUST be string LITERALS:
+                // a computed string cannot be embedded in the IR, and silently emitting
+                // something else would produce garbage the assembler accepts. Reject instead.
+                if fn_name == "asm" and len(children) == 2
+                    let _asm_t = ""
+                    let _asm_c = ""
+                    let _asm_ok = 0
+                    match children[0]
+                        Expr(_at0, _av0, _an0, _ac0, _af0, _al0) =>
+                            if _at0 == "str"
+                                _asm_t = _av0
+                                _asm_ok = _asm_ok + 1
+                    match children[1]
+                        Expr(_at1, _av1, _an1, _ac1, _af1, _al1) =>
+                            if _at1 == "str"
+                                _asm_c = _av1
+                                _asm_ok = _asm_ok + 1
+                    if _asm_ok != 2
+                        print("error[E1014]: asm() requires STRING LITERAL template and constraints (they are emitted into the module, so they cannot be computed at runtime)")
+                        print("compilation failed: 1 error(s)")
+                        exit(1)
+                    // Template and constraints ride in value/label as "templateconstraints";
+                    //  cannot appear in NOVA source, so it is an unambiguous separator.
+                    // The instruction carries ONE label, so template and constraints are joined
+                    // with "@@". A template legitimately containing "@@" would split wrongly, so it
+                    // is REJECTED rather than silently mis-emitted -- malformed inline asm is
+                    // accepted by the assembler and fails at RUNTIME, the worst possible outcome.
+                    if find(_asm_t, "@@") >= 0 or find(_asm_c, "@@") >= 0
+                        print("error[E1014]: asm() template/constraints must not contain '@@' (reserved as the internal separator)")
+                        print("compilation failed: 1 error(s)")
+                        exit(1)
+                    ir_emit_side(b, "inline_asm", dest, ir_type_int(), [], _asm_t + "@@" + _asm_c, 0)
+                    return dest
                 if fn_name == "field_get" and len(children) == 2
                     let fg_sty = ir_expr_struct_type(b, children[0])
                     if fg_sty != "" and list_contains(b.ir_fnames, fg_sty + "__field_get")
@@ -17322,6 +17357,15 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["cstr_of"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["null_ptr"] = NTypeScheme([], nt_fn([], nt_any()))
     reg["is_null"] = NTypeScheme([], nt_fn([nt_any()], nt_bool()))
+    // 7.1 INLINE ASM. `asm(template, constraints) -> int` emits an LLVM inline-asm call:
+    //     %r = call i64 asm sideeffect "<template>", "<constraints>"()
+    // Both arguments must be STRING LITERALS -- they become part of the emitted module,
+    // not runtime values, so a computed string is rejected at lowering rather than
+    // silently producing garbage IR. `sideeffect` is always set: the optimizer must never
+    // delete or reorder an asm block it cannot reason about (rdtsc, cpuid, fences).
+    // Returns i64; use constraint "=r" to take a result, or "" for a pure side effect.
+    // Gated by `unsafe` (see _is_unsafe_builtin) -- this is the least safe thing NOVA can do.
+    reg["asm"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_int()))
     reg["ptr_read"] = NTypeScheme([], nt_fn([nt_any()], nt_any()))
     reg["ptr_write"] = NTypeScheme([], nt_fn([nt_any(), nt_any()], nt_unit()))
     reg["ptr_read_u8"] = NTypeScheme([], nt_fn([nt_any()], nt_int()))               // typed-width raw reads (native byte width, no 8-byte over-read)
@@ -17925,7 +17969,9 @@ fn ti_infer_expr(st: TiState, expr: Expr) -> NType
 // calls, these require an enclosing `unsafe` block/expression, so "no UB in safe code" becomes a checkable
 // property. Kept in sync with the registrations near reg["ptr_read"]... / reg["alloc_raw"].
 fn _is_unsafe_builtin(name)
-    let _ub = ["ptr_read", "ptr_write", "ptr_read_u8", "ptr_read_i8", "ptr_read_u16", "ptr_read_i16", "ptr_read_u32", "ptr_read_i32", "ptr_read_u64", "ptr_read_f32", "ptr_read_f64", "ptr_write_u8", "ptr_write_u16", "ptr_write_u32", "ptr_write_u64", "ptr_write_f32", "ptr_write_f64", "ptr_add", "ptr_diff", "memcpy_unsafe", "memset_unsafe", "alloc_raw", "free_raw"]
+    // 7.1: `asm` is the definition of outside-the-safety-envelope — it can do literally
+    // anything to the machine — so it is gated exactly like the raw-memory primitives.
+    let _ub = ["ptr_read", "ptr_write", "ptr_read_u8", "ptr_read_i8", "ptr_read_u16", "ptr_read_i16", "ptr_read_u32", "ptr_read_i32", "ptr_read_u64", "ptr_read_f32", "ptr_read_f64", "ptr_write_u8", "ptr_write_u16", "ptr_write_u32", "ptr_write_u64", "ptr_write_f32", "ptr_write_f64", "ptr_add", "ptr_diff", "memcpy_unsafe", "memset_unsafe", "alloc_raw", "free_raw", "asm"]
     return contains(_ub, name)
 
 fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
@@ -21344,6 +21390,12 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
             else if op == "fn_ptr_of"
                 rt[dest] = "int"
                 return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
+            else if op == "inline_asm"
+                // 7.1: always i64. Without this the result register has no recorded type and
+                // downstream consumers guess -- the exact "missing type-tracking entry" class
+                // that caused the emitBinary ADD segfault (compiler-architecture.md rule 2).
+                rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
             else if op == "add"
                 if len(args) == 2 and ir_reg_nn(rt, args[0]) == 1 and ir_reg_nn(rt, args[1]) == 1
                     rt["@nn@" + dest] = 1
@@ -23335,6 +23387,33 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let ptr_reg = dest + ".p"
                 ire_indent(e, ptr_reg + " = getelementptr inbounds [" + str(byte_len) + " x i8], ptr " + str_name + ", i64 0, i64 0")
                 ire_indent(e, dest + " = ptrtoint ptr " + ptr_reg + " to i64")
+            else if op == "inline_asm"
+                // 7.1: `%r = call i64 asm sideeffect "<template>", "<constraints>"()`
+                // `sideeffect` is ALWAYS set. LLVM cannot reason about the body, so without
+                // it an asm block with no used result (a fence, a cpuid, an int3) is legally
+                // deleted or hoisted -- which is exactly the class of surprise inline asm
+                // exists to avoid. The two halves were joined with "@@" at lowering.
+                let _ia_sep = find(value, "@@")
+                let _ia_tmpl = value
+                let _ia_cons = ""
+                if _ia_sep >= 0
+                    _ia_tmpl = slice(value, 0, _ia_sep)
+                    _ia_cons = slice(value, _ia_sep + 2, len(value))
+                // LLVM requires `call VOID asm` when the constraint list declares no OUTPUT
+                // ("inline asm without outputs must return void"), so the return type follows
+                // the constraints rather than being fixed at i64. An output constraint begins
+                // with '=' (write-only) or '+' (read-write); anything else -- ""
+                // (pure side effect: nop, mfence, int3) or a clobber-only list like
+                // "~{memory}" -- has no output. The no-output form still yields a defined
+                // register (0) so downstream consumers never read an undefined value.
+                let _ia_has_out = false
+                if find(_ia_cons, "=") >= 0 or find(_ia_cons, "+") >= 0
+                    _ia_has_out = true
+                if _ia_has_out
+                    ire_indent(e, dest + " = call i64 asm sideeffect \"" + _ia_tmpl + "\", \"" + _ia_cons + "\"()")
+                else
+                    ire_indent(e, "call void asm sideeffect \"" + _ia_tmpl + "\", \"" + _ia_cons + "\"()")
+                    ire_indent(e, dest + " = add i64 0, 0")
             else if op == "fn_ptr_of"
                 ire_indent(e, dest + " = ptrtoint ptr @" + value + " to i64")
             else if op == "add"

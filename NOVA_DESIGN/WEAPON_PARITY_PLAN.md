@@ -530,9 +530,22 @@ from assumption rather than measurement. Every future item gets grepped before i
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | TODO |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | TODO |
 | 3.5 | Process-scoped arena allocators | C/Zig | M | TODO |
-| 3.6 | @stack hints for stack allocation | C/Zig | S | TODO |
+| 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
 
 ---
+
+### ❌ 3.6 `@stack` — REJECTED: NOVA already does this automatically, and better
+
+`ir_stackable_structs(typed_fn, escape_summary, all_scalar)` computes the set of structs that
+provably do not escape, and the emitter turns each one into
+`alloca [N x i64], align 8` instead of a heap allocation. **SROA is ON BY DEFAULT** —
+`NOVA_NO_SROA=1` opts *out*, not in — and `sroa_stress_test` is in the regression.
+
+So a `@stack` annotation would be **redundant with an existing automatic optimisation**, and worse,
+it would violate the project's own principle: *the compiler is the genius, not the developer.* A hint
+can only agree with escape analysis (adds nothing) or contradict it (must be ignored, or it is a
+use-after-free). Zig needs explicit allocators because it has no GC/RC and refuses hidden control
+flow; NOVA has escape analysis and can simply decide. Nothing to build.
 
 ## PHASE 4 — CONCURRENCY (match Go, approach Erlang)
 
@@ -541,8 +554,8 @@ from assumption rather than measurement. Every future item gets grepped before i
 | 4.1 | N>1 concurrency scaling | Go | L | **✅ MEASURED GOOD 2026-08-20 — 1.95x at 4 carriers** |
 | 4.2 | Work-stealing between carriers | Go/Java FJP | L | **❌ REJECTED 2026-08-21 — measured strictly worse than decomposition** |
 | 4.3 | Preemptive scheduling (yield at loop back-edges) | Erlang | M | TODO |
-| 4.4 | Supervision trees (library) | Erlang | S | TODO |
-| 4.5 | Small fiber stacks (4KB initial, grow on demand) | Erlang | M | TODO |
+| 4.4 | Supervision trees (library) | Erlang | S | **✅ ALREADY EXISTS** (`forge_otp.nova`: `sup_new`/`child_add`/`sup_start`/restart intensity) |
+| 4.5 | Small fiber stacks (4KB initial, grow on demand) | Erlang | M | **✅ ALREADY EXISTS** — `NOVA_FIBER_COMMIT_SIZE 4096` |
 | 4.6 | `nova watch` (fast restart < 0.5s) | Erlang/Go | S | **✅ DONE 2026-08-21 — 369 ms save-to-running** |
 | 4.6b | Incremental cache ignored IMPORTED files (stale builds) | — | S | **✅ FIXED 2026-08-21 — found via 4.6** |
 | 4.7 | Distributed channels (network transport) | Erlang | XL | TODO |
@@ -761,12 +774,43 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 7.1 | Inline asm / LLVM IR blocks | C/Zig | M | TODO |
+| 7.1 | Inline asm | C/Zig | M | **✅ DONE 2026-08-21** — `asm(template, constraints)` |
 | 7.2 | C header import (extern fn auto-gen) | Zig | L | manual extern exists |
 | 7.3 | @cdecl improvements | C/Rust | S | basic exists |
-| 7.4 | unsafe {} blocks for raw pointer work | Rust | M | TODO |
+| 7.4 | `unsafe {}` blocks for raw pointer work | Rust | M | **✅ ALREADY EXISTS** (`unsafe` block + expression forms) |
 
 ---
+
+### ✅ 7.1 Inline asm — `asm(template, constraints) -> int`
+
+Emits `call i64 asm sideeffect "<tmpl>", "<cons>"()`, or `call void asm …` when the constraints
+declare no output. Requires `unsafe` (added to `_is_unsafe_builtin` — inline asm is the definition of
+outside-the-safety-envelope). `sideeffect` is **always** set: LLVM cannot reason about the body, so
+without it a block whose result is unused — a fence, a `cpuid`, an `int3` — is legally deleted or
+hoisted, which is precisely the surprise inline asm exists to avoid.
+
+Verified: `asm("mov $$42, $0", "=r")` returns **42**; `asm("nop", "")` lowers to `call void asm` and
+still yields a defined `0`. Gated by `_asm_inline_test`.
+
+**Three real constraints, all found by probing rather than assumed:**
+
+1. **Operands must be string LITERALS.** They are emitted into the module, so a computed string
+   cannot work. Rejected with `E1014` rather than silently emitting malformed asm — malformed asm
+   *assembles fine* and fails at runtime, the worst possible outcome.
+2. **Clobber lists work — via the `\{` escape that already existed.** LLVM's `~{reg}` syntax meets
+   NOVA's brace interpolation, but the lexer already accepts `\{` / `\}` for a literal brace (its own
+   error message lists `\n \t \r \\ \" \0 \u{XXXX} \{ \}`). So `asm("nop", "~\{memory}")` emits
+   `"~{memory}"` — verified in the IR.
+   *I first documented this as an unfixable limitation and proposed adding a `{{` escape. Both were
+   wrong.* The escape existed, and `{{` would have been actively harmful: **123 occurrences of `{{`
+   already exist** across `std/text/template.nova`, `std/parsing/template.nova` and others whose
+   entire syntax *is* `{{var}}` — adding it would have silently changed their meaning. Checking
+   before building saved a real regression here, not just effort.
+3. **Fixed-register constraints (`"=a"`) fail to allocate on this target** — "couldn't allocate
+   output register for constraint 'a'". `"=r"` and letting the register allocator choose is the
+   portable form. (My first probe also got this *wrong* in a second way — `rdtsc` clobbers `rdx`
+   without declaring it — and LLVM correctly refused. Constraints are a contract; the hard error is
+   the system working.)
 
 ## STRUCTURALLY IMPOSSIBLE (by design — NOVA's trade-offs)
 
