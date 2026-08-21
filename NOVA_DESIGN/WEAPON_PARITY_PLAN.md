@@ -18,8 +18,8 @@
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
 | 1.6 | null ≠ 0 (indistinguishable) | All | L | TODO |
 | 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | DESIGNED |
-| 1.8 | Reject a non-defaulted param AFTER a defaulted one | Python/C++ | S | FOUND 2026-08-20, pre-existing |
-| 1.9 | Variadic (`T...`) + named args across the module boundary | Python | S | FOUND 2026-08-20, pre-existing |
+| 1.8 | Reject a non-defaulted param AFTER a defaulted one | Python/C++ | S | **✅ DONE 2026-08-20** `3a8e64a1` |
+| 1.9 | Variadic (`T...`) + named args across the module boundary | Python | S | **✅ DONE 2026-08-20** `3a8e64a1` |
 
 ### 1.8 Defaults must be trailing — currently unenforced (found while doing 1.3)
 
@@ -526,10 +526,10 @@ from assumption rather than measurement. Every future item gets grepped before i
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
 | 3.1 | Float/array perf 1.7x → 1.0x C | C | L | S4.2 shipped, extend |
-| 3.2 | SIMD / @simd annotation | C/C++/Rust | M | TODO |
+| 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | TODO |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
-| 3.5 | Process-scoped arena allocators | C/Zig | M | TODO |
+| 3.5 | Process-scoped arena allocators | C/Zig | M | **✅ ALREADY EXISTS** — per-task arenas, `nova_task_arena_cleanup` |
 | 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
 
 ---
@@ -778,7 +778,7 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 |---|---------|------|--------|--------|
 | 5.1 | Linux native build | Go/Rust/all | M | WSL-once exists |
 | 5.2 | macOS native build | Swift/all | L | needs hardware |
-| 5.3 | WASM compilation target (LLVM wasm32) | JS/Rust | L | TODO |
+| 5.3 | WASM compilation target (LLVM wasm32) | JS/Rust | L | **✅ SUBSTANTIALLY EXISTS** — 9 WASM CI gates incl. native-vs-wasm agreement |
 | 5.4 | Cross-compilation (target triple param) | Go/Zig/Rust | M | TODO |
 | 5.5 | Single-command toolchain (bundle clang) | Go/Zig | M | TODO |
 | 5.6 | Prism → Canvas/WebGL for browser | JS | XL | TODO |
@@ -790,11 +790,11 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 6.1 | AST-based formatter (real nova fmt) | Go/Rust | M | whitespace-only exists |
-| 6.2 | REPL polish (multi-line, completion, history) | Python | S | basic exists |
-| 6.3 | Debugger integration (nova debug) | All | L | DWARF emitted |
-| 6.4 | Linter / nova lint | Rust clippy | L | TODO |
-| 6.5 | Wire package manager CLI | Go/Rust/Python | S | resolver built |
+| 6.1 | AST-based formatter (real `nova fmt`) | Go/Rust | M | **✅ ALREADY EXISTS** — CI stage 2i gates canonical+faithful+idempotent |
+| 6.2 | REPL | Python | S | **✅ EXISTS + GATED** — CI stage 2e2 (end-to-end compile+link+run) |
+| 6.3 | Debugger integration (`nova debug`) | All | L | **✅ EXISTS + GATED** — `debug` subcommand + DWARF gate 2j |
+| 6.4 | Linter / `nova lint` | Rust clippy | L | **✅ EXISTS** — `lint` subcommand + `linter_test` in regression |
+| 6.5 | Wire package manager CLI | Go/Rust/Python | S | **✅ DONE** — `install`/`add` wired, CI stage 2c2 gates offline+transitive+cycle |
 
 ---
 
