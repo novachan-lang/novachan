@@ -289,6 +289,52 @@ f(x)?)` short-circuiting and yielding `Result<list>`, which would beat Rust's ma
 legitimately hold error values, and NOVA cannot distinguish `null` from `0`; see 1.6), so it is
 deliberately NOT bundled here. Tracked as a Phase 2 candidate.
 
+### 📊 1.6 BLAST RADIUS MEASURED (2026-08-22) — 28 failures / 2862, and they share ONE root cause
+
+Ran the full regression with `NOVA_FIRSTCLASS_NULL=1`. Result: **2835 PASS, 28 FAIL** — under 1%,
+against 510 `== null` call sites. The scariest unknown in the plan is now a short list.
+
+**The 28 are not 28 problems. They are two families:**
+
+| family | count | examples |
+|---|---|---|
+| tree / list / heap structures (mostly **TIMEOUT**) | 11 | `_linkedlist`, `_treap`, `_avltree`, `_skiplist`, `_splaytree`, `_ostree`, `_pairingheap`, `_skewheap`, `_leftistheap`, `_bktree`, `forge_treap` |
+| serialization codecs | 10 | msgpack, cbor, bson, ubjson, yaml, mongodb |
+| singles | 7 | `forge_pg`, `forge_kafka`, `_tdiff`, `_mock`, `_asn1_time`, `_kat_validate`, `_kat_cli` |
+
+**ROOT CAUSE of the whole first family — one line.** `nova_rt_dict_get` returns raw `0` for a
+missing key:
+
+```c
+    return 0;      /* nova_rt_dict_get, missing key */
+```
+
+`std/collections/linkedlist.nova` does `let nx = h["next"]` on a node whose `next` was never set.
+That returns raw `0`, which no longer equals the null singleton — so `if nx == null` is **false**,
+the traversal never terminates, and the test TIMEOUTs. Every tree/heap/list failure is that same
+shape: an **absent** value produced as raw `0` and then compared against `null`.
+
+**So the migration is NOT 510 call sites. It is a handful of "absent value" PRODUCERS:**
+
+1. `nova_rt_dict_get` — missing key → must yield the singleton
+2. struct field never assigned / list index out of range — same
+3. the ~10 codec encode/decode paths that special-case null
+
+That is a bounded, mechanical list. **Revised again: ~2–4 days of migration, not 1–3 weeks.**
+
+**One design consequence worth stating.** The flag is currently compile-time only (the compiler
+reads it when lowering the literal). Making "absent" producers return the singleton requires the
+**runtime** to know too, so it must read the same `NOVA_FIRSTCLASS_NULL` env var — consistent,
+since a program is compiled and run with the same setting.
+
+**And a genuine tension to resolve deliberately, not by accident:**
+- `let z = 0; z == null` must be **false** (that is the fix)
+- `node.next == null` where `next` was never set must be **true** (or traversal breaks)
+
+These are only compatible if *absent* is represented as the singleton rather than as raw `0`.
+Making `== null` simply accept raw `0` again would reinstate the original bug. **The producers must
+change; the comparison must not.**
+
 ### 🔑 1.6 DESIGN (2026-08-21) — the representation ALREADY EXISTS; this is a wiring + migration job
 
 **The single most important finding of the audit.** I estimated 4–6 weeks assuming a value-model
