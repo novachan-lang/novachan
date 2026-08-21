@@ -28441,15 +28441,78 @@ fn nova_replace_ext(path: string, old_ext: string, new_ext: string) -> string
         return slice(path, 0, len(path) - len(old_ext)) + new_ext
     return path + new_ext
 
+// Newest mtime across `path` and every module it transitively imports.
+//
+// The incremental-build check needs to know "is the cached output older than ANY of
+// its inputs", and the entry file is only one input. Scanning is LEXICAL, not a parse:
+// this runs before parsing on purpose (skipping the parse is the point of the cache),
+// and `import <name>` at the start of a line is enough to find the file set.
+//
+// FAILS SAFE. Returns 0 if the entry file has no readable mtime, or if any import
+// cannot be resolved to a file — and the caller treats 0 as "cache not usable", so an
+// unknown dependency forces a rebuild instead of trusting a stale artifact. Being
+// wrong here costs a recompile; being wrong the other way silently runs old code.
+//
+// `seen` guards against import cycles and re-walking a diamond dependency.
+fn nova_newest_source_mtime_rec(path: string, seen: dict) -> int
+    if contains(seen, path)
+        return 0
+    seen[path] = 1
+    let mt = build_file_mtime(path)
+    if mt <= 0
+        return 0
+    let src = read_file(path)
+    if len(src) == 0
+        return mt
+    let dir = path_dir(path)
+    let newest = mt
+    for line in split(src, "\n")
+        let t = trim(line)
+        if starts_with(t, "import ")
+            // `import name` / `import name as alias` -- the module name is the first token.
+            let rest = trim(slice(t, 7, len(t)))
+            let mod_name = rest
+            let sp = find(rest, " ")
+            if sp > 0
+                mod_name = trim(slice(rest, 0, sp))
+            if len(mod_name) > 0
+                let dep = resolve_module_file(mod_name, dir)
+                if dep == ""
+                    // Unresolvable here (alias/edge case): do NOT claim freshness.
+                    return 0
+                let dep_mt = nova_newest_source_mtime_rec(dep, seen)
+                if dep_mt == 0
+                    return 0
+                if dep_mt > newest
+                    newest = dep_mt
+    newest
+
+fn nova_newest_source_mtime(path: string) -> int
+    nova_newest_source_mtime_rec(path, {})
+
 fn nova_compile_file(input_path: string, output_path: string, use_ir: int, target: string) -> string
     if not file_exists(input_path)
         print("error: cannot read '" + input_path + "': file not found")
         exit(1)
-    // Incremental compilation: if the output .ll exists and is newer than
-    // the input .nova, skip the compile. Honors NOVA_NO_CACHE=1 to force
+    // Incremental compilation: if the output .ll exists and is newer than every
+    // source that feeds it, skip the compile. Honors NOVA_NO_CACHE=1 to force
     // a rebuild (useful when nova_compiler itself or the runtime changed).
+    //
+    // ⚠ THE ENTRY FILE IS NOT THE ONLY INPUT. This compared ONLY the entry file's
+    // mtime, so editing an IMPORTED module while the entry file stayed untouched
+    // left the cache "valid" and served a STALE build — silently, with no warning.
+    // Reproduced: app.nova imports helper.nova; change helper's return 41 -> 99 ->
+    // 777 and `nova run app.nova` keeps printing the previous value. That hits every
+    // multi-file project, which is to say every real one: edit a library module, run
+    // your app, get the old behaviour and no indication why.
+    //
+    // Fix: compare against the NEWEST mtime across the entry file and its transitive
+    // imports. The dependency scan is lexical (`import <name>` lines) rather than a
+    // parse — the whole point of this check is to run BEFORE parsing, and a scan is
+    // enough to find the file set. It fails SAFE: an import that cannot be resolved
+    // makes the scan return 0, which forces a rebuild rather than trusting the cache.
     if file_exists(output_path) and env("NOVA_NO_CACHE") != "1" and env("NOVA_COV") != "1"
-        let in_mt = build_file_mtime(input_path)
+        let in_mt = nova_newest_source_mtime(input_path)
         let out_mt = build_file_mtime(output_path)
         if in_mt > 0 and out_mt >= in_mt
             return output_path
@@ -32044,6 +32107,7 @@ fn compiler_main()
         print("  init                  Create nova.toml in current directory")
         print("  build [file]          Build project (or specific file) to executable")
         print("  run [file]            Build and run project (or specific file)")
+        print("  watch <file.nova>     Rebuild + rerun on every save (watches *.nova beside it)")
         print("  test                  Run all *_test.nova files in tests/ and ./")
         print("  clean                 Remove .ll, .exe build artifacts")
         print("  fmt <file.nova>       Format source (whitespace normalization)")
@@ -32194,6 +32258,69 @@ fn compiler_main()
         let errs = nova_check_file(arguments[2])
         if errs > 0
             exit(1)
+        exit(0)
+    // ── `nova watch <file.nova>` (4.6) ───────────────────────────────────────────
+    // Turns the 170ms self-compile into something you can FEEL: save the file, see it
+    // run. The speed already existed; nothing surfaced it.
+    //
+    // Watches every .nova file in the entry file's DIRECTORY, not just the entry file
+    // — a project's imports normally sit beside it, and a watcher that misses them
+    // silently reruns stale code, which is worse than not watching at all.
+    //
+    // Re-invokes `self run <file>` via system() rather than compiling in-process: a
+    // compile error, a panic, or a runtime crash then kills only the child, so the
+    // watcher survives and keeps watching. That is the whole point — the loop must be
+    // the one thing that cannot die.
+    if cmd == "watch"
+        if len(arguments) < 3
+            print("Usage: nova watch <file.nova>")
+            exit(1)
+        let w_in = arguments[2]
+        if not file_exists(w_in)
+            print("error: cannot read '" + w_in + "': file not found")
+            exit(1)
+        let w_self = arguments[0]
+        let w_dir = path_dir(w_in)
+        if w_dir == ""
+            w_dir = "."
+        // Poll interval: 150ms is under the ~200ms that reads as instant, and a
+        // handful of mtime stats per tick is far cheaper than the compile it guards.
+        let w_poll = 150
+        // Sum of mtimes over the watched set: changes when any file is edited, and
+        // when one is added or removed. Cheap, and no per-file bookkeeping.
+        let w_prev = 0 - 1
+        print("nova watch: " + w_in + "  (watching *.nova in " + w_dir + ", ctrl-c to stop)")
+        loop
+            let w_files = list_dir(w_dir)
+            let w_stamp = 0
+            for w_f in w_files
+                if ends_with(w_f, ".nova")
+                    w_stamp = w_stamp + build_file_mtime(w_dir + "/" + w_f)
+            if w_stamp != w_prev
+                if w_prev != 0 - 1
+                    print("")
+                    print("nova watch: change detected, rebuilding...")
+                w_prev = w_stamp
+                let w_t0 = time_ms()
+                // Plain `self run <file>` — no NOVA_NO_CACHE wrapper. The incremental
+                // check now takes the newest mtime across the entry file AND its
+                // transitive imports (nova_newest_source_mtime), so editing an imported
+                // module correctly invalidates the cache. An earlier version forced
+                // NOVA_NO_CACHE through a `cmd /c "set X=1 && ..."` wrapper; the nested
+                // quoting silently failed to pass the variable, which is what exposed
+                // the stale-import-cache bug in the first place. Dropping the wrapper
+                // removes the fragile quoting AND keeps warm rebuilds fast.
+                // `cmd /c ""prog" "args""` — the doubled outer quotes are REQUIRED on
+                // Windows: cmd strips them when a command both begins and ends with a
+                // quote, so the bare `"exe" run "file"` form fails instantly (exit 1 in
+                // ~45ms, before any compile). Same shape the `cov` command already uses.
+                let w_rc = system("cmd /c \"\"" + w_self + "\" run \"" + w_in + "\"\"")
+                let w_ms = time_ms() - w_t0
+                if w_rc == 0
+                    print("nova watch: ok in " + str(w_ms) + " ms")
+                else
+                    print("nova watch: exited " + str(w_rc) + " after " + str(w_ms) + " ms")
+            sleep(w_poll)
         exit(0)
     if cmd == "cov" or cmd == "coverage"
         // Build with coverage and run. We re-invoke ourselves through cmd.exe

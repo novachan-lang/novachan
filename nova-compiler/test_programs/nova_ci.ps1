@@ -151,6 +151,14 @@ Write-Host "`n[CI 2b3/3] pmap threshold gate (serial path == threaded path, orde
 & .\_pmap_threshold_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b3 (pmap threshold) ==="; exit 1 }
 
+# Incremental-build staleness: the cache used to compare only the ENTRY file's mtime, so editing an
+# IMPORTED module silently served a stale build. Asserts BOTH directions -- an import edit must
+# invalidate, AND an unchanged rerun must still hit the cache (a "fix" that just disabled caching
+# would pass the first and destroy the 170ms build). Check follows its own invocation.
+Write-Host "`n[CI 2c3/3] Incremental-build staleness gate (import edits invalidate the cache)..."
+& .\_incr_import_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2c3 (incremental staleness) ==="; exit 1 }
+
 Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, value-asserted)..."
 & .\_p2_pattern_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }

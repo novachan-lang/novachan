@@ -543,7 +543,8 @@ from assumption rather than measurement. Every future item gets grepped before i
 | 4.3 | Preemptive scheduling (yield at loop back-edges) | Erlang | M | TODO |
 | 4.4 | Supervision trees (library) | Erlang | S | TODO |
 | 4.5 | Small fiber stacks (4KB initial, grow on demand) | Erlang | M | TODO |
-| 4.6 | nova watch (fast restart < 0.5s) | Erlang/Go | S | TODO |
+| 4.6 | `nova watch` (fast restart < 0.5s) | Erlang/Go | S | **✅ DONE 2026-08-21 — 369 ms save-to-running** |
+| 4.6b | Incremental cache ignored IMPORTED files (stale builds) | — | S | **✅ FIXED 2026-08-21 — found via 4.6** |
 | 4.7 | Distributed channels (network transport) | Erlang | XL | TODO |
 
 ---
@@ -682,6 +683,53 @@ guidance:
 *Note: `pmap` runs on the OS thread pool, NOT the green carriers — so it is orthogonal to the
 `NOVA_CARRIERS` scaling in 4.1, and the 4.2 rejection of green-scheduler work-stealing does not
 apply to it.*
+
+### ✅ 4.6 `nova watch` — and the much bigger bug it uncovered
+
+**`nova watch <file.nova>`**: rebuild + rerun on save, **369 ms** from edit to running output.
+The 170 ms self-compile speed already existed; nothing surfaced it. Two deliberate choices:
+
+- **Watches every `.nova` in the entry file's directory**, not just the entry file. A project's
+  imports sit beside it, and a watcher that misses them silently reruns stale code — worse than not
+  watching at all.
+- **Re-invokes `self run <file>` as a child process** rather than compiling in-process, so a compile
+  error, panic or crash kills only the child. The watch loop is the one thing that must not die.
+
+### ⚠ 4.6b The real find: the incremental cache ignored IMPORTED files
+
+Building `watch` exposed a **pre-existing bug that hits every multi-file project**.
+`nova_compile_file`'s cache check compared **only the entry file's mtime** against the output:
+
+```nova
+// app.nova imports helper.nova, and app.nova is never edited
+let in_mt = build_file_mtime(input_path)     // <- entry file ONLY
+if in_mt > 0 and out_mt >= in_mt: return output_path
+```
+
+Reproduced directly: change `helper.compute()` from 41 → 99 → 777 and `nova run app.nova` keeps
+printing the previous value. **Edit a library module, run your app, get the old behaviour with no
+warning.** Silent stale builds — the same class this whole campaign exists to remove, sitting in the
+build path the entire time.
+
+**Fix:** compare against the newest mtime across the entry file **and its transitive imports**
+(`nova_newest_source_mtime`). The dependency scan is **lexical**, not a parse — this check runs
+*before* parsing on purpose, and `import <name>` at line start is enough to find the file set. It
+**fails safe**: an unreadable mtime or an unresolvable import returns 0, which the caller treats as
+"cache unusable" and rebuilds. Being wrong costs a recompile; being wrong the other way runs old code.
+A `seen` set handles import cycles and diamond dependencies.
+
+**Gate `_incr_import_gate.ps1` (CI stage 2c3) asserts BOTH directions**, because either alone is
+passable by a broken build: an import edit must invalidate, **and** an unchanged rerun must still hit
+the cache — a "fix" that simply disabled caching would pass the first test while destroying the
+170 ms build that makes `watch` worth having. Verified the gate genuinely detects the defect: it
+**fails on the pre-fix compiler** and passes after.
+
+*How it surfaced: `watch` originally forced `NOVA_NO_CACHE=1` through a
+`cmd /c "set X=1 && ..."` wrapper. The nested quoting silently failed to pass the variable — so the
+rebuild used the cache and printed stale output, which is what made the underlying bug visible. The
+wrapper is gone now (the cache is correct, so it is unnecessary), but note the Windows quoting rule
+it taught: `cmd /c ""prog" "args""` needs the doubled outer quotes, because cmd strips them when a
+command both begins and ends with a quote — the bare form exits 1 in ~45 ms before any compile.*
 
 ## PHASE 5 — PLATFORM REACH (run everywhere)
 
