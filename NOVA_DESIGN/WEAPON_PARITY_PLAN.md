@@ -528,7 +528,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 | 3.1 | Float/array perf 1.7x → 1.0x C | C | L | S4.2 shipped, extend |
 | 3.2 | SIMD / @simd annotation | C/C++/Rust | M | TODO |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | TODO |
-| 3.4 | Buffer views (read-only, no copy) | C/Rust | M | TODO |
+| 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
 | 3.5 | Process-scoped arena allocators | C/Zig | M | TODO |
 | 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
 
@@ -546,6 +546,34 @@ it would violate the project's own principle: *the compiler is the genius, not t
 can only agree with escape analysis (adds nothing) or contradict it (must be ignored, or it is a
 use-after-free). Zig needs explicit allocators because it has no GC/RC and refuses hidden control
 flow; NOVA has escape analysis and can simply decide. Nothing to build.
+
+### ✅ 7.2 C header import — already exists as `bindgen`
+
+`bindgen.nova` parses C prototypes and emits `extern fn name(args) -> ret`, mapping C types to NOVA
+(`char*` -> string, `double`/`float` -> float, other pointers -> int, `int`/`long`/`short`/`size_t`
+-> int, `void` return -> int). Wrapping a C library is a one-liner instead of hand-writing every
+extern. Already in `_run_final_regression.ps1` and passing.
+
+Not a full C preprocessor — it handles simple prototypes, "the common 90%" by its own description.
+A real header parser (macros, typedefs, structs, conditional compilation) is a much larger thing, and
+worth doing only if the 90% proves insufficient in practice.
+
+### ⚠ 3.4 Buffer views — genuinely open, and now precisely scoped
+
+Confirmed by reading the runtime: `nova_rt_bytes_slice` **allocates and `memcpy`s**:
+
+```c
+if (nb && nb->data) memcpy(nb->data, b->data + start, (size_t)new_size);
+```
+
+So every slice is a copy. A real zero-copy view needs a **new value kind** carrying a pointer into
+the parent's buffer, a length, and — critically — a **reference to the parent** so RC keeps the
+backing store alive. That last part is the whole difficulty: without it, a view outliving its parent
+is a use-after-free, and NOVA has no borrow checker to prevent it statically.
+
+It also touches every consumer that assumes bytes own their data: indexing, `len`, equality,
+hashing, printing, channel send (deep copy), and the RC drop path. That is a value-model change with
+a memory-safety failure mode — a multi-session item with its own full arc, not something to bolt on.
 
 ## PHASE 4 — CONCURRENCY (match Go, approach Erlang)
 
@@ -775,7 +803,7 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
 | 7.1 | Inline asm | C/Zig | M | **✅ DONE 2026-08-21** — `asm(template, constraints)` |
-| 7.2 | C header import (extern fn auto-gen) | Zig | L | manual extern exists |
+| 7.2 | C header import (extern fn auto-gen) | Zig | L | **✅ ALREADY EXISTS** — `bindgen.nova`, gated |
 | 7.3 | @cdecl improvements | C/Rust | S | basic exists |
 | 7.4 | `unsafe {}` blocks for raw pointer work | Rust | M | **✅ ALREADY EXISTS** (`unsafe` block + expression forms) |
 
