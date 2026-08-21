@@ -1414,6 +1414,14 @@ static void nova_rt_oddballs_init(void) {
 }
 /* First-class null / bool values (Stage 0: dead from any NOVA program; reached from json_decode in Stage 1). */
 int64_t nova_rt_null(void) { nova_rt_oddballs_init(); return g_null_box; }
+
+/* ABSENT (missing dict key, unknown field, out-of-range index) DELIBERATELY stays raw 0,
+   even under NOVA_FIRSTCLASS_NULL. Measured, not assumed: routing absent through the null
+   singleton took the blast radius from 28 FAIL to 32 FAIL (2026-08-22). `0`-as-absent is
+   load-bearing across the stdlib -- `d["count"] + 1` on a missing key must be 1, not
+   arithmetic on a box pointer, and the codecs check absence with `== 0`. Making ABSENT
+   first-class null is a whole-stdlib semantic migration, NOT part of 1.6; 1.6 is scoped to
+   the `null` LITERAL (JSON null vs 0 fidelity). See WEAPON_PARITY_PLAN.md 1.6. */
 int64_t nova_rt_bool(int64_t v) { nova_rt_oddballs_init(); return v ? g_true_box : g_false_box; }
 
 /* Container element read (list_get/dict_get/inline index): a FLOAT box is kept
@@ -4802,7 +4810,7 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
             return nova_rt_unbox_elem(d->vals[ei]);
         slot = (slot + 1) & (d->idx_cap - 1);
     }
-    return 0;
+    return 0;   /* missing key -> 0. See the ABSENT note near nova_rt_bool: intentional. */
 }
 
 /* dict.get(d, key, default): the value for key, or `deflt` if the key is absent (Python/JS dict.get).
@@ -6864,7 +6872,7 @@ int64_t nova_rt_field_get(int64_t val, int64_t name) {
             return fv;                                    /* int/string/struct/list/dict/boxed pass through */
         }
     }
-    return 0;                                             /* unknown field -> null */
+    return 0;   /* unknown field -> 0. See the ABSENT note near nova_rt_bool: intentional. */
 }
 
 int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {

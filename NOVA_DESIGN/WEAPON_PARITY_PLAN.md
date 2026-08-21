@@ -16,7 +16,7 @@
 | 1.3 | Cross-module default params | Rust/Python | M | **✅ DONE 2026-08-20** |
 | 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | **✅ DONE 2026-08-20** + both refinements applied `3a8e64a1` |
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
-| 1.6 | null ≠ 0 (indistinguishable) | All | L | TODO |
+| 1.6 | null ≠ 0 (indistinguishable) | All | L | **PARTIAL** — null-as-*value* done `a7e5fc76` (flag, default off); null-as-*absence* NOT solved, cause unknown |
 | 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | DESIGNED |
 | 1.8 | Reject a non-defaulted param AFTER a defaulted one | Python/C++ | S | **✅ DONE 2026-08-20** `3a8e64a1` |
 | 1.9 | Variadic (`T...`) + named args across the module boundary | Python | S | **✅ DONE 2026-08-20** `3a8e64a1` |
@@ -289,12 +289,10 @@ f(x)?)` short-circuiting and yielding `Result<list>`, which would beat Rust's ma
 legitimately hold error values, and NOVA cannot distinguish `null` from `0`; see 1.6), so it is
 deliberately NOT bundled here. Tracked as a Phase 2 candidate.
 
-### 📊 1.6 BLAST RADIUS MEASURED (2026-08-22) — 28 failures / 2862, and they share ONE root cause
+### 📊 1.6 BLAST RADIUS MEASURED (2026-08-22) — 28/2862, and the "one root cause" theory was TESTED and DISPROVED
 
 Ran the full regression with `NOVA_FIRSTCLASS_NULL=1`. Result: **2835 PASS, 28 FAIL** — under 1%,
-against 510 `== null` call sites. The scariest unknown in the plan is now a short list.
-
-**The 28 are not 28 problems. They are two families:**
+against 510 `== null` call sites.
 
 | family | count | examples |
 |---|---|---|
@@ -302,38 +300,40 @@ against 510 `== null` call sites. The scariest unknown in the plan is now a shor
 | serialization codecs | 10 | msgpack, cbor, bson, ubjson, yaml, mongodb |
 | singles | 7 | `forge_pg`, `forge_kafka`, `_tdiff`, `_mock`, `_asn1_time`, `_kat_validate`, `_kat_cli` |
 
-**ROOT CAUSE of the whole first family — one line.** `nova_rt_dict_get` returns raw `0` for a
-missing key:
+**The hypothesis.** Every tree/list TIMEOUT is one line: `nova_rt_dict_get` returns raw `0` for a
+missing key, so `let nx = h["next"]` on an unset key yields `0`, `nx == null` is false, and the
+traversal never terminates. Fix the *absent-value producers* (`dict_get` miss, unknown field) to
+yield the null singleton and the whole family clears: **predicted 28 → ~17**.
 
-```c
-    return 0;      /* nova_rt_dict_get, missing key */
-```
+**❌ FALSIFIED.** Implemented exactly that (`nova_absent()` helper, applied at both producers),
+rebuilt, re-ran the full 2862: **2831 PASS, 32 FAIL**. Not 17 — *worse than the 28 baseline*, and
+**every tree/list test still TIMED OUT**. Both halves of the theory were wrong.
 
-`std/collections/linkedlist.nova` does `let nx = h["next"]` on a node whose `next` was never set.
-That returns raw `0`, which no longer equals the null singleton — so `if nx == null` is **false**,
-the traversal never terminates, and the test TIMEOUTs. Every tree/heap/list failure is that same
-shape: an **absent** value produced as raw `0` and then compared against `null`.
+**Why it is worse — `0`-as-absent is load-bearing across the stdlib.** A missing key feeding
+arithmetic (`d["count"] + 1`) must be `1`, not pointer arithmetic on a box; the codecs test absence
+with `== 0`. Routing absent through the singleton silently corrupts all of that — hence the 4 *new*
+failures. And since the timeouts survived the change, their termination depends on something other
+than the `dict_get` path I blamed; that cause is still unidentified.
 
-**So the migration is NOT 510 call sites. It is a handful of "absent value" PRODUCERS:**
+**Consequence — 1.6 is rescoped, and the estimate revised UP, not down.**
+- **In scope, and landed (`a7e5fc76`):** the `null` **literal** lowers to a distinct singleton;
+  `nova_rt_eq` tests null-boxness *before* unboxing; `nova_rt_is_null` knows the singleton. This is
+  the actual JSON-fidelity gap (`null` vs `0` as *values*). Flag default **OFF** → zero behaviour
+  change → CI green.
+- **Out of scope:** making *absent* first-class null. That is a whole-stdlib semantic migration
+  touching every implicit-zero read, not "a handful of producers". The ~2–4 day estimate was based
+  on the falsified theory and is withdrawn; it is not costed until the timeout cause is actually
+  found.
 
-1. `nova_rt_dict_get` — missing key → must yield the singleton
-2. struct field never assigned / list index out of range — same
-3. the ~10 codec encode/decode paths that special-case null
+The producer change was reverted; `nova_runtime.c` carries a comment at the `nova_rt_bool` site
+recording *why* absent deliberately stays `0`, so this is not re-attempted from scratch.
 
-That is a bounded, mechanical list. **Revised again: ~2–4 days of migration, not 1–3 weeks.**
+**The tension that remains genuinely unresolved:**
+- `let z = 0; z == null` must be **false** (that is the fix, and it works)
+- `node.next == null` where `next` was never set must be **true** (and this is NOT solved)
 
-**One design consequence worth stating.** The flag is currently compile-time only (the compiler
-reads it when lowering the literal). Making "absent" producers return the singleton requires the
-**runtime** to know too, so it must read the same `NOVA_FIRSTCLASS_NULL` env var — consistent,
-since a program is compiled and run with the same setting.
-
-**And a genuine tension to resolve deliberately, not by accident:**
-- `let z = 0; z == null` must be **false** (that is the fix)
-- `node.next == null` where `next` was never set must be **true** (or traversal breaks)
-
-These are only compatible if *absent* is represented as the singleton rather than as raw `0`.
-Making `== null` simply accept raw `0` again would reinstate the original bug. **The producers must
-change; the comparison must not.**
+Under the flag these are still incompatible. That is the honest state: 1.6 fixes null-as-a-*value*
+and does **not** fix null-as-*absence*. Anything claiming otherwise is contradicted by the 32.
 
 ### 🔑 1.6 DESIGN (2026-08-21) — the representation ALREADY EXISTS; this is a wiring + migration job
 
