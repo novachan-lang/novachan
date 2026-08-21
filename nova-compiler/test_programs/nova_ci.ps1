@@ -159,6 +159,15 @@ Write-Host "`n[CI 2c3/3] Incremental-build staleness gate (import edits invalida
 & .\_incr_import_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2c3 (incremental staleness) ==="; exit 1 }
 
+# 3.1 float path: nova_rt_unbox/_elem are pure reads, so their declares carry `readonly`, letting
+# LLVM CSE/DCE the redundant unboxes float-typed code emits (measured 8 -> 2 survivors at -O2 on
+# the gate file). A VALUE test cannot see the attribute -- correctness is identical either way,
+# only speed changes -- so a silent revert would go unnoticed without this. Check follows its own
+# invocation.
+Write-Host "`n[CI 2b4/3] Unbox readonly gate (float-path optimisation intact)..."
+& .\_unbox_readonly_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b4 (unbox readonly) ==="; exit 1 }
+
 Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, value-asserted)..."
 & .\_p2_pattern_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }

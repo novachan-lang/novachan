@@ -289,7 +289,61 @@ f(x)?)` short-circuiting and yielding `Result<list>`, which would beat Rust's ma
 legitimately hold error values, and NOVA cannot distinguish `null` from `0`; see 1.6), so it is
 deliberately NOT bundled here. Tracked as a Phase 2 candidate.
 
-### 1.6 null ≠ 0 — the cheap shortcut was investigated and REJECTED
+### 🔑 1.6 DESIGN (2026-08-21) — the representation ALREADY EXISTS; this is a wiring + migration job
+
+**The single most important finding of the audit.** I estimated 4–6 weeks assuming a value-model
+invention. That was wrong: `nova_runtime.c` already carries a first-class null, built for the
+JSON value model and proven in production:
+
+```c
+#define NOVA_BOX_NULL  2   /* JSON-native value model: first-class null (singleton oddball) */
+/* pinned singleton oddball cells (null/true/false) so bool/null survive as
+   first-class values DISTINCT FROM INTEGER 0/1 */
+static int64_t g_null_box = 0, g_true_box = 0, g_false_box = 0;
+int64_t nova_rt_null(void) { nova_rt_oddballs_init(); return g_null_box; }
+```
+
+It is **lazy and inert** — nothing mints the cells until first use, so a program that never touches
+them is byte-identical. That is exactly the property a migration needs.
+
+**The gap is one line.** The language-level `null` literal lowers to a raw zero:
+
+```nova
+else if tag == "null"
+    ir_emit_inst(b, "const_int", dest, ir_type_any(), [], "0", 0)   // <- the whole bug
+```
+
+So `null` is `0` *in the language* while the runtime has a perfectly good distinct null sitting
+unused. Point the literal at `nova_rt_null()` and `null` becomes distinguishable.
+
+**Therefore the work is NOT invention — it is migration, and the risk lives entirely there.**
+`== null` appears **510 times** (std 157, tests 322, forge 23, compiler 8). Today many of those
+rely, knowingly or not, on `null == 0`. After the change:
+- `x == null` where `x` is integer `0` becomes **false** — which is *correct*, and is precisely what
+  makes it a breaking change.
+- An uninitialised slot reads `0`, which will no longer equal `null`. That is arguably a second bug
+  this exposes rather than causes.
+- `is_null()` must recognise the singleton (and decide, deliberately, whether raw `0` still counts).
+- Every `null` literal becomes a call rather than a constant. `nova_rt_null()` is
+  `oddballs_init()` (idempotent branch) + a global read — cheap, but it should be hoisted/cached
+  before this ships.
+
+**How to land it safely — flag-first, measure the blast radius, then decide.**
+This codebase already has the pattern (`NOVA_DWARF_VARS`, `NOVA_NO_SROA`, `NOVA_T8_FULLRC`):
+1. Put the new lowering behind `NOVA_FIRSTCLASS_NULL=1`. **Flag off ⇒ byte-identical** — provable by
+   reconverge, so the change is zero-risk until deliberately enabled.
+2. Run the full 2861-test regression with the flag **on**. The suite then *tells us* exactly what
+   depends on `null == 0` instead of us guessing. That converts the scariest unknown in the whole
+   plan into a measured list.
+3. Triage that list. Each failure is either a real latent bug (fix it) or intentional
+   `null`-as-zero (migrate it).
+4. Flip the default only once the list is empty, and gate it.
+
+**Revised estimate: ~1 week to build + 1–3 weeks of migration, driven by what step 2 reports** —
+not 4–6 weeks of invention. And step 1 alone is a day's work that makes the remaining cost
+*knowable* rather than estimated, which is the highest-value next action on this entire plan.
+
+### 1.6 — the cheap shortcut (reject-`== null`-on-non-optional) was investigated and REJECTED
 
 **Root cause:** NOVA represents null as integer 0, so `null == 0` is true and no type-tag check can
 separate them.
