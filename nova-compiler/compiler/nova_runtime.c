@@ -7056,7 +7056,25 @@ int64_t nova_rt_le(int64_t a, int64_t b) { return nova_rt_cmp(a, b) <= 0 ? 1 : 0
 int64_t nova_rt_gt(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >  0 ? 1 : 0; }
 int64_t nova_rt_ge(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >= 0 ? 1 : 0; }
 
+/* 1.6: is this handle the first-class null singleton (NOVA_BOX_NULL)? Raw 0 is NOT --
+   that is the legacy language-level null, and conflating the two here would defeat the
+   whole point. Cheap: a non-zero guard, then the same box test every unbox already does. */
+static int nova_is_null_box(int64_t v) {
+    if (v == 0) return 0;
+    if (!nova_is_box(v)) return 0;
+    return ((NovaBox*)(uintptr_t)v)->kind == NOVA_BOX_NULL;
+}
+
 int64_t nova_rt_eq(int64_t a, int64_t b) {
+    /* 1.6 FIRST-CLASS NULL -- this test MUST come before the unbox below. The null
+       cell's payload is 0 (`n->kind = NOVA_BOX_NULL; n->payload = 0`), so unboxing it
+       first turns `null` into `0` and makes `null == 0` true, which is exactly the
+       soundness hole this exists to close. A null equals only another null.
+       Flag-independent and safe: under NOVA_FIRSTCLASS_NULL=off the language never
+       mints a NULL box, so the only values reaching here are JSON-decoded nulls --
+       where treating them as distinct from integer 0 is a fix, not a regression. */
+    int _an = nova_is_null_box(a), _bn = nova_is_null_box(b);
+    if (_an || _bn) return (_an && _bn) ? 1 : 0;
     /* Unbox boxed scalars (NovaBox float/bool) so two equal floats compare equal
        regardless of how each was produced (literal=raw bits vs push/dict-set=boxed).
        For every non-box value nova_rt_unbox is a tag-checked no-op, so this only
@@ -22336,7 +22354,20 @@ int64_t nova_rt_cstr_of(int64_t str_handle) {
 int64_t nova_rt_null_ptr(void) { return 0; }
 
 /* nova_rt_is_null: Test if a pointer is null */
-int64_t nova_rt_is_null(int64_t ptr) { return ptr == 0 ? 1 : 0; }
+/* 1.6: recognise BOTH nulls. Raw 0 is the historical language-level null; g_null_box is
+   the first-class singleton oddball the JSON value model already uses (NOVA_BOX_NULL),
+   and the one `null` lowers to under NOVA_FIRSTCLASS_NULL=1.
+
+   This is deliberately ADDITIVE and flag-INDEPENDENT: it only ever returns 1 for MORE
+   inputs than before, never fewer, so it is correct under both lowerings and needs no
+   coordination with the flag. g_null_box is 0 until the oddballs are minted, hence the
+   non-zero guard -- without it, an unminted g_null_box would make is_null(0) match twice
+   and, worse, would make the second test meaningless. */
+int64_t nova_rt_is_null(int64_t ptr) {
+    if (ptr == 0) return 1;
+    if (g_null_box != 0 && ptr == g_null_box) return 1;
+    return 0;
+}
 
 /* nova_rt_ptr_read: Read i64 from arbitrary pointer */
 int64_t nova_rt_ptr_read(int64_t ptr_val) {
