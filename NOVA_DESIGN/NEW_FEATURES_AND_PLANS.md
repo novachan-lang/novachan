@@ -612,8 +612,8 @@ No pointers for developers
 Bounds-checked access
 Process isolation instead of shared memory
 Ownership tracking at compile time
-No null, no undefined behavior
-NOVA's security model is closest to Rust — but achieved differently. Rust uses borrow checker (compile-time proof). NOVA uses process isolation + RC (architectural safety). Both prevent the same bugs, NOVA just does it with simpler syntax.
+No null, sound-by-default type checking (in-file proven; cross-module hardening still in progress)
+NOVA's security model is inspired by Rust — but achieved differently. Rust uses a borrow checker (compile-time proof) with a decade of scrutiny behind it. NOVA uses process isolation + RC (architectural safety), with the same simpler-syntax goal — not yet proven at the same scope or maturity as Rust's guarantee.
 
 The gaps we have (RC cycles, future FFI safety, crypto, input sanitization) are all solvable library problems, not architectural flaws. The foundation is solid.
 

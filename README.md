@@ -6,11 +6,11 @@ NOVA is a programming language designed to unify all computing domains — syste
 
 ## Why NOVA?
 
-- **Faster than C** — LLVM AOT compilation, zero-cost abstractions, C-parity benchmarks proven
-- **Safer than Rust** — process-isolated memory model, no lifetime annotations, no undefined behavior
-- **Simpler than Python** — zero type annotations for 95%+ of code, one-word error handling, reads like English
-- **Concurrent like Go** — lightweight green threads, typed channels, M:N scheduling, automatic parallelism
-- **Fault-tolerant like Erlang** — process isolation, crash recovery, distributed channels
+- **C-class performance** — LLVM AOT compilation, zero-cost abstractions, within ~4% of C on scalar benchmarks
+- **Memory-safe by design** — process-isolated model, no lifetime annotations, sound-by-default type checking (cross-module hardening in progress)
+- **Simpler than Python** — zero type annotations for the large majority of code, one-word error handling, reads like English
+- **Concurrent like Go** — lightweight green threads, typed channels, M:N scheduling, proven multi-core scaling for compute-bound workloads
+- **Process isolation, Erlang-inspired** — isolated processes with crash notification via monitors; distributed spawn/channels are still in development
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ fn main()
 
 ## Features
 
-- **Self-hosted compiler** — the NOVA compiler is written in NOVA (~30k lines), compiles itself to a byte-identical fixpoint
+- **Self-hosted compiler** — the NOVA compiler is written in NOVA (~31k lines), compiles itself to a byte-identical fixpoint
 - **Three primitives** — Values, Processes, Channels: the entire computational model
 - **Forge framework** — full-stack web framework built in, HTTP/1.1 + HTTP/2 + WebSocket + TLS + ORM
 - **Type inference** — Hindley-Milner based, generics, ADTs, pattern matching, Result types
@@ -67,7 +67,7 @@ The compiler infers types, picks allocation strategy, derives capabilities, and 
 
 ## Standard Library
 
-570+ modules across 20+ categories: crypto, networking, data structures, AI/ML, text processing, media codecs, databases, and more. Every module is KAT-gated (known-answer tested against authoritative vectors).
+1,800+ modules across 20+ categories: crypto, networking, data structures, AI/ML, text processing, media codecs, databases, and more. Every module is KAT-gated (known-answer tested against authoritative vectors).
 
 ## License
 
