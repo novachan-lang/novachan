@@ -941,8 +941,59 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 |---|---------|------|--------|--------|
 | 7.1 | Inline asm | C/Zig | M | **✅ DONE 2026-08-21** — `asm(template, constraints)` |
 | 7.2 | C header import (extern fn auto-gen) | Zig | L | **✅ ALREADY EXISTS** — `bindgen.nova`, gated |
-| 7.3 | @cdecl improvements | C/Rust | S | basic exists |
+| 7.3 | @cdecl improvements | C/Rust | S | **✅ DONE 2026-08-22 — ABI-correct sized ints + floats, gated from a real C host (CI 2k5)** |
 | 7.4 | `unsafe {}` blocks for raw pointer work | Rust | M | **✅ ALREADY EXISTS** (`unsafe` block + expression forms) |
+
+---
+
+### ✅ 7.3 CLOSED (2026-08-22) — @cdecl is ABI-correct; NO new syntax was needed
+
+**What was actually broken.** The old wrapper was i64-everywhere. The in-code comment called
+that "not ABI-correct in general" — an understatement. Measured severity:
+
+| C callback shape | Old behaviour | Severity |
+|---|---|---|
+| `int cmp(void*, void*)` | i64 in/out; caller reads EAX | worked by **x86-64 ABI accident** |
+| `int` **params** | caller sets only EDI; RDI's top 32 bits are ABI-*unspecified* | **latent garbage** |
+| `double` **params** | C passes in XMM0; wrapper read RDI | **hard break** |
+| struct-by-value | unhandled | hard break (out of scope) |
+
+**The design fork, and why it was not really a fork.** The original author proposed putting an
+exact prototype on the annotation: `@cdecl("i32(ptr,ptr)")`. That is a second, stringly-typed type
+language embedded in a string — which `compiler-architecture.md` forbids outright ("No stringly-typed
+IR") and which breaks "one obvious way". **The prototype is derived from the NOVA signature
+instead**, reusing the annotations the language already has. Zero new syntax; the type checker
+already validates it.
+
+**Implementation.** `cdecl_c_type()` + `cdecl_c_unsigned()` map an annotation to its true C type,
+and the wrapper marshals each edge:
+- narrow ints → explicit `sext`/`zext` (never trust the caller to have extended)
+- `double`/`f32` → boxed in, `nova_rt_unbox` out (`f32` also `fpext`/`fptrunc`)
+- unannotated params → `i64`, so every pre-existing @cdecl fn emits **byte-identical IR**
+
+Kept **deliberately separate** from `ffi_llvm_type` (the inbound direction, NOVA→C): that mapping
+coarsens all ints to i64 and every existing `extern fn` depends on it — widening it here would
+silently change the ABI of working code.
+
+**⚠️ The bug the first implementation had, and why it matters.** Passing the raw double bit pattern
+as i64 looked obviously right (it is exactly what `bitcast double .. to i64` produces everywhere
+else) — and it returned **`dmul(2.5, 4.0) = 0`**. Reason: a @cdecl fn usually has *no NOVA call
+site*, so type inference never specializes it and its body falls back to the generic `nova_rt_mul`,
+which read the bit pattern as an **integer** and overflowed to 0. A raw float pattern is not
+self-describing. Boxing is correct in **both** directions: a specialized body unboxes it, a generic
+body dispatches on the tag. Same root cause as the long-standing float-boxing tax (see 3.3/3.1).
+
+**Gated (CI 2k5, `_cdecl_abi_gate.ps1`).** The KAT existed since `808342ca` but was **never wired
+into CI** — verified once by hand, then unguarded. It now links `_kat_cdecl.nova` against a real C
+host declaring each callback with its TRUE prototype, and asserts on **output content**, not just
+exit code: sext discriminator (`narrow_i32(-7,3) = -4`, a wrong zext gives 4294967289), zext
+discriminator (`narrow_u8(200) = 200`, a wrong sext gives -56), doubles, and f32. 8/8 assertions.
+
+**Known limitations (deliberate, documented in-code):**
+- `bool` stays i64 — a NOVA bool can be a *boxed* value, so `trunc i64 to i8` on a returned bool
+  would truncate a **pointer**. Declare `-> int` for a `_Bool` callback; the caller reads AL fine.
+- struct-by-value is out of scope — SysV eightbyte classification vs Win64 by-reference differ per
+  platform, and it is genuinely rare in callbacks.
 
 ---
 

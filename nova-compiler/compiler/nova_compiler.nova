@@ -2728,6 +2728,46 @@ fn ffi_llvm_type(ann: string) -> string
         return "ptr"
     "i64"
 
+// ── @cdecl C-callback ABI (7.3) ──────────────────────────────────────────────
+// The EXACT C type for a @cdecl param/return. @cdecl is the OUTBOUND direction (C calls
+// INTO NOVA), so the C caller obeys the C ABI, not NOVA's uniform-i64 convention. Getting
+// this wrong is not cosmetic: a C callback taking `double` passes it in XMM0, and the old
+// i64-everywhere wrapper read RDI instead -- pure garbage. Narrow ints are a quieter version
+// of the same bug: for an `int` param the SysV/Win64 caller need only set EDI, leaving RDI's
+// top 32 bits UNSPECIFIED, so reading the full i64 can pick up junk.
+//
+// DELIBERATELY SEPARATE from ffi_llvm_type (the INBOUND direction, NOVA calls C). That
+// mapping intentionally coarsens every integer to i64 and every existing `extern fn` relies
+// on it; widening it to sized ints here would silently change the ABI of working code.
+// Different direction, different contract -- same reason the two LLVM backends stay separate.
+fn cdecl_c_type(ann: string) -> string
+    if ann == "float" or ann == "f64" or ann == "double"
+        return "double"
+    if ann == "f32"
+        return "float"
+    if ann == "i32" or ann == "int32" or ann == "u32" or ann == "uint32"
+        return "i32"
+    if ann == "i16" or ann == "u16"
+        return "i16"
+    if ann == "i8" or ann == "u8" or ann == "byte"
+        return "i8"
+    if ann == "void" or ann == "unit"
+        return "void"
+    // int/i64/u64/usize/isize/ptr/string/struct/list/dict/any/"" -> the uniform i64 word.
+    //
+    // KNOWN LIMITATION -- `bool` stays i64 ON PURPOSE. A NOVA bool can be a BOXED value
+    // (g_true_box is a pointer, not 0/1), so `trunc i64 %r to i8` on a returned bool would
+    // truncate a POINTER and hand C a garbage byte. Declare `-> int` for a C callback whose
+    // prototype returns `_Bool`; the value is 0/1 and the caller reads AL correctly.
+    // Struct-by-value is likewise out of scope (SysV eightbyte classification vs Win64
+    // by-reference differ per platform) -- see WEAPON_PARITY_PLAN.md 7.3.
+    "i64"
+
+// Is this annotation an UNSIGNED sized int? Decides zext vs sext when widening a narrow C
+// argument to NOVA's i64 word. Getting this backwards turns C's 200u8 into -56.
+fn cdecl_c_unsigned(ann: string) -> bool
+    ann == "u8" or ann == "u16" or ann == "u32" or ann == "uint32" or ann == "byte"
+
 fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
@@ -27939,6 +27979,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // LOCK-6 Phase 2: names of fns carrying @cdecl (C-callback entry points).
     let _cdecl_fns = []
     let _cdecl_arity = {}
+    // 7.3: the declared C types, so the wrapper can be ABI-correct rather than i64-everywhere.
+    let _cdecl_ptypes = {}
+    let _cdecl_ret = {}
     for _xfs in stmts
         match _xfs
             Stmt(_xt, _xn, _xe, _xb, _xp, _xeb, _xanns, _xsl) =>
@@ -27951,6 +27994,19 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                 if _xat == "ann" and _xav == "cdecl"
                                     push(_cdecl_fns, _xn)
                                     _cdecl_arity[_xn] = len(_xp)
+                                    let _cdpt = []
+                                    for _cdp in _xp
+                                        match _cdp
+                                            Param(_cdpn, _cdpt1, _cdpd) =>
+                                                push(_cdpt, _cdpt1)
+                                    _cdecl_ptypes[_xn] = _cdpt
+                                    // Return annotation rides on the fn Stmt's expr slot.
+                                    let _cdrt = ""
+                                    match _xe
+                                        Expr(_cdet, _cdev, _cden, _cdec, _cdef, _cdel) =>
+                                            if _cdet == "rettype"
+                                                _cdrt = _cdev
+                                    _cdecl_ret[_xn] = _cdrt
 
     // LOCK-6 Phase 2 — @cdecl C-CALLBACK ENTRY POINTS.
     // A NOVA fn marked @cdecl is meant to be handed to C as a function pointer (qsort's
@@ -27971,27 +28027,83 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // is a public-API design decision, not an implementation detail.
     for _cdn in _cdecl_fns
         let _cda = _cdecl_arity[_cdn]
-        let _cdh = "define i64 @" + _cdn + "__cdecl("
+        let _cdpt = _cdecl_ptypes[_cdn]
+        let _cdrc = cdecl_c_type(_cdecl_ret[_cdn])
+        // Header carries each param's REAL C type. An unannotated @cdecl fn maps every slot
+        // to "i64" and this emits byte-for-byte what it always did -- the marshaling below is
+        // all no-ops in that case, so existing callbacks are untouched and reconverge holds.
+        let _cdh = "define " + _cdrc + " @" + _cdn + "__cdecl("
         let _cdi = 0
         while _cdi < _cda
             if _cdi > 0
                 _cdh = _cdh + ", "
-            _cdh = _cdh + "i64 %a" + str(_cdi)
+            _cdh = _cdh + cdecl_c_type(_cdpt[_cdi]) + " %a" + str(_cdi)
             _cdi = _cdi + 1
         _cdh = _cdh + ") nounwind uwtable \{"
         ire_line(e, _cdh)
         ire_line(e, "entry:")
         ire_indent(e, "call void @nova_rt_ensure_init()")
+        // C argument -> NOVA's uniform i64 word.
+        let _cdargs = []
+        let _cdk = 0
+        while _cdk < _cda
+            let _pann = _cdpt[_cdk]
+            let _pct = cdecl_c_type(_pann)
+            let _psrc = "%a" + str(_cdk)
+            if _pct == "i64"
+                push(_cdargs, _psrc)
+            else if _pct == "double"
+                // BOX the incoming double -- do NOT pass the raw bit pattern. A raw pattern
+                // is not self-describing, and a @cdecl fn usually has NO NOVA call site to
+                // specialize it, so its body falls back to the generic nova_rt_mul/add, which
+                // would read the pattern as an INTEGER (measured: dmul(2.5,4.0) returned 0 via
+                // integer overflow). A box works either way: a specialized body unboxes it,
+                // and a generic body dispatches on the tag.
+                ire_indent(e, "%b" + str(_cdk) + " = bitcast double " + _psrc + " to i64")
+                ire_indent(e, "%n" + str(_cdk) + " = call i64 @nova_rt_box_float(i64 %b" + str(_cdk) + ")")
+                push(_cdargs, "%n" + str(_cdk))
+            else if _pct == "float"
+                ire_indent(e, "%w" + str(_cdk) + " = fpext float " + _psrc + " to double")
+                ire_indent(e, "%b" + str(_cdk) + " = bitcast double %w" + str(_cdk) + " to i64")
+                ire_indent(e, "%n" + str(_cdk) + " = call i64 @nova_rt_box_float(i64 %b" + str(_cdk) + ")")
+                push(_cdargs, "%n" + str(_cdk))
+            else
+                // Narrow int: widen explicitly rather than trusting the caller to have
+                // extended it -- the ABI does NOT promise the high bits are clean.
+                let _ext = "sext"
+                if cdecl_c_unsigned(_pann)
+                    _ext = "zext"
+                ire_indent(e, "%n" + str(_cdk) + " = " + _ext + " " + _pct + " " + _psrc + " to i64")
+                push(_cdargs, "%n" + str(_cdk))
+            _cdk = _cdk + 1
+        // The NOVA fn itself is always uniform i64 in and i64 out.
         let _cdc = "call i64 @" + _cdn + "("
         let _cdj = 0
         while _cdj < _cda
             if _cdj > 0
                 _cdc = _cdc + ", "
-            _cdc = _cdc + "i64 %a" + str(_cdj)
+            _cdc = _cdc + "i64 " + _cdargs[_cdj]
             _cdj = _cdj + 1
         _cdc = _cdc + ")"
         ire_indent(e, "%r = " + _cdc)
-        ire_indent(e, "ret i64 %r")
+        // NOVA i64 result -> the declared C return type. Floats go through nova_rt_unbox
+        // because the returned word may be a BOX or a raw bit pattern; unbox accepts both.
+        if _cdrc == "void"
+            ire_indent(e, "ret void")
+        else if _cdrc == "i64"
+            ire_indent(e, "ret i64 %r")
+        else if _cdrc == "double"
+            ire_indent(e, "%ru = call i64 @nova_rt_unbox(i64 %r)")
+            ire_indent(e, "%rd = bitcast i64 %ru to double")
+            ire_indent(e, "ret double %rd")
+        else if _cdrc == "float"
+            ire_indent(e, "%ru = call i64 @nova_rt_unbox(i64 %r)")
+            ire_indent(e, "%rd = bitcast i64 %ru to double")
+            ire_indent(e, "%rf = fptrunc double %rd to float")
+            ire_indent(e, "ret float %rf")
+        else
+            ire_indent(e, "%rc = trunc i64 %r to " + _cdrc)
+            ire_indent(e, "ret " + _cdrc + " %rc")
         ire_line(e, "}")
         ire_line(e, "")
     let _entry_name = "main"

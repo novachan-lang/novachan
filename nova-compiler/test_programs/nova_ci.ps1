@@ -172,6 +172,10 @@ Write-Host "`n[CI 2k4/3] Pattern gate (nested constructor patterns + guards, val
 & .\_p2_pattern_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k4 (pattern matching) ==="; exit 1 }
 
+Write-Host "`n[CI 2k5/3] @cdecl ABI gate (real C host: sized ints, doubles, f32)..."
+& .\_cdecl_abi_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k5 (@cdecl ABI) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }
