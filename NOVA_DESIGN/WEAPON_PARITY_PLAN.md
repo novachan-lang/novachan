@@ -627,10 +627,47 @@ from assumption rather than measurement. Every future item gets grepped before i
 |---|---------|------|--------|--------|
 | 3.1 | Float/array perf 1.7x → 1.0x C | C | L | S4.2 shipped, extend |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
-| 3.3 | Verify generics monomorphize to zero-cost | C++ | S | TODO |
+| 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
 | 3.5 | Process-scoped arena allocators | C/Zig | M | **✅ ALREADY EXISTS** — per-task arenas, `nova_task_arena_cleanup` |
 | 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
+
+---
+
+### ✅ 3.3 CLOSED (2026-08-22) — erasure is zero-cost; the float tax is the CALLING CONVENTION, not generics
+
+The item's title was premised on monomorphization. NOVA does **type erasure** (one i64-shaped
+function), so the real question is "does erasure cost anything at runtime". Measured, not argued —
+`_gen_zerocost.nova` + `_gz_run.ps1`.
+
+**Structural evidence (decisive).** The erased generic and the fully-typed concrete function emit
+**byte-identical LLVM IR** — same instructions, same registers, same order:
+
+| pair | result |
+|---|---|
+| `gadd(a, b)` (erased) vs `iadd(a: int, b: int) -> int` | identical: `load`/`load`/`add i64`/`ret` |
+| `gmul(a, b)` (erased) vs `fmul_c(a: float, b: float) -> float` | identical: 2×`nova_rt_unbox`/`bitcast`/`fmul double`/`bitcast`/`ret` |
+
+Identical code cannot be systematically slower, so this settles it without needing timings. Timings
+agree anyway: float 101/102, 104/104, 103/91 ms over 20M iterations — the ordering flips, so the
+gap is run-to-run noise.
+
+**⚠️ Two measurement traps caught here, both worth remembering:**
+1. The first int benchmark reported `generic=0ms concrete=0ms`. Not "infinitely fast" — LLVM
+   recognised the arithmetic series and replaced the whole loop with a closed form. The accumulator
+   was *correct*, which is what made it look like a valid result. Fixed by deriving every input from
+   `time_ms()` so nothing is compile-time knowable. **A benchmark that folds away measures nothing
+   and looks fantastic** — same lesson as the module-`let`-reads-0 bug.
+2. I predicted the float generic would cost more (boxing at the any-widen). **Wrong** — and the
+   reason matters more than the prediction.
+
+**The real finding, and it belongs to 3.1.** `fmul_c` is declared `(a: float, b: float) -> float`
+with zero generics involved, and it *still* calls `nova_rt_unbox` on both parameters. The float
+boxing tax is not a generics problem — it is in the **uniform i64 calling convention**: every float
+crossing a call boundary is boxed regardless of how precisely it is typed. That is the mechanism
+behind the long-standing "float ≈1.7× C" number, and it is the concrete lead for **3.1**. The
+earlier `readonly` work on `nova_rt_unbox` (CI gate 2b4, 8→2 surviving calls at -O2) was already
+chipping at exactly this surface.
 
 ---
 
