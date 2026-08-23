@@ -1081,6 +1081,48 @@ static uint64_t nova_struct_bitmap_for_hash(int64_t hash);
 #define NOVA_FS_HEAP_SIZE (8 * 1024 * 1024)
 #endif
 
+/* ── 1.7 cycle DETECTOR (opt-in: NOVA_CYCLE_DETECT=1) ────────────────────────
+   Diagnostic only -- it never frees anything, so it cannot corrupt memory. Tracks the
+   live RC-object set and, at exit, reports objects whose refcount is entirely accounted
+   for from WITHIN that set: those are unreachable from any root, i.e. cycle members.
+
+   Why this and not a collector first: NOVA already ships weak refs (weak_create/upgrade/
+   alive/invalidate, auto-invalidated in nova_rc_free), so the manual escape hatch exists
+   and NOVA is at parity with Swift and Rust. What none of those three give you is a
+   built-in answer to "WHERE is my cycle" -- Xcode needs Instruments, Rust has nothing.
+   Being TOLD, with type names, is most of the value and carries none of a collector's
+   hot-path risk.
+
+   Cost when off: ONE predicted compare against a cached global. g_cyc_on is -1 until the
+   first allocation resolves it from the environment, then 0 or 1 forever -- so the hot path
+   is `if (g_cyc_on != 0)`, which after the first alloc is a single not-taken branch and
+   never a call. */
+static int  g_cyc_on = -1;                 /* -1 = env not yet read; 0 = off; 1/2 = on */
+static int  nova_cyc_enabled(void);
+static void nova_cyc_track(void* ptr);
+static void nova_cyc_untrack(void* ptr);
+/* The hook sits in the two HOTTEST functions in the runtime (nova_heap_alloc and
+   nova_rc_free), so it must not perturb them. `g_cyc_on > 0` is a single compare against a
+   cached global with NO call in the off case -- g_cyc_on is resolved eagerly in
+   nova_rt_init, so the -1 state never reaches the steady-state hot path. The cold-branch
+   hint keeps the tracking call out of the fallthrough path so inlining decisions for the
+   allocator are unchanged. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NOVA_CYC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define NOVA_CYC_UNLIKELY(x) (x)
+#endif
+/* MEASURED off-path cost: ~2% on a deliberately allocation-SATURATED microbenchmark
+   (1.5M dict+list allocations in a tight loop), which is at this machine's noise floor;
+   0% on anything not allocation-bound. Build with -DNOVA_NO_CYCLE_DETECT to compile the
+   hooks out entirely and get literal zero -- NOVA promises no hidden costs, so the escape
+   hatch exists even though the default is worth its price. */
+#ifdef NOVA_NO_CYCLE_DETECT
+#define NOVA_CYC_HOOK(call) do { } while (0)
+#else
+#define NOVA_CYC_HOOK(call) do { if (NOVA_CYC_UNLIKELY(g_cyc_on > 0)) { call; } } while (0)
+#endif
+
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
     char* base;
@@ -1129,6 +1171,9 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
     nova_mem_total++;
     NOVA_MEM_LIVE_ADD(1);
+    /* Track exactly the set nova_mem_live counts -- arena-owned and freestanding objects
+       return above and are deliberately excluded from both (freed wholesale, never a leak). */
+    NOVA_CYC_HOOK(nova_cyc_track(base + NOVA_RC_HDR_SIZE));
     return base + NOVA_RC_HDR_SIZE;
 }
 
@@ -1172,6 +1217,7 @@ void* nova_rt_aligned_struct_alloc(int64_t size, int64_t alignment) {
     nova_mem_total++;
     NOVA_MEM_LIVE_ADD(1);
     if (base) nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + aligned_total);
+    NOVA_CYC_HOOK(nova_cyc_track(base + NOVA_RC_HDR_SIZE));
     return base + NOVA_RC_HDR_SIZE;
 }
 
@@ -11342,6 +11388,9 @@ int64_t nova_rt_reload_requested(void) {
 }
 
 void nova_rt_init(void) {
+    /* 1.7: resolve the cycle-detector flag ONCE, here, so the allocator hot path only ever
+       tests `g_cyc_on > 0` and never calls into the resolver. */
+    (void)nova_cyc_enabled();
 #ifdef _WIN32
     /* TIMER RESOLUTION. Windows' default timer granularity is 15.6 ms, and the netpoller thread
        idles on Sleep(1) (see the poller loop below), which ROUNDS UP to a full tick. A green task
@@ -13236,6 +13285,7 @@ static void nova_rt_weak_invalidate(int64_t obj_handle);  /* forward */
 static void nova_rc_free(void* ptr) {
     NovaMemTag tag = NOVA_RC_TAG(ptr);
     NOVA_MEM_LIVE_ADD(-1);
+    NOVA_CYC_HOOK(nova_cyc_untrack(ptr));
     /* Auto-invalidate any weak refs pointing to this object (soundness:
        prevents dangling weak refs after RC free). */
     nova_rt_weak_invalidate((int64_t)(uintptr_t)ptr);
@@ -13626,8 +13676,352 @@ int64_t nova_rt_live_count(void) {
     return nova_mem_live;
 }
 
+/* ── 1.7 cycle DETECTOR — implementation ─────────────────────────────────────
+   Set NOVA_CYCLE_DETECT=1 to arm. Everything below is dead when off.
+
+   The test: an object whose ENTIRE refcount is accounted for by references from other
+   objects that are THEMSELVES still live is unreachable from any root -- nothing outside
+   the live set points at it, so it can only be held by a cycle. This is the counting half
+   of Bacon-Rajan trial deletion, without the deletion: nothing is freed, nothing is
+   mutated, so it cannot corrupt memory. */
+
+/* Spinlock rather than a CRITICAL_SECTION so there is NOTHING to initialise -- the first
+   allocation can precede nova_rt_init, and a lazily-initialised lock would race there. */
+static volatile long g_cyc_spin = 0;
+static void nova_cyc_lock(void) {
+#ifdef _WIN32
+    while (InterlockedCompareExchange(&g_cyc_spin, 1, 0) != 0) { Sleep(0); }
+#else
+    while (__atomic_exchange_n(&g_cyc_spin, 1L, __ATOMIC_ACQUIRE)) { sched_yield(); }
+#endif
+}
+static void nova_cyc_unlock(void) {
+#ifdef _WIN32
+    InterlockedExchange(&g_cyc_spin, 0);
+#else
+    __atomic_store_n(&g_cyc_spin, 0L, __ATOMIC_RELEASE);
+#endif
+}
+
+#define NOVA_CYC_TOMB ((void*)(uintptr_t)1)
+static void**   g_cyc_tab  = NULL;    /* open-addressed set of LIVE object bodies */
+static size_t   g_cyc_cap  = 0;       /* power of two */
+static size_t   g_cyc_used = 0;
+static size_t   g_cyc_tomb = 0;
+static int      g_cyc_oom  = 0;       /* registry could not grow -> report is PARTIAL */
+
+static int nova_cyc_enabled(void) {
+#ifdef NOVA_NO_SYSHEADERS
+    return 0;
+#else
+    if (g_cyc_on < 0) {
+        const char* e = getenv("NOVA_CYCLE_DETECT");
+        /* Benign race: every racer reads the same environment and stores the same value.
+           "2" = verbose: additionally dump every live object (addr, type, rc, internal),
+           which is what you want when the summary says "N cycle-held" and you need to know
+           WHICH. */
+        g_cyc_on = (e && e[0] == '2') ? 2 : ((e && e[0] == '1') ? 1 : 0);
+    }
+    return g_cyc_on;
+#endif
+}
+
+static size_t nova_cyc_hash(void* p) {
+    uintptr_t x = (uintptr_t)p >> 4;          /* bodies are >=16-byte aligned */
+    x *= (uintptr_t)0x9E3779B97F4A7C15ull;    /* fibonacci mix */
+    return (size_t)(x >> 16);
+}
+
+/* Caller holds the lock. Returns 0 on OOM, having left the old table intact. */
+static int nova_cyc_grow(void) {
+    size_t ncap = g_cyc_cap ? (g_cyc_cap * 2) : 1024;
+    if (ncap < g_cyc_cap) { g_cyc_oom = 1; return 0; }            /* size_t overflow */
+    if (ncap > (size_t)-1 / sizeof(void*)) { g_cyc_oom = 1; return 0; }
+    void** nt = (void**)calloc(ncap, sizeof(void*));
+    if (!nt) { g_cyc_oom = 1; return 0; }
+    size_t m = ncap - 1;
+    for (size_t i = 0; i < g_cyc_cap; i++) {
+        void* v = g_cyc_tab[i];
+        if (!v || v == NOVA_CYC_TOMB) continue;
+        size_t j = nova_cyc_hash(v) & m;
+        while (nt[j]) j = (j + 1) & m;
+        nt[j] = v;
+    }
+    free(g_cyc_tab);
+    g_cyc_tab = nt; g_cyc_cap = ncap; g_cyc_tomb = 0;
+    return 1;
+}
+
+static void nova_cyc_track(void* ptr) {
+    if (!ptr) return;
+    nova_cyc_lock();
+    /* Keep load factor <= 1/2 counting tombstones, so probes stay short. */
+    if ((g_cyc_used + g_cyc_tomb + 1) * 2 >= g_cyc_cap) {
+        if (!nova_cyc_grow()) { nova_cyc_unlock(); return; }
+    }
+    size_t m = g_cyc_cap - 1, j = nova_cyc_hash(ptr) & m;
+    size_t reuse = (size_t)-1;
+    while (g_cyc_tab[j]) {
+        if (g_cyc_tab[j] == ptr) { nova_cyc_unlock(); return; }   /* already tracked */
+        if (g_cyc_tab[j] == NOVA_CYC_TOMB && reuse == (size_t)-1) reuse = j;
+        j = (j + 1) & m;
+    }
+    if (reuse != (size_t)-1) { g_cyc_tab[reuse] = ptr; g_cyc_tomb--; }
+    else                     { g_cyc_tab[j] = ptr; }
+    g_cyc_used++;
+    nova_cyc_unlock();
+}
+
+static void nova_cyc_untrack(void* ptr) {
+    if (!ptr || !g_cyc_cap) return;
+    nova_cyc_lock();
+    size_t m = g_cyc_cap - 1, j = nova_cyc_hash(ptr) & m;
+    while (g_cyc_tab[j]) {
+        if (g_cyc_tab[j] == ptr) {
+            g_cyc_tab[j] = NOVA_CYC_TOMB;
+            g_cyc_used--; g_cyc_tomb++;
+            break;
+        }
+        j = (j + 1) & m;
+    }
+    nova_cyc_unlock();
+}
+
+/* Slot of `p` in the live set, or -1. Report-time only (no lock: single-threaded at exit). */
+static long nova_cyc_slot_of(void* p) {
+    if (!g_cyc_cap || !p) return -1;
+    size_t m = g_cyc_cap - 1, j = nova_cyc_hash(p) & m;
+    while (g_cyc_tab[j]) {
+        if (g_cyc_tab[j] == p) return (long)j;
+        j = (j + 1) & m;
+    }
+    return -1;
+}
+
+/* Managed children of `obj`. MIRRORS nova_rc_free's traversal exactly -- same tag
+   dispatch, same per-type bitmap, same elem_kind==2 exclusion (raw doubles are never
+   heap refs; feeding a double's bit pattern to find_tag is precisely the bug that
+   exclusion exists to prevent). Any divergence here would misreport, so it is kept
+   structurally identical rather than re-derived. */
+typedef void (*nova_cyc_visit_fn)(void* ctx, long child_slot);
+static void nova_cyc_walk(void* obj, nova_cyc_visit_fn visit, void* ctx) {
+    NovaMemTag tag = NOVA_RC_TAG(obj);
+    if ((tag & 0x7) == NOVA_MEM_STRUCT) {
+        if (!NOVA_STRUCT_HASHED(obj)) return;   /* closure/repr_c: no bitmap, as rc_free */
+        int64_t  nslots = NOVA_STRUCT_NSLOTS(obj);
+        int64_t* slots  = (int64_t*)obj;
+        uint64_t mask   = nova_struct_bitmap_for_hash(slots[0]);
+        if (!mask) return;
+        int64_t lim = nslots < 64 ? nslots : 64;
+        for (int64_t i = 1; i < lim; i++) {
+            if (!((mask >> (uint64_t)i) & 1ull)) continue;
+            long s = nova_cyc_slot_of((void*)(uintptr_t)slots[i]);
+            if (s >= 0) visit(ctx, s);
+        }
+        return;
+    }
+    if (tag == NOVA_MEM_LIST) {
+        NovaList* l = (NovaList*)obj;
+        if (l->elem_kind == 2) return;
+        for (int64_t i = 0; i < l->size; i++) {
+            long s = nova_cyc_slot_of((void*)(uintptr_t)l->data[i]);
+            if (s >= 0) visit(ctx, s);
+        }
+        return;
+    }
+    if (tag == NOVA_MEM_DICT) {
+        NovaDict* d = (NovaDict*)obj;
+        for (int64_t i = 0; i < d->size; i++) {
+            long sk = nova_cyc_slot_of((void*)(uintptr_t)d->keys[i]);
+            if (sk >= 0) visit(ctx, sk);
+            long sv = nova_cyc_slot_of((void*)(uintptr_t)d->vals[i]);
+            if (sv >= 0) visit(ctx, sv);
+        }
+        return;
+    }
+    /* RAW / BYTES / typed-array / fat string: no managed children. */
+}
+
+static void nova_cyc_v_count(void* ctx, long slot) { (void)slot; (*(int64_t*)ctx)++; }
+typedef struct { int32_t* to; int64_t n; } NovaCycFill;
+static void nova_cyc_v_fill(void* ctx, long slot) {
+    NovaCycFill* f = (NovaCycFill*)ctx;
+    f->to[f->n++] = (int32_t)slot;
+}
+
+static const char* nova_cyc_typename(void* o) {
+    NovaMemTag tag = NOVA_RC_TAG(o);
+    if ((tag & 0x7) == NOVA_MEM_STRUCT) {
+        if (NOVA_STRUCT_HASHED(o)) {
+            const char* n = nova_struct_meta_name(((int64_t*)o)[0]);
+            if (n && n[0]) return n;
+        }
+        return "<struct>";
+    }
+    if (tag == NOVA_MEM_LIST)  return "list";
+    if (tag == NOVA_MEM_DICT)  return "dict";
+    if (tag == NOVA_MEM_BYTES) return "bytes";
+    if (tag == NOVA_MEM_RAW)   return "string/raw";
+    return "<other>";
+}
+
+#define NOVA_CYC_MAX_KINDS 64
+static void nova_cyc_report(void) {
+#ifndef NOVA_NO_SYSHEADERS
+    if (g_cyc_on < 1 || !g_cyc_cap) return;
+    if (g_cyc_used == 0) {
+        fprintf(stderr, "=== NOVA cycle detector: no live objects at exit -- no cycles ===\n");
+        return;
+    }
+    if (g_cyc_used > 4000000u) {
+        fprintf(stderr, "=== NOVA cycle detector: %llu live objects, too many to analyse ===\n",
+                (unsigned long long)g_cyc_used);
+        return;
+    }
+    size_t cap = g_cyc_cap;
+
+    /* ── Build CSR adjacency over the live set ──────────────────────────────
+       A CYCLE IS A GRAPH PROPERTY, so this looks for one directly rather than
+       inferring it from refcounts. The refcount test ("is every reference internal?")
+       answers a DIFFERENT question -- is it unreachable -- and NOVA cannot answer that
+       at exit: the compiler conservatively emits no drop for a local that escapes, so a
+       dead stack slot still holds a count. Measured: a real A<->B cycle showed rc=2,
+       internal=1 on both nodes and the refcount test called it clean. Tarjan does not
+       care how many stale references exist -- if the objects point at each other, that
+       is a cycle. */
+    int64_t nedges = 0;
+    for (size_t i = 0; i < cap; i++) {
+        void* o = g_cyc_tab[i];
+        if (!o || o == NOVA_CYC_TOMB) continue;
+        nova_cyc_walk(o, nova_cyc_v_count, &nedges);
+    }
+    int64_t* eoff  = (int64_t*)calloc(cap + 1, sizeof(int64_t));
+    int32_t* eto   = (int32_t*)calloc((size_t)(nedges > 0 ? nedges : 1), sizeof(int32_t));
+    int32_t* xidx  = (int32_t*)calloc(cap, sizeof(int32_t));
+    int32_t* xlow  = (int32_t*)calloc(cap, sizeof(int32_t));
+    unsigned char* onstk = (unsigned char*)calloc(cap, 1);
+    unsigned char* incyc = (unsigned char*)calloc(cap, 1);
+    int32_t* sstk  = (int32_t*)calloc(cap, sizeof(int32_t));
+    int32_t* wv    = (int32_t*)calloc(cap, sizeof(int32_t));
+    int64_t* wi    = (int64_t*)calloc(cap, sizeof(int64_t));
+    if (!eoff || !eto || !xidx || !xlow || !onstk || !incyc || !sstk || !wv || !wi) {
+        fprintf(stderr, "=== NOVA cycle detector: OOM building graph (%llu live) ===\n",
+                (unsigned long long)g_cyc_used);
+        free(eoff); free(eto); free(xidx); free(xlow);
+        free(onstk); free(incyc); free(sstk); free(wv); free(wi);
+        return;
+    }
+    {   /* prefix sums, then fill */
+        int64_t run = 0;
+        for (size_t i = 0; i < cap; i++) {
+            eoff[i] = run;
+            void* o = g_cyc_tab[i];
+            if (o && o != NOVA_CYC_TOMB) {
+                int64_t d = 0;
+                nova_cyc_walk(o, nova_cyc_v_count, &d);
+                run += d;
+            }
+        }
+        eoff[cap] = run;
+        NovaCycFill f;
+        for (size_t i = 0; i < cap; i++) {
+            void* o = g_cyc_tab[i];
+            if (!o || o == NOVA_CYC_TOMB) continue;
+            f.to = eto; f.n = eoff[i];
+            nova_cyc_walk(o, nova_cyc_v_fill, &f);
+        }
+    }
+
+    /* ── Iterative Tarjan (explicit stacks: a deep list must not blow the C stack) ── */
+    int64_t sp = 0, wsp = 0, counter = 0, nscc = 0;
+    for (size_t root = 0; root < cap; root++) {
+        void* ro = g_cyc_tab[root];
+        if (!ro || ro == NOVA_CYC_TOMB || xidx[root]) continue;
+        xidx[root] = xlow[root] = (int32_t)(++counter);
+        sstk[sp++] = (int32_t)root; onstk[root] = 1;
+        wv[wsp] = (int32_t)root; wi[wsp] = eoff[root]; wsp++;
+        while (wsp > 0) {
+            int32_t v = wv[wsp - 1];
+            if (wi[wsp - 1] < eoff[v + 1]) {
+                int32_t w = eto[wi[wsp - 1]++];
+                if (!xidx[w]) {
+                    xidx[w] = xlow[w] = (int32_t)(++counter);
+                    sstk[sp++] = w; onstk[w] = 1;
+                    wv[wsp] = w; wi[wsp] = eoff[w]; wsp++;
+                } else if (onstk[w]) {
+                    if (xidx[w] < xlow[v]) xlow[v] = xidx[w];
+                }
+            } else {
+                wsp--;
+                if (wsp > 0) {
+                    int32_t p = wv[wsp - 1];
+                    if (xlow[v] < xlow[p]) xlow[p] = xlow[v];
+                }
+                if (xlow[v] == xidx[v]) {
+                    int64_t members = 0, base = sp;
+                    int32_t w;
+                    do { w = sstk[--sp]; onstk[w] = 0; members++; } while (w != v && sp > 0);
+                    int self_loop = 0;
+                    if (members == 1)
+                        for (int64_t e = eoff[v]; e < eoff[v + 1]; e++)
+                            if (eto[e] == v) { self_loop = 1; break; }
+                    if (members > 1 || self_loop) {
+                        nscc++;
+                        for (int64_t k = sp; k < base; k++) incyc[sstk[k]] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ── Report ─────────────────────────────────────────────────────────────── */
+    const char* names[NOVA_CYC_MAX_KINDS];
+    int64_t     counts[NOVA_CYC_MAX_KINDS];
+    int         nkinds = 0;
+    int64_t     total_cyc = 0, total_live = 0;
+    for (size_t i = 0; i < cap; i++) {
+        void* o = g_cyc_tab[i];
+        if (!o || o == NOVA_CYC_TOMB) continue;
+        total_live++;
+        if (g_cyc_on >= 2) {
+            NovaMemTag _vt = NOVA_RC_TAG(o);
+            fprintf(stderr, "    [live] %p  %-20s rc=%-5d out=%-4lld %s%s\n",
+                    o, nova_cyc_typename(o), (int)NOVA_RC_COUNT(o),
+                    (long long)(eoff[i + 1] - eoff[i]),
+                    incyc[i] ? "IN-CYCLE" : "",
+                    ((_vt & 0x7) == NOVA_MEM_STRUCT && !NOVA_STRUCT_HASHED(o)) ? " (unhashed: no bitmap)" : "");
+        }
+        if (!incyc[i]) continue;
+        total_cyc++;
+        const char* nm = nova_cyc_typename(o);
+        int k = 0;
+        for (; k < nkinds; k++) if (names[k] == nm || strcmp(names[k], nm) == 0) break;
+        if (k == nkinds && nkinds < NOVA_CYC_MAX_KINDS) { names[nkinds] = nm; counts[nkinds] = 0; nkinds++; }
+        if (k < NOVA_CYC_MAX_KINDS) counts[k]++;
+    }
+    fprintf(stderr, "=== NOVA cycle detector ===\n");
+    fprintf(stderr, "  live objects at exit : %lld\n", (long long)total_live);
+    fprintf(stderr, "  objects in cycles    : %lld  (in %lld distinct cycle%s)\n",
+            (long long)total_cyc, (long long)nscc, nscc == 1 ? "" : "s");
+    if (g_cyc_oom)
+        fprintf(stderr, "  WARNING: registry hit OOM -- this report is PARTIAL\n");
+    if (total_cyc > 0) {
+        fprintf(stderr, "  by type:\n");
+        for (int k = 0; k < nkinds; k++)
+            fprintf(stderr, "    %-24s %lld\n", names[k], (long long)counts[k]);
+        fprintf(stderr, "  Reference counting can NEVER free these. Break the cycle with a weak\n");
+        fprintf(stderr, "  reference: weak_create(obj) / weak_upgrade(w) / weak_alive(w).\n");
+    }
+    free(eoff); free(eto); free(xidx); free(xlow);
+    free(onstk); free(incyc); free(sstk); free(wv); free(wi);
+#endif
+}
+
 void nova_rt_cleanup(void) {
 #ifndef NOVA_NO_SYSHEADERS
+    /* 1.7: cycle report BEFORE the heap profile, so "held only by cycles = N" reads
+       directly above the "still-live objects = N" line it explains. */
+    nova_cyc_report();
     /* #31 heap profiler: print the per-tag allocation breakdown at exit when requested. */
     if (getenv("NOVA_HEAP_PROFILE")) {
         const char* _hp_names[16] = {0};

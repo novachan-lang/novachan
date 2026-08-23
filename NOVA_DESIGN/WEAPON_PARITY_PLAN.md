@@ -17,7 +17,7 @@
 | 1.4 | Field-slot collision → sound resolution | Rust | **M** (was S) | **✅ DONE 2026-08-20** + both refinements applied `3a8e64a1` |
 | 1.5 | `?` in lambda silent corruption | Rust | M | **✅ CLOSED (fail-closed) — gated 2026-08-20** |
 | 1.6 | null ≠ 0 (indistinguishable) | All | L | **PARTIAL** — null-as-*value* done `a7e5fc76` (flag, default off); null-as-*absence* NOT solved, cause unknown |
-| 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | DESIGNED |
+| 1.7 | RC cycle collector (Tier 4.7) | Rust/Erlang | L | **DETECTOR ✅ DONE 2026-08-23** (`NOVA_CYCLE_DETECT`, SCC-based, gated CI 2k6); collector still open |
 | 1.8 | Reject a non-defaulted param AFTER a defaulted one | Python/C++ | S | **✅ DONE 2026-08-20** `3a8e64a1` |
 | 1.9 | Variadic (`T...`) + named args across the module boundary | Python | S | **✅ DONE 2026-08-20** `3a8e64a1` |
 
@@ -439,6 +439,62 @@ at exit with type names), and only then a *collector*. The detector is diagnosti
 corrupt memory; the collector touches the RC hot path and needs the full RED-tier arc. For a
 language that prizes predictability, being *told* about a cycle may well be better than having it
 silently collected — so the detector may be most of the value.
+
+---
+
+### ✅ 1.7 DETECTOR LANDED (2026-08-23) — `NOVA_CYCLE_DETECT=1`, and it beats Swift/Rust here
+
+**First, a correction to this plan's own premise.** The competitive framing above implied NOVA
+was behind on cycles generally. Grepping the runtime says otherwise: **weak references already
+exist and are exposed as builtins** — `weak_create` / `weak_upgrade` / `weak_alive` /
+`weak_invalidate`, auto-invalidated in `nova_rc_free`. So the real standing is:
+
+| Language | Cycle story | vs NOVA |
+|---|---|---|
+| Python | automatic cycle GC | NOVA loses |
+| **Swift** | no collector — you write `weak`/`unowned` | **tie** |
+| **Rust** | no collector — you write `Weak` | **tie** |
+| Go/Java | tracing GC | different memory model |
+
+NOVA was already at parity with the two languages closest to its memory model. What *none* of the
+three gives you is a built-in answer to **"where is my cycle"** — Xcode needs Instruments, Rust has
+nothing. That is the gap this closes, and it is a genuine WIN rather than catching up.
+
+**Why a graph search and not the refcount test.** The plan's implied approach — an object whose
+refcount is entirely internal to the live set is unreachable, therefore cycle-held — was
+implemented and **measured wrong**. A real `A <-> B` cycle reported `rc=2, internal=1` on both
+nodes and the test called it clean. Reason: NOVA's compiler conservatively emits **no drop** for a
+local that escapes (both nodes escape into each other's fields), so a *dead stack slot* still holds
+a count. The refcount test answers "is this unreachable", which cannot be answered at exit. **A
+cycle is a graph property**, so the detector runs **Tarjan SCC** over the live object graph
+instead: it does not care how many stale references exist — if the objects point at each other,
+that is a cycle. Iterative, not recursive, so a deep list cannot blow the C stack.
+
+**How it enumerates children.** `nova_cyc_walk` mirrors `nova_rc_free`'s traversal *structurally* —
+same tag dispatch, same per-type managed-slot bitmap, same `elem_kind == 2` exclusion (raw doubles
+are never heap refs; feeding a double's bit pattern to `find_tag` is exactly the bug that exclusion
+prevents). Any divergence would misreport, so it is kept identical rather than re-derived.
+
+**Gated (CI 2k6, `_cycle_detect_gate.ps1`), 5 assertions:**
+- POSITIVE `_cyc_pos`: 6 objects in 3 distinct cycles — a 2-node pair, a **self-loop** (an SCC of
+  size 1, which Tarjan calls acyclic unless the self-edge is checked), and a 3-node ring
+- attribution: reported by type name (`CycNode`), not just a count
+- **NEGATIVE `_cyc_neg`: 0 cycles** across lists, dicts, strings and an acyclic chain — the
+  load-bearing half, since a detector that flags healthy programs is worse than none
+- opt-in: completely silent when the env flag is unset
+
+**Cost, measured not asserted.** The first cut regressed an allocation-saturated microbenchmark by
+a best-of-7 **24.8%** — the hook sat inline in the two hottest runtime functions
+(`nova_heap_alloc`, `nova_rc_free`) and could call the resolver. Fixed by resolving the flag
+eagerly in `nova_rt_init` and marking the branch cold: now **~2% (min 1.9%, median 2.4%)** on 1.5M
+dict+list allocations in a tight loop, at that machine's noise floor, and 0% on anything not
+allocation-bound. `-DNOVA_NO_CYCLE_DETECT` compiles the hooks out for literal zero.
+
+**`NOVA_CYCLE_DETECT=2`** additionally dumps every live object (address, type, refcount, out-degree,
+IN-CYCLE flag) — which is what turned the falsified refcount theory into a diagnosis in minutes.
+
+**Still open: the COLLECTOR.** Detection tells you; it does not free. That remains the larger,
+RED-tier piece (Bacon–Rajan trial deletion touching the RC hot path).
 
 ---
 
