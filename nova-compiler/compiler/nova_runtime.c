@@ -1429,9 +1429,54 @@ static int nova_is_box(int64_t handle) {
     return nova_mem_find_tag((void*)a) == NOVA_MEM_BOX;
 }
 /* If handle points to a box, return its raw payload; otherwise pass through. */
-int64_t nova_rt_unbox(int64_t handle) {
+/* 3.1 — INLINABLE FAST REJECT for the unbox pair.
+   These are the hottest guards in float code: every declared-`float` parameter is unboxed
+   defensively on entry, because an i64 float argument may be a box OR a raw IEEE-754 bit
+   pattern and the callee cannot tell. Measured on a scalar float benchmark, that cost
+   2.21x C -- three full nova_mem_find_tag calls per axpy() call (range + alignment +
+   ownership-table + header reads, each).
+
+   The whole managed object space is ONE contiguous reservation, so a value outside
+   [base, cap) cannot possibly be a NOVA object -- and a raw double's bit pattern is
+   nowhere near it (1.5 is 0x3FF8000000000000 ~ 4.6e18). Rejecting on that is two loads,
+   a subtract and one compare.
+
+   WHY base/cap AND NOT g_oa_region_end: base and cap are written exactly once, inside
+   nova_oa_reserve, and never change -- so LLVM may hoist these loads out of loops freely.
+   g_oa_region_end GROWS as memory commits; hoisting a load of a moving bound would let a
+   box allocated later fall outside a stale range and be silently misread as a raw double.
+   [base, cap) is a conservative SUPERSET of the committed region, so the reject is sound:
+   anything it rejects is definitely not an object, anything it accepts falls through to
+   the full structural check below.
+
+   Before the first reservation both are 0, so the span is 0 and everything is rejected --
+   correct, since nothing has been allocated yet and no box can exist.
+
+   The point is INLINABILITY: the runtime is compiled in the same clang invocation as the
+   emitted IR, so a small enough fast path is inlined into the caller and the call vanishes.
+   The slow path stays behind a real call so the inlined body stays tiny. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NOVA_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define NOVA_NOINLINE __declspec(noinline)
+#else
+#define NOVA_NOINLINE
+#endif
+
+static inline int nova_unbox_cannot_be_box(int64_t handle) {
+    uintptr_t base = g_oa_region_base;
+    uintptr_t span = g_oa_region_cap - base;
+    return ((uintptr_t)handle - base) >= span;
+}
+
+NOVA_NOINLINE static int64_t nova_rt_unbox_slow(int64_t handle) {
     if (nova_is_box(handle)) return ((NovaBox*)(uintptr_t)handle)->payload;
     return handle;
+}
+
+int64_t nova_rt_unbox(int64_t handle) {
+    if (nova_unbox_cannot_be_box(handle)) return handle;
+    return nova_rt_unbox_slow(handle);
 }
 
 /* Lazily mint the three immortal singleton oddball cells (null / true / false). Reuses
@@ -1477,13 +1522,18 @@ int64_t nova_rt_bool(int64_t v) { nova_rt_oddballs_init(); return v ? g_true_box
    model overhaul deletes the magnitude heuristic that used to recover unboxed
    float bits). A BOOL box is still unboxed to raw 0/1 so existing truthiness and
    bool handling are unchanged (no regression). See VALUE_MODEL_OVERHAUL.md. */
-int64_t nova_rt_unbox_elem(int64_t handle) {
+NOVA_NOINLINE static int64_t nova_rt_unbox_elem_slow(int64_t handle) {
     if (nova_is_box(handle)) {
         NovaBox* bx = (NovaBox*)(uintptr_t)handle;
         if (bx->kind == NOVA_BOX_FLOAT) return handle;  /* keep float boxed */
         return bx->payload;                              /* bool -> raw 0/1 */
     }
     return handle;
+}
+
+int64_t nova_rt_unbox_elem(int64_t handle) {
+    if (nova_unbox_cannot_be_box(handle)) return handle;   /* see nova_rt_unbox above */
+    return nova_rt_unbox_elem_slow(handle);
 }
 
 /* Convert a NOVA container element to a double. An element may be a boxed float

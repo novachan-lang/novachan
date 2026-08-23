@@ -681,12 +681,65 @@ from assumption rather than measurement. Every future item gets grepped before i
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | S4.2 shipped, extend |
+| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL 2026-08-23** — scalar float call path **2.21x → 1.69x C** (inline unbox fast-reject); array ~1.5x; residual needs the param-representation change |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
 | 3.5 | Process-scoped arena allocators | C/Zig | M | **✅ ALREADY EXISTS** — per-task arenas, `nova_task_arena_cleanup` |
 | 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
+
+---
+
+### 🔧 3.1 PARTIAL (2026-08-23) — scalar float 2.21x → 1.69x C, and the real numbers measured
+
+**The plan's "1.7x" was one stale number covering two very different paths.** Measured against C
+(-O2), best-of-3:
+
+| path | before | after | benchmark |
+|---|---|---|---|
+| **scalar float through function calls** | **2.21x** | **1.69x** | `_f31_scalar.nova` vs `_f31_scalar.c` |
+| float array sum | ~1.5x | ~1.5x (unchanged) | `_fa_bench.nova` vs `_fa_bench.c` |
+
+The scalar call path — not arrays — was the worse offender, exactly as 3.3 predicted.
+
+**Root cause, confirmed in the IR.** `axpy(a: float, x: float, y: float) -> float` emits **three
+`nova_rt_unbox` calls, one per declared-float parameter**. Not a generics problem (3.3 proved
+erasure is free): an i64 float argument may be a box OR a raw IEEE-754 pattern and the callee
+cannot tell, so it unboxes defensively. Each of those was a full `nova_mem_find_tag` — range +
+alignment + ownership-table + header reads.
+
+Note what the compiler *already* gets right: `%r4.af = bitcast i64 %r2 to double` — the
+intermediate is NOT unboxed, because the compiler tracks that it just produced a raw value.
+**Parameters simply are not in that known-raw set.**
+
+**The fix (runtime only — zero compiler change).** The managed object space is ONE contiguous
+reservation, so a value outside `[base, cap)` cannot be a NOVA object, and a raw double is nowhere
+near it (`1.5` = `0x3FF8000000000000` ≈ 4.6e18). `nova_rt_unbox`/`nova_rt_unbox_elem` now reject on
+two loads, a subtract and a compare, with the structural check behind a `noinline` slow path.
+
+**Why `base`/`cap` and NOT `g_oa_region_end`:** base and cap are written once in `nova_oa_reserve`
+and never change, so LLVM may hoist the loads out of loops. `g_oa_region_end` **grows** — hoisting
+a load of a moving bound would let a box allocated later fall outside a stale range and be silently
+misread as a raw double. `[base, cap)` is a conservative *superset*, so the reject stays sound.
+
+**Correctness gated** (`_f31_float_unbox_test.nova`, auto-discovered): boxed floats via
+`list<any>` and dict, boxed→float-param, raw→float-param, `any` round-trip, negative and zero —
+the cases where a wrong reject would return a pointer bit-pattern as an astronomical double.
+
+**⚠️ Two measurements that redirected the work:**
+1. **LTO buys nothing.** `-flto -fuse-ld=lld` measured **59 ms vs 59 ms** — identical. The residual
+   call overhead is free; it was `find_tag`'s *body* that cost. Do not reach for LTO here.
+2. Without `-flto` there is **no cross-TU inlining**, so `nova_rt_unbox` is still a real call in the
+   shipped build. It just got cheap. That is why the win is 24% and not more.
+
+**What is left, and the decisive experiment for it.** Closing the remaining 1.69x needs declared-
+`float` params to be treated as **known-raw**, eliminating the unbox rather than cheapening it. That
+is a parameter-representation change and is genuinely risky: if a boxed float ever reaches a callee
+that assumes raw, a *pointer* is read as a double — silent wrong answers, the worst failure class.
+The blocking question is whether NOVA inserts a coercion when an `any` holding a boxed float is
+passed to a `float` param. **Test that first** (pass `mixed[0]` from a `list<any>` to a float param
+and read the emitted call site); the answer decides whether the safe form is caller-side
+normalisation or a non-address-taken specialised entry point.
 
 ---
 
