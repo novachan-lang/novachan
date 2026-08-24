@@ -684,7 +684,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 | 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL 2026-08-24** — scalar float **2.21x → 1.69x C**; Phase 2 complete (3 rules, 6/6 gate, 5 defects closed); float-array work still open |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
-| 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
+| 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **✅ DONE 2026-08-24** — `bytes_view` is O(1) zero-copy; `bytes_slice` still copies (contract kept); writes through a view abort; gated CI 2k8 |
 | 3.5 | Process-scoped arena allocators | C/Zig | M | **✅ ALREADY EXISTS** — per-task arenas, `nova_task_arena_cleanup` |
 | 3.6 | `@stack` hints for stack allocation | C/Zig | S | **❌ REJECTED 2026-08-21 — already automatic (SROA), a hint would be redundant** |
 
@@ -999,6 +999,53 @@ spans three things at once: struct float fields are stored as raw doubles; SROA 
 tag the by-name helper depends on; and `frt` is monotone-refining, so a return type once published
 as float cannot be widened. That is VALUE_MODEL_OVERHAUL work, not a patch — which is why it is
 tracked here with an executable repro instead of being half-done.
+
+### ✅ 3.4 CLOSED (2026-08-24) — zero-copy read-only buffer views
+
+`bytes_slice` memcpy's, which was the confirmed gap. The fix is **additive**: `bytes_view(b, start,
+end)` is O(1) with no payload allocation, and `bytes_slice` keeps copying.
+
+**Why not just make `slice` a view.** Copying IS slice's contract — callers are entitled to mutate
+the result. Turning it into a view would silently alias every existing caller's buffer, which is the
+same silent-corruption class as the float bugs above. The KAT asserts this directly, so it FAILS if
+anyone later "optimises" slice into a view.
+
+**How zero-copy is proven.** By observable aliasing — write the parent, read it back through the
+view — not by timing and not by reading IR. Aliasing can only hold if no copy was made, and unlike a
+benchmark it cannot pass by luck on a fast machine.
+
+**Encoding.** `NovaBytes` gains one field, `owner`: non-zero means the struct borrows `data` from
+that parent, which is `rc_inc`'d at creation and `rc_dec`'d in `rc_free` (so a view outliving the
+scope that built its parent — the ordinary case — is safe, and a chain of views unwinds one hop at a
+time). `NOVA_BYTES_IS_VIEW` is the single predicate.
+
+**Writes through a view abort loudly.** A silent no-op loses data; an allowed write corrupts a
+buffer the writer does not own. Both are the silent-wrong-data class. `bytes_append` is why the guard
+is mandatory rather than cosmetic: on a view `size >= cap` holds by construction, so an unguarded
+append would call `nova_back_grow` on **borrowed** storage and realloc the parent's buffer out from
+under it. The audit surface is exactly three functions — `bytes_set`, `bytes_append`,
+`bytes_append_str` — because `NovaBuffer` is a separate type.
+
+**Two bugs the probes caught before this could ship, both worth remembering:**
+
+1. The first encoding also set `cap = 0` as a redundant view marker. That silently broke `find_tag`,
+   whose structural validation is `cap < size -> reject` — a *security* predicate whose own comment
+   warns that weakening it reintroduces a CVE-class wild read. So a view stopped being recognised as
+   bytes by every polymorphic path: `==`, `str()`, `deep_copy`, `json`. Caught **only** by the
+   `view == copy` assertion in the integration section — the happy-path assertions all passed.
+   Fixed with `cap = size`; `owner` is the sole marker. Lesson: assert that a new value type works
+   everywhere its type works, not just in the feature's own code path.
+2. `sizeof(NovaBytes)` went 24 -> 32, but `find_tag` still bounds-checked `ptr + 24` while the
+   mutation guards read offset 24..32. Tightened to `+32`, which rejects nothing legitimate (every
+   bytes struct is now a 32-byte allocation) and matches the `TARRAY` arm's existing `+32`.
+
+**Gated:** `_bytes_view_gate.ps1`, CI stage 2k8, 4/4 — including a NEGATIVE test
+(`_bytes_view_ro_neg.nova`) that must abort. A gate checking only the happy path would pass just as
+well with the read-only guard deleted.
+
+**Also fixed in the harness:** `_impact_gate.ps1` now understands the `*_neg` expected-fail
+convention (non-zero exit = pass, and a `_neg` test that *succeeds* is a real failure). Without it a
+`-Match` sweep reported every negative test as broken, which trains you to ignore gate output.
 
 #### Tooling: `_impact_gate.ps1` — the fast loop
 

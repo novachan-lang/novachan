@@ -184,6 +184,10 @@ Write-Host "`n[CI 2k7/3] Param representation (no hidden box; builtin ABI; int-t
 & .\_f31_param_repr_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k7 (param representation) ==="; exit 1 }
 
+Write-Host "`n[CI 2k8/3] Zero-copy read-only buffer views (aliasing + slice-still-copies + read-only guard)..."
+& .\_bytes_view_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k8 (buffer views) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }

@@ -1308,7 +1308,12 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
            CVE-class wild read. */
         if (NOVA_RC_TAG(ptr) == NOVA_MEM_BYTES) {
             if (nova_heap_base) {
-                if ((uintptr_t)((const char*)ptr + 24) > nova_heap_top) return (NovaMemTag)-1;
+                /* 32, not 24: NovaBytes gained the `owner` field (3.4 views), so the struct is
+                   32 bytes and the mutation guards read offset 24..32. Every legitimate bytes
+                   struct is a 32-byte allocation, so tightening rejects nothing real -- it just
+                   stops a faked pointer near the heap top from being over-read. Matches the
+                   TARRAY arm below, which already validates +32 for its 4-field struct. */
+                if ((uintptr_t)((const char*)ptr + 32) > nova_heap_top) return (NovaMemTag)-1;
                 int64_t bsz = ((const int64_t*)ptr)[1];
                 int64_t bcp = ((const int64_t*)ptr)[2];
                 if (bsz < 0 || bcp < bsz || (uint64_t)bcp > (1ULL << 40)) return (NovaMemTag)-1;
@@ -2028,7 +2033,22 @@ typedef struct {
     uint8_t* data;
     int64_t  size;
     int64_t  cap;
+    /* 3.4 ZERO-COPY VIEW. Non-zero => this NovaBytes BORROWS `data` from the NovaBytes at
+       `owner` (rc_inc'd at creation, rc_dec'd in rc_free) and must never free it. The first
+       three fields are unchanged and at unchanged offsets, so find_tag's structural predicate
+       (shared with NovaList) is unaffected.
+
+       `owner` is the SOLE marker -- NOVA_BYTES_IS_VIEW is the only predicate anything should
+       use. An earlier cut also set cap = 0 as a redundant sentinel and that was a bug: find_tag
+       structurally validates bytes with `cap < size -> reject`, so the view stopped being
+       recognised as bytes by every polymorphic path. A view carries cap == size. */
+    int64_t  owner;
 } NovaBytes;
+
+/* A view borrows its storage: every in-place mutator MUST refuse it. bytes_append is the
+   dangerous one -- on a view size >= cap holds by construction, so an unguarded append would
+   call nova_back_grow on BORROWED memory and realloc/free the parent's buffer. */
+#define NOVA_BYTES_IS_VIEW(b) ((b) && (b)->owner != 0)
 
 /* ── LOCK-4 inc3d: PACKED TYPED ARRAYS ────────────────────────────────────────
    A u8[]/i32[]/f32[] stored PACKED at its element width -- 1 MB for a million u8, not 8 MB.
@@ -13465,6 +13485,21 @@ static void nova_rc_free(void* ptr) {
                header). Arena-bytes never reach here (rc_dec no-ops arena objects), and Stage-0
                bytes data is always plain calloc, so an unconditional free(b->data) is correct. */
             NovaBytes* bb = (NovaBytes*)ptr;
+            /* 3.4: a VIEW borrows `data` from bb->owner and must NOT free it -- doing so would
+               free the parent's live buffer (or a pointer into the middle of it, which is not even
+               a valid free target). Release the parent reference taken in nova_rt_bytes_view
+               instead; that is what allows a view to outlive the scope that built its parent.
+               rc_dec is used rather than a direct free so a chain of views unwinds one hop at a
+               time and the root is released only when the last borrower goes away. */
+            if (bb->owner != 0) {
+                int64_t parent = bb->owner;
+                bb->owner = 0;
+                bb->data = NULL;
+                bb->size = 0;
+                nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
+                nova_rc_dec(parent);
+                break;
+            }
             if (bb->data) free(bb->data);
             nova_oa_free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
@@ -17591,6 +17626,7 @@ int64_t nova_rt_bytes_create(int64_t size_val) {
     b->data = (uint8_t*)nova_back_calloc((size_t)cap);
     b->size = sz;
     b->cap = cap;
+    b->owner = 0;   /* owns its storage; see NOVA_BYTES_IS_VIEW */
     if (!b->data) { b->size = 0; b->cap = 0; }
     return (int64_t)(uintptr_t)b;
 }
@@ -17603,6 +17639,7 @@ int64_t nova_rt_bytes_get(int64_t handle, int64_t index) {
 
 void nova_rt_bytes_set(int64_t handle, int64_t index, int64_t value) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (NOVA_BYTES_IS_VIEW(b)) nova_panic("bytes_set: cannot write through a read-only bytes_view");
     if (!b || index < 0 || index >= b->size) return;
     b->data[index] = (uint8_t)(value & 0xFF);
 }
@@ -17611,6 +17648,41 @@ int64_t nova_rt_bytes_len(int64_t handle) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
     if (!b) return 0;
     return b->size;
+}
+
+/* 3.4 -- bytes_view(b, start, end): a READ-ONLY window onto b's storage. No allocation of the
+   payload, no memcpy; O(1) regardless of length, which is the C/Rust parity this closes.
+   bytes_slice below deliberately still COPIES: callers of slice are entitled to mutate the result,
+   so silently aliasing them would corrupt buffers they own. The two are separate operations.
+
+   Bounds are CLAMPED, never trusted: start < 0 -> 0, end > size -> size, start >= end -> empty.
+   An empty result is a normal owning buffer, not a view -- there is nothing to borrow, so it needs
+   no parent reference and stays freely mutable.
+
+   The parent is rc_inc'd so it cannot be freed while the view is alive (a view escaping the scope
+   that built its parent is the ordinary case, not a corner one). A view OF a view borrows from the
+   inner view, whose own reference keeps the root alive -- so nesting is safe without flattening,
+   and rc_dec unwinds the chain one hop at a time. */
+int64_t nova_rt_bytes_view(int64_t handle, int64_t start, int64_t end) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b || !b->data) return nova_rt_bytes_create(0);
+    if (start < 0) start = 0;
+    if (end > b->size) end = b->size;
+    if (start >= end) return nova_rt_bytes_create(0);
+    NovaBytes* v = (NovaBytes*)nova_heap_alloc(sizeof(NovaBytes), NOVA_MEM_BYTES);
+    if (!v) return nova_rt_bytes_create(0);
+    v->data  = b->data + start;
+    v->size  = end - start;
+    /* cap == size, NOT 0. find_tag structurally validates every NovaBytes with `cap < size ->
+       reject` (a deliberate, security-critical defense: without it an integer faking the tag
+       magic becomes a wild read). A cap of 0 with size > 0 fails that check, so the view was not
+       recognised as bytes at all by any polymorphic path -- ==, str(), deep_copy and json all
+       silently fell through. Caught by the `view == copy` assertion in _bytes_view_kat.
+       cap == size is also honest: there is exactly `size` bytes of space here, and no more. */
+    v->cap   = v->size;
+    v->owner = handle;
+    nova_rc_inc(handle);   /* keeps the parent alive for the view's whole lifetime */
+    return (int64_t)(uintptr_t)v;
 }
 
 int64_t nova_rt_bytes_slice(int64_t handle, int64_t start, int64_t end) {
@@ -17650,6 +17722,9 @@ int64_t nova_rt_bytes_concat(int64_t ah, int64_t bh) {
    -- the foundation for streaming/compression output and request-body accumulation. */
 int64_t nova_rt_bytes_append(int64_t handle, int64_t byte_val) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    /* MUST come before the grow check: on a view size >= cap always holds, so falling through
+       would nova_back_grow BORROWED storage and free the parent's buffer. */
+    if (NOVA_BYTES_IS_VIEW(b)) nova_panic("bytes_append: cannot append to a read-only bytes_view");
     if (!b) return handle;
     if (b->size >= b->cap) {
         int64_t newcap = b->cap < 16 ? 16 : b->cap * 2;
@@ -17670,6 +17745,7 @@ int64_t nova_rt_bytes_append(int64_t handle, int64_t byte_val) {
    Returns the same handle (only b->data may be reallocated). Text semantics (strlen length, like str concat). */
 int64_t nova_rt_bytes_append_str(int64_t handle, int64_t str_ptr) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (NOVA_BYTES_IS_VIEW(b)) nova_panic("bytes_append_str: cannot append to a read-only bytes_view");
     if (!b) return handle;
     const char* s = nova_str_safe(str_ptr);
     if (!s) return handle;

@@ -80,7 +80,11 @@ if ($Tests.Count -gt 0) {
         Invoke-Timed -FilePath $ClangPath -Arguments "-c -O2 -DSQLITE_THREADSAFE=0 `"$sqliteSrc`" -o `"$sqliteObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 240000 -WorkingDirectory $PSScriptRoot | Out-Null
     }
 
-    $maxParallel = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount - 2))
+    # Half the cores, matching the arc's reservation: the whole point is that this stays usable
+    # WHILE a full arc runs in the background, and 6 here + 4 there would oversubscribe an
+    # 8-core box and push test compiles into their timeouts -- spurious failures on both sides.
+    $maxParallel = [Math]::Max(2, [Math]::Min(8, [int]([Environment]::ProcessorCount / 2)))
+    if ($env:NOVA_CI_PARALLEL) { $maxParallel = [Math]::Max(1, [int]$env:NOVA_CI_PARALLEL) }
     $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxParallel)
     $pool.Open()
     $jobs = New-Object System.Collections.ArrayList
@@ -105,10 +109,22 @@ if ($Tests.Count -gt 0) {
         } catch {
             $r = @{ Name = $job.Name; Status = "FAIL"; Detail = "EXCEPTION: $($_.Exception.Message)" }
         } finally { $job.PS.Dispose() }
+        # EXPECTED-FAIL convention: a program named *_neg.nova asserts that something is REJECTED,
+        # so a non-zero exit is the pass condition. Without this a -Match sweep reports every
+        # negative test as broken, which trains you to ignore the gate's output -- the worst thing
+        # a gate can do. The inverse is checked too: a _neg test that SUCCEEDS is a real failure,
+        # because the thing it was supposed to reject got through.
+        $isNeg = $r.Name -like "*_neg"
         switch ($r.Status) {
-            "PASS" { Write-Host "PASS $($r.Name)" }
+            "PASS" {
+                if ($isNeg) { $fail++; $failures += "$($r.Name) (expected-fail test SUCCEEDED)"; Write-Host "FAIL $($r.Name)  (expected-fail test SUCCEEDED)" }
+                else        { Write-Host "PASS $($r.Name)" }
+            }
             "SKIP" { Write-Host "SKIP $($r.Name)" }
-            default { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail))" }
+            default {
+                if ($isNeg) { Write-Host "PASS $($r.Name)  (rejected as expected: $($r.Detail))" }
+                else        { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail))" }
+            }
         }
     }
     $pool.Close()

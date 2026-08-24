@@ -1,0 +1,102 @@
+// 3.4 — zero-copy read-only buffer views (`bytes_view`).
+//
+// WHY A NEW BUILTIN RATHER THAN CHANGING bytes_slice. bytes_slice memcpy's, and that IS its
+// contract: callers are entitled to mutate the result without touching the parent. Making it a
+// view would silently alias every existing caller's buffer -- exactly the class of silent
+// corruption this project keeps paying for. So bytes_slice keeps copying, and the zero-copy
+// capability is additive. Assertion 2 below locks that in: it FAILS if anyone later "optimises"
+// bytes_slice into a view.
+//
+// HOW ZERO-COPY IS PROVEN. Not by timing (noisy) and not by reading IR (a view is a runtime
+// property). It is proven by OBSERVABLE ALIASING: write to the parent, and the view must see it.
+// That can only be true if no copy was made.
+//
+// LIFETIME. A view borrows the parent's storage, so the parent must outlive it. The view holds a
+// reference to the parent, which is what assertion 5 exercises -- the parent is a function-local
+// that goes out of scope while the view escapes.
+
+fn make_escaping_view() -> any
+    let b = bytes_create(4)
+    bytes_set(b, 0, 42)
+    bytes_set(b, 1, 43)
+    // The view escapes; `b` does not. Without the parent reference this is a use-after-free.
+    bytes_view(b, 0, 2)
+
+fn main()
+    let src = bytes_create(8)
+    for i in 0..8
+        bytes_set(src, i, i * 10)
+
+    // ── 1. a view SHARES storage ─────────────────────────────────────────────────────────────
+    let v = bytes_view(src, 2, 6)
+    assert(bytes_len(v) == 4, "view length is end-start")
+    assert(bytes_get(v, 0) == 20, "view[0] reads through to the parent")
+    assert(bytes_get(v, 3) == 50, "view[3] reads through to the parent")
+
+    // The zero-copy proof: a parent write is visible through the view.
+    bytes_set(src, 2, 99)
+    assert(bytes_get(v, 0) == 99, "ZERO-COPY: view observes a parent write")
+
+    // ── 2. bytes_slice still COPIES (contract unchanged) ─────────────────────────────────────
+    let s = bytes_slice(src, 2, 6)
+    assert(bytes_get(s, 0) == 99, "slice starts equal to the source")
+    bytes_set(src, 2, 77)
+    assert(bytes_get(s, 0) == 99, "slice is INDEPENDENT of later parent writes (still a copy)")
+    assert(bytes_get(v, 0) == 77, "view still aliases after the slice was taken")
+
+    // ── 3. bounds are clamped, never out-of-range ───────────────────────────────────────────
+    assert(bytes_len(bytes_view(src, 5, 5)) == 0, "start == end is empty")
+    assert(bytes_len(bytes_view(src, 6, 3)) == 0, "start > end is empty, not negative")
+    assert(bytes_len(bytes_view(src, 6, 100)) == 2, "end past the buffer clamps to size")
+    assert(bytes_len(bytes_view(src, 0 - 3, 2)) == 2, "negative start clamps to 0")
+    assert(bytes_len(bytes_view(src, 0, 8)) == 8, "a full-range view is the whole buffer")
+
+    // ── 4. a view of a view ─────────────────────────────────────────────────────────────────
+    let vv = bytes_view(v, 1, 3)
+    assert(bytes_len(vv) == 2, "nested view length")
+    assert(bytes_get(vv, 0) == 30, "nested view reads through both hops")
+    bytes_set(src, 3, 88)
+    assert(bytes_get(vv, 0) == 88, "nested view still aliases the ROOT buffer")
+
+    // ── 5. a view outliving the scope that created its parent ───────────────────────────────
+    let esc = make_escaping_view()
+    assert(bytes_len(esc) == 2, "escaped view length")
+    assert(bytes_get(esc, 0) == 42, "escaped view still readable (parent kept alive)")
+    assert(bytes_get(esc, 1) == 43, "escaped view fully intact")
+
+    // ── 6. a view must work EVERYWHERE bytes work ───────────────────────────────────────────
+    // A view is a NovaBytes with borrowed storage, so every reader that dispatches on the bytes
+    // tag has to accept it unchanged. These are the readers that touch data/size directly --
+    // if any of them mishandled the view they would read the parent's full buffer instead of the
+    // window, so each assertion pins the WINDOW, not the parent.
+    let base = bytes_create(4)
+    bytes_set(base, 0, 222)
+    bytes_set(base, 1, 173)
+    bytes_set(base, 2, 190)
+    bytes_set(base, 3, 239)
+    let w = bytes_view(base, 1, 3)
+
+    assert(bytes_len(w) == 2, "len_any on a view is the window, not the parent")
+    assert(bytes_to_hex(w) == "adbe", "to_hex reads only the window")
+    assert(bytes_to_hex(base) == "deadbeef", "parent unaffected by having a view taken")
+
+    // A view and a copy of the same range must compare and hash as equal: borrowed vs owned
+    // storage is an implementation detail, never an observable difference in VALUE.
+    let cpy = bytes_slice(base, 1, 3)
+    assert(w == cpy, "a view equals the copy of the same range")
+    assert(bytes_to_hex(cpy) == bytes_to_hex(w), "view and copy render identically")
+
+    // to_list must yield the window's bytes in order.
+    let lst = bytes_to_list(w)
+    assert(len(lst) == 2, "to_list length is the window")
+    assert(lst[0] == 173, "to_list[0]")
+    assert(lst[1] == 190, "to_list[1]")
+
+    // Concatenating FROM a view produces a normal owning buffer, and must not alias.
+    let cat = bytes_concat(w, w)
+    assert(bytes_len(cat) == 4, "concat of two views")
+    assert(bytes_to_hex(cat) == "adbeadbe", "concat copies the window twice")
+    bytes_set(base, 1, 1)
+    assert(bytes_to_hex(cat) == "adbeadbe", "concat result is INDEPENDENT of the parent")
+
+    print("bytes_view kat passed")
