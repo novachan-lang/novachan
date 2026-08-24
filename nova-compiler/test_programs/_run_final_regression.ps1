@@ -582,7 +582,15 @@ if (Test-Path $sqliteSrc) {
 Write-Host ""
 
 # ─── Step 2: Parallel test runner ───
-$maxParallel = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount - 2))
+# RESERVE CORES FOR THE INNER LOOP. This used to be ProcessorCount-2 (6 of 8 here), which
+# starved everything else on the box: a gen4 build alongside the run pushed test compiles
+# past their timeout and failed the CI on a ROTATING set of innocent tests (see the 150s
+# note in _test_worker.ps1 -- same cause). Since nothing WAITS on this run, it is in the
+# background, a slower arc costs nothing while being blocked costs everything. Half the
+# cores keeps _impact_gate.ps1 usable throughout and gives the run headroom, so it should
+# flake less too. Override with NOVA_CI_PARALLEL.
+$maxParallel = [Math]::Max(2, [Math]::Min(8, [int]([Environment]::ProcessorCount / 2)))
+if ($env:NOVA_CI_PARALLEL) { $maxParallel = [Math]::Max(1, [int]$env:NOVA_CI_PARALLEL) }
 Write-Host "Running tests ($maxParallel parallel)..."
 Write-Host ""
 
