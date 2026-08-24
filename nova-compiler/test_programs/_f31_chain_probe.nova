@@ -1,0 +1,65 @@
+// Transitive param-type propagation.
+//
+// THE BUG. ir_collect_param_types learns a parameter's type from call sites, but reseeded `st`
+// from DECLARED types on every round -- so what it learned about one function was never available
+// when it walked that function's body. An inferred type therefore stopped after one hop:
+//
+//     main -> cfwd(CPt, CPt)     learned
+//     cfwd -> cdot(p, q)         p/q still unknown here, so cdot resolved to NOTHING
+//
+// The consequence was silent data corruption, not slow code. Field OFFSETS still resolve (a slot
+// comes from the global name->slot map and needs no struct type), so the GEPs were right and only
+// the field TYPE was lost. The multiply then went through nova_rt_mul, which integer-multiplies
+// two double bit patterns: bits(1.5) and bits(3.0) each carry 51 trailing zero bits, so the
+// product had more than 64 and the answer was EXACTLY 0. Nothing crashed.
+//
+// Asserted by value AND structurally. The value catches the 0; the structure catches the case
+// where the answer is right but every float op went through dynamic dispatch, which no value
+// assertion can see and which is the entire point of 3.1.
+
+type CPt
+    cx: float
+    cy: float
+
+// Reached ONLY through cfwd -- there is no direct call to it anywhere in this program.
+fn cdot(a, b)
+    a.cx * b.cx + a.cy * b.cy
+
+fn cfwd(p, q)
+    cdot(p, q)
+
+// Two hops, so this proves a real fixpoint rather than one extra hardcoded level.
+fn cfwd2(p, q)
+    cfwd(p, q)
+
+// ── THE SOUNDNESS DIRECTION ──────────────────────────────────────────────────────────────────
+// Chaining must not propagate a type past the point where it stops being true. `cur` starts as
+// `root` (a dict) and is REASSIGNED on every hop, so after the first one it is whatever the
+// previous hop returned -- here a nested dict, then a LIST. `pget` is genuinely polymorphic and
+// must stay generic.
+//
+// This is the shape that broke std/core/getin: the warm-up inference ran a single pass, which
+// visits blocks in order, so it harvested `pget(cur, ...)` as "dict" from the seed and never saw
+// the reassignment contradict it. `cur[k]` then specialized to nova_rt_dict_get, which returns 0
+// for a LIST hop -- get_in(d, ["a","b",1]) gave 0 instead of 20. Silent wrong data.
+fn pget(c, k)
+    c[k]
+
+fn walk(root, path)
+    let cur = root
+    let n = len(path)
+    for i in 0..n
+        cur = pget(cur, path[i])
+    cur
+
+fn main()
+    let p = CPt { cx: 1.5, cy: 2.5 }
+    let q = CPt { cx: 3.0, cy: 4.0 }
+
+    // 1.5*3.0 + 2.5*4.0 = 4.5 + 10.0 = 14.5
+    print("chain1 " + str(cfwd(p, q)))
+    print("chain2 " + str(cfwd2(p, q)))
+
+    // dict -> dict -> list index. 20 iff pget stayed generic.
+    let d = {"a": {"b": [10, 20]}}
+    print("widen " + str(walk(d, ["a", "b", 1])))

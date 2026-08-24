@@ -22836,7 +22836,12 @@ fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
                 return 1
             return 0
 
-fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
+// prev_fpt  IN  : the previous round's result. Seeding `st` from it is what lets an inferred param
+//                 type CHAIN through a second function -- see the st seeding below. {} = cold start.
+// chg       OUT : chg["n"] = how many entries differ from prev_fpt, so the driver's fixpoint keeps
+//                 iterating while param types are still moving. Without it the loop stops as soon
+//                 as RETURN types settle, which dropped a param type mid-propagation.
+fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict, prev_fpt: dict, chg: dict) -> dict
     let fpt = {}
     // 3.1: SEED FROM THE DECLARATION FIRST, and treat a declared `float` as AUTHORITATIVE.
     // Everything below derives param types from CALL SITES and collapses any disagreement to
@@ -22875,6 +22880,7 @@ fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
                     // call site can route the list's element type to the lambda body. Empty
                     // tramp_map (flag NOVA_S5_HOF off) => no HOF harvest => byte-identical.
                     let mc_def = {}
+                    let _spi = 0
                     for p in fp
                         match p
                             IrParam(pname, ptype) =>
@@ -22886,8 +22892,56 @@ fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
                                         // and every raw-float caller heap-allocated a box.
                                         if tk == "int" or tk == "str" or tk == "list" or tk == "dict" or tk == "float"
                                             st[pname] = tk
+                                        else if contains(prev_fpt, fname)
+                                            // CHAINING. Without this an inferred param type dies
+                                            // after ONE hop. main teaches the pass that `cfwd`
+                                            // takes CPt, but walking cfwd's body reseeded its
+                                            // params from DECLARED types, so `cdot(p, q)` inside
+                                            // it saw two unknowns and cdot resolved to nothing.
+                                            // Not merely slow: field OFFSETS still resolve (a slot
+                                            // comes from the global name->slot map and needs no
+                                            // struct type), so the GEPs were right and only the
+                                            // field TYPE was lost. The multiply then went through
+                                            // nova_rt_mul, which integer-multiplies two double bit
+                                            // patterns -- bits(1.5) and bits(3.0) each carry 51
+                                            // trailing zero bits, so the product was EXACTLY 0.
+                                            // Silent wrong data, no crash. (_f31_chain_probe.nova)
+                                            let _sk = str(_spi)
+                                            if contains(prev_fpt[fname], _sk)
+                                                st[pname] = prev_fpt[fname][_sk]
+                                            else
+                                                st[pname] = "any"
                                         else
                                             st[pname] = "any"
+                        _spi = _spi + 1
+                    // Warm-up inference, run to a FIXPOINT rather than once. A local reassigned
+                    // with a different type must widen BEFORE any call site is harvested below,
+                    // and one pass visits blocks in order, so it records the local's FIRST type
+                    // and never sees the reassignment that contradicts it.
+                    //
+                    // Measured, and it is a soundness bug not a missed optimisation. std/core/getin
+                    // has a deliberately polymorphic helper:
+                    //
+                    //     fn step_get(cur, step)
+                    //         if type_of(cur) == "dict"
+                    //             return cur[step]
+                    //         return cur[step]          // cur may be a LIST
+                    //
+                    // and get_in walks `let cur = obj` / `cur = step_get(cur, step)`. Once param
+                    // types chain, `cur` is seeded from obj ("dict"), a single pass harvested
+                    // step_get(cur, ...) as "dict" before the reassignment widened it, and
+                    // `cur[step]` specialized to nova_rt_dict_get -- which returns 0 for the LIST
+                    // hop in get_in(d, ["a","b",1]). Silent 0 instead of 20.
+                    //
+                    // Three rounds matches ir_infer_types, and rt is reset each round for the same
+                    // reason it is there: register types are per-round, only `st` carries over.
+                    let _wu = 0
+                    while _wu < 3
+                        _wu = _wu + 1
+                        rt = {}
+                        for block in fblocks
+                            ir_infer_block(rt, st, frt, {}, block)
+                    rt = {}
                     for block in fblocks
                         ir_infer_block(rt, st, frt, {}, block)
                     for block in fblocks
@@ -22977,6 +23031,19 @@ fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
                                                                     fpt[_lname][_lk] = "any"
                                                             else
                                                                 fpt[_lname][_lk] = _ek
+    // Report movement so the driver keeps iterating while param types are still propagating.
+    // Counting fpt-vs-prev_fpt DIFFERENCES (not "did we write") keeps this monotone: a round that
+    // re-derives the same answer reports zero and the loop stops.
+    let _n = 0
+    for _cc in keys(fpt)
+        for _ck in keys(fpt[_cc])
+            let _old = ""
+            if contains(prev_fpt, _cc)
+                if contains(prev_fpt[_cc], _ck)
+                    _old = str(prev_fpt[_cc][_ck])
+            if str(fpt[_cc][_ck]) != _old
+                _n = _n + 1
+    chg["n"] = _n
     fpt
 
 // ── IR → LLVM Emission ───────────────────────────────────────────────────────
@@ -27721,10 +27788,18 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             _s5_tramp_map[_s5_sp[0]] = [_s5_sp[1], _s5_sp[2]]
     let changed = true
     let pass_count = 0
+    // Param types now CHAIN: each round seeds from the last one's result, so a type learned at a
+    // call site in main reaches a callee two hops down. This loop already existed for RETURN types;
+    // _pfpt_chg is what keeps it running while PARAM types are still moving, because return types
+    // can settle first and used to stop the loop mid-propagation.
+    let _pfpt_chg = {}
     while changed and pass_count < 6
         changed = false
         pass_count = pass_count + 1
-        fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map)
+        fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map, fpt, _pfpt_chg)
+        if contains(_pfpt_chg, "n")
+            if _pfpt_chg["n"] > 0
+                changed = true
         for ir_fn in all_fns
             match ir_fn
                 IrFunction(fname, fp, fret, fblocks, ftp, fex) =>
@@ -27739,7 +27814,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     if new_type != old_type and new_type != "any" and not contains(ti_state.ti_fn_hetero, fname)
                         frt[fname] = new_type
                         changed = true
-    fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map)
+    fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map, fpt, _pfpt_chg)
 
     // PERF P1 (beat-C struct math): mark every float-returning user fn that PROVABLY
     // returns raw double bits as "@raw@<fn>" in frt. ir_infer_one then types calls to

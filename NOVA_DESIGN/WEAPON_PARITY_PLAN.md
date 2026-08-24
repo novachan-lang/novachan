@@ -896,7 +896,7 @@ them apart, so a wrong guess becomes a silently wrong number rather than a slow 
 change is representation-stable.
 
 **Verified green:** `struct_perf_test`, `_pack_float_kat`, `_antimeridian_test`, `statsd_kat`,
-`statsd_ratefix_kat`, `_avro_kat_test`, and `_f31_param_repr_gate.ps1` **9/9**. Full CI both modes:
+`statsd_ratefix_kat`, `_avro_kat_test`, and `_f31_param_repr_gate.ps1` **11/11**. Full CI both modes:
 2862 PASS / 1 FAIL, the one failure being `forge_tls_upgrade_test`, which does live HTTPS to
 example.com and badssl.com and passes 4/4 in isolation on both this compiler and the previous one.
 
@@ -933,6 +933,72 @@ struct type there is not a slow path, it is a wrong field slot, i.e. memory corr
 work, tracked as its own item rather than smuggled into this one. Rule 4 asserts the shape that
 *does* work today (direct call typed, forwarding call must not erase it — exactly the regression
 above) and documents this case in the probe.
+
+#### ✅ CLOSED — an inferred param type now CHAINS through a second function
+
+This was recorded above as an open defect and is now fixed. `ir_collect_param_types` learned param
+types from call sites but reseeded `st` from **declared** types every round, so what it learned
+about one function was never available when it walked that function's body. An inferred type died
+after one hop:
+
+```nova
+fn cdot(a, b)          // reached ONLY through cfwd -- no direct call anywhere
+    a.cx * b.cx + a.cy * b.cy
+fn cfwd(p, q)
+    cdot(p, q)         // main taught the pass that cfwd takes CPt; cdot still saw two unknowns
+```
+
+**Fix.** Thread the previous round's result back in (`prev_fpt`) and seed `st` from it, so types
+propagate; and report movement (`chg["n"]`) so the driver's existing fixpoint keeps iterating.
+That last part is load-bearing and was easy to miss: the loop already ran up to six rounds, but
+`changed` was set only by **return**-type refinement, so it stopped as soon as those settled and
+dropped a param type mid-propagation. Verified at two hops, not one, so it is a real fixpoint
+rather than one extra hardcoded level.
+
+`chain1 0` / `chain2 0` → `14.5` / `14.5`, and `@cdot` lowers to `fmul`/`fadd` with zero
+`nova_rt_*`. Both are now gated (Rules 6, below).
+
+**It also exposed a latent library bug, which is the interesting part.** `_pack_float_kat`'s
+round-trip started failing: 1.0 packed as ~4.6e18. Not a compiler regression — chaining resolved a
+call site that had previously been invisible, and that new knowledge *conflicted*, so
+`pack_f64_be(v)` correctly widened from `float` to `any`. The two have **opposite** conventions:
+
+| param | who is responsible for boxing a float |
+|---|---|
+| declared `float` | the CALLEE — it unboxes defensively, so raw *or* boxed both read correctly |
+| `any` | the CALLER — and a caller holding an already-`any` value has nothing to box with |
+
+`_pack_one` passes a list element it cannot type, so raw double bits reached `float_to_bits`, which
+converts NUMERICALLY. The right fix is the annotation the function always deserved —
+`pack_f64_be(v: float)` (and `_le`, plus both `f32` forms) — because a declared-`float` param is
+the representation-**tolerant** contract. Left unannotated, a function that takes a float is one
+un-typeable caller away from silently wrong bytes on the wire.
+
+#### ⚠ OPEN GAP — address-taken function + raw float field (`_f31_polyfield_known_gap.nova`)
+
+Found by the adversarial half of the same probe. Pre-existing, verified against the previously
+committed compiler. Prints `poly 1.5 3.45845952088873e-323` where `poly 1.5 7` is correct.
+
+Specializing a parameter from call sites is only valid when every call site is visible. A function
+referenced by name lowers to a `make_closure` over a `__fnref_` trampoline, and that closure can be
+invoked from anywhere. `poly` is specialized to `CPt` on the strength of its one visible direct
+call, `frt["poly"]` is then labelled float, and the closure path reads `QPt`'s **int** field through
+that float label.
+
+**Three fixes were tried and every one was a lateral move — a different wrong answer, not a better
+one.** Recording them so they are not re-attempted:
+
+| attempt | result |
+|---|---|
+| Exclude address-taken fns from specialization | closure call right, **direct** call now wrong (`poly(p)` → `4609434218613702656`, the bits of 1.5 as an integer) |
+| Route un-inferrable field reads via `nova_rt_field_get` at **lowering** | correct mechanism, wrong time — the param fixpoint has not run, so every unannotated struct param still looks un-inferrable and `sdot` fell from `fmul` to a runtime name walk |
+| Same routing, **after** the fixpoint (right placement) | still wrong: non-`@repr(C)` structs are SROA'd onto the stack, and `field_get`'s tag guard accepts only heap structs → returned null, `poly(p)` → `0` |
+
+A real fix has to establish the invariant *a float in an `any` context is always boxed*, and that
+spans three things at once: struct float fields are stored as raw doubles; SROA removes the runtime
+tag the by-name helper depends on; and `frt` is monotone-refining, so a return type once published
+as float cannot be widened. That is VALUE_MODEL_OVERHAUL work, not a patch — which is why it is
+tracked here with an executable repro instead of being half-done.
 
 #### Tooling: `_impact_gate.ps1` — the fast loop
 

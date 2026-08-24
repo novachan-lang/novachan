@@ -125,6 +125,57 @@ if ($out -like "*anyp 2.5 7*") {
     Write-Host "  FAIL declared-any narrowed: '$got' (want 'anyp 2.5 7')"; $fail++
 }
 
+# --- RULE 6: an inferred param type CHAINS through a second function ----------------------
+# Separate probe, because it needs a function with NO direct call site at all. main teaches the
+# pass that cfwd takes CPt; cdot is reached only through cfwd. Before the fixpoint, cdot resolved
+# to nothing and the body fell back to nova_rt_mul on raw double bits -- bits(1.5)*bits(3.0) has
+# more than 64 trailing zero bits, so it returned EXACTLY 0. Value + structure, for the same
+# reason as Rule 4: with the type erased the code still runs, just dynamically.
+Remove-Item -Force _f31_chain_probe.ll, _f31_chain_probe.exe -ErrorAction SilentlyContinue
+$cc = Invoke-Timed -FilePath $exe.Path -Arguments "_f31_chain_probe.nova _f31_chain_probe.ll" -TimeoutMs 240000
+if ($cc.ExitCode -ne 0 -or -not (Test-Path _f31_chain_probe.ll)) {
+    Write-Host "  FAIL chain probe: emit (exit=$($cc.ExitCode))"; $fail++
+} else {
+    $cll = Get-Content _f31_chain_probe.ll
+    $cbody = @(); $cin = $false
+    foreach ($line in $cll) {
+        if ($line -match "^define .*@cdot\(") { $cin = $true; continue }
+        if ($cin) { if ($line -match "^\}") { break }; $cbody += $line }
+    }
+    $cdyn = @($cbody | Where-Object { $_ -match "@nova_rt_(mul|add)\(" })
+    $cnat = @($cbody | Where-Object { $_ -match "= (fmul|fadd) double " })
+    if ($cbody.Count -eq 0) {
+        Write-Host "  FAIL transitive dispatch: @cdot not found in IR"; $fail++
+    } elseif ($cdyn.Count -eq 0 -and $cnat.Count -ge 3) {
+        Write-Host "  ok   transitive dispatch: @cdot lowers native through a forwarding-only caller"
+    } else {
+        Write-Host "  FAIL transitive dispatch: @cdot has $($cdyn.Count) dynamic op(s), $($cnat.Count) native (want 0 / >=3)"
+        $fail++
+    }
+    $cb = Invoke-Timed -FilePath $exe.Path -Arguments "build _f31_chain_probe.nova" -TimeoutMs 240000
+    if ($cb.ExitCode -ne 0) { Write-Host "  FAIL chain probe: build"; $fail++ }
+    else {
+        $cr = Invoke-Timed -FilePath (Resolve-Path ".\_f31_chain_probe.exe").Path -Arguments "" -TimeoutMs 120000
+        $cout = $cr.StdOut.Trim()
+        # RULE 7: the soundness direction. Chaining must not propagate a type past the point it
+        # stops holding. `cur` is reassigned every hop (dict -> dict -> list), so `pget` must stay
+        # generic; specializing it to nova_rt_dict_get returns 0 on the list hop. This is exactly
+        # what broke std/core/getin (get_in(d,["a","b",1]) -> 0 instead of 20).
+        if ($cout -like "*widen 20*") {
+            Write-Host "  ok   polymorphic local widens (reassigned across dict/list stays generic)"
+        } else {
+            $gotw = ($cout -split [char]10 | Where-Object { $_ -like "widen *" }) -join ""
+            Write-Host "  FAIL polymorphic local narrowed: '$gotw' (want 'widen 20')"; $fail++
+        }
+        if ($cout -like "*chain1 14.5*" -and $cout -like "*chain2 14.5*") {
+            Write-Host "  ok   transitive param type correct at one hop AND two (14.5)"
+        } else {
+            Write-Host "  FAIL transitive param type: '$($cout -replace [char]10, "`n")' (want chain1 14.5 / chain2 14.5)"
+            $fail++
+        }
+    }
+}
+
 if ($fail -gt 0) { Write-Host "PARAM-REPR-GATE FAIL ($fail)"; exit 1 }
-Write-Host "PARAM-REPR-GATE OK (9/9 assertions)"
+Write-Host "PARAM-REPR-GATE OK (12/12 assertions)"
 exit 0

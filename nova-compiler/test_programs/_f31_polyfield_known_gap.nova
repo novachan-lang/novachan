@@ -1,0 +1,52 @@
+// ⚠ KNOWN GAP -- this program prints a WRONG number today. Deliberately NOT wired into nova_ci:
+// a gate that asserts current behaviour would lock the bug in. It exists so the defect has an
+// executable repro, and it is described in NOVA_DESIGN/WEAPON_PARITY_PLAN.md.
+//
+// Run it with:  gen3_test.exe build _f31_polyfield_known_gap.nova && _f31_polyfield_known_gap.exe
+// Correct output:  poly 1.5 7
+// Actual output:   poly 1.5 3.45845952088873e-323      <- the int 7 read as a double
+//
+// WHAT IS WRONG. Deriving a parameter type from call sites is only valid when EVERY call site is
+// visible. Referencing a function by name lowers to a make_closure over a `__fnref_<target>`
+// trampoline, and that closure can be invoked from anywhere -- a call the analysis never sees.
+// `poly` below is specialized to CPt on the strength of its ONE visible direct call, so
+// ir_analyze_return_type labels frt["poly"] float, and the closure path then reads QPt's INT field
+// through that float label.
+//
+// WHY IT IS STILL OPEN. Three fixes were tried and each was a LATERAL move, not an improvement:
+//
+//   1. Exclude address-taken functions from specialization. Makes the closure call right and the
+//      DIRECT call wrong (`poly(p)` printed 4609434218613702656 -- the bits of 1.5 as an integer),
+//      because `v.cx` then reads raw double bits into a register labelled `any`.
+//   2. Route un-inferrable field reads through nova_rt_field_get at LOWERING time. It boxes using
+//      the object's own slot-0 type hash, which is exactly right -- but at lowering the param-type
+//      fixpoint has not run yet, so every unannotated struct param still looks un-inferrable and
+//      `sdot`-style code fell from fmul/fadd to a runtime name walk.
+//   3. Same routing, moved AFTER the fixpoint (correct placement). Still wrong, for a different
+//      reason: non-@repr(C) structs are SROA'd onto the stack, and nova_rt_field_get's tag guard
+//      only accepts heap structs, so it returned null and `poly(p)` printed 0.
+//
+// WHAT A REAL FIX NEEDS. The invariant "a float in an `any` context is always boxed" has to hold,
+// which spans three places at once: struct float fields are stored as raw doubles; SROA removes the
+// runtime tag that the by-name helper depends on; and frt is monotone-refining, so a return type
+// once published as float cannot be widened. That is the VALUE_MODEL_OVERHAUL area, not a patch.
+
+type CPt
+    cx: float
+    cy: float
+
+type QPt
+    cx: int
+    cy: int
+
+fn poly(v)
+    v.cx
+
+fn apply_it(f, v)
+    f(v)
+
+fn main()
+    let p = CPt { cx: 1.5, cy: 2.5 }
+    let r = QPt { cx: 7, cy: 8 }
+    // want "poly 1.5 7"
+    print("poly " + str(poly(p)) + " " + str(apply_it(poly, r)))
