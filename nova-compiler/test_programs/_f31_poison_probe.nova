@@ -1,0 +1,99 @@
+// 3.1 gate input. Two independent representation rules, both of which produced SILENTLY WRONG
+// numbers before they were fixed — nothing crashed, the values were just quietly incorrect.
+//
+// RULE 1 (call-site poisoning). Does ONE boxed/`any` call site degrade a declared-`float`
+// parameter's representation for EVERY other caller?
+//   clean_f and poisoned_f have IDENTICAL signatures. clean_f is only ever called with raw
+//   floats; poisoned_f is called with raw floats AND once with a boxed list<any> element. If the
+//   annotation `x: float` guarantees a representation, both must compile the same. Before the
+//   fix, every raw call site of poisoned_f emitted nova_rt_box_float — a HEAP ALLOCATION — to
+//   pass a float into a parameter explicitly annotated `float`.
+//
+// RULE 2 (builtin raw-float ABI). A declared-`float` param handed to a runtime fn that reads its
+// argument as `any` MUST be boxed. `float_to_bits` -> nova_rt_float_to_bits -> nova_elem_to_double,
+// which converts a raw i64 NUMERICALLY, so the bit pattern of 1.0 (0x3FF0000000000000) came back
+// as 4.6e18. This broke Avro double encoding (_avro_kat_test) and nova_rt_tensor_scale. Note the
+// direct call is checked too: it was wrong even BEFORE the param change — a latent bug this fix
+// also closes.
+
+// RULE 4 (a forwarding call must not erase an unannotated param's struct type). `sdot`'s params
+// carry no annotation; their FPt type comes from the DIRECT call in main. `fwd` forwards its own
+// untyped params into sdot, so that second call site types both arguments "unknown" -- and a rule
+// that collapses a parameter whenever some call site is unknown erases the struct type, dropping
+// the whole body from fmul/fadd to nova_rt_mul/nova_rt_add. Asserted STRUCTURALLY as well as by
+// value, because the structural half is the half a value test cannot see: with FPt erased the
+// answer is still computable, just dispatched dynamically, and 3.1 is about exactly that dispatch.
+//
+// KNOWN LIMITATION, deliberately NOT asserted here: if sdot had NO direct call and were reached
+// only through fwd, nothing would resolve its params at all -- ir_collect_param_types rebuilds
+// fpt from declared types on every pass, so an inferred param type never chains through a second
+// function. That case returns a WRONG NUMBER, not merely a slow one (raw double bits integer-
+// multiplied: bits(1.5)*bits(3.0) has >64 trailing zero bits, so the product is exactly 0). It
+// predates 3.1 -- verified by running the previously committed compiler -- and is tracked in
+// WEAPON_PARITY_PLAN.md as its own defect.
+//
+// RULE 5 (a declared `any` is never narrowed). `anyfmt(v: any)` is reached once with a float
+// literal and once through `passthru`, whose own `any` parameter is untypeable at that call
+// site. Inferring the parameter from the visible call sites alone concludes "float", and the
+// int 7 is then reinterpreted as raw double bits -- forge_statsd shipped 1 as
+// 4.94065645841247e-324 this way. A VALUE assertion on purpose: nothing crashes.
+
+type FPt
+    fx: float
+    fy: float
+
+fn sdot(a, b)
+    a.fx * b.fx + a.fy * b.fy
+
+fn fwd(p, q)
+    sdot(p, q)
+
+fn anyfmt(v: any) -> string
+    str(v)
+
+fn passthru(v: any) -> string
+    anyfmt(v)
+
+fn clean_f(x: float) -> float
+    x * 2.0
+
+fn poisoned_f(x: float) -> float
+    x * 2.0
+
+fn to_bits(v: float) -> int
+    float_to_bits(v)
+
+fn main()
+    let mixed = [1.5, "s"]
+
+    // ── RULE 1 ────────────────────────────────────────────────────────────────
+    // clean_f: raw floats ONLY
+    let a = 3.5
+    let c1 = clean_f(a)
+    let c2 = clean_f(7.25)
+
+    // poisoned_f: the same raw floats, PLUS one boxed element
+    let p1 = poisoned_f(a)
+    let p2 = poisoned_f(7.25)
+    let p3 = poisoned_f(mixed[0])
+
+    print(str(c1) + " " + str(c2) + " " + str(p1) + " " + str(p2) + " " + str(p3))
+
+    // ── RULE 2 ────────────────────────────────────────────────────────────────
+    // 1.0 -> 0x3FF0000000000000 -> 4607182418800017408, through a declared-float
+    // param AND at a direct call site.
+    print("bits " + str(to_bits(1.0)) + " " + str(float_to_bits(1.0)))
+
+    // ── RULE 3 ────────────────────────────────────────────────────────────────
+    // An INT literal passed to a declared-float param must be converted to float.
+    // Without this, int 1 arrives as raw i64 1, and the callee's `rate * 1.0`
+    // bitcasts it to double 4.94e-324 instead of 1.0.
+    print("itof " + str(poisoned_f(3)))
+
+    // ── RULE 4 ──────────────────────────────────────────────────────────────────
+    let sp = FPt { fx: 1.5, fy: 2.5 }
+    let sq = FPt { fx: 3.0, fy: 4.0 }
+    print("sdot " + str(sdot(sp, sq)) + " " + str(fwd(sp, sq)))
+
+    // ── RULE 5 ──────────────────────────────────────────────────────────────────
+    print("anyp " + anyfmt(2.5) + " " + passthru(7))

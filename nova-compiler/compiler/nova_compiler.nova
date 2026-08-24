@@ -11703,9 +11703,15 @@ type IrBuilder
     ir_label_hdrs: dict
     ir_label_exits: dict
     ir_sredact: dict
+    // Parameters the SOURCE explicitly annotated `any`, keyed "<emit_name>#<index>". An explicit
+    // `any` is a declaration that the parameter is polymorphic, so call-site specialization must
+    // not narrow it -- see the guard in ir_collect_param_types. Undeclared params are NOT in here:
+    // they carry no such promise, and specializing them is what makes unannotated struct params
+    // lower to fmul instead of nova_rt_mul.
+    ir_any_params: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {}, {})
 
 // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
 // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
@@ -14780,6 +14786,27 @@ fn ir_flush_pending_block(b: IrBuilder)
         ir_emit_defers(b)
         ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure", b.ir_cur_line))
 
+// Declared parameter type -> IR type. ONE caller (the IrParam construction), so this is
+// exactly "what a declared param annotation means to the IR" and nothing else.
+//
+// 3.1: `float` used to fall through to `any`, which DISCARDED the annotation before
+// inference ever ran. The consequence was measured and is worth stating plainly: since
+// ir_collect_param_types derives param types purely from CALL SITES and collapses any
+// conflict to "any", ONE call passing a boxed/`val` argument -- e.g. `f(mixed[0])` from a
+// list<any>, anywhere in the program -- degraded the parameter for EVERY other caller, and
+// each of those then emitted nova_rt_box_float: a HEAP ALLOCATION per call, to pass a float
+// to a parameter explicitly annotated `float`. Two functions with identical signatures
+// compiled differently based on who else called them (see _f31_poison_probe.nova).
+// That is a hidden cost and action-at-a-distance, both of which NOVA's design rules forbid.
+//
+// Mapping it through keeps the annotation authoritative. It is SAFE in both directions
+// because callee bodies retain their defensive nova_rt_unbox on float params -- they are
+// box-TOLERANT, so a boxed value that still arrives (from a genuinely `any` call site) is
+// unboxed as before, while a raw value passes through untouched.
+//
+// `bool` deliberately still maps to int here: that is a separate representation question
+// (and the root of the documented "a bool cannot be type-validated" behaviour), with its
+// own blast radius. Not bundled in.
 fn source_type_to_ir(t: string) -> IrType
     if t == "int"
         ir_type_int()
@@ -14791,6 +14818,8 @@ fn source_type_to_ir(t: string) -> IrType
         IrType("dict", "", [], 0)
     else if t == "bool"
         ir_type_int()
+    else if t == "float"
+        ir_type_float()
     else
         ir_type_any()
 
@@ -15274,6 +15303,12 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
                     Param(pname, ptype, pdefault) =>
                         push(ir_params, IrParam(pname, source_type_to_ir(ptype)))
                         push(_s4_pnames, pname)
+                        // A written-out `any` and an omitted annotation both lower to IrType("any"),
+                        // so the distinction has to be captured HERE, while the source text is still
+                        // in hand. ir_collect_param_types needs it: `any` written by the author is a
+                        // promise the parameter is polymorphic, absence of an annotation is not.
+                        if ptype == "any"
+                            b.ir_any_params[_fnkey + "#" + str(_pidx)] = 1
                         if ptype != "" and (contains(b.ir_sdefs, ptype) or _is_builtin_type_name(ptype))
                             b.ir_locals[pname] = ptype
                         else if _pidx < len(_inf_pst) and contains(b.ir_sdefs, _inf_pst[_pidx])
@@ -22277,6 +22312,37 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 return IrInst(op, dest, copy_itype, args, value, num, effect, line)
             return inst
 
+// 3.1 Phase 2 — the runtime's RAW-FLOAT ABI, DECLARED rather than guessed.
+//
+// A runtime fn reads an i64 float argument in exactly one of two ways, and they are NOT
+// interchangeable:
+//   nova_float_arg(x)      box => unbox; RAW => i2f(x), REINTERPRETS the bits.   raw-SAFE
+//   nova_elem_to_double(x) box => unbox; RAW => (double)x, converts NUMERICALLY. raw-UNSAFE
+// So handing a raw double to the second kind reads 1.0 (0x3FF0000000000000) as 4.6e18.
+//
+// Every name below was extracted MECHANICALLY from nova_runtime.c as "calls nova_float_arg" —
+// this is the runtime's actual ABI, not a guess. Anything ABSENT is treated as raw-UNSAFE and
+// its float args get boxed. That default is deliberate and FAIL-SAFE, because the two error
+// directions are not symmetric: a MISSING entry costs one heap box (slower, still correct),
+// while a WRONG entry returns a silently incorrect number. `nova_rt_format` is deliberately
+// omitted for exactly this reason — it could not be confirmed, so it boxes.
+//
+// WHY THIS IS NEEDED AT ALL: ir_collect_param_types records fpt[callee][i] from CALL SITES, and
+// that inference is unsound for a builtin — a C function's ABI cannot be learned from whoever
+// happens to call it. Passing a float made the compiler conclude "this builtin wants a raw
+// float" and skip the box. That was already known for the any-STORING fns (format_one / ok /
+// err / some, special-cased below); making declared-`float` params raw turned a rare case into
+// a broad one and broke av_encode_double (1.0 encoded as 4.6e18, caught by _avro_kat_test) and
+// nova_rt_tensor_scale. Boxing is always TOLERATED — both readers above unbox — so the only
+// cost of over-boxing is speed, which is why the unknown case boxes.
+fn ir_builtin_raw_float_safe(name: string) -> int
+    let g1 = "|nova_rt_abs|nova_rt_acos|nova_rt_asin|nova_rt_assert_approx|nova_rt_assert_near|nova_rt_atan|nova_rt_atan2|nova_rt_buffer_append_float|nova_rt_cbrt|nova_rt_ceil|nova_rt_clamp|nova_rt_copysign|nova_rt_cos|nova_rt_cosh|nova_rt_erf|nova_rt_exp|nova_rt_fabs|nova_rt_float_to_int|nova_rt_floor|nova_rt_fma|nova_rt_fmax|nova_rt_fmin|nova_rt_fmod|"
+    let g2 = "nova_rt_hypot|nova_rt_isinf|nova_rt_isnan|nova_rt_json_encode_float|nova_rt_lgamma|nova_rt_log|nova_rt_log10|nova_rt_log2|nova_rt_nextafter|nova_rt_offheap_set|nova_rt_offheap_set_f64|nova_rt_pow|nova_rt_ptr_write|nova_rt_ptr_write_f32|nova_rt_ptr_write_f64|"
+    let g3 = "nova_rt_round|nova_rt_sin|nova_rt_sinh|nova_rt_sqrt|nova_rt_tan|nova_rt_tanh|"
+    if find(g1 + g2 + g3, "|" + name + "|") != -1
+        return 1
+    0
+
 fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> IrBlock
     match block
         IrBlock(label, insts, terminator) =>
@@ -22303,20 +22369,18 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                             let ai = 0
                             for a in args
                                 let do_box = false
+                                let do_itof = false
                                 if ir_reg_type(rt, a) == "float"
                                     let akey = str(ai)
-                                    if not contains(pm, akey)
+                                    if starts_with(value, "nova_rt_")
+                                        if ir_builtin_raw_float_safe(value) == 0
+                                            do_box = true
+                                    else if not contains(pm, akey)
                                         do_box = true
                                     else if pm[akey] == "any" or pm[akey] == "val"
-                                        // A float arg into a GENERIC param must be boxed. "any" and
-                                        // "val" are both generic value slots (the latter is the label
-                                        // for a generic index_get/call result; fpt records it as a
-                                        // param type when a call site passes e.g. p[0] from an untyped
-                                        // param). Boxing only special-cased "any", so a float read
-                                        // (e.g. floatlist[i] via get_f, raw double bits) passed into a
-                                        // "val" param flowed in UNBOXED and was rendered as an integer
-                                        // (geox/stats: haversine(p1[0],..) got raw bits). Treat val==any.
                                         do_box = true
+                                else if ir_reg_type(rt, a) == "int" and contains(pm, "d" + str(ai))
+                                    do_itof = true
                                 if do_box
                                     let bxc = 0
                                     if contains(rt, "@wbox@")
@@ -22325,6 +22389,15 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                     rt["@wbox@"] = bxc + 1
                                     push(new_insts, IrInst("call", bxr, ir_type_any(), [a], "nova_rt_box_float", 0, "pure", line))
                                     push(new_args, bxr)
+                                else if do_itof
+                                    let itfc = 0
+                                    if contains(rt, "@wbox@")
+                                        itfc = rt["@wbox@"]
+                                    let itfr = "%witof" + str(itfc)
+                                    rt["@wbox@"] = itfc + 1
+                                    push(new_insts, IrInst("call", itfr, ir_type_any(), [a], "nova_rt_int_to_float", 0, "pure", line))
+                                    rt[itfr] = "float"
+                                    push(new_args, itfr)
                                 else
                                     push(new_args, a)
                                 ai = ai + 1
@@ -22765,6 +22838,33 @@ fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
 
 fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
     let fpt = {}
+    // 3.1: SEED FROM THE DECLARATION FIRST, and treat a declared `float` as AUTHORITATIVE.
+    // Everything below derives param types from CALL SITES and collapses any disagreement to
+    // "any". That let a single caller passing a boxed/`val` argument degrade the parameter for
+    // EVERY other caller, each of which then heap-allocated a box to pass a float into a
+    // parameter explicitly annotated `float` (measured: _f31_poison_probe.nova). fpt_decl
+    // records which entries came from an annotation so the conflict rule below cannot
+    // downgrade them.
+    let fpt_decl = {}
+    for _dfn in all_fns
+        match _dfn
+            IrFunction(_dname, _dp, _dret, _dblocks, _dtp, _dex) =>
+                if _dex == 0
+                    let _dpi = 0
+                    for _dprm in _dp
+                        match _dprm
+                            IrParam(_dpn, _dpt) =>
+                                match _dpt
+                                    IrType(_dtk, _, _, _) =>
+                                        if _dtk == "float"
+                                            if not contains(fpt, _dname)
+                                                fpt[_dname] = {}
+                                            if not contains(fpt_decl, _dname)
+                                                fpt_decl[_dname] = {}
+                                            fpt[_dname][str(_dpi)] = "float"
+                                            fpt_decl[_dname][str(_dpi)] = 1
+                                            fpt[_dname]["d" + str(_dpi)] = 1
+                        _dpi = _dpi + 1
     for ir_fn in all_fns
         match ir_fn
             IrFunction(fname, fp, fret, fblocks, ftp, fex) =>
@@ -22780,7 +22880,11 @@ fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
                             IrParam(pname, ptype) =>
                                 match ptype
                                     IrType(tk, _, _, _) =>
-                                        if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
+                                        // 3.1: "float" included so a DECLARED float param is
+                                        // known-raw inside the body, exactly like int/str/list/
+                                        // dict. Without it the annotation was erased to "any"
+                                        // and every raw-float caller heap-allocated a box.
+                                        if tk == "int" or tk == "str" or tk == "list" or tk == "dict" or tk == "float"
                                             st[pname] = tk
                                         else
                                             st[pname] = "any"
@@ -22803,11 +22907,39 @@ fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
                                                     let atype = "any"
                                                     if contains(rt, iargs[ai])
                                                         atype = rt[iargs[ai]]
-                                                    if atype != "any"
-                                                        let akey = str(ai)
+                                                    let akey = str(ai)
+                                                    // A parameter the author WROTE as `any` is never
+                                                    // narrowed from call sites. Doing so is unsound in
+                                                    // exactly one direction and it bites hard: a raw
+                                                    // double is the only NOVA value whose bits are
+                                                    // indistinguishable from an i64 at runtime, so once
+                                                    // a param is compiled "float", an int arriving from
+                                                    // any other caller is reinterpreted and the function
+                                                    // returns a silently wrong number. Measured:
+                                                    // forge_statsd's `_statsd_fmt_num(value: any)` saw
+                                                    // only float call sites here (the int ones passed
+                                                    // registers we could not type, and those were
+                                                    // skipped), specialized to float, and rendered the
+                                                    // int 1 as 4.94065645841247e-324 on the wire.
+                                                    //
+                                                    // The guard is deliberately limited to a WRITTEN
+                                                    // `any`. Applying it to unannotated params instead
+                                                    // was tried and reverted: it erased the struct type
+                                                    // an unannotated param forwards (`fn norm_sq(a) =
+                                                    // dot(a, a)` made `dot`'s Point params dynamic,
+                                                    // fmul -> nova_rt_mul), and it left the SAME param
+                                                    // reached both boxed and raw from different callers,
+                                                    // which is worse than either alone.
+                                                    let _p_is_any = contains(frt, "@anyp@" + callee + "#" + akey)
+                                                    if atype != "any" and not _p_is_any
                                                         if contains(fpt[callee], akey)
                                                             if fpt[callee][akey] != atype
-                                                                fpt[callee][akey] = "any"
+                                                                let _is_decl = false
+                                                                if contains(fpt_decl, callee)
+                                                                    if contains(fpt_decl[callee], akey)
+                                                                        _is_decl = true
+                                                                if not _is_decl
+                                                                    fpt[callee][akey] = "any"
                                                         else
                                                             fpt[callee][akey] = atype
                                                     ai = ai + 1
@@ -27558,6 +27690,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let _sft_keys = keys(b.ir_field_types)
     for _sfk in _sft_keys
         frt["@sf@" + _sfk] = b.ir_field_types[_sfk]
+    // Declared-`any` parameters ride the same out-of-band frt channel as @sf@/@sfkinds@ above,
+    // because ir_collect_param_types is handed frt but not the builder.
+    for _apk in keys(b.ir_any_params)
+        frt["@anyp@" + _apk] = "any"
     // PERF Stage 3 (Representation Inference): per-struct POSITIONAL float-field map.
     // "@sfkinds@<Struct>" -> a string with one char per field in declaration order:
     // "f" if that field is float, "." otherwise. make_struct args are positional, but

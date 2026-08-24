@@ -180,6 +180,10 @@ Write-Host "`n[CI 2k6/3] Cycle detector gate (SCC: pair/self-loop/ring + no fals
 & .\_cycle_detect_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k6 (cycle detector) ==="; exit 1 }
 
+Write-Host "`n[CI 2k7/3] Param representation (no hidden box; builtin ABI; int-to-float; struct forwarding; declared-any)..."
+& .\_f31_param_repr_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k7 (param representation) ==="; exit 1 }
+
 Write-Host "`n[CI 2l/3] WASM stack-guard gate (wasm has no signals/SEH; native must stay guard-free)..."
 & .\_wasm_stackguard_probe.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2l (wasm stack guard) ==="; exit 1 }

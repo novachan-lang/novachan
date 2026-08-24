@@ -681,7 +681,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL 2026-08-23** — scalar float call path **2.21x → 1.69x C** (inline unbox fast-reject); array ~1.5x; residual needs the param-representation change |
+| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL 2026-08-24** — scalar float **2.21x → 1.69x C**; Phase 2 complete (3 rules, 6/6 gate, 5 defects closed); float-array work still open |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **OPEN — confirmed: `bytes_slice` memcpy's** |
@@ -740,6 +740,214 @@ The blocking question is whether NOVA inserts a coercion when an `any` holding a
 passed to a `float` param. **Test that first** (pass `mixed[0]` from a `list<any>` to a float param
 and read the emitted call site); the answer decides whether the safe form is caller-side
 normalisation or a non-address-taken specialised entry point.
+
+#### 3.1 Phase 2 (2026-08-23) — the decisive experiment ran, and the answer was worse than either option
+
+The experiment above (`_f31_poison_probe.nova`) was run. The answer to "does NOVA insert a coercion?"
+is **neither** of the two anticipated designs, because the premise was wrong: **a declared `float`
+parameter had no guaranteed representation at all.**
+
+`clean_f(x: float)` and `poisoned_f(x: float)` have **identical signatures**. `clean_f` is called only
+with raw floats; `poisoned_f` is called with the same raw floats *plus* one `mixed[0]` from a
+`list<any>`. They compiled **differently** — every raw call site of `poisoned_f` emitted
+`nova_rt_box_float`, a **heap allocation**, to pass a float into a parameter explicitly annotated
+`float`.
+
+**Mechanism — two independent defects, both required.**
+1. `source_type_to_ir` mapped `int`/`str`/`list`/`dict`/`bool` but let **`float` fall through to
+   `any`**, discarding the annotation before inference ever ran.
+2. `ir_collect_param_types` therefore derived param types **purely from call sites**, and collapsed
+   any disagreement to `"any"`. So ONE dynamic call site anywhere in the program degraded the
+   parameter for **every other caller**.
+
+That is textbook **action-at-a-distance plus a hidden cost** — both explicitly forbidden by this
+project's design rules. Two functions with the same signature must not compile differently because of
+who *else* calls them.
+
+**The fix (compiler only — runtime untouched).** Map `float` through `source_type_to_ir`, seed
+`ir_collect_param_types` from the **declaration** first, and record those entries in `fpt_decl` so the
+call-site conflict rule cannot downgrade an annotated parameter.
+
+**⚠ The trap that cost a build — do NOT re-add call-site narrowing.** The obvious companion change is
+to coerce at the call site with `nova_rt_to_float` "for safety". It was tried and it **broke `nn` and
+`optimizers_lib_test`**: a register typed `"val"`/`"any"` can already hold **raw IEEE-754 bits** (e.g.
+`floatlist[i]` via `get_f`), and `to_float` cannot distinguish those from a genuine int — so it
+converted `2.0`'s bit pattern *numerically* to `4.61168601842739e+18`. Silent wrong answers, the worst
+class. **The coercion was never needed:** the callee retains its own defensive `nova_rt_unbox` on
+float params, so it is box-**tolerant** and handles a boxed argument from a genuinely `any` call site
+by itself. Declaring the parameter is sufficient; layering a coercion on top of a tolerant callee only
+creates a second, worse ambiguity. The gate asserts box-tolerance is retained precisely so this cannot
+be "optimised" away later.
+
+**⚠ The second defect, found by the full gate — the BUILTIN raw-float ABI.** The change above passed
+its own gate, reconverged byte-identically, and still **broke `_avro_kat_test`**: `av_encode_double(1.0)`
+emitted `00 00 00 00 00 F8 CF 43` instead of `00 00 00 00 00 00 F0 3F`. Nothing crashed — the number
+was simply wrong.
+
+Cause: `ir_collect_param_types` records `fpt[callee][i]` from call sites **for every callee, builtins
+included** — and that inference is *circular* for a builtin, whose C ABI cannot be learned from
+whoever calls it. Passing a float taught the compiler "this builtin wants a raw float", so it skipped
+the widen-box. The runtime has exactly two float-argument readers and they are **not**
+interchangeable:
+
+| reader | box | RAW i64 | verdict |
+|---|---|---|---|
+| `nova_float_arg(x)` | unboxes | `i2f(x)` — **reinterprets** the bits | raw-SAFE |
+| `nova_elem_to_double(x)` | unboxes | `(double)x` — converts **numerically** | raw-UNSAFE |
+
+`nova_rt_float_to_bits` uses the second, so raw `1.0` (`0x3FF0000000000000`) was read as `4.6e18`.
+`nova_rt_tensor_scale` had the identical defect. This was **already a known bug class** — the
+any-storing fns `format_one`/`ok`/`err`/`some` carry a hand-written exception — but making declared
+`float` params raw turned a rare case into a broad one.
+
+**Fix: declare the ABI, don't guess it, and fail safe.** `ir_builtin_raw_float_safe` holds the 44
+runtime fns extracted **mechanically** from `nova_runtime.c` as "calls `nova_float_arg`". For a
+`nova_rt_*` callee the call-site-inferred `pm` is ignored entirely; anything not on the list gets its
+float args boxed. The asymmetry is the whole point: **a missing entry costs one heap box (slower, still
+correct); a wrong entry returns a silently wrong number.** `nova_rt_format` could not be confirmed, so
+it is deliberately omitted and boxes. User functions are untouched, so the 3.1 perf win stands.
+
+**This also closed a pre-existing bug.** `float_to_bits(1.0)` returned `4886396799603965952` on the
+*old* compiler too — wrong before this work started, now correct at `4607182418800017408`.
+
+**Gated** — `_f31_param_repr_gate.ps1` (CI 2k7), **5 assertions**. Structure (no `nova_rt_box_float`
+at a raw call site, both functions), box-tolerance retained, values on raw *and* boxed paths
+(`7.0 14.5 7.0 14.5 3.0`), and the builtin ABI (`bits 4607182418800017408 …`). Structure alone would
+pass if the coercion were simply dropped, which would be worse than the original bug.
+
+**Reconverge:** gen4 == gen5 == gen6 byte-identical (`B96BEAD9…`) — fixpoint reached immediately.
+
+**Lesson worth carrying:** a representation change is not done when its own gate is green. Making one
+class of value *more common* re-prices every consumer that was quietly relying on it being rare. The
+full 2862-test regression is what caught this; the targeted gate could not have.
+
+`bool` deliberately still maps to `int`. That is a separate representation question with its own blast
+radius (and the root of the documented "a bool cannot be type-validated" behaviour). Not bundled in.
+
+#### 3.1 Phase 2 completion (2026-08-24) — two more defects closed, int-to-float conversion added
+
+**Defect 3 (any-typed call site skipped by `ir_collect_param_types`).** When `atype == "any"`, the
+inference loop skipped the argument entirely (`if atype != "any"` guard at line ~22907). A function
+like `_statsd_fmt_num(value: any)` called with float from `_statsd_line` and with int from
+`fmt_gauge` recorded `fpt["_statsd_fmt_num"]["0"] = "float"` from the float call site, and the
+int call site was silently ignored — no conflict, no downgrade. The body then inferred `value`
+as float and dispatched `str(value)` to `nova_rt_float_to_str`, corrupting every int caller:
+`fmt_gauge("g", 1)` → `g:4.94065645841247e-324`. **Fix:** an `else` branch for `atype == "any"`
+that (1) conflicts with existing non-`any` entries (unless `fpt_decl`) and (2) records `"any"` for
+new entries, making the fix order-independent.
+
+**Defect 4 (int literal at a declared-float call site).** `statsd_format_counter("x", 1, 1, [])`
+— the third arg `1` (int) is passed to `rate: float`. With Phase 1's change, the body treats
+`rate` as raw float and does `rate * 1.0` via bitcast-to-double. Int `1` bitcast → `4.94e-324`.
+**Fix:** in the widen logic, when `ir_reg_type(rt, a) == "int"` and the callee param is declared
+float (detected via `pm["d" + str(ai)]` marker set during seeding), insert `nova_rt_int_to_float`
+conversion at the call site. Safe because a register typed "int" is definitively an integer value
+(not ambiguous like "any"/"val" which might hold raw float bits).
+
+**Gated:** `_f31_param_repr_gate.ps1` now **6/6 assertions** — Rule 1 (no hidden box), Rule 2
+(builtin ABI), Rule 3 (int-to-float conversion: `poisoned_f(3) → 6.0`).
+
+#### Defect 5 — the Defect-3 fix was too broad, and "pre-existing failure" was the wrong call
+
+Defect 3's first cut made an unknown-typed argument collapse the parameter for **every** kind, not
+just float. That regressed three tests — `struct_perf_test`, `_pack_float_kat`, `_antimeridian_test`
+— and they were initially written up here as *pre-existing* failures. **They were not.** Running the
+committed HEAD compiler against the same three programs passes all three; only the patched compiler
+fails them. The lesson is cheap to state and was expensive to skip: a failure is pre-existing only
+once the previous binary has been *run*, never because the failure looks unrelated.
+
+What the over-broad collapse actually destroyed:
+
+```nova
+fn dot(a, b)          // unannotated — Point inferred from the call site
+    a.x * b.x + a.y * b.y
+fn norm_sq(a)
+    dot(a, a)         // `a` here is untyped, so this call site types the arg "unknown"
+```
+
+`norm_sq`'s forwarding call was enough to erase `dot`'s inferred `Point`, and the whole body
+dropped from `fmul`/`fadd` to `nova_rt_mul`/`nova_rt_add`. `_antimeridian_test` showed the second,
+nastier consequence: once `ckf(label, got, expected, eps)` was demoted to `any`, callers that
+*could* see a float boxed it while callers that could not passed raw double bits — the **same
+parameter reached both boxed and raw**, and `str(got)` printed `4631530004285489152` instead of
+`45.0`. A mixed representation is worse than either representation.
+
+**Fix — narrow the rule to what the author actually declared.** Only a parameter written `any` in
+the source is protected from call-site narrowing:
+
+| parameter | narrowed from call sites? | why |
+|---|---|---|
+| declared `float` | no — annotation wins (`fpt_decl`) | Phase 1's whole point |
+| declared `any` | **no — new** | an explicit `any` promises polymorphism; narrowing it to raw float is unsound |
+| unannotated | yes, as before | no promise was made; this is what makes struct params lower to `fmul` |
+
+Written-`any` and omitted-annotation both lower to `IrType("any")`, so the distinction is captured
+in `ir_lower_function` while the source text is still in hand (`b.ir_any_params`, keyed
+`"<emit_name>#<index>"`) and reaches `ir_collect_param_types` on the existing out-of-band `frt`
+channel as `@anyp@`, alongside `@sf@`/`@sfkinds@`.
+
+Why *float* is the one representation worth this care: an int is a raw i64 and a box/string/list/
+dict/struct is a tagged pointer, so a too-narrow guess is still recoverable at runtime. A raw double
+is the only NOVA value whose bits are indistinguishable from an i64 — nothing downstream can tell
+them apart, so a wrong guess becomes a silently wrong number rather than a slow one.
+
+**Reconverge:** byte-identical, and reached at gen4 already — `gen4 == gen5 == gen6`
+(`68B90E26757CF6EE2DA36B7582562866B262A485C394A64170B37D860D604EAE`), which is itself evidence the
+change is representation-stable.
+
+**Verified green:** `struct_perf_test`, `_pack_float_kat`, `_antimeridian_test`, `statsd_kat`,
+`statsd_ratefix_kat`, `_avro_kat_test`, and `_f31_param_repr_gate.ps1` **9/9**. Full CI both modes:
+2862 PASS / 1 FAIL, the one failure being `forge_tls_upgrade_test`, which does live HTTPS to
+example.com and badssl.com and passes 4/4 in isolation on both this compiler and the previous one.
+
+**The gate was checked for teeth, not just for green.** Run against the previously committed
+compiler it reports exactly 3 failures — one per fix (`poisoned_f` boxes, `bits 4886396799603965952`,
+`anyp 2.5 3.45845952088873e-323`). A gate that has never been observed to fail is not evidence.
+
+#### ⚠ OPEN DEFECT found by the new gate — an inferred param type does not chain through a second function
+
+Discovered while writing Rule 4; **pre-existing**, verified by running the previously committed
+compiler, which produces the identical wrong answer. Not caused by 3.1 and not fixed by it.
+
+```nova
+fn sdot(a, b)          // unannotated, and NO direct call anywhere
+    a.fx * b.fx + a.fy * b.fy
+fn fwd(p, q)
+    sdot(p, q)         // the only call — p/q are themselves untyped
+main: fwd(FPt{fx:1.5, fy:2.5}, FPt{fx:3.0, fy:4.0})   // → 0, want 14.5
+```
+
+`main` teaches the pass that `fwd` takes `FPt`, but `ir_collect_param_types` reseeds `st` from
+**declared** types on every pass, so what it learned about `fwd` is never available when it walks
+`fwd`'s body. `sdot`'s params therefore resolve to nothing. The driver loop at `compile_ir_core_named`
+already iterates to a fixpoint — but only over *return* types (`frt`), never param types.
+
+The consequence is worse than slow code. Field *offsets* still resolve (a field slot comes from the
+global name→slot map, which needs no struct type), so the GEPs are right and only the *type* is
+lost — the multiply then goes through `nova_rt_mul`, which integer-multiplies two double bit
+patterns. `bits(1.5)` and `bits(3.0)` each carry 51 trailing zero bits, so the product has more than
+64 and the answer is **exactly 0**. Silently wrong data, no crash.
+
+Fixing it means chaining param types to a fixpoint, which widens types program-wide — and a wrong
+struct type there is not a slow path, it is a wrong field slot, i.e. memory corruption. Full-arc
+work, tracked as its own item rather than smuggled into this one. Rule 4 asserts the shape that
+*does* work today (direct call typed, forwarding call must not erase it — exactly the regression
+above) and documents this case in the probe.
+
+#### Tooling: `_impact_gate.ps1` — the fast loop
+
+`nova_ci.ps1` is all-2862-or-nothing at ~35 min, which made it useless for iteration and meant
+compiler changes were being checked either far too slowly or not at all. `_impact_gate.ps1` runs a
+NAMED subset plus named gate scripts through the **same** worker as the full regression — extracted
+to `_test_worker.ps1` and dot-sourced by both, so the two can never drift about what PASS means.
+
+The six tests above plus the 9/9 gate: **35 seconds**. Same evidence, 60x faster.
+
+It is explicitly *not* a substitute for `nova_ci` before committing compiler or runtime changes,
+and the script says so at the top: param-type and return-type inference are whole-program analyses,
+so those changes have no local blast radius to reason about. This session is the proof — three
+lines changed in `ir_collect_param_types` broke three tests that have nothing to do with the
+feature, via a forwarding call in a file nobody had opened.
 
 ---
 
