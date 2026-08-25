@@ -509,7 +509,7 @@ RED-tier piece (Bacon–Rajan trial deletion touching the RC hot path).
 | 2.5 | Extended @comptime (full language at compile time) | Zig/C++ | L | PARTIAL — `@comptime` + const-fn fold exist |
 | 2.6 | Generics proven in framework code | C++/Rust/Swift | M | **✅ TRUE — 74 in `std/`, 9 in `forge/`** (0 in `prism/`) |
 | 2.7 | Error message suggestions ("did you mean X?") | Python/Rust/Elm | S | **✅ ALREADY EXISTS** (edit-distance) |
-| 2.8 | Move semantics / move(x) builtin | C++/Rust | M | PARTIAL — use-after-move enforced for `send()`; no general `move()` |
+| 2.8 | Move semantics / move(x) builtin | Rust | M | **DONE 2026-08-25** — general `move(x)`: identity at runtime (0 runtime calls), use-after-move + double-move are E1003 BY DEFAULT, cross-module, diagnostics name which construct moved it and where; `send()`-moves stay opt-in for back-compat. Gate 2q, 14/14 |
 | 2.9 | Nested-pattern exhaustiveness | Rust/Haskell | L→M | **✅ DONE 2026-08-21** |
 
 ### ✅ 2.1 Nested patterns — landed
@@ -681,7 +681,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL** — scalar float 2.21x → **1.69x** shipped; parity (1.00x) MEASURED but the implementation was REVERTED (25 float regressions); float ARRAY ~1.7x open |
+| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL** — float ARRAY **1.60x → 1.09x C DONE 2026-08-25** (element read inlined, bounds+kind checked, gate 2r 11/11); scalar float 1.69x shipped, parity measured but reverted — see the 3.1 section |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **✅ DONE 2026-08-24** — `bytes_view` is O(1) zero-copy; `bytes_slice` still copies (contract kept); writes through a view abort; gated CI 2k8 |
@@ -698,7 +698,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 | path | before | after | benchmark |
 |---|---|---|---|
 | **scalar float through function calls** | **2.21x** | **1.69x** | `_f31_scalar.nova` vs `_f31_scalar.c` |
-| float array sum | ~1.5x | ~1.5x (unchanged) | `_fa_bench.nova` vs `_fa_bench.c` |
+| float array sum | 1.60x | **1.09x** (element read inlined, 2026-08-25) | `_fa_bench.nova` vs `_fa_bench.c` |
 
 The scalar call path — not arrays — was the worse offender, exactly as 3.3 predicted.
 
@@ -1050,6 +1050,42 @@ least four ways for a call site to be invisible to an IR-level pass — closures
 box-on-one-path returns, backend-generated ABI wrappers, and inferred (not declared) float params
 that `ir_infer_types` rewrites so they look declared. A future attempt should enumerate call-site
 kinds FIRST and prove coverage, rather than fixing them one regression at a time.
+
+**THE UNEXPLAINED #4 NOW HAS A MECHANISM (2026-08-25, from the float-array work).**
+
+The array half of 3.1 reproduced the same failure shape in miniature, which is what finally named it.
+Inlining the float element read measured 120 ms instead of the expected 99 ms. Cause: the inline
+changed the value's PROVENANCE. The emitter recognises `call nova_rt_list_get_f` as proven-raw but
+does NOT recognise a `phi`, so it silently inserted a defensive `nova_rt_unbox` before every `fadd` --
+trading one call per element for a different call per element, with every correctness test green. One
+`ire_mark_float` fixed it.
+
+So the rule, stated generally: **inserting or replacing an instruction changes what the emitter
+believes about that register, and it silently adds or removes unboxes downstream.** The value is
+unchanged; the emitter's belief about its REPRESENTATION is not.
+
+That is almost certainly what corrupted `_polyderiv_test`. Reading the working HEAD IR for `approx`
+shows the callee does NOT unbox at entry -- it unboxes AT THE POINT OF USE, on the slot load:
+```
+%r0       = load i64, ptr %slot.a
+%r2.af.ub = call i64 @nova_rt_unbox(i64 %r0)   ; a slot_load is not proven-raw
+%r2.af    = bitcast i64 %r2.af.ub to double
+%r2.rf    = fsub double %r2.af, %r2.bf
+```
+The reverted change inserted a normalisation register at the CALL SITE and marked it `rt[nmr] =
+"float"`. Everything downstream that consults that marking -- `ir_reg_is_raw_double`, the float-slot
+pre-pass, `ire_float_load` -- then saw a different answer for that register, which is exactly the
+mechanism above. The bisect fits: corruption appeared whenever normalisation was ON, independent of
+the callee-side marking, because the damage was on the CALLER side.
+
+**The bounded experiment for the next attempt** (do this FIRST, before re-applying anything):
+insert the normalisation WITHOUT marking the new register float, and see whether `_polyderiv_test`
+passes. That isolates the marking from the instruction in one build. If it passes, the fix is to make
+the marking match reality rather than asserting it -- the same one-line shape as `ire_mark_float` on
+the array read.
+
+Note the array fix also changed `ck_flist`'s `got[i] * 1.0` codegen, so this experiment must be
+re-run against current HEAD rather than reasoning from yesterday's IR.
 
 **STILL OPEN — the float ARRAY half.** ~1.7x, a different mechanism (element representation, not the
 call boundary), untouched by any of this. The reading was taken with an arc running (167/247/176 ms
@@ -1427,7 +1463,7 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 | 5.1 | Linux native build | Go/Rust/all | M | WSL-once exists |
 | 5.2 | macOS native build | Swift/all | L | needs hardware |
 | 5.3 | WASM compilation target (LLVM wasm32) | JS/Rust | L | **✅ SUBSTANTIALLY EXISTS** — 9 WASM CI gates incl. native-vs-wasm agreement |
-| 5.4 | Cross-compilation (target triple param) | Go/Zig/Rust | M | TODO |
+| 5.4 | Cross-compilation (target triple param) | Go/Zig/Rust | M | **DONE 2026-08-25** — 6 targets emit correct triple+datalayout; IR lowers to a valid target OBJECT from any host with no sysroot; `nova emit --obj`; cross-link refuses with the real reason + `NOVA_SYSROOT` escape hatch. Gate 2p, 13/13 |
 | 5.5 | Single-command toolchain (bundle clang) | Go/Zig | M | TODO |
 | 5.6 | Prism → Canvas/WebGL for browser | JS | XL | TODO |
 | 5.7 | ARM/AArch64 native | Go/Rust/all | L | needs hardware |

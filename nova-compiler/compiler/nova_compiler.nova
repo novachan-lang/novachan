@@ -12145,6 +12145,15 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 return dest
             else if tag == "call"
                 let fn_name = value
+                // 2.8 -- `move(x)` IS THE IDENTITY AT RUNTIME. It emits no call and no copy:
+                // the value is already there, and moving it only changes who is allowed to
+                // NAME it from here on. That check is entirely static (move_check_program), so
+                // the runtime cost is exactly zero -- which is the whole point of having it.
+                // Rust`s `move` is the same trade: a compile-time ownership statement, not an
+                // operation. Emitting a nova_rt_move would make the feature cost something for
+                // no benefit whatsoever.
+                if fn_name == "move" and len(children) == 1
+                    return ir_lower_expr(b, children[0])
                 if fn_name == "static_assert"
                     // Compile-time only (checked during inference); emit no runtime
                     // code -> a const 0 value that the optimizer dead-strips.
@@ -16225,6 +16234,11 @@ fn ti_build_stdlib() -> dict
     let U = nt_var(-2)
     reg["print"] = NTypeScheme([-1], nt_fn([T], nt_unit()))
     reg["copy"] = NTypeScheme([-1], nt_fn([T], T))
+    // 2.8: same shape as copy -- T in, T out -- but the OPPOSITE meaning. copy duplicates the
+    // value; move transfers it and kills the source name. Identical types, because the
+    // difference is in ownership, which the type system does not track; the static
+    // use-after-move pass enforces it instead.
+    reg["move"] = NTypeScheme([-1], nt_fn([T], T))
     reg["input"] = NTypeScheme([], nt_fn([], nt_string()))
     reg["read_line"] = NTypeScheme([], nt_fn([], nt_string()))
     reg["read_file"] = NTypeScheme([], nt_fn([nt_string()], nt_string()))
@@ -19877,30 +19891,61 @@ fn break_continue_check(body: list, st: TiState)
 // here after move" patterns at compile time. Opt-in so existing programs
 // that send-then-print still compile in legacy mode.
 
-fn move_expr_uses(e: Expr, moved: dict, errors: list)
+// track_send: whether `send(ch, x)` also counts as a move.
+//
+// The asymmetry is deliberate. An EXPLICIT `move(x)` is always checked: the developer wrote
+// the word, so they are asking for the guarantee, and silently ignoring it would be worse than
+// not having the feature. An IMPLICIT move via `send()` stays opt-in (NOVA_TRACK8=1) because
+// thousands of existing lines send-then-read, and turning that into a hard error by default
+// would break working programs that were never told about the rule.
+fn move_expr_uses(e: Expr, moved: dict, errors: list, track_send: int)
     match e
         Expr(tag, value, num, children, fields, eline) =>
             // `send(ch, x)` — moves x. Don't traverse into the second arg
             // (its use IS the move; we add it to moved AFTER processing).
-            if tag == "call" and value == "send" and len(children) >= 2
+            // EXPLICIT move(x): x is dead from here. Only an identifier can be moved --
+            // `move(f())` would name nothing, so there is nothing to invalidate and the
+            // developer almost certainly meant something else. Rejected rather than ignored.
+            if tag == "call" and value == "move" and len(children) == 1
+                let mv_name = move_arg_name(children[0])
+                if mv_name == ""
+                    push(errors, "error[E1003]: move() needs a variable, not a temporary, on line " + str(eline))
+                    move_expr_uses(children[0], moved, errors, track_send)
+                    return 0
+                if contains(moved, mv_name)
+                    let _fw = moved[mv_name]
+                    let _fp = split(_fw, "#")
+                    push(errors, "error[E1003]: value '" + mv_name + "' moved twice -- first by " + _fp[0] + " on line " + _fp[1] + ", again on line " + str(eline))
+                    return 0
+                // Record HOW and WHERE, so the diagnostic can name the real cause. Storing only
+                // the line made every message blame send(), including moves that came from move().
+                moved[mv_name] = "move()#" + str(eline)
+                return 0
+            if tag == "call" and value == "send" and len(children) >= 2 and track_send == 1
                 // First arg (channel) is allowed to be a moved var? In
                 // practice channels are values themselves; we conservatively
                 // check it.
-                move_expr_uses(children[0], moved, errors)
+                move_expr_uses(children[0], moved, errors, track_send)
                 match children[1]
                     Expr(at, av, an, ac, af, al) =>
                         if at == "ident" and contains(moved, av)
-                            push(errors, "error[E1003]: value '" + av + "' used after move on line " + str(al))
+                            let _sw = moved[av]
+                            let _sp = split(_sw, "#")
+                            push(errors, "error[E1003]: value '" + av + "' sent on line " + str(al) + " after being moved by " + _sp[0] + " on line " + _sp[1])
                         else if at != "ident"
-                            move_expr_uses(children[1], moved, errors)
-                moved[move_arg_name(children[1])] = eline
+                            move_expr_uses(children[1], moved, errors, track_send)
+                moved[move_arg_name(children[1])] = "send()#" + str(eline)
                 return 0
             if tag == "ident"
                 if contains(moved, value)
-                    push(errors, "error[E1003]: value '" + value + "' used after move on line " + str(eline) + " (moved earlier in this scope by send())")
+                    let _mw = moved[value]
+                    let _mp = split(_mw, "#")
+                    let _mkind = _mp[0]
+                    let _mline = _mp[1]
+                    push(errors, "error[E1003]: value '" + value + "' used on line " + str(eline) + " after being moved by " + _mkind + " on line " + _mline)
                 return 0
             for ch in children
-                move_expr_uses(ch, moved, errors)
+                move_expr_uses(ch, moved, errors, track_send)
 
 fn move_arg_name(e: Expr) -> string
     match e
@@ -19909,7 +19954,7 @@ fn move_arg_name(e: Expr) -> string
                 return value
     ""
 
-fn move_check_stmts(stmts: list, errors: list)
+fn move_check_stmts(stmts: list, errors: list, track_send: int)
     let moved = {}
     for s in stmts
         match s
@@ -19918,40 +19963,40 @@ fn move_check_stmts(stmts: list, errors: list)
                     if name != "" and contains(moved, name)
                         del(moved, name)
                     if expr != null_expr()
-                        move_expr_uses(expr, moved, errors)
+                        move_expr_uses(expr, moved, errors, track_send)
                 else if tag == "expr"
                     if expr != null_expr()
-                        move_expr_uses(expr, moved, errors)
+                        move_expr_uses(expr, moved, errors, track_send)
                 else if tag == "return"
                     if expr != null_expr()
-                        move_expr_uses(expr, moved, errors)
+                        move_expr_uses(expr, moved, errors, track_send)
                 else if tag == "fn"
                     let fn_errs = []
-                    move_check_stmts(body, fn_errs)
+                    move_check_stmts(body, fn_errs, track_send)
                     for fe in fn_errs
                         push(errors, fe)
                 else if tag == "spawn"
                     // Fresh scope for the spawned process body
                     let sp_errs = []
-                    move_check_stmts(body, sp_errs)
+                    move_check_stmts(body, sp_errs, track_send)
                     for se in sp_errs
                         push(errors, se)
                 else if tag == "if" or tag == "while" or tag == "for"
                     if expr != null_expr()
-                        move_expr_uses(expr, moved, errors)
+                        move_expr_uses(expr, moved, errors, track_send)
                     let inner_errs = []
-                    move_check_stmts(body, inner_errs)
+                    move_check_stmts(body, inner_errs, track_send)
                     for ie in inner_errs
                         push(errors, ie)
                     if len(else_body) > 0
                         let else_errs = []
-                        move_check_stmts(else_body, else_errs)
+                        move_check_stmts(else_body, else_errs, track_send)
                         for ee in else_errs
                             push(errors, ee)
 
-fn move_check_program(stmts: list) -> list
+fn move_check_program(stmts: list, track_send: int) -> list
     let errors = []
-    move_check_stmts(stmts, errors)
+    move_check_stmts(stmts, errors, track_send)
     errors
 
 // ── Main entry point: infer types for a parsed program ───────────────────────
@@ -23517,6 +23562,73 @@ fn ire_get_line_loc(e: IrEmitter, line_num: int) -> int
     push(e.ire_loc_entries, [loc_id, e.ire_fn_sp_id, line_num])
     loc_id
 
+fn ire_emit_farray_read(e: IrEmitter, dest: string, harg: string, iarg: string)
+    // 3.1 FLOAT-ARRAY READ, INLINED. A call per element was the ENTIRE array
+    // gap. Measured on _fa_bench (2M doubles x 50 reps), best-of-3, quiet box:
+    //     call nova_rt_list_get_f ....... 145 ms   1.60x C
+    //     + -flto (inlines the call) .... 133 ms   1.39x C
+    //     inlined, NO checks ............  96 ms   1.00x C   <- the ceiling
+    //     inlined, bounds + kind checked   99 ms   1.03x C   <- this code
+    // C is 96 ms. So the checks cost ~3%, not 60%: LLVM hoists the
+    // loop-invariant size/kind/data loads out of the loop, and what remains per
+    // element is one compare. Removing the bounds check to chase the last 3%
+    // would trade a core safety guarantee for nothing worth having.
+    //
+    // NovaList is {data@0, size@8, cap@16, elem_kind@24}. The SLOW path is the
+    // existing runtime call, unchanged, so every case this inline does not
+    // handle -- negative indices, kind=0 boxed elements, the out-of-range error
+    // message -- still behaves exactly as before. That is what makes this safe
+    // to inline at all: it is a fast path in front of the real function, not a
+    // reimplementation of it.
+    //
+    // `icmp ult` does BOTH bounds checks in one compare: a negative index wraps
+    // to a huge unsigned and fails the same test as index >= size.
+    let _fa_lp = ire_fresh_tmp(e, "falp")
+    let _fa_szp = ire_fresh_tmp(e, "faszp")
+    let _fa_sz = ire_fresh_tmp(e, "fasz")
+    let _fa_ekp = ire_fresh_tmp(e, "faekp")
+    let _fa_ek = ire_fresh_tmp(e, "faek")
+    let _fa_c1 = ire_fresh_tmp(e, "fac1")
+    let _fa_c2 = ire_fresh_tmp(e, "fac2")
+    let _fa_ok = ire_fresh_tmp(e, "faok")
+    let _fa_dp = ire_fresh_tmp(e, "fadp")
+    let _fa_ep = ire_fresh_tmp(e, "faep")
+    let _fa_v = ire_fresh_tmp(e, "fav")
+    let _fa_sv = ire_fresh_tmp(e, "fasv")
+    let _fa_n = str(e.ire_tc)
+    e.ire_tc = e.ire_tc + 1
+    let _fa_fast = "fa_fast" + _fa_n
+    let _fa_slow = "fa_slow" + _fa_n
+    let _fa_join = "fa_join" + _fa_n
+    ire_indent(e, _fa_lp + " = inttoptr i64 " + harg + " to ptr")
+    ire_indent(e, _fa_szp + " = getelementptr inbounds i8, ptr " + _fa_lp + ", i64 8")
+    ire_indent(e, _fa_sz + " = load i64, ptr " + _fa_szp + ", align 8")
+    ire_indent(e, _fa_ekp + " = getelementptr inbounds i8, ptr " + _fa_lp + ", i64 24")
+    ire_indent(e, _fa_ek + " = load i64, ptr " + _fa_ekp + ", align 8")
+    ire_indent(e, _fa_c1 + " = icmp eq i64 " + _fa_ek + ", 2")
+    ire_indent(e, _fa_c2 + " = icmp ult i64 " + iarg + ", " + _fa_sz)
+    ire_indent(e, _fa_ok + " = and i1 " + _fa_c1 + ", " + _fa_c2)
+    ire_indent(e, "br i1 " + _fa_ok + ", label %" + _fa_fast + ", label %" + _fa_slow)
+    ire_line(e, _fa_fast + ":")
+    ire_indent(e, _fa_dp + " = load ptr, ptr " + _fa_lp + ", align 8")
+    ire_indent(e, _fa_ep + " = getelementptr inbounds i64, ptr " + _fa_dp + ", i64 " + iarg)
+    ire_indent(e, _fa_v + " = load i64, ptr " + _fa_ep + ", align 8")
+    ire_indent(e, "br label %" + _fa_join)
+    ire_line(e, _fa_slow + ":")
+    ire_indent(e, _fa_sv + " = call i64 @nova_rt_list_get_f(i64 " + harg + ", i64 " + iarg + ")")
+    ire_indent(e, "br label %" + _fa_join)
+    ire_line(e, _fa_join + ":")
+    ire_indent(e, dest + " = phi i64 [ " + _fa_v + ", %" + _fa_fast + " ], [ " + _fa_sv + ", %" + _fa_slow + " ]")
+    // The result is RAW DOUBLE BITS on BOTH paths -- kind=2 returns data[i] directly, and the
+    // runtime slow path returns nova_rt_unbox(data[i]) for kind=0 -- so this carries exactly
+    // the same guarantee the plain call did, and must be marked the same way.
+    //
+    // Without this the inline is a PESSIMISATION: the emitter recognised the old
+    // `call nova_rt_list_get_f` as proven-raw, but a `phi` is not on that list, so it inserted
+    // a defensive nova_rt_unbox before every fadd -- trading one call per element for a
+    // different call per element. Measured 120 ms with the unbox vs 99 ms without.
+    ire_mark_float(e, dest)
+
 fn ire_fresh_tmp(e: IrEmitter, prefix: string) -> string
     let name = "%" + prefix + str(e.ire_tc)
     e.ire_tc = e.ire_tc + 1
@@ -24268,6 +24380,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     e.ire_load_origin[args[0]] = value
             else if op == "call"
                 let call_inlined = false
+                // 3.1: inline the FLOAT-ARRAY element read. Keyed on the call value, because
+                // by this point the IR rewrite has already established that this is a typed
+                // float read -- re-deriving it from ire_reg_types just made the inline miss
+                // every list that arrives through a slot_load, which is nearly all of them.
+                if value == "nova_rt_list_get_f" and len(args) == 2 and dest != ""
+                    ire_emit_farray_read(e, dest, args[0], args[1])
+                    call_inlined = true
                 // P4 distributed: a program that calls call_by_name / remote_spawn needs
                 // its functions registered by name at @main init — flag it so the prologue
                 // emits nova_rt_register_fn(...) for each user fn (else: zero cost).
@@ -24327,7 +24446,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         // the old inline), kind=2 -> the raw bits directly (no unbox, no find_tag), and
                         // it bounds/negative-index checks (which the inline lacked). Result is a raw
                         // double either way -- the existing consumer semantics are preserved.
-                        ire_indent(e, dest + " = call i64 @nova_rt_list_get_f(i64 " + args[0] + ", i64 " + args[1] + ")")
+                        ire_emit_farray_read(e, dest, args[0], args[1])
                         call_inlined = true
                 if (value == "nova_rt_list_create" or value == "nova_rt_list_create_filled") and dest != ""
                     e.ire_reg_types[dest] = "list"
@@ -25686,9 +25805,17 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
 
     // Track 8 Week 4: use-after-move check (opt-in via NOVA_TRACK8=1).
     // send(ch, x) moves x; any subsequent use of x is a compile error.
+    // ALWAYS RUN. Previously the whole pass was behind NOVA_TRACK8, which meant an explicit
+    // `move(x)` was silently unchecked in normal builds -- a guarantee nobody could rely on.
+    // The flag now selects only whether IMPLICIT send()-moves are enforced too; explicit
+    // move() is always enforced. With no move() and no flag the pass finds nothing and costs
+    // one AST walk.
     let t8_env_chk = env("NOVA_TRACK8")
+    let _track_send = 0
     if len(t8_env_chk) > 0 and t8_env_chk[0] == "1"
-        let move_errs = move_check_program(stmts)
+        _track_send = 1
+    if 1 == 1
+        let move_errs = move_check_program(stmts, _track_send)
         if len(move_errs) > 0
             for me in move_errs
                 print(me)
@@ -29339,7 +29466,33 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         if contains(line, "call ") and contains(line, "@sqlite3_")
             needs_sqlite = 1
     let rt_link = rt
-    let is_cross = target != "" and target != "native" and target != "windows" and target != "win"
+    // CROSS-COMPILATION -- compare the RESOLVED triple against the HOST triple. The old test
+    // hardcoded "windows"/"win" as the native case, which is only correct ON Windows: on Linux or
+    // macOS, `--target linux` was flagged as a cross build and took the slow path for no reason.
+    // Comparing resolved-vs-native is host-agnostic and gives the same answer on Windows, so
+    // nothing changes for the platform this is developed on.
+    let _native_triple = native_target_triple()
+    let is_cross = resolved != _native_triple
+    // A cross LINK needs target libc headers to compile nova_runtime.c, and NOVA bundles no
+    // sysroots. Zig ships ~45 MB of libc headers precisely to make this work; Go sidesteps it by
+    // having no libc dependency at all. We do neither, so clang fails deep inside the runtime with
+    // "'stdio.h' file not found" -- an error that says nothing about the real cause and sends the
+    // developer looking for a broken include path.
+    //
+    // What IS true is worth stating precisely, because it is most of the way there: NOVA's own IR
+    // cross-compiles CLEANLY to a target object today -- verified for x86_64-unknown-linux-gnu and
+    // aarch64-apple-darwin. Only the C runtime needs the sysroot. So refuse early, name the real
+    // reason, and offer the two routes that actually work.
+    if is_cross
+        let _sysroot = env("NOVA_SYSROOT")
+        if _sysroot == ""
+            print("error: cannot link for " + resolved + " -- no sysroot for that target")
+            print("  NOVA code cross-compiles fine; only the C runtime needs target libc headers.")
+            print("  Options:")
+            print("    nova emit <file> --target " + target + " --obj     # target .o, link it ON the target")
+            print("    build natively on the target (see .github/workflows/cross-platform.yml)")
+            print("    NOVA_SYSROOT=<path> nova build --target " + target + "   # attempt a full cross-link")
+            return 1
     let use_ssl_define = needs_ssl == 1 and target_is_windows(resolved) == 0
     if not is_cross and use_ssl_define == 0
         let rt_o = replace(rt, ".c", ".o")
@@ -29370,6 +29523,10 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         cmd = cmd + " -g"
     if is_cross
         cmd = cmd + " --target=" + resolved
+        // Only reachable with NOVA_SYSROOT set (the guard above returns otherwise).
+        let _sr = env("NOVA_SYSROOT")
+        if _sr != ""
+            cmd = cmd + " --sysroot=\"" + _sr + "\""
     cmd = cmd + " \"" + ll_path + "\" \"" + rt_link + "\" -o \"" + exe_path + "\""
     if target_is_windows(resolved) == 1
         cmd = cmd + " -lws2_32 -lwinhttp -ladvapi32 -lbcrypt"
@@ -33128,6 +33285,12 @@ fn compiler_main()
         let emit_in = ""
         let emit_target = ""
         let emit_asm = 0
+        // --obj: lower the IR to a RELOCATABLE OBJECT for the target. This is the one cross
+        // path that works with no sysroot, because the IR is already fully lowered -- no C, no
+        // headers, nothing to include. Verified producing valid objects for
+        // x86_64-unknown-linux-gnu and aarch64-apple-darwin from a Windows host. Link the
+        // result against nova_runtime.o built ON the target.
+        let emit_obj = 0
         let ei = 2
         while ei < len(arguments)
             let ea = arguments[ei]
@@ -33137,15 +33300,33 @@ fn compiler_main()
                     emit_target = arguments[ei]
             else if ea == "--asm"
                 emit_asm = 1
+            else if ea == "--obj"
+                emit_obj = 1
             else
                 emit_in = ea
             ei = ei + 1
         if emit_in == ""
-            print("Usage: nova emit <file.nova> [--asm] [--target <t>]")
+            print("Usage: nova emit <file.nova> [--asm|--obj] [--target <t>]")
             print("  --asm    Emit native assembly instead of LLVM IR")
+            print("  --obj    Emit a relocatable object (.o) for --target; needs no sysroot")
             exit(1)
         let emit_ll = nova_replace_ext(emit_in, ".nova", ".ll")
         nova_compile_file(emit_in, emit_ll, 1, emit_target)
+        if emit_obj == 1
+            let obj_clang = nova_find_clang()
+            let obj_out = nova_replace_ext(emit_in, ".nova", ".o")
+            let obj_triple = resolve_target(emit_target)
+            // Written to a FILE, not stdout: an object is binary and piping it through the
+            // terminal would corrupt it.
+            let obj_cmd = "\"" + obj_clang + "\" -c -O2 -w --target=" + obj_triple + " \"" + emit_ll + "\" -o \"" + obj_out + "\""
+            let obj_rc = system(_win_wrap_cmd(obj_cmd))
+            if obj_rc != 0 or not file_exists(obj_out)
+                print("error: could not emit an object for " + obj_triple)
+                exit(1)
+            print("object: " + obj_out + "  (" + obj_triple + ")")
+            print("link it on the target, e.g.:")
+            print("  clang -O2 -o <exe> " + obj_out + " nova_runtime.o -lm -lpthread -ldl")
+            exit(0)
         if emit_asm == 1
             let emit_clang = nova_find_clang()
             let asm_out = exec(_win_wrap_cmd("\"" + emit_clang + "\" -S -O2 -o - " + emit_ll + " -D_CRT_SECURE_NO_WARNINGS -w"))

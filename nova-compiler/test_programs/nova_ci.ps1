@@ -213,6 +213,18 @@ Write-Host "`n[CI 2n/3] WASM execution gate (native vs wasm32 agree; no unresolv
 & .\_wasm_exec_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2n (wasm execution) ==="; exit 1 }
 
+Write-Host "`n[CI 2q/3] Move semantics gate (move() zero-cost + use-after-move + send opt-in)..."
+& .\_move_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2q (move semantics) ==="; exit 1 }
+
+Write-Host "`n[CI 2r/3] Float-array gate (inlined element read: bounds+kind checked, no defensive unbox)..."
+& .\_farray_perf_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2r (float array) ==="; exit 1 }
+
+Write-Host "`n[CI 2p/3] Cross-compilation gate (6 targets: triple + datalayout + object; cross-link refusal)..."
+& .\_xcompile_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2p (cross-compilation) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1
