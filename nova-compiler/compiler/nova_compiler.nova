@@ -22409,6 +22409,20 @@ fn ir_builtin_raw_float_safe(name: string) -> int
 fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> IrBlock
     match block
         IrBlock(label, insts, terminator) =>
+            // Defining op/value per register, so the raw-double proof-gate below can ask how a
+            // value was PRODUCED rather than only what it is typed. Stashed in rt under keys a
+            // register name can never collide with.
+            let _dop = {}
+            let _dvl = {}
+            for _di in insts
+                match _di
+                    IrInst(_dio, _did, _dit, _dia, _div, _din, _die, _dil) =>
+                        if _did != ""
+                            _dop[_did] = _dio
+                            _dvl[_did] = _div
+            rt["@defop@"] = _dop
+            rt["@defval@"] = _dvl
+            // NB: "@fslot@" is set by the caller (ir_infer_types) and must survive here.
             let new_insts = []
             for inst in insts
                 let ti = ir_infer_one(rt, st, frt, inst)
@@ -22444,6 +22458,33 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                         do_box = true
                                 else if ir_reg_type(rt, a) == "int" and contains(pm, "d" + str(ai))
                                     do_itof = true
+                                let do_norm = false
+                                // USER FUNCTIONS ONLY. fpt carries entries for nova_rt_* builtins too,
+                                // and normalising those is actively WRONG: nova_rt_list_append expects a
+                                // BOXED float so the list stays heterogeneous-safe, so unboxing the
+                                // argument stores raw double bits where a box belongs and the value is
+                                // misread on the way out. THAT is the "unexplained" corruption that forced
+                                // the 2026-08-25 revert -- not provenance, not the RC pass: a single
+                                // missing `not starts_with(value, "nova_rt_")`.
+                                //
+                                // Found by diffing the WHOLE emitted module rather than the two functions
+                                // the failing assertion pointed at. The diff in those two was real but
+                                // harmless -- hand-inserting exactly those unboxes into the working IR
+                                // changed nothing. The damage was in a list_append the assertion never
+                                // mentioned.
+                                if env("NOVA_EXP_NORM") == "1" and not do_box and not do_itof and not starts_with(value, "nova_rt_")
+                                    // PROOF-GATE. Normalising an argument that is ALREADY raw is pure
+                                    // overhead, and it is the difference between a win and a loss:
+                                    // axpy(a, acc, 0.5) has three float args, all provably raw, so
+                                    // unconditional normalisation added three calls per iteration and made
+                                    // the benchmark SLOWER than the defensive unboxing it replaced
+                                    // (64 ms vs 59 ms, against C at 35 ms).
+                                    let _nk = str(ai)
+                                    if contains(pm, _nk) and pm[_nk] == "float"
+                                        do_norm = true
+                                        if contains(rt, "@defop@") and contains(rt, "@defval@")
+                                            if ir_reg_is_raw_double(a, rt, rt["@defop@"], rt["@defval@"], frt) == 1
+                                                do_norm = false
                                 if do_box
                                     let bxc = 0
                                     if contains(rt, "@wbox@")
@@ -22461,6 +22502,16 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                     push(new_insts, IrInst("call", itfr, ir_type_any(), [a], "nova_rt_int_to_float", 0, "pure", line))
                                     rt[itfr] = "float"
                                     push(new_args, itfr)
+                                else if do_norm
+                                    let nmc = 0
+                                    if contains(rt, "@wbox@")
+                                        nmc = rt["@wbox@"]
+                                    let nmr = "%wnorm" + str(nmc)
+                                    rt["@wbox@"] = nmc + 1
+                                    push(new_insts, IrInst("call", nmr, ir_type_float(), [a], "nova_rt_unbox", 0, "pure", line))
+                                    if env("NOVA_EXP_NOMARK") != "1"
+                                        rt[nmr] = "float"
+                                    push(new_args, nmr)
                                 else
                                     push(new_args, a)
                                 ai = ai + 1
@@ -22695,6 +22746,59 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                         fixed_term = IrInst(btop, btdest, bttyp, br_args, btval, btnum, bteff, btline)
             IrBlock(label, new_insts, fixed_term)
 
+// ALWAYS-FLOAT SLOTS (3.1). A slot holds raw double bits on EVERY path iff every store into it
+// stores a provably-raw value. Computed over the WHOLE function, because a single forward pass
+// cannot know about a later store when it emits the first load.
+//
+// Deliberately conservative: ONE unprovable store disqualifies the slot, and a disqualified slot
+// simply keeps its defensive unbox -- the safe direction. Runs at the IR layer, not the emitter, so
+// the call-site proof-gate in ir_infer_block can actually consult it; an earlier version computed
+// the same set in the emitter, where the gate could not see it and the marks did nothing.
+fn ir_float_slots(blocks: list, frt: dict) -> dict
+    let dop = {}
+    let dvl = {}
+    let rt2 = {}
+    for _b in blocks
+        match _b
+            IrBlock(_bl, _bi, _bt) =>
+                for _in in _bi
+                    match _in
+                        IrInst(_o, _d, _t, _a, _v, _n, _ef, _l) =>
+                            if _d != ""
+                                dop[_d] = _o
+                                dvl[_d] = _v
+                                match _t
+                                    IrType(_tk, _tn, _tp, _tid) =>
+                                        rt2[_d] = _tk
+                                // A CALL result is still typed `any` in `blocks` at this point --
+                                // inference rewrites instruction types, but this analysis reads the
+                                // PRE-inference block list for the round. So take the callee`s return
+                                // kind from frt, which is what inference is about to conclude anyway.
+                                // Without this, `acc = axpy(...)` reads as `any`, ir_reg_is_raw_double
+                                // fails at its first gate, and slot.acc is disqualified -- leaving one
+                                // unbox in the hot loop for no reason.
+                                if _o == "call" and contains(frt, _v)
+                                    if frt[_v] == "float"
+                                        rt2[_d] = "float"
+    let ok = {}
+    let bad = {}
+    for _b2 in blocks
+        match _b2
+            IrBlock(_bl2, _bi2, _bt2) =>
+                for _in2 in _bi2
+                    match _in2
+                        IrInst(_o2, _d2, _t2, _a2, _v2, _n2, _ef2, _l2) =>
+                            if _o2 == "slot_store" and len(_a2) > 0
+                                if ir_reg_is_raw_double(_a2[0], rt2, dop, dvl, frt) == 1
+                                    ok[_v2] = 1
+                                else
+                                    bad[_v2] = 1
+    let out = {}
+    for _k in keys(ok)
+        if not contains(bad, _k)
+            out[_k] = 1
+    out
+
 fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
@@ -22732,6 +22836,16 @@ fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
                 for k in old_keys
                     push(old_vals, st[k])
                 let rt = {}
+                // Recomputed per round: the set can only GROW as return types are resolved
+                // (a slot fed by axpy() qualifies only once axpy is known @raw@), and the
+                // driver loop already iterates to a fixpoint.
+                if env("NOVA_EXP_PSLOT") == "1"
+                    rt["@fslot@"] = ir_float_slots(blocks, frt)
+                    if env("NOVA_EXP_DBG") == "1"
+                        let _dbgs = ""
+                        for _dk in keys(rt["@fslot@"])
+                            _dbgs = _dbgs + " " + _dk
+                        print("[FSLOT] " + name + " raw=" + str(contains(frt, "@raw@" + name)) + " slots:" + _dbgs)
                 new_blocks = []
                 for block in blocks
                     push(new_blocks, ir_infer_block(rt, st, frt, fpt, block))
@@ -22830,6 +22944,20 @@ fn ir_reg_is_raw_double(rv: string, rt: dict, defop: dict, defval: dict, frt: di
         return 1
     if op == "index_get"
         return 1
+    if op == "slot_load"
+        // A slot is normally NEVER provable -- it is mutable, so another path can store a box
+        // into it, and trusting it is what broke nn/stats in the first attempt. But when a
+        // WHOLE-FUNCTION pre-pass has shown that EVERY store into this slot stores a provably
+        // raw value, the slot is raw on every path by construction.
+        //
+        // This is the difference between the 3.1 scalar win being real and merely RELOCATED:
+        // axpy(a, acc, 0.5) receives both floats as slot_loads, so without this the call site
+        // normalises them and we trade two unboxes in the callee for two in the caller.
+        if contains(rt, "@fslot@")
+            let _fsl = rt["@fslot@"]
+            if contains(defval, rv) and contains(_fsl, defval[rv])
+                return 1
+        return 0
     if op == "call"
         let cv = defval[rv]
         if cv == "nova_rt_sin" or cv == "nova_rt_cos" or cv == "nova_rt_tan" or cv == "nova_rt_asin" or cv == "nova_rt_acos" or cv == "nova_rt_atan" or cv == "nova_rt_atan2" or cv == "nova_rt_log" or cv == "nova_rt_log2" or cv == "nova_rt_log10" or cv == "nova_rt_exp" or cv == "nova_rt_fabs" or cv == "nova_rt_fmod" or cv == "nova_rt_sqrt" or cv == "nova_rt_pow" or cv == "nova_rt_fmax" or cv == "nova_rt_fmin" or cv == "nova_rt_fmax_ri" or cv == "nova_rt_fmax_li" or cv == "nova_rt_fmin_ri" or cv == "nova_rt_fmin_li" or cv == "nova_rt_random_float" or cv == "nova_rt_int_to_float" or cv == "nova_rt_to_float" or cv == "nova_rt_parse_float" or cv == "nova_rt_float_from_bits" or cv == "nova_rt_f32_from_bits" or cv == "nova_rt_sinh" or cv == "nova_rt_cosh" or cv == "nova_rt_tanh" or cv == "nova_rt_cbrt" or cv == "nova_rt_hypot" or cv == "nova_rt_clamp" or cv == "nova_rt_copysign" or cv == "nova_rt_fma" or cv == "nova_rt_nextafter" or cv == "nova_rt_lgamma" or cv == "nova_rt_erf" or cv == "nova_rt_rng_float" or cv == "nova_rt_pi" or cv == "nova_rt_e" or cv == "nova_rt_simd_dot" or cv == "nova_rt_simd_sum"
@@ -23510,6 +23638,9 @@ type IrEmitter
     ire_dwarf_vars: int         // #33: when 1 (NOVA_DWARF_VARS / `nova debug`), emit DWARF DILocalVariable + llvm.dbg.declare so lldb can inspect NOVA locals. Default 0 -> byte-identical line-tables-only DWARF.
     ire_dbg_vars: list          // #33: collected [varid, name, sp_id, line] DILocalVariable entries, emitted in the metadata section. EMPTY unless ire_dwarf_vars.
     ire_cur_fn_line: int        // #33: source line of the function currently being emitted (for DILocalVariable line attrs).
+    ire_frt_snapshot: dict      // function return kinds, for the always-float slot pre-pass
+    ire_keep_external: dict     // names that MUST keep external linkage (@export/@cdecl/entry). Everything else is emitted `internal`, which is what lets LLVM inline a small float fn.
+    ire_addr_taken: dict        // fn names whose ADDRESS is taken (a __fnref_ trampoline exists), so their call sites are NOT all visible and a declared-float param slot cannot be assumed raw.
     ire_const_float: dict       // Registers defined by a float LITERAL. Strictly narrower than
                                 // ire_proven_float, which also covers float-typed CONTAINER reads --
                                 // and a container's element type can be stale (a list literal [1.0]
@@ -23517,7 +23648,7 @@ type IrEmitter
                                 // the only operand whose float-ness cannot be invalidated later.
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0, {})
+    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0, {}, {}, {}, {})
     // #33: enable DWARF variable emission when requested (NOVA_DWARF_VARS or `nova debug`).
     if env("NOVA_DWARF_VARS") != ""
         e.ire_dwarf_vars = 1
@@ -25142,6 +25273,57 @@ fn ire_liveness(blocks: list, slot_names: list) -> dict
             i = i - 1
     live_out
 
+// ALWAYS-FLOAT SLOT PRE-PASS (3.1). A slot_load can only skip its defensive unbox if the SLOT is
+// known to hold raw double bits on EVERY path -- and that cannot be decided by the emitter's single
+// forward pass, because a later store is not visible when the first load is emitted. Hence a
+// pre-pass over the whole function.
+//
+// The rule is deliberately conservative: a slot qualifies only if EVERY store into it stores a
+// register that ir_reg_is_raw_double proves raw. One unprovable store disqualifies the slot, which
+// is the safe direction -- the load then keeps its unbox, exactly as before.
+//
+// This is what makes the 3.1 scalar win real rather than a relocation of cost. Without it,
+// `axpy(a, acc, 0.5)` still normalises `a` and `acc` at the CALL SITE (they arrive as slot_loads),
+// so removing the callee's two unboxes just moves two calls from callee to caller -- measured 94 ms
+// vs 85 ms baseline, i.e. slightly WORSE. With the slots proven, both sides drop to zero.
+fn ire_float_slot_prepass(func: IrFunction, frt: dict) -> dict
+    let ok = {}
+    let bad = {}
+    match func
+        IrFunction(_fpn, _fpp, _fpr, _fpb, _fptp, _fpx) =>
+            // defop/defval over the WHOLE function: a slot's stores can live in any block.
+            let rt2 = {}
+            let dop = {}
+            let dvl = {}
+            for _b in _fpb
+                match _b
+                    IrBlock(_bl, _bi, _bt) =>
+                        for _in in _bi
+                            match _in
+                                IrInst(_o, _d, _t, _a, _v, _n, _ef, _l) =>
+                                    if _d != ""
+                                        dop[_d] = _o
+                                        dvl[_d] = _v
+                                        match _t
+                                            IrType(_tk, _tn, _tp, _tid) =>
+                                                rt2[_d] = _tk
+            for _b2 in _fpb
+                match _b2
+                    IrBlock(_bl2, _bi2, _bt2) =>
+                        for _in2 in _bi2
+                            match _in2
+                                IrInst(_o2, _d2, _t2, _a2, _v2, _n2, _ef2, _l2) =>
+                                    if _o2 == "slot_store" and len(_a2) > 0
+                                        if ir_reg_is_raw_double(_a2[0], rt2, dop, dvl, frt) == 1
+                                            ok[_v2] = 1
+                                        else
+                                            bad[_v2] = 1
+    let out = {}
+    for _k in keys(ok)
+        if not contains(bad, _k)
+            out[_k] = 1
+    out
+
 fn ire_emit_function(e: IrEmitter, func: IrFunction)
     // Reset per-function state — including Track 8 W5b local slot set
     // so drops from a previous function don't leak into this one.
@@ -25463,7 +25645,11 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                     let _s5_entry = _s5_entries[_s5_ei]
                     _s5_pmap[str(_s5_entry[0])] = _s5_entry[1]
                     _s5_ei = _s5_ei + 1
-            let header = "define i64 @" + name + "("
+            // NOVA_EXP_LINK=1 gates this while 3.1 is being validated.
+            let _lnk = ""
+            if env("NOVA_EXP_LINK") == "1" and not contains(e.ire_keep_external, name)
+                _lnk = "internal "
+            let header = "define " + _lnk + "i64 @" + name + "("
             let i = 0
             let _s5_first_param = 1
             while i < len(params)
@@ -25594,7 +25780,19 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                                     e.ire_reg_types["slot." + pname] = "list"
                                                 else if pk == "dict"
                                                     e.ire_reg_types["slot." + pname] = "dict"
+                                                else if pk == "float" and env("NOVA_EXP_PSLOT") == "1"
+                                                    // EXPERIMENT: a float-typed param slot holds RAW double bits, so
+                                                    // loads from it need no defensive unbox. Sound only if every call
+                                                    // site normalises (NOVA_EXP_NORM) AND the address is not taken.
+                                                    if not contains(e.ire_addr_taken, name)
+                                                        e.ire_reg_types["slot." + pname] = "float"
                                 pi2 = pi2 + 1
+                            // 3.1: mark always-float LOCAL slots before any load is emitted.
+                            if env("NOVA_EXP_PSLOT") == "1"
+                                let _fsl = ire_float_slot_prepass(func, e.ire_frt_snapshot)
+                                for _fsk in keys(_fsl)
+                                    if not contains(e.ire_reg_types, "slot." + _fsk)
+                                        e.ire_reg_types["slot." + _fsk] = "float"
                             // Allocate local variable slots
                             for slot_name in local_slots
                                 ire_indent(e, "%slot." + slot_name + " = alloca i64, align 8")
@@ -28300,6 +28498,38 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let do_sroa = not (len(_nosroa_env) > 0 and _nosroa_env[0] == "1")
     let total_allocs = 0
     let total_escape = 0
+    // Address-taken functions: read from b.ir_tramps, NOT by scanning all_fns. Trampolines are
+    // materialised from ir_tramps at emission time and never appear in all_fns, which is exactly
+    // how the first attempt missed them and read a heap pointer as a double.
+    for _at_spec in b.ir_tramps
+        e.ire_addr_taken[_at_spec[1]] = 1
+    // 3.1 INTERNAL LINKAGE. Measured: with the callee-entry unbox gone AND the function emitted
+    // `internal`, the scalar float path went 61 ms -> 35 ms against C's 35 ms. NEITHER change does
+    // anything alone (63 ms and 60 ms) -- LLVM will not inline a function with external linkage, and
+    // will not keep an inlined body in registers while it still calls into the runtime.
+    //
+    // A NOVA program is ONE translation unit (imports compile into the same module), so nothing
+    // outside needs these symbols, with three exceptions:
+    //   @export / @cdecl -- a C host resolves those BY SYMBOL, which is their entire purpose;
+    //   nova_user_main   -- kept external out of conservatism; it runs once, so inlining it buys
+    //                       nothing and the entry path is not where to take risk.
+    // Everything else is safe: nova_rt_register_fn takes a function's ADDRESS via ptrtoint rather
+    // than a symbol lookup (which both keeps an internal function alive against DCE and yields a
+    // valid pointer), @test functions are run by a generated in-module runner, and trampolines call
+    // their targets directly. The failure mode is also the good kind: a missing symbol is a LINK
+    // ERROR, not a silently wrong number.
+    e.ire_keep_external["nova_user_main"] = 1
+    e.ire_frt_snapshot = frt
+    for _kx_s in stmts
+        match _kx_s
+            Stmt(_kxt, _kxn, _kxe, _kxb, _kxp, _kxeb, _kxanns, _kxsl) =>
+                if _kxt == "fn"
+                    for _kxa in _kxanns
+                        match _kxa
+                            Expr(_kxat, _kxav, _kxan, _kxac, _kxaf, _kxal) =>
+                                if _kxat == "ann" and (_kxav == "export" or _kxav == "cdecl")
+                                    e.ire_keep_external[_kxn] = 1
+
     for ir_fn in ir_fns
         let typed_fn = ir_infer_types(ir_fn, frt, fpt)
         if want_escape
@@ -28539,8 +28769,26 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                 // integer overflow). A box works either way: a specialized body unboxes it,
                 // and a generic body dispatches on the tag.
                 ire_indent(e, "%b" + str(_cdk) + " = bitcast double " + _psrc + " to i64")
-                ire_indent(e, "%n" + str(_cdk) + " = call i64 @nova_rt_box_float(i64 %b" + str(_cdk) + ")")
-                push(_cdargs, "%n" + str(_cdk))
+                // 3.1: when the NOVA annotation is literally `float`, the param becomes an
+                // IrType float and its body now ASSUMES raw bits (the callee-entry unbox is
+                // gone), so a box here is read as a pointer -- measured dmul(-1.5,3.0) = 0.
+                // Pass the raw pattern for that case and keep boxing for f64/f32, whose bodies
+                // stay generic.
+                //
+                // Gated on the NOVA ANNOTATION, not the C type: cdecl_c_type maps float, f64
+                // AND double all to "double", so keying on _pct would also strip the box from
+                // f64 params and break fhalf(3.0f), which is why the first attempt at this
+                // traded one failure for another.
+                //
+                // This wrapper is emitted DIRECTLY by the backend and never lowered as an
+                // IrFunction, so the call-site normalisation pass cannot see it -- it has to be
+                // handled here by hand. That invisibility is exactly why it was one of the four
+                // call-site classes that broke the 2026-08-25 attempt.
+                if _pann == "float" and env("NOVA_EXP_PSLOT") == "1"
+                    push(_cdargs, "%b" + str(_cdk))
+                else
+                    ire_indent(e, "%n" + str(_cdk) + " = call i64 @nova_rt_box_float(i64 %b" + str(_cdk) + ")")
+                    push(_cdargs, "%n" + str(_cdk))
             else if _pct == "float"
                 ire_indent(e, "%w" + str(_cdk) + " = fpext float " + _psrc + " to double")
                 ire_indent(e, "%b" + str(_cdk) + " = bitcast double %w" + str(_cdk) + " to i64")
