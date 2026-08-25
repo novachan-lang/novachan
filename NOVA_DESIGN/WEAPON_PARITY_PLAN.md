@@ -681,7 +681,7 @@ from assumption rather than measurement. Every future item gets grepped before i
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL 2026-08-24** — scalar float **2.21x → 1.69x C**; Phase 2 complete (3 rules, 6/6 gate, 5 defects closed); float-array work still open |
+| 3.1 | Float/array perf 1.7x → 1.0x C | C | L | **PARTIAL** — scalar float 2.21x → **1.69x** shipped; parity (1.00x) MEASURED but the implementation was REVERTED (25 float regressions); float ARRAY ~1.7x open |
 | 3.2 | SIMD | C/C++/Rust | M | **✅ ALREADY EXISTS** — `simd_add/sub/mul/scale/dot/sum/ready` builtins |
 | 3.3 | Verify generics monomorphize to zero-cost | C++ | S | **✅ DONE 2026-08-22 — zero-cost PROVEN structurally (byte-identical IR)** |
 | 3.4 | Buffer views (read-only, no copy) | C/Rust | M | **✅ DONE 2026-08-24** — `bytes_view` is O(1) zero-copy; `bytes_slice` still copies (contract kept); writes through a view abort; gated CI 2k8 |
@@ -973,6 +973,87 @@ converts NUMERICALLY. The right fix is the annotation the function always deserv
 `pack_f64_be(v: float)` (and `_le`, plus both `f32` forms) — because a declared-`float` param is
 the representation-**tolerant** contract. Left unannotated, a function that takes a float is one
 un-typeable caller away from silently wrong bytes on the wire.
+
+### ⚠ 3.1 SCALAR PARITY — MEASURED AT 1.00x C, THEN **REVERTED**. Read this before retrying.
+
+**The win is real and reproducible: 34 ms vs C's 34 ms**, down from 61 ms (1.74x), on
+`_f31_scalar.nova` vs `_f31_scalar.c`. It required exactly two changes together:
+
+| variant | time | vs C (34 ms) |
+|---|---|---|
+| shipped HEAD | 61 ms | 1.74x |
+| remove the callee-entry unbox only | 63 ms | 1.80x |
+| `internal` linkage only | 60 ms | 1.71x |
+| **both** | **34 ms** | **1.00x** |
+
+**Neither does anything alone.** LLVM will not inline a function with external linkage, and will not
+keep an inlined body in registers while it still calls into the runtime. The plan previously blamed
+the residual purely on `nova_rt_unbox`; that is at most half right — Phase 1 had already reduced the
+unbox to a two-load fast reject, so removing it changes nothing on its own. The missing half is that
+NOVA emits every user function `external`, so LLVM can never prove there are no other callers. C's
+`axpy` is `static`.
+
+**WHY IT WAS REVERTED.** Removing the callee-entry unbox makes every float-param callee assume raw
+bits, which is only sound if EVERY call site normalises. Four separate classes of call site turned
+out to violate that, three of which were found and fixed, and one of which is still unexplained:
+
+| # | invisible/unsound call site | symptom | status |
+|---|---|---|---|
+| 1 | address-taken fn reached via a `__fnref_` closure | pointer read as double | fixed (exclude from `b.ir_tramps`) |
+| 2 | `frt[fn] == "float"` is NOT "returns raw" — `determinant` returns a box on one of two paths | `linalg_lib_test: det=5` | fixed (proof-gate on `ir_reg_is_raw_double`) |
+| 3 | the `@cdecl` ABI wrapper — emitted directly by the backend, never lowered as an IrFunction, and it BOXES its incoming C double | `dmul(2.5,4.0) = 0` | fixed (pass raw; gate on the NOVA annotation, since `float`/`f64`/`double` all map to C `double` but only `float` becomes an IrType float) |
+| 4 | **unexplained** — still unidentified; see the correction below | `_polyderiv_test: got=4.886e18 want=2.0` | **NOT understood** |
+
+25 float-math tests regressed in total (`_poly*`, `_dist_*`, `_geo_*`, `_dms`, `_shannon`,
+`_matsolve`, …). Fixing #1-#3 recovered 23 of them. The last two (`_polyderiv_test`,
+`_polyinterp_test`) resisted, and a three-way toggle bisect gave a result that contradicts the
+runtime source:
+
+- all three sub-changes OFF -> PASS
+- call-site normalisation ON -> value corrupted to 4.886e18
+- normalisation OFF, callee-raw ON -> value CORRECT (2.0) but the comparison fails
+
+**CORRECTION (2026-08-25), tested directly.** The first write-up blamed the normalisation
+insertion itself. That is WRONG, and the experiment is cheap enough that it should have been run
+before writing the claim down: take the HEAD compiler's own `_polyderiv_test.ll` (which passes),
+hand-insert exactly one `nova_rt_unbox` at the `approx` call site, change nothing else, relink --
+**it still passes**. So inserting the call is innocent, which also matches the runtime source
+(`if (cannot_be_box) return handle;` over a `NOVA_NOINLINE` slow path that only dereferences a
+genuine box).
+
+The corruption therefore comes from a SIDE EFFECT of how the compiler inserts it, not from the call.
+The prime suspect is the type assigned to the new register (`ir_type_float()` plus `rt[nmr] =
+"float"`), which is visible to later inference and can change downstream decisions for the callee --
+but that was not confirmed, so it stays an open question rather than a conclusion.
+
+Shipping on top of an unexplained float corruption is not acceptable, so the whole change was
+reverted to HEAD and `_f31_unbox_elim_gate.ps1` was UNWIRED from nova_ci (stage 2k9 removed) because
+it fails without it.
+
+**⚠ AND RESTORE THE BINARY WHEN REVERTING SOURCE.** The 3.1 arc reconverged successfully before the
+regression failed, so it had already installed its gen5 as `gen3_test.exe`. Reverting
+`nova_compiler.nova` alone left the working-tree binary containing the reverted-away code -- every
+later test would have silently run the wrong compiler. Same class as the stale-`.ll` trap above:
+after a revert, `git checkout` the built artifacts too.
+
+**WHAT SURVIVES for the next attempt** (all committed, all currently passing):
+- `_f31_unbox_elim_probe.nova` + `_f31_export_linkage_probe.nova` + `_f31_unbox_elim_gate.ps1`
+  (9/9 when the change is present) — the falsifiable spec, teeth-checked.
+- The measurement table above, and the fact that BOTH changes are required.
+- `_f31_scalar_run`-style runners now ASSERT the IR they are about to time (`define internal i64
+  @axpy`). Without that assertion the first reading was 1.69x from a STALE `.ll` served by the mtime
+  cache, and the change would have been discarded as useless.
+
+**THE LESSON, which generalises past 3.1.** "Remove the defensive unbox" is a whole-program
+obligation, not a local optimisation: it is sound only if every call site normalises, and NOVA has at
+least four ways for a call site to be invisible to an IR-level pass — closures via trampolines,
+box-on-one-path returns, backend-generated ABI wrappers, and inferred (not declared) float params
+that `ir_infer_types` rewrites so they look declared. A future attempt should enumerate call-site
+kinds FIRST and prove coverage, rather than fixing them one regression at a time.
+
+**STILL OPEN — the float ARRAY half.** ~1.7x, a different mechanism (element representation, not the
+call boundary), untouched by any of this. The reading was taken with an arc running (167/247/176 ms
+spread) so it needs a quiet machine before being trusted.
 
 #### ⚠ OPEN GAP — address-taken function + raw float field (`_f31_polyfield_known_gap.nova`)
 

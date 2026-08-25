@@ -7,13 +7,22 @@ Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
 $compiler   = (Resolve-Path "$PSScriptRoot\gen3_test.exe").Path
-$runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
+# LIVE runtime, not the output/ copy. That copy was 16 days and 79 KB stale (2026-08-09 vs
+# 2026-08-24), so every CLEAN verdict was measured against a runtime missing every fix since --
+# and CLEAN is the criterion for wiring a test INTO the gate. A classifier that adopts tests on
+# the strength of the wrong runtime is worse than no classifier: it manufactures confidence.
+# Only compiler/ is live; see the stale-runtime-copy note in project memory.
+$runtimeSrc = "$PSScriptRoot\..\compiler\nova_runtime.c"
 $runtimeObj = "$PSScriptRoot\_orphan_rt.o"
 $env:NOVA_NO_CACHE = "1"
 $clang = "clang"
 
 Write-Host "Pre-compiling runtime -> _orphan_rt.o ..."
-$rtc = Invoke-Timed -FilePath $clang -Arguments "-c -O2 `"$runtimeSrc`" -o `"$runtimeObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 180000 -WorkingDirectory $PSScriptRoot
+# -fms-extensions: the live runtime uses __try/__except for fiber stack-overflow containment and
+# does not compile without it on Windows (the same flag nova_link passes).
+$rtFlags = "-c -O2 `"$runtimeSrc`" -o `"$runtimeObj`" -D_CRT_SECURE_NO_WARNINGS -w"
+if ($env:OS -eq "Windows_NT") { $rtFlags = $rtFlags + " -fms-extensions" }
+$rtc = Invoke-Timed -FilePath $clang -Arguments $rtFlags -TimeoutMs 180000 -WorkingDirectory $PSScriptRoot
 if (-not (Test-Path $runtimeObj)) { Write-Host "FATAL: runtime precompile failed"; exit 2 }
 
 $names = Get-Content $ListFile | Where-Object { $_.Trim() -ne "" } | Select-Object -First $Max

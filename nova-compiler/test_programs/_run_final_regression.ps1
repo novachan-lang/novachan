@@ -614,7 +614,7 @@ foreach ($t in $parallel_tests) {
     [void]$jobs.Add(@{ PS = $ps; Handle = $handle; Name = $t })
 }
 
-$pass = 0; $fail = 0; $skip = 0; $failures = @(); $suspects = @()
+$pass = 0; $fail = 0; $skip = 0; $failures = @(); $suspects = @(); $outfails = @()
 foreach ($job in $jobs) {
     try {
         $res = $job.PS.EndInvoke($job.Handle)
@@ -625,7 +625,7 @@ foreach ($job in $jobs) {
     }
 
     switch ($r.Status) {
-        "PASS" { $pass++; Write-Host "PASS $($r.Name)"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name } }
+        "PASS" { $pass++; Write-Host "PASS $($r.Name)"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name }; if ($r.OutFail) { $outfails += $r.Name } }
         "SKIP" { $skip++ }
         default {
             $fail++
@@ -656,7 +656,7 @@ foreach ($t in $server_tests) {
         $r = @{ Name = $t; Status = "FAIL"; Detail = "RUNSPACE ERROR" }
     }
     switch ($r.Status) {
-        "PASS" { $pass++; Write-Host "PASS $($r.Name) [serial]"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name } }
+        "PASS" { $pass++; Write-Host "PASS $($r.Name) [serial]"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name }; if ($r.OutFail) { $outfails += $r.Name } }
         "SKIP" { $skip++ }
         default { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail)) [serial]" }
     }
@@ -681,6 +681,14 @@ if ($suspects.Count -gt 0) {
     Write-Host ""
     Write-Host "SUSPECT (exit 0 but NO stdout - possible false-pass, audit these):"
     foreach ($s in $suspects) { Write-Host "  $s" }
+}
+# Exit 0 while PRINTING a failure report. Non-fatal for now, on purpose -- see the note in
+# _test_worker.ps1. This count is the measurement needed to decide whether the check can be made
+# fatal; a zero here means it can.
+if ($outfails.Count -gt 0) {
+    Write-Host ""
+    Write-Host "SUSPECT-OUTFAIL ($($outfails.Count)) (exit 0 but stdout reports FAIL - these pass the gate while failing):"
+    foreach ($s in $outfails) { Write-Host "  $s" }
 }
 if ($fail -gt 0) { exit 1 }
 exit 0

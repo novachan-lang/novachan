@@ -10,7 +10,7 @@
 $testScript = {
     param($testName, $compilerPath, $rtObjPath, $workDir, $clangExe, $lFlags, $sqPath)
 
-    $r = @{ Name = $testName; Status = "PASS"; Detail = ""; Out = "" }
+    $r = @{ Name = $testName; Status = "PASS"; Detail = ""; Out = ""; OutFail = $false }
 
     if (-not (Test-Path "$workDir\$testName.nova")) {
         $r.Status = "SKIP"; return $r
@@ -101,6 +101,35 @@ $testScript = {
     if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
     elseif ($rr.X -ne 0) { $r.Status = "FAIL"; $r.Detail = "RUN exit=$($rr.X)" }
     elseif ($rr.E -match 'FAIL assert') { $r.Status = "FAIL"; $r.Detail = "ASSERT FAIL" }
+
+    # STDOUT failure reports: a test that prints its own "FAIL ..." and returns 0 currently PASSES,
+    # because the checks above look only at the exit code and at stderr. That is a real hole -- the
+    # hand-rolled checker idiom is everywhere in this suite, and one that forgets its exit(1) reports
+    # nothing. Found 2026-08-25: _kat_ascii85 prints "Man=FAIL (9`P.n)" and _kat_bech32 prints
+    # "abcdef=FAIL (...)", both exit 0. Real encoder bugs that would have been invisible if gated.
+    #
+    # Recorded as a SUSPECT rather than a failure, deliberately. The pattern is broad enough to hit
+    # legitimate output ("0 failed", a test that prints the word FAIL as data), and the false-positive
+    # rate over ~2994 gated tests has not been measured yet. Warn first, measure, then decide whether
+    # to make it fatal -- flipping it straight to fatal would red the CI on unknown grounds, which is
+    # how a gate gets disabled instead of fixed.
+    # -cmatch, not -match: PowerShell's -match is CASE-INSENSITIVE by default, so the first cut
+    # also fired on benign lowercase summaries like 'ok=9 fail=0'. Case matters here -- the
+    # convention in this suite is an uppercase FAIL for a real failure report.
+    # Zero-count summaries ('PASS=17 FAIL=0') are excluded for the same reason: they report
+    # SUCCESS. Measured on the 2026-08-25 arc: 35 raw hits, of which only a minority were real.
+    $_of = $false
+    if ($rr.O -cmatch '(^|[^A-Za-z])FAIL([^A-Za-z]|$)') { $_of = $true }
+    if ($rr.O -cmatch 'Assertion failed') { $_of = $true }
+    if ($_of -and ($rr.O -cmatch 'FAIL\s*[=:]\s*0(\D|$)') -and -not ($rr.O -cmatch '(^|
+)\s*FAIL[ :]')) { $_of = $false }
+    # A test OF the test framework prints FAIL as its subject matter -- _atest_test and
+    # _atest_fixes_test exercise a deliberately-failing case ('FAIL t_fails_on_purpose'), so the
+    # word appearing in their output is correct behaviour, not a defect. Narrow, explicit
+    # allowlist rather than a looser pattern: loosening the pattern would hide real failures
+    # everywhere else, which is the opposite of what this check is for.
+    if ($testName -eq '_atest_test' -or $testName -eq '_atest_fixes_test') { $_of = $false }
+    if ($_of) { $r.OutFail = $true }
     if ($rr.O) { $r.Out = ([string]$rr.O).Trim() }
 
     return $r

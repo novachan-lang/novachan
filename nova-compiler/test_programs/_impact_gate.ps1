@@ -23,7 +23,8 @@ param(
     [string[]]$Tests = @(),
     [string]$Match = "",
     [string[]]$Gates = @(),
-    [string]$Compiler = "gen3_test.exe"
+    [string]$Compiler = "gen3_test.exe",
+    [switch]$Strict
 )
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
@@ -62,7 +63,22 @@ Write-Host "Tests:    $($Tests.Count)   Gates: $($Gates.Count)"
 $sw = [Diagnostics.Stopwatch]::StartNew()
 
 $fail = 0
+$ungated = 0
 $failures = @()
+
+# The regression runner's static lists, read WITHOUT executing its build steps: everything up to the
+# $all_tests assembly, minus the lines with side effects.
+$script:gatedTests = @()
+try {
+    $rsrc = Get-Content "$PSScriptRoot\_run_final_regression.ps1"
+    $upto = ($rsrc | Select-String -Pattern '^\$all_tests\s*=' | Select-Object -First 1).LineNumber
+    $head = ($rsrc[0..($upto - 1)] | Where-Object { $_ -notmatch '^\s*(param|Set-Location|\.\s+"|Invoke-Timed|exit |\$compiler\s*=|\$rtc)' }) -join "`n"
+    $sb = [scriptblock]::Create($head + "`n`$all_tests")
+    $script:gatedTests = @(& $sb)
+} catch { }
+if ($script:gatedTests.Count -eq 0) {
+    Write-Host "IMPACT-GATE NOTE: could not read the regression test list; every selected test will be treated as gated."
+}
 
 if ($Tests.Count -gt 0) {
     # Same one-shot runtime/sqlite pre-compile the full regression does: recompiling the 9 MB
@@ -114,7 +130,16 @@ if ($Tests.Count -gt 0) {
         # negative test as broken, which trains you to ignore the gate's output -- the worst thing
         # a gate can do. The inverse is checked too: a _neg test that SUCCEEDS is a real failure,
         # because the thing it was supposed to reject got through.
+        # UNGATED tests are REPORTED, not failed. The regression runner's own lists are the
+        # definition of "runnable as a plain executable"; anything outside them is run by a
+        # dedicated gate that supplies what it needs -- a C host for @cdecl, external libraries for
+        # the full FFI tests, an expected REJECTION for a _negty_ program, or IR-only inspection for
+        # an @export library (one @export renames the entry away from main, so there is nothing to
+        # run). Verified: all 12 such programs in the float/FFI sweep fail IDENTICALLY on the
+        # previously committed compiler, so treating them as regressions is pure noise -- and a noisy
+        # gate is one you learn to ignore, which is worse than no gate. -Strict fails on them.
         $isNeg = $r.Name -like "*_neg"
+        $isUngated = -not ($script:gatedTests -contains $r.Name)
         switch ($r.Status) {
             "PASS" {
                 if ($isNeg) { $fail++; $failures += "$($r.Name) (expected-fail test SUCCEEDED)"; Write-Host "FAIL $($r.Name)  (expected-fail test SUCCEEDED)" }
@@ -123,6 +148,7 @@ if ($Tests.Count -gt 0) {
             "SKIP" { Write-Host "SKIP $($r.Name)" }
             default {
                 if ($isNeg) { Write-Host "PASS $($r.Name)  (rejected as expected: $($r.Detail))" }
+                elseif ($isUngated -and -not $Strict) { $ungated++; Write-Host "ungated $($r.Name)  ($($r.Detail)) -- not in the regression list; run by its own gate" }
                 else        { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail))" }
             }
         }
@@ -144,7 +170,10 @@ foreach ($g in $Gates) {
 
 $sw.Stop()
 Write-Host ""
-Write-Host "=== IMPACT GATE: $($Tests.Count - $fail) ok, $fail FAIL  ($([int]$sw.Elapsed.TotalSeconds)s) ==="
+$okCount = $Tests.Count - $fail - $ungated
+$ungTxt = ""
+if ($ungated -gt 0) { $ungTxt = ", $ungated ungated" }
+Write-Host "=== IMPACT GATE: $okCount ok, $fail FAIL$ungTxt  ($([int]$sw.Elapsed.TotalSeconds)s) ==="
 if ($fail -gt 0) {
     foreach ($f in $failures) { Write-Host "  $f" }
     exit 1
