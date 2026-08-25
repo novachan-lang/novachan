@@ -7203,9 +7203,63 @@ int64_t nova_rt_eq(int64_t a, int64_t b) {
        regardless of how each was produced (literal=raw bits vs push/dict-set=boxed).
        For every non-box value nova_rt_unbox is a tag-checked no-op, so this only
        fixes boxed scalars and never changes existing int/string/list/struct eq. */
+    /* Remember which side arrived as a FLOAT BOX before unboxing destroys the evidence. That is
+       the only reliable signal available here: after unboxing, a raw double's bits and a raw int
+       are indistinguishable i64s, which is the whole reason this function could not compare them. */
+    int _af = 0, _bf = 0;
+    if (nova_is_box(a)) { NovaBox* _bx = (NovaBox*)(uintptr_t)a; _af = (_bx->kind == NOVA_BOX_FLOAT); }
+    if (nova_is_box(b)) { NovaBox* _bx = (NovaBox*)(uintptr_t)b; _bf = (_bx->kind == NOVA_BOX_FLOAT); }
     a = nova_rt_unbox(a);
     b = nova_rt_unbox(b);
     if (a == b) return 1;
+    /* INT vs FLOAT, compared NUMERICALLY. Without this, equality meant different things depending
+       on a value's STATIC type, which is the kind of inconsistency that is worse than either
+       answer alone. Measured: `sum([1,2,3,4,5]) == 15.0` is TRUE when the sum is statically int
+       (the compiler converts and compares as doubles), while the identical value through
+       Query.sum() -> any is FALSE, because it reaches here and 15 != the bit pattern of 15.0.
+       Reported by _kat_query as "sum: got 15 want 15.0".
+
+       Applied ONLY when exactly one side was a float box. That asymmetry is what makes it sound:
+       it means one operand is known-float and the other is a plain integer, so the numeric
+       comparison is unambiguous. When neither side is boxed we cannot tell a raw double from an
+       i64 and must not guess; when both are, the raw compare above already handled them. */
+    /* The non-float side must be a genuine SCALAR, not a heap object. The emitter decides to box
+       a float operand from its static type, and that type can be WRONG: a list literal [1.0]
+       starts out float-typed and stays so after strings are pushed onto it, so `g[20] == "19"`
+       arrived here as (float box, string pointer) and the numeric branch compared the pointer as
+       a number. Caught by _s4_adv_test ("realloc: tail"). Checking the tag here keeps this sound
+       no matter how the operand was labelled upstream -- the runtime knows what the value IS.
+    */
+    /* FALL THROUGH when either side is not plainly scalar -- never `return`. An earlier version
+       returned 0 here, and that suppressed the string/list/dict/struct comparisons BELOW, turning a
+       pre-existing latent mis-box into a visible wrong answer: forge_typed_query_test compares a
+       value that upstream had boxed as a float even though its payload is a POINTER
+       (af=1 a=1983349000456 -- 9.8e-312 as a double, the pointer-read-as-double signature) against
+       a string. The old code coped because it ignored the float-ness and reached the string
+       compare; short-circuiting to 0 broke it.
+       So the rule is: take the numeric path ONLY when both operands are plainly numeric, and
+       otherwise leave the existing logic completely untouched. A wrong `float` label can then
+       never make this function answer differently than it did before. */
+    if (_af != _bf) {
+        int64_t _fv = _af ? a : b;
+        int64_t _ov = _af ? b : a;
+        int _both_scalar = 1;
+        if (nova_mem_find_tag((void*)(uintptr_t)_fv) != (NovaMemTag)-1) _both_scalar = 0;
+        if (nova_mem_find_tag((void*)(uintptr_t)_ov) != (NovaMemTag)-1) _both_scalar = 0;
+        if (_both_scalar && (uint64_t)_fv > 0x10000 &&
+            nova_is_readable_str((void*)(uintptr_t)_fv)) _both_scalar = 0;
+        if (_both_scalar && (uint64_t)_ov > 0x10000 &&
+            nova_is_readable_str((void*)(uintptr_t)_ov)) _both_scalar = 0;
+        if (_both_scalar) {
+        /* memcpy inline rather than i2f(): that helper is defined ~5000 lines BELOW this
+           function, and calling it here is an implicit declaration (caught loudly by the
+           build, which is the good failure mode). */
+            double _da, _db;
+            if (_af) memcpy(&_da, &a, sizeof(double)); else _da = (double)a;
+            if (_bf) memcpy(&_db, &b, sizeof(double)); else _db = (double)b;
+            return (_da == _db) ? 1 : 0;
+        }
+    }
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
@@ -13239,8 +13293,40 @@ int64_t nova_rt_abs(int64_t x) {
     if (exp > 0 && exp < 0x7FF) return nova_rt_box_float((int64_t)(ux & 0x7FFFFFFFFFFFFFFFULL));
     return x < 0 ? -x : x;
 }
-int64_t nova_rt_max(int64_t a, int64_t b) { return a > b ? a : b; }
-int64_t nova_rt_min(int64_t a, int64_t b) { return a < b ? a : b; }
+/* BOX-AWARE min/max. These used to be a bare integer compare, which is correct for ints and
+   catastrophically wrong for BOXED floats: it compared the box POINTERS and returned whichever
+   address happened to be smaller, then the result was typed int. Measured in forge_dtw:
+   min(0.0, 1000000000.0) returned 1978058933000 -- a heap address, and it CHANGED between runs,
+   which is what identified it as an address rather than a miscomputation.
+
+   The compiler DOES specialise this to nova_rt_fmin/fmax when it can prove both operands are
+   statically float, and that path is unaffected. This is the fallback it cannot prove -- a float
+   that reached here through a generic container or a dynamic arithmetic result, where the value is
+   a box and the static type is `any`. Compile-time specialisation cannot cover that case by
+   construction, so the runtime has to.
+
+   Returns the WINNING ARGUMENT rather than a freshly computed double, so the caller gets back
+   exactly the representation it passed in (a box stays a box, which every downstream reader
+   -- any_to_str, float_to_str, arithmetic -- already unboxes correctly). Recomputing would force a
+   representation choice this function has no business making.
+
+   nova_elem_to_double is the box-aware reader: box -> payload, raw int -> numeric convert. That is
+   the right pairing for the mixed case min(3, boxed 2.5). It is NOT correct for a RAW double
+   operand, but a raw double is precisely the case the compiler already specialised away above. */
+int64_t nova_rt_max(int64_t a, int64_t b) {
+    if (nova_is_box(a) || nova_is_box(b)) {
+        double da = nova_elem_to_double(a), db = nova_elem_to_double(b);
+        return da >= db ? a : b;
+    }
+    return a > b ? a : b;
+}
+int64_t nova_rt_min(int64_t a, int64_t b) {
+    if (nova_is_box(a) || nova_is_box(b)) {
+        double da = nova_elem_to_double(a), db = nova_elem_to_double(b);
+        return da <= db ? a : b;
+    }
+    return a < b ? a : b;
+}
 int64_t nova_rt_fmax(int64_t a, int64_t b) { return f2i(fmax(nova_float_arg(a), nova_float_arg(b))); }
 int64_t nova_rt_fmin(int64_t a, int64_t b) { return f2i(fmin(nova_float_arg(a), nova_float_arg(b))); }
 int64_t nova_rt_fmax_ri(int64_t a, int64_t b) { return f2i(fmax(i2f(a), (double)b)); }

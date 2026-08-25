@@ -22035,6 +22035,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if dest != ""
                             rt[dest] = "float"
                         return IrInst(op, dest, ir_type_float(), args, mfv, num, effect, line)
+                    // Anything reaching the DYNAMIC nova_rt_min/max -- i.e. not one of the three
+                    // specialised float forms above -- must be typed `any` unless BOTH operands
+                    // are int. The runtime is box-aware now and returns the winning ARGUMENT, so
+                    // with a boxed-float operand the result IS a box; typing it int made str()
+                    // render that pointer as an integer (min(0.0, 1e9) printed 1847044604392).
+                    // Fixing the comparison without fixing the type only moved the bug -- the
+                    // value became right while the rendering stayed wrong.
+                    if _mlt != "int" or _mrt != "int"
+                        if dest != ""
+                            rt[dest] = "any"
+                        return IrInst(op, dest, ir_type_any(), args, value, num, effect, line)
                 if value == "nova_rt_abs" and len(args) == 1
                     if ir_reg_type(rt, args[0]) == "float"
                         if dest != ""
@@ -23454,9 +23465,14 @@ type IrEmitter
     ire_dwarf_vars: int         // #33: when 1 (NOVA_DWARF_VARS / `nova debug`), emit DWARF DILocalVariable + llvm.dbg.declare so lldb can inspect NOVA locals. Default 0 -> byte-identical line-tables-only DWARF.
     ire_dbg_vars: list          // #33: collected [varid, name, sp_id, line] DILocalVariable entries, emitted in the metadata section. EMPTY unless ire_dwarf_vars.
     ire_cur_fn_line: int        // #33: source line of the function currently being emitted (for DILocalVariable line attrs).
+    ire_const_float: dict       // Registers defined by a float LITERAL. Strictly narrower than
+                                // ire_proven_float, which also covers float-typed CONTAINER reads --
+                                // and a container's element type can be stale (a list literal [1.0]
+                                // stays float-typed after strings are pushed onto it). A literal is
+                                // the only operand whose float-ness cannot be invalidated later.
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0)
+    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0, {})
     // #33: enable DWARF variable emission when requested (NOVA_DWARF_VARS or `nova debug`).
     if env("NOVA_DWARF_VARS") != ""
         e.ire_dwarf_vars = 1
@@ -23647,6 +23663,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 else
                     ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
                 ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
+                e.ire_const_float[dest] = 1   // a LITERAL: float-ness can never be invalidated
             else if op == "const_str"
                 let str_name = ire_intern_string(e, value)
                 let byte_len = len(value) + 1
@@ -23887,7 +23904,36 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, tmp + " = icmp eq i32 " + cmp + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
                         else
-                            ire_indent(e, dest + " = call i64 @nova_rt_eq(i64 " + args[0] + ", i64 " + args[1] + ")")
+                            // DYNAMIC COMPARISON: box a PROVABLY-RAW float operand first.
+                            // Reaching here means at least one side is statically `any`, so fcmp
+                            // is not available -- but the raw bits of a double are indistinguishable
+                            // from an i64 at runtime, so nova_rt_eq/neq could only compare them as
+                            // integers. That made equality depend on STATIC type: with the sum
+                            // statically int, `sum([1,2,3,4,5]) == 15.0` is TRUE (the emitter uses
+                            // fcmp with sitofp), while the identical value through Query.sum() ->
+                            // any is FALSE. Same values, opposite answers -- worse than either.
+                            // Boxing carries the float-ness across the call so the runtime can
+                            // compare numerically. Gated on a float LITERAL only -- the narrowest
+                            // signal available, and the narrowness is the point.
+                            //
+                            // ire_reg_types was tried first and is a static GUESS. ire_proven_float
+                            // was tried next and is still too broad: it includes float-typed
+                            // CONTAINER reads, and a container's element type goes stale --
+                            // `let g = [1.0]` stays float-typed after strings are pushed, so
+                            // `g[20]` compiles to nova_rt_list_get_f and boxing its result wrapped a
+                            // STRING POINTER in a float box (_s4_adv_test, "realloc: tail").
+                            // A literal is the only operand whose float-ness nothing downstream can
+                            // invalidate, and it is exactly the case that needs this: comparing an
+                            // `any` against a written-out float such as `x == 15.0`.
+                            let _eqa0 = args[0]
+                            let _eqa1 = args[1]
+                            if contains(e.ire_const_float, args[0])
+                                _eqa0 = dest + ".bx0"
+                                ire_indent(e, _eqa0 + " = call i64 @nova_rt_box_float(i64 " + args[0] + ")")
+                            if contains(e.ire_const_float, args[1])
+                                _eqa1 = dest + ".bx1"
+                                ire_indent(e, _eqa1 + " = call i64 @nova_rt_box_float(i64 " + args[1] + ")")
+                            ire_indent(e, dest + " = call i64 @nova_rt_eq(i64 " + _eqa0 + ", i64 " + _eqa1 + ")")
             else if op == "neq"
                 match typ
                     IrType(tk, tn, tp, tid) =>
@@ -23920,7 +23966,36 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, tmp + " = icmp ne i32 " + cmp + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
                         else
-                            ire_indent(e, dest + " = call i64 @nova_rt_neq(i64 " + args[0] + ", i64 " + args[1] + ")")
+                            // DYNAMIC COMPARISON: box a PROVABLY-RAW float operand first.
+                            // Reaching here means at least one side is statically `any`, so fcmp
+                            // is not available -- but the raw bits of a double are indistinguishable
+                            // from an i64 at runtime, so nova_rt_eq/neq could only compare them as
+                            // integers. That made equality depend on STATIC type: with the sum
+                            // statically int, `sum([1,2,3,4,5]) == 15.0` is TRUE (the emitter uses
+                            // fcmp with sitofp), while the identical value through Query.sum() ->
+                            // any is FALSE. Same values, opposite answers -- worse than either.
+                            // Boxing carries the float-ness across the call so the runtime can
+                            // compare numerically. Gated on a float LITERAL only -- the narrowest
+                            // signal available, and the narrowness is the point.
+                            //
+                            // ire_reg_types was tried first and is a static GUESS. ire_proven_float
+                            // was tried next and is still too broad: it includes float-typed
+                            // CONTAINER reads, and a container's element type goes stale --
+                            // `let g = [1.0]` stays float-typed after strings are pushed, so
+                            // `g[20]` compiles to nova_rt_list_get_f and boxing its result wrapped a
+                            // STRING POINTER in a float box (_s4_adv_test, "realloc: tail").
+                            // A literal is the only operand whose float-ness nothing downstream can
+                            // invalidate, and it is exactly the case that needs this: comparing an
+                            // `any` against a written-out float such as `x == 15.0`.
+                            let _nea0 = args[0]
+                            let _nea1 = args[1]
+                            if contains(e.ire_const_float, args[0])
+                                _nea0 = dest + ".bx0"
+                                ire_indent(e, _nea0 + " = call i64 @nova_rt_box_float(i64 " + args[0] + ")")
+                            if contains(e.ire_const_float, args[1])
+                                _nea1 = dest + ".bx1"
+                                ire_indent(e, _nea1 + " = call i64 @nova_rt_box_float(i64 " + args[1] + ")")
+                            ire_indent(e, dest + " = call i64 @nova_rt_neq(i64 " + _nea0 + ", i64 " + _nea1 + ")")
             else if op == "lt"
                 match typ
                     IrType(tk, tn, tp, tid) =>
@@ -26681,8 +26756,14 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare void @nova_rt_cov_dump() nounwind")
     ire_line(e, "declare i64 @nova_rt_write_raw(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_abs(i64) nounwind readnone")
-    ire_line(e, "declare i64 @nova_rt_max(i64, i64) nounwind readnone")
-    ire_line(e, "declare i64 @nova_rt_min(i64, i64) nounwind readnone")
+    // readONLY, not readNONE. These are box-aware now: on a boxed-float operand they read the
+    // box to compare numerically instead of comparing POINTERS. `readnone` promises the function
+    // touches no memory, and clang compiles nova_runtime.c together with this IR -- so with the
+    // old attribute LLVM was entitled to discard the box load as unreachable-by-contract, and it
+    // did: the runtime fix had no effect until this line changed. An IR attribute is a CONTRACT,
+    // and changing an implementation to read memory means changing it too.
+    ire_line(e, "declare i64 @nova_rt_max(i64, i64) nounwind readonly")
+    ire_line(e, "declare i64 @nova_rt_min(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_sqrt(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_sinh(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_cosh(i64) nounwind")
@@ -27750,6 +27831,21 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         if b.ir_fn_returns[_br_fn] == "bool"
             frt[_br_fn] = "bool"
             _decl_bool[_br_fn] = 1
+    // A DECLARED `-> any` IS NOT NARROWED EITHER. This is the return-side twin of the
+    // declared-`any` PARAM rule (@anyp@): writing `any` is a statement that the value is
+    // polymorphic, and narrowing it to a concrete kind is unsound in exactly one direction.
+    // Measured: forge_deque's element accessors are annotated `-> any` because a deque holds
+    // heterogeneous values, but the return-type fixpoint re-derived "int" from the IR (every NOVA
+    // value is an i64 there), so str() took the integer path and printed a string's POINTER --
+    // fifo1: got=140695274946605 want=a.
+    //
+    // b.ir_fn_returns only holds an entry when an annotation was actually written, so this cannot
+    // catch an inferred `any`; it is exactly the author's declaration. The cost is that a
+    // genuinely-int-returning function declared `-> any` loses specialisation, which is the
+    // author's choice by writing `any`.
+    for _ar_fn in keys(b.ir_fn_returns)
+        if b.ir_fn_returns[_ar_fn] == "any"
+            _decl_bool[_ar_fn] = 1
     // EXTERNS. ti returns nt_unit() for `extern_fn` without recording a signature, so an
     // extern never reached ti_fn_types and therefore never reached frt -- its call result
     // stayed untyped and `str()` lowered to any_to_str, which runs find_tag on raw double
@@ -27849,12 +27945,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     // conflict) must STAY `any` — do not refine it to a first-return concrete type, or
                     // callers mis-dispatch print/box on the non-primary-type returns. (Incomplete-`any`
                     // fns are NOT in ti_fn_hetero, so the IR may still refine those for perf.)
-                    // A DECLARED `-> bool` is not up for re-derivation. ir_analyze_return_type reads
-                    // the IR, where a bool IS an i64, so it concludes "int" and clobbers the seeded
-                    // "bool" -- which is why seeding alone changed nothing and the emitted IR still
-                    // showed nova_rt_int_to_str. Same shape as fpt_decl protecting declared floats
-                    // from call-site narrowing: an annotation the author wrote outranks a type the
-                    // compiler re-inferred from a representation that cannot distinguish the two.
+                    // A DECLARED `-> bool` or `-> any` is not up for re-derivation.
+                    // ir_analyze_return_type reads the IR, where every NOVA value is an i64, so it
+                    // concludes "int" and clobbers the declaration -- which is why seeding frt alone
+                    // changed nothing and the emitted IR still showed nova_rt_int_to_str. Same shape
+                    // as fpt_decl protecting declared floats from call-site narrowing: an annotation
+                    // the author wrote outranks a type the compiler re-inferred from a
+                    // representation that cannot distinguish the two. (_decl_bool holds both cases.)
                     if new_type != old_type and new_type != "any" and not contains(ti_state.ti_fn_hetero, fname) and not contains(_decl_bool, fname)
                         frt[fname] = new_type
                         changed = true
