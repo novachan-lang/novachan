@@ -61,6 +61,41 @@ if ($sc.Count -eq 0) {
     Write-Host "  FAIL @scale2 lost its unbox -- a closure call would read a pointer as a double"; $fail++
 }
 
+# --- LINKAGE: internal for ordinary fns, EXTERNAL for @export ----------------------------
+# The two halves of the perf win are unbox removal and internal linkage, and neither does
+# anything without the other -- so both need asserting or a future change could quietly undo
+# half of it and leave the ratio at 1.7x with every test still green.
+if (@($ll | Where-Object { $_ -match "^define internal i64 @axpy\(" }).Count -eq 1) {
+    Write-Host "  ok   @axpy has INTERNAL linkage (LLVM may inline it)"
+} else {
+    Write-Host "  FAIL @axpy is not internal -- LLVM will not inline it, costing the whole win"; $fail++
+}
+# @export is the C ABI, and it needs its OWN probe: one @export puts the unit into C-library mode,
+# which renames the entry away from `main`, so it cannot be a runnable program. IR only.
+# Internalising an @export still compiles and still links as a library -- a C host simply cannot
+# resolve the symbol, and nothing in this repo would notice. Hence the structural assertion.
+Remove-Item -Force _f31_export_linkage_probe.ll -ErrorAction SilentlyContinue
+$xc = Invoke-Timed -FilePath $exe.Path -Arguments "_f31_export_linkage_probe.nova _f31_export_linkage_probe.ll" -TimeoutMs 240000
+if ($xc.ExitCode -ne 0 -or -not (Test-Path _f31_export_linkage_probe.ll)) {
+    Write-Host "  FAIL export probe: emit (exit=$($xc.ExitCode))"; $fail++
+} else {
+    $xll = Get-Content _f31_export_linkage_probe.ll
+    $bad = @($xll | Where-Object { $_ -match "^define internal i64 @nova_exported_" })
+    $good = @($xll | Where-Object { $_ -match "^define i64 @nova_exported_" })
+    if ($bad.Count -gt 0) {
+        Write-Host "  FAIL $($bad.Count) @export fn(s) internalised -- the C ABI symbol is gone"; $fail++
+    } elseif ($good.Count -eq 2) {
+        Write-Host "  ok   both @export fns keep EXTERNAL linkage (C ABI intact)"
+    } else {
+        Write-Host "  FAIL expected 2 external @export fns, found $($good.Count)"; $fail++
+    }
+    if (@($xll | Where-Object { $_ -match "^define internal i64 @helper_add\(" }).Count -eq 1) {
+        Write-Host "  ok   a non-exported fn is still internal in library mode"
+    } else {
+        Write-Host "  FAIL helper_add should be internal even in @export library mode"; $fail++
+    }
+}
+
 # --- values: raw path, boxed path, and both address-taken paths ---------------------------
 $b = Invoke-Timed -FilePath $exe.Path -Arguments "build _f31_unbox_elim_probe.nova" -TimeoutMs 240000
 if ($b.ExitCode -ne 0) { Write-Host "UNBOX-ELIM-GATE FAIL: build"; Write-Host $b.StdErr; exit 1 }
@@ -82,5 +117,5 @@ foreach ($k in @("axpy","axpy_boxed","scale2","scale2_indirect")) {
 }
 
 if ($fail -gt 0) { Write-Host "UNBOX-ELIM-GATE FAIL ($fail)"; exit 1 }
-Write-Host "UNBOX-ELIM-GATE OK (6/6 assertions)"
+Write-Host "UNBOX-ELIM-GATE OK (9/9 assertions)"
 exit 0
