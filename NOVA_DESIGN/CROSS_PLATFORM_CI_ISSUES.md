@@ -143,3 +143,65 @@ have cross-platform CI that means something". None of them require touching the 
 Nothing here has been changed yet — this is the register only. The macOS/Linux seeds must be
 generated from a COMMITTED compiler state, so the right moment is immediately after the current
 batch lands, not before.
+
+---
+
+## Live runs — findings
+
+### X-7 · Linux self-hosted CI PASSES · **RESOLVED 2026-08-25**
+
+Run 32862098961, commit `c6abf5b5`: `linux-selfhosted` → **success**. First time NOVA has built
+and passed its core suite on Linux in CI. Before today the repo had exactly ONE workflow run in its
+entire history, and it failed. The bootstrap-seed mechanism works.
+
+### X-8 · A broken workflow YAML reports as a FAILED RUN WITH ZERO JOBS · **PROCESS**
+
+Run 32864962314 came back `conclusion: failure` — but `/jobs` returned `total_count: 0`. Nothing
+ran. The cause was invalid YAML in the workflow itself: an `echo "... $(… | tr '\n' ' ')"` had a
+LITERAL newline inside the double-quoted string, so the file stopped parsing at that line.
+
+Two things worth keeping:
+
+1. **A failed run with zero jobs means the workflow did not parse** — it does not mean the build
+   broke. Check `total_count` before reading anything into a red X, or you will debug the compiler
+   when the problem is the YAML.
+2. **Validate the workflow locally before every push.** One line does it and it would have caught
+   this before it cost a round trip:
+   ```
+   python -c "import yaml; yaml.safe_load(open('.github/workflows/cross-platform.yml', encoding='utf-8'))"
+   ```
+   Both workflow files now parse; `release.yml` declares build-linux / build-macos / build-windows /
+   publish-release.
+
+### X-9 · The Actions logs endpoint needs a token even on a public repo · **TOOLING**
+
+`GET /actions/jobs/<id>/logs` returns **403** unauthenticated, though the repo is public and run
+metadata reads fine. So available without a token: run status, per-job conclusions, and WHICH STEP
+failed. Not available: the actual error text.
+
+That is enough to diagnose a lot (X-8 was found from `total_count` alone), but not enough to read a
+compiler error off a runner. Two workarounds, both in use:
+- have the job PRINT its own diagnostics (arch, clang version, seed triple) into the step name/summary;
+- pipe the compiler through `tail` **with `set -o pipefail`** — without pipefail a failing clang
+  reports GREEN, because `tail` succeeded.
+
+A read-only token in the environment would remove the whole problem.
+
+### X-10 · `windows-full-regression` fails at its own step · **OPEN**
+
+Same run: `windows-full-regression` → failure at "Run full regression suite (114 tests)". This is
+the hand-maintained 62-entry array described in X-4 (whose step name says 114 — wrong in both
+directions). Not yet diagnosed; it is a separate defect from the Linux/macOS work and needs the
+X-4 fix (derive the list from `_orphan_coverage_manifest.txt`) before it is worth chasing.
+
+### X-11 · macOS still unproven · **OPEN**
+
+Two macOS attempts so far, both dying at the seed build step; the second never ran at all because of
+X-8, so the diagnostics added for it have not reported yet. The seed itself checks out locally: no
+Windows API imports (the `windows` matches in it are NOVA's own `list_windows*` functions and the
+compiler's target-name string table), 1419 declares, correct `aarch64-apple-darwin` triple and
+`e-m:o` datalayout.
+
+Prime remaining suspect is an arch mismatch — the seed is arm64 on the assumption that
+`macos-latest` is ARM64. The next run prints `uname -m`, which settles it. If that is the cause the
+fix is either pinning `runs-on: macos-14` or shipping an x86_64 seed alongside.
