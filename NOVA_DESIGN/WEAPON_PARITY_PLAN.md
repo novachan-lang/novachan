@@ -1131,6 +1131,73 @@ because rows 2/3 already show the rest of the mechanism works.
 2026-08-25 "unexplained #4" no longer reproduces at all under row 2. So do NOT reason from
 yesterday's IR dumps; re-measure.
 
+### ROOT CAUSE FOUND 2026-08-26 — the "unexplained #4" was a missing builtin exclusion
+
+**It was one condition.** Normalisation was firing on `nova_rt_*` BUILTINS as well as user
+functions, because `fpt` carries entries for both. The damage:
+
+```
+-  %r47 = call i64 @nova_rt_list_append(i64 %r45, i64 %r46)
++  %r47 = call i64 @nova_rt_list_append(i64 %r45, i64 %wnorm3)
+```
+
+`nova_rt_list_append` expects a BOXED float so the list stays heterogeneous-safe. Unboxing the
+argument stored raw double bits where a box belongs, and the value was misread coming out. Fix:
+`and not starts_with(value, "nova_rt_")`.
+
+**How it was finally found, after three wrong theories** (provenance marking, instruction type, the
+RC pass -- all eliminated by toggles): by diffing the WHOLE emitted module instead of the two
+functions the failing assertion named. The diff inside `approx`/`ck_flist` was real but HARMLESS --
+hand-inserting exactly those unboxes into the working IR changed nothing. The damage was in a
+`list_append` the assertion never mentioned. The lesson is cheap and general: **diff the whole
+module, not the function the error points at.**
+
+With that one condition added: **38/38 float tests clean**, including all 25 that regressed on
+2026-08-25, with call-site normalisation AND the callee-side param slot marked raw.
+
+### What the change now produces (structural, verified)
+
+`axpy(a: float, x: float, y: float) -> float` emits exactly what C does:
+```
+define internal i64 @axpy(i64 %p0, i64 %p1, i64 %p2)
+  %r2.af = bitcast i64 %r0 to double      ; no nova_rt_unbox
+  %r2.rf = fmul double %r2.af, %r2.bf
+  %r4.rf = fadd double %r4.af, %r4.bf
+```
+`internal` linkage + zero defensive unboxes. Whole-module unbox count 5 -> 4.
+
+### WHAT IS STILL MISSING, precisely
+
+Two unboxes remain AT THE CALL SITE in the hot loop:
+```
+%wnorm0 = call i64 @nova_rt_unbox(i64 %r8)   ; %r8 = load slot.a
+%wnorm1 = call i64 @nova_rt_unbox(i64 %r9)   ; %r9 = load slot.acc
+%r11    = call i64 @axpy(i64 %wnorm0, i64 %wnorm1, i64 %r10)
+```
+Both arguments are `slot_load`s, and the proof-gate correctly refuses to call a slot raw (a slot can
+hold a box on another path). So the cost was RELOCATED from callee to caller, not removed.
+
+The fix needs an ALWAYS-FLOAT SLOT analysis: a slot is raw everywhere iff every store into it stores
+a provably-raw value. Written and working (`ire_float_slot_prepass`), but in the wrong LAYER -- it
+marks the EMITTER's slot table, while the proof-gate that decides normalisation runs at the IR level
+in `ir_infer_block`. Those are separate states, so the marks are invisible to it. The remaining work
+is to run that analysis at the IR level and stash it in `rt` (e.g. `rt["@fslot@"]`) so the proof-gate
+can consult it, then treat a `slot_load` from an always-float slot as proven raw.
+
+### Measurement is NOT yet possible on this machine
+
+Three interleaved best-of-5 runs of a deterministic benchmark gave baseline 1.36x / 1.82x / 2.04x and
+the change 1.14x / 1.61x / 2.09x. C itself swung 47-69 ms. Two of three favour the change and one
+does not: the noise (IDE + browser on the same box) exceeds the effect. **Do not claim a ratio from
+this machine.** `_f31_scalar_det.nova` / `.c` were added for exactly this reason -- the original
+`_f31_scalar` seeds `a` from `time_ms()`, and since `acc = a*acc + 0.5` compounds 20M times the seed
+decides whether it overflows to inf, which changes the RUNTIME as well as the value. A benchmark
+whose speed depends on the clock cannot measure a 10% codegen effect.
+
+The experiment is preserved at `/tmp/_nc_31exp.nova` (all behind `NOVA_EXP_NORM` / `NOVA_EXP_PSLOT` /
+`NOVA_EXP_LINK`) and is NOT committed: the remaining layer fix and a quiet-machine measurement both
+have to land before it is worth an arc.
+
 **STILL OPEN — the float ARRAY half.** ~1.7x, a different mechanism (element representation, not the
 call boundary), untouched by any of this. The reading was taken with an arc running (167/247/176 ms
 spread) so it needs a quiet machine before being trusted.
