@@ -1,0 +1,144 @@
+// LeetCode 1226 — The Dining Philosophers (Hard)
+//
+// Five philosophers sit around a circular table with five forks between them.
+// Each alternates between thinking and eating; to eat, a philosopher must hold
+// BOTH adjacent forks. Design a concurrent protocol that prevents DEADLOCK
+// (all block forever) and STARVATION (some never eat).
+//
+// ALGORITHM — resource ordering + channel-based mutexes + crash-safe cleanup.
+//
+//   Fork = channel_bounded(1) pre-loaded with one token.
+//     recv(fork) = pick up   (blocks if held — the channel IS the lock)
+//     send(fork, 1) = put down (wakes exactly one waiting philosopher)
+//
+//   Deadlock prevention: every philosopher picks up the LOWER-numbered fork
+//   first. This breaks the circular-wait condition — philosopher 4 would
+//   normally grab fork 4 then fork 0, but resource ordering forces fork 0
+//   first, so no cycle can form.
+//
+//   Crash-safe fork release via on_exit_send / cancel_on_exit_val:
+//
+//     on_exit_send(fork, 1)          — registers a cleanup in the task's
+//       runtime cleanup list, drained by the fiber trampoline on BOTH normal
+//       exit AND panic/fault. If the philosopher crashes mid-meal, the fork
+//       is returned automatically.
+//
+//     cancel_on_exit_val(fork, 1)    — cancels the registration after a
+//       normal put_down, preventing double-release.
+//
+//     TRAP: `defer send(fork, 1)` reads like Go's defer (which IS panic-safe
+//       via stack unwinding) but NOVA's defer is compile-time inlining — a
+//       panic longjmps past all defers. Using defer for pooled resource
+//       release leaks the resource on crash. This is the wrong tool; the
+//       right tool is on_exit_send.
+//
+//   Each philosopher is a spawn'd green task — lightweight (~KB, not ~MB OS
+//   threads), truly parallel (M:N scheduled across CPU cores, auto-detected),
+//   process-isolated (channel_send deep-copies values — no shared mutable
+//   state, enforced by the runtime, not convention).
+//
+// COMPLEXITY — O(N * M) total work, N = philosophers, M = meals. Resource
+// ordering is O(1) per meal (index comparison, done once at spawn time).
+// Channel-mutex operations are O(1) amortized (bounded channel send/recv).
+//
+// TEST 2 below proves crash-safety empirically: philosopher 2 crashes while
+// holding both forks. on_exit_send returns them to the table. The remaining
+// 4 philosophers complete without deadlock. Remove the on_exit_send calls
+// and the test hangs — the forks are lost.
+
+const N = 5
+const MEALS = 3
+
+fn fork_new() -> channel<int>
+    let f = channel_bounded(1)
+    send(f, 1)
+    f
+
+fn pick_up(f: channel<int>)
+    recv(f)
+
+fn put_down(f: channel<int>)
+    send(f, 1)
+
+// Crash-safe philosopher: on_exit_send guarantees forks return on ANY exit.
+fn philosopher(id: int, first: channel<int>, second: channel<int>, done: channel<int>)
+    for meal in 0..MEALS
+        sleep(1)
+        pick_up(first)
+        on_exit_send(first, 1)
+        pick_up(second)
+        on_exit_send(second, 1)
+        sleep(1)
+        put_down(second)
+        cancel_on_exit_val(second, 1)
+        put_down(first)
+        cancel_on_exit_val(first, 1)
+    send(done, id)
+
+// Philosopher that crashes on a specific meal while holding both forks.
+// on_exit_send fires from the fiber trampoline's fault handler, returning
+// both forks despite the crash. Without it, forks 2 and 3 are lost forever.
+fn philosopher_doomed(id: int, first: channel<int>, second: channel<int>, done: channel<int>, crash_meal: int)
+    for meal in 0..MEALS
+        sleep(1)
+        pick_up(first)
+        on_exit_send(first, 1)
+        pick_up(second)
+        on_exit_send(second, 1)
+        if meal == crash_meal
+            assert(false, "philosopher " + str(id) + " crashes mid-meal")
+        sleep(1)
+        put_down(second)
+        cancel_on_exit_val(second, 1)
+        put_down(first)
+        cancel_on_exit_val(first, 1)
+    send(done, id)
+
+fn main()
+    // --- TEST 1: Normal operation — 5 philosophers, no crashes ---
+    let forks = [fork_new() for _ in 0..N]
+    let done = channel()
+
+    for i in 0..N
+        let li = i
+        let ri = (i + 1) % N
+        spawn philosopher(i, forks[min(li, ri)], forks[max(li, ri)], done)
+
+    let finished = []
+    for _ in 0..N
+        finished.push(recv(done))
+
+    let seen = {id: true for id in finished}
+    for i in 0..N
+        assert(i in seen, "philosopher " + str(i) + " completed (no starvation)")
+    assert(len(finished) == N, "all 5 finished (no deadlock)")
+
+    // --- TEST 2: Crash recovery — philosopher 2 dies mid-meal ---
+    // Philosopher 2 acquires forks 2 and 3, then crashes. on_exit_send
+    // returns both forks. Philosophers 1 (needs fork 2) and 3 (needs fork 3)
+    // must still complete — proving the forks were recovered, not leaked.
+    let forks2 = [fork_new() for _ in 0..N]
+    let done2 = channel()
+
+    for i in 0..N
+        let li = i
+        let ri = (i + 1) % N
+        let first = forks2[min(li, ri)]
+        let second = forks2[max(li, ri)]
+        if i == 2
+            spawn philosopher_doomed(i, first, second, done2, 1)
+        else
+            spawn philosopher(i, first, second, done2)
+
+    // 4 completions (philosopher 2 crashed, never sends to done2).
+    let finished2 = []
+    for _ in 0..(N - 1)
+        finished2.push(recv(done2))
+
+    let seen2 = {id: true for id in finished2}
+    for i in 0..N
+        if i != 2
+            assert(i in seen2, "philosopher " + str(i) + " completed despite philosopher 2 crashing")
+    assert(2 not in seen2, "philosopher 2 crashed (expected)")
+
+    print("PASS: The Dining Philosophers")

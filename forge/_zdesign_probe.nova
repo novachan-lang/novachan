@@ -1,0 +1,77 @@
+// FULL recommended ORM handle design, verified end-to-end.
+enum OrmDrv
+    DSqlite(dsq_pool: any, dsq_size: int)
+    DPostgres(dpg_pool: any, dpg_size: int)
+    DMysql(dmy_pool: any, dmy_size: int)
+
+type OrmDb
+    odb_drv: OrmDrv
+    odb_timeout_ms: int
+
+fn _acquire(pool, ms: int) -> Result<int>
+    let r = select_timeout(pool, ms)
+    if r[0] == 0
+        on_exit_send(pool, r[1])
+        return ok(r[1])
+    err("orm: pool acquire timeout after {ms}ms")
+
+fn _release(pool, v)
+    send(pool, v)
+    cancel_on_exit_val(pool, v)
+
+fn OrmDb.pool() -> any
+    match self.odb_drv
+        DSqlite(p, n) => p
+        DPostgres(p, n) => p
+        DMysql(p, n) => p
+
+fn OrmDb.size() -> int
+    match self.odb_drv
+        DSqlite(p, n) => n
+        DPostgres(p, n) => n
+        DMysql(p, n) => n
+
+fn OrmDb.qident(name: string) -> string
+    match self.odb_drv
+        DMysql(p, n) => "`" + name.replace("`", "``") + "`"
+        _ => "\"" + name.replace("\"", "\"\"") + "\""
+
+// crash-safe acquire -> use -> release, ONE place, generic in the body's result
+fn <T> OrmDb.with_conn(body) -> Result<T>
+    let c = _acquire(self.pool(), self.odb_timeout_ms)?
+    let r = body(c)
+    _release(self.pool(), c)
+    ok(r)
+
+// agnostic transaction: wrap the tx connection in its OWN 1-slot pool, hand back a
+// derived OrmDb so every orm_* call inside the body transparently uses THAT connection
+fn OrmDb.tx_handle(c) -> OrmDb
+    let one = channel()
+    send(one, c)
+    match self.odb_drv
+        DSqlite(p, n)   => OrmDb { ...self, odb_drv: DSqlite(one, 1) }
+        DPostgres(p, n) => OrmDb { ...self, odb_drv: DPostgres(one, 1) }
+        DMysql(p, n)    => OrmDb { ...self, odb_drv: DMysql(one, 1) }
+
+fn main()
+    let ch = channel()
+    send(ch, 101)
+    send(ch, 102)
+    let db = OrmDb { odb_drv: DSqlite(ch, 2), odb_timeout_ms: 500 }
+    print("size = {db.size()}")
+    print("qident = {db.qident("Order")}")
+    let r = db.with_conn((c) => c * 2)
+    print("with_conn ok={is_ok(r)} val={unwrap(r)}")
+    // saturate the pool -> bounded err, not a hang
+    let a = _acquire(db.pool(), 200)
+    let b = _acquire(db.pool(), 200)
+    let c3 = _acquire(db.pool(), 200)
+    print("3rd acquire is_err = {is_err(c3)} : {unwrap_err(c3)}")
+    _release(db.pool(), unwrap(a))
+    _release(db.pool(), unwrap(b))
+    // tx handle
+    let txdb = db.tx_handle(999)
+    print("tx size = {txdb.size()} timeout = {txdb.odb_timeout_ms}")
+    let tr = txdb.with_conn((c) => c + 1)
+    print("tx conn used = {unwrap(tr)}")
+    print("SURVIVED")

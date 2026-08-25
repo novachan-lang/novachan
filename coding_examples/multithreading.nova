@@ -1,0 +1,529 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  NOVA Multithreading & Parallelism — Complete Showcase
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  NOVA has TRUE multi-core parallelism (M:N scheduler, per-carrier deques,
+//  work-stealing, single-poller I/O thread) — shipped and production-grade.
+//
+//  In Java you write: Thread t = new Thread(() -> { ... }); t.start();
+//  In C++  you write: std::thread t([&]() { ... }); t.join();
+//  In NOVA you write: spawn fn() ...
+//
+//  No Thread class. No mutex. No synchronized. No lock_guard. No join().
+//  Just: spawn (create), channel (communicate), select (multiplex),
+//        monitor (watch), pmap (auto-parallel).
+//
+//  Run with: NOVA_CARRIERS=4 ./multithreading.exe   (uses 4 OS threads)
+//  Default:  N=1 (single carrier, still concurrent via green tasks)
+//
+//  This single file demonstrates ALL of NOVA's concurrency patterns.
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ─── SECTION 1: Basic spawn + channel (like Java Thread + BlockingQueue) ───
+
+fn section_1()
+    print("=== SECTION 1: Basic spawn + channel ===")
+
+    let ch = channel()
+
+    // Spawn 3 workers — each runs as a green process on the M:N scheduler
+    spawn fn()
+        send(ch, "Hello from worker 1")
+
+    spawn fn()
+        send(ch, "Hello from worker 2")
+
+    spawn fn()
+        send(ch, "Hello from worker 3")
+
+    // Receive all 3 messages (order may vary — that's concurrency!)
+    let i = 0
+    while i < 3
+        let msg = receive(ch)
+        print("  received: " + msg)
+        i = i + 1
+    print("")
+
+
+// ─── SECTION 2: Producer-Consumer (like Java BlockingQueue pattern) ─────
+
+fn section_2()
+    print("=== SECTION 2: Producer-Consumer ===")
+
+    let queue = channel()
+    let results = channel()
+
+    // Producer: generates work items
+    spawn fn()
+        let i = 1
+        while i <= 10
+            send(queue, i)
+            i = i + 1
+        send(queue, -1)   // poison pill — "no more work"
+
+    // Consumer: processes work items
+    spawn fn()
+        let sum = 0
+        let running = 1
+        while running == 1
+            let item = receive(queue)
+            if item == -1
+                running = 0
+            else
+                sum = sum + item * item   // square each item
+        send(results, sum)
+
+    let total = receive(results)
+    print("  sum of squares 1..10 = " + str(total))
+    assert(total == 385, "1^2 + 2^2 + ... + 10^2 = 385")
+    print("")
+
+
+// ─── SECTION 3: Worker Pool (like Java ExecutorService / ThreadPool) ────
+
+fn worker(id, jobs, results)
+    let running = 1
+    while running == 1
+        let job = receive(jobs)
+        if job == -1
+            running = 0
+        else
+            let result = fib(job)
+            send(results, "worker-" + str(id) + ": fib(" + str(job) + ") = " + str(result))
+
+fn fib(n)
+    if n <= 1
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+fn section_3()
+    print("=== SECTION 3: Worker Pool (4 workers, 8 fib jobs) ===")
+
+    let jobs = channel()
+    let results = channel()
+    let num_workers = 4
+    let num_jobs = 8
+
+    // Spawn worker pool — with NOVA_CARRIERS>1, these run on REAL OS threads
+    let w = 0
+    while w < num_workers
+        spawn worker(w, jobs, results)
+        w = w + 1
+
+    // Submit jobs: compute fib(20..27)
+    let j = 0
+    while j < num_jobs
+        send(jobs, 20 + j)
+        j = j + 1
+
+    // Send poison pills to shut down all workers
+    let p = 0
+    while p < num_workers
+        send(jobs, -1)
+        p = p + 1
+
+    // Collect all results
+    let r = 0
+    while r < num_jobs
+        let msg = receive(results)
+        print("  " + msg)
+        r = r + 1
+    print("")
+
+
+// ─── SECTION 4: Pipeline (like Unix pipes, but concurrent) ─────────────
+
+fn stage_double(raw_in, out)
+    let running = 1
+    while running == 1
+        let v = receive(raw_in)
+        if v == -1
+            send(out, -1)
+            running = 0
+        else
+            send(out, v * 2)
+
+fn stage_add_100(input, out)
+    let running = 1
+    while running == 1
+        let v = receive(input)
+        if v == -1
+            send(out, -1)
+            running = 0
+        else
+            send(out, v + 100)
+
+fn stage_collect(input, done)
+    let results = []
+    let running = 1
+    while running == 1
+        let v = receive(input)
+        if v == -1
+            running = 0
+        else
+            push(results, v)
+    send(done, results)
+
+fn section_4()
+    print("=== SECTION 4: 3-Stage Concurrent Pipeline ===")
+
+    let pipe1 = channel()
+    let pipe2 = channel()
+    let pipe3 = channel()
+    let done = channel()
+
+    // Wire: input -> double -> add_100 -> collect -> output
+    spawn stage_double(pipe1, pipe2)
+    spawn stage_add_100(pipe2, pipe3)
+    spawn stage_collect(pipe3, done)
+
+    // Feed data
+    let data = [1, 2, 3, 4, 5]
+    let i = 0
+    while i < len(data)
+        send(pipe1, data[i])
+        i = i + 1
+    send(pipe1, -1)
+
+    let output = receive(done)
+    print("  input:  " + str(data))
+    print("  output: " + str(output) + "  (each: x*2 + 100)")
+    assert(output[0] == 102, "1*2+100=102")
+    assert(output[4] == 110, "5*2+100=110")
+    print("")
+
+
+// ─── SECTION 5: Fan-out / Fan-in (like Java CompletableFuture.allOf) ───
+
+fn is_prime(n)
+    if n < 2
+        return 0
+    let d = 2
+    while d * d <= n
+        if n % d == 0
+            return 0
+        d = d + 1
+    return 1
+
+fn find_primes_in_range(start, end_val, ch)
+    let primes = []
+    let n = start
+    while n <= end_val
+        if is_prime(n) == 1
+            push(primes, n)
+        n = n + 1
+    send(ch, primes)
+
+fn section_5()
+    print("=== SECTION 5: Fan-out / Fan-in (parallel prime search) ===")
+
+    let ch = channel()
+    let num_workers = 8
+
+    // Fan-out: 8 workers each search a range of 125 numbers
+    let w = 0
+    while w < num_workers
+        let start = w * 125 + 1
+        let end_val = start + 124
+        if w == 0
+            start = 2
+        spawn find_primes_in_range(start, end_val, ch)
+        w = w + 1
+
+    // Fan-in: merge all results
+    let all_primes = []
+    let collected = 0
+    while collected < num_workers
+        let batch = receive(ch)
+        let j = 0
+        while j < len(batch)
+            push(all_primes, batch[j])
+            j = j + 1
+        collected = collected + 1
+
+    sort(all_primes)
+    print("  " + str(num_workers) + " workers searched 1..1000")
+    print("  found " + str(len(all_primes)) + " primes")
+    print("  first: " + str(all_primes[0]) + ", " + str(all_primes[1]) + ", " + str(all_primes[2]) + ", " + str(all_primes[3]) + ", " + str(all_primes[4]) + " ...")
+    let last = len(all_primes) - 1
+    print("  last:  ..." + str(all_primes[last - 2]) + ", " + str(all_primes[last - 1]) + ", " + str(all_primes[last]))
+    assert(len(all_primes) == 168, "there are 168 primes <= 1000")
+    print("")
+
+
+// ─── SECTION 6: Select — Multiplex channels (like Go select{}) ─────────
+
+fn ticker(ch, label, count)
+    let i = 0
+    while i < count
+        send(ch, label + " tick " + str(i))
+        i = i + 1
+
+fn section_6()
+    print("=== SECTION 6: Select — channel multiplexing ===")
+
+    let fast = channel()
+    let slow = channel()
+
+    spawn ticker(fast, "[fast]", 4)
+    spawn ticker(slow, "[slow]", 2)
+
+    // Receive all 6 messages from whichever channel is ready
+    let total = 6
+    let i = 0
+    while i < total
+        let result = select(fast, slow)
+        let _who = result[0]
+        let msg = result[1]
+        print("  " + str(msg))
+        i = i + 1
+    print("")
+
+
+// ─── SECTION 7: Monitor + Supervisor (Erlang-style fault tolerance) ────
+
+fn crashy_worker(ch, attempt)
+    if attempt < 3
+        send(ch, "attempt " + str(attempt) + ": about to crash...")
+        panic("simulated crash")
+    send(ch, "attempt " + str(attempt) + ": SUCCESS!")
+
+fn section_7()
+    print("=== SECTION 7: Supervisor (auto-restart on crash) ===")
+
+    let ch = channel()
+    let attempt = 1
+    let success = 0
+
+    while success == 0
+        let pid = spawn crashy_worker(ch, attempt)
+        let mon = monitor(pid)
+        let msg = receive(ch)
+        print("  " + msg)
+        let status = receive(mon)
+        if status == 0
+            success = 1
+        else
+            print("  -> worker crashed, restarting...")
+            attempt = attempt + 1
+
+    print("  supervisor: worker recovered after " + str(attempt) + " attempts")
+    print("")
+
+
+// ─── SECTION 8: pmap — Auto-parallelization (like Java parallelStream) ─
+
+fn heavy_compute(x)
+    let acc = 0
+    let i = 0
+    while i < 500
+        acc = acc + (x * i) % 7
+        i = i + 1
+    acc
+
+fn section_8()
+    print("=== SECTION 8: pmap — automatic parallelism ===")
+
+    // Build a list of 5000 numbers
+    let nums = []
+    let i = 0
+    while i < 5000
+        push(nums, i)
+        i = i + 1
+
+    // Serial map
+    let t1 = time_ms()
+    let serial = map(nums, fn(x) heavy_compute(x))
+    let t2 = time_ms()
+
+    // Parallel map — NOVA auto-distributes across CPU cores
+    let t3 = time_ms()
+    let par = pmap(nums, fn(x) heavy_compute(x))
+    let t4 = time_ms()
+
+    // Verify correctness: identical results
+    let mismatch = 0
+    let j = 0
+    while j < len(serial)
+        if serial[j] != par[j]
+            mismatch = mismatch + 1
+        j = j + 1
+
+    assert(mismatch == 0, "pmap must produce identical results to map")
+    print("  map  of 5k items: " + str(t2 - t1) + "ms (serial)")
+    print("  pmap of 5k items: " + str(t4 - t3) + "ms (parallel, " + str(cpu_count()) + " CPUs)")
+    print("  results identical: YES")
+    print("")
+
+
+// ─── SECTION 9: Bounded channels (back-pressure, like Java SynchronousQueue) ─
+
+fn section_9()
+    print("=== SECTION 9: Bounded channel (back-pressure) ===")
+
+    // Capacity 3: producer blocks when buffer is full until consumer drains
+    let ch = channel_bounded(3)
+    let done = channel()
+
+    // Slow consumer
+    spawn fn()
+        let received = []
+        let i = 0
+        while i < 10
+            let v = receive(ch)
+            push(received, v)
+            i = i + 1
+        send(done, received)
+
+    // Fast producer — back-pressured when buffer hits 3
+    let k = 1
+    while k <= 10
+        send(ch, k * 10)
+        k = k + 1
+
+    let result = receive(done)
+    print("  produced 10 items into capacity-3 channel")
+    print("  consumer got: " + str(result))
+    assert(len(result) == 10, "all 10 items received")
+    assert(result[0] == 10, "first item")
+    assert(result[9] == 100, "last item")
+    print("")
+
+
+// ─── SECTION 10: 1000 concurrent green tasks (M:N scale test) ──────────
+
+fn section_10()
+    print("=== SECTION 10: 1000 concurrent green tasks ===")
+
+    let hub = channel()
+    let n = 1000
+    let t1 = time_ms()
+
+    // Spawn 1000 tasks — each is a lightweight green process (~2KB)
+    // With NOVA_CARRIERS=4, these are distributed across 4 OS threads
+    let i = 0
+    while i < n
+        let val = i
+        spawn fn()
+            send(hub, val * val)
+        i = i + 1
+
+    // Collect all results
+    let sum = 0
+    let j = 0
+    while j < n
+        sum = sum + receive(hub)
+        j = j + 1
+
+    let t2 = time_ms()
+
+    // sum of i^2 for i in 0..999 = n*(n-1)*(2n-1)/6
+    let expected = n * (n - 1) * (2 * n - 1) / 6
+    assert(sum == expected, "sum of squares 0..999")
+    print("  spawned " + str(n) + " green tasks")
+    print("  sum of squares = " + str(sum) + " (correct)")
+    print("  time: " + str(t2 - t1) + "ms")
+    print("")
+
+
+// ─── SECTION 11: Multi-core fib race (the TRUE parallelism test) ───────
+
+fn fib_heavy(n)
+    if n <= 1
+        return n
+    return fib_heavy(n - 1) + fib_heavy(n - 2)
+
+fn section_11()
+    print("=== SECTION 11: Multi-core parallel compute ===")
+    print("  (Set NOVA_CARRIERS=4 or 8 to see real multi-core speedup)")
+
+    let ch = channel()
+    let jobs = [35, 34, 33, 32, 31, 30, 29, 28]
+
+    let t1 = time_ms()
+
+    // Spawn 8 heavy fib tasks — with NOVA_CARRIERS>1 these run on
+    // separate OS carrier threads (true parallelism, not just concurrency)
+    let i = 0
+    while i < len(jobs)
+        let n = jobs[i]
+        spawn fn()
+            let result = fib_heavy(n)
+            send(ch, result)
+        i = i + 1
+
+    // Collect all 8 results
+    let total = 0
+    let j = 0
+    while j < len(jobs)
+        total = total + receive(ch)
+        j = j + 1
+
+    let t2 = time_ms()
+
+    print("  8 parallel fib(28..35) computed")
+    print("  total = " + str(total))
+    print("  time: " + str(t2 - t1) + "ms")
+    print("  CPUs: " + str(cpu_count()))
+    print("")
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MAIN — Run all sections
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn main()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║    NOVA Multithreading & Parallelism — Complete Showcase    ║")
+    print("║                                                            ║")
+    print("║  M:N scheduler: green tasks on multiple OS carrier threads ║")
+    print("║  Per-carrier deques, work-stealing, single-poller I/O      ║")
+    print("║  No async/await. No mutex. No Thread class. No join().     ║")
+    print("║  Just: spawn, channel, select, monitor, pmap.             ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print("")
+
+    section_1()    // basic spawn + channel
+    section_2()    // producer-consumer
+    section_3()    // worker pool (like ExecutorService)
+    section_4()    // pipeline
+    section_5()    // fan-out / fan-in
+    section_6()    // select (channel multiplex)
+    section_7()    // supervisor (crash recovery)
+    section_8()    // pmap (auto-parallel, heavy compute)
+    section_9()    // bounded channel (back-pressure)
+    section_10()   // 1000 concurrent tasks
+    section_11()   // TRUE multi-core parallel compute
+
+    print("═══════════════════════════════════════════════════════════")
+    print("ALL 11 SECTIONS PASSED")
+    print("")
+    print("NOVA's M:N Runtime Architecture:")
+    print("  - Green tasks (fibers): lightweight (~2KB each), cooperative scheduling")
+    print("  - Carrier threads: OS threads that drive green tasks (set NOVA_CARRIERS=N)")
+    print("  - Per-carrier deques: each carrier has its own run-queue (no global lock)")
+    print("  - Work-stealing: idle carriers steal tasks from busy ones")
+    print("  - Single-poller I/O: dedicated thread for epoll/select (no thundering herd)")
+    print("  - Deep-copy isolation: processes share NOTHING (no data races, ever)")
+    print("  - Atomic RC: reference counting is lock-free at N>1")
+    print("")
+    print("NOVA concurrency primitives (the COMPLETE API):")
+    print("  spawn fn()          — create a green process")
+    print("  channel()           — typed communication pipe")
+    print("  channel_bounded(n)  — back-pressured channel")
+    print("  send(ch, value)     — send (deep-copied, zero shared state)")
+    print("  receive(ch)         — receive (parks if empty, no busy-wait)")
+    print("  select(ch1, ch2...) — multiplex channels")
+    print("  monitor(pid)        — watch for completion/crash")
+    print("  pmap(list, fn)      — auto-parallel map across CPU cores")
+    print("  cpu_count()         — number of available CPU cores")
+    print("")
+    print("Compare to Java/C++:")
+    print("  Java:  Thread, Runnable, ExecutorService, Future, synchronized,")
+    print("         ReentrantLock, Condition, BlockingQueue, CompletableFuture,")
+    print("         ForkJoinPool, AtomicInteger, volatile, happens-before...")
+    print("  C++:   std::thread, std::mutex, std::condition_variable,")
+    print("         std::lock_guard, std::future, std::async, std::atomic,")
+    print("         std::barrier, std::latch, std::counting_semaphore...")
+    print("  NOVA:  spawn, channel, select, monitor, pmap. That's ALL.")

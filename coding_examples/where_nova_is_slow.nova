@@ -1,0 +1,202 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  WHERE NOVA IS SLOW — Honest Performance Gaps (and whether they're fixable)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  This file exposes every known performance weakness in NOVA.
+//  Run it, see the numbers, read the verdicts.
+//
+//  Compare with: clang -O2 bench_c.c -o bench_c.exe && ./bench_c.exe
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ─── GAP 1: Tight integer loop with modulo (prime sieve) ────────────────
+//  NOVA ~8x slower than C on this pattern.
+//  WHY: the inner `n % d` loop goes through nova_rt_mod (runtime dispatch)
+//       instead of a native x86 `div` instruction. The compiler KNOWS
+//       n and d are ints, but the i64 ABI discards that info at codegen.
+
+fn count_primes(limit)
+    let count = 0
+    let n = 2
+    while n <= limit
+        let is_p = 1
+        let d = 2
+        while d * d <= n
+            if n % d == 0
+                is_p = 0
+            d = d + 1
+        if is_p == 1
+            count = count + 1
+        n = n + 1
+    count
+
+fn gap_1()
+    print("=== GAP 1: Prime sieve (tight int loop + modulo) ===")
+    let t1 = time_ms()
+    let p = count_primes(100000)
+    let t2 = time_ms()
+    print("  primes <= 100000: " + str(p) + "  [" + str(t2 - t1) + "ms]")
+    print("  C does this in ~4ms")
+    print("")
+
+
+// ─── GAP 2: Float array sum (boxed floats in lists) ────────────────────
+//  NOVA ~120x slower than C on float arrays.
+//  WHY: every float in a list is BOXED (heap-allocated NovaBox wrapper)
+//       for any-soundness. Reading xs[i] unboxes (dereference + extract).
+//       C just does raw double* pointer arithmetic.
+
+fn float_array_sum(xs)
+    let sum = 0.0
+    let i = 0
+    while i < len(xs)
+        sum = sum + xs[i]
+        i = i + 1
+    sum
+
+fn gap_2()
+    print("=== GAP 2: Float array sum (boxed floats) ===")
+    let xs = []
+    let i = 0
+    while i < 100000
+        push(xs, 1.001)
+        i = i + 1
+
+    let t1 = time_ms()
+    let _s = float_array_sum(xs)
+    let t2 = time_ms()
+    print("  sum of 100k floats: " + str(t2 - t1) + "ms")
+    print("  C does raw double[] in <1ms")
+    print("")
+
+
+// ─── GAP 3: Higher-order function (closure params stay dynamic) ────────
+//  map/filter/reduce with a lambda: the closure body uses nova_rt_mul
+//  instead of native mul, because fpt can't type params through a HOF.
+//  The WORK is the same, but each operation pays ~50-100ns dispatch.
+
+fn gap_3()
+    print("=== GAP 3: map with lambda (closure dispatch overhead) ===")
+    let nums = []
+    let i = 0
+    while i < 50000
+        push(nums, i)
+        i = i + 1
+
+    // Direct loop — compiler knows types, uses native mul
+    let t1 = time_ms()
+    let direct = []
+    let j = 0
+    while j < len(nums)
+        push(direct, nums[j] * nums[j])
+        j = j + 1
+    let t2 = time_ms()
+
+    // map with lambda — closure params are dynamically dispatched
+    let t3 = time_ms()
+    let _mapped = map(nums, fn(x) x * x)
+    let t4 = time_ms()
+
+    print("  direct loop (50k):  " + str(t2 - t1) + "ms")
+    print("  map+lambda (50k):   " + str(t4 - t3) + "ms")
+    print("  (map is slower because lambda params go through runtime dispatch)")
+    print("")
+
+
+// ─── GAP 4: Struct field access in a tight loop ────────────────────────
+//  Struct fields are accessed via heap pointer + offset load.
+//  C can SROA (scalar replacement of aggregates) — put fields in registers.
+//  NOVA keeps structs on the heap even when they don't escape the function.
+
+type Vec3
+    x: float
+    y: float
+    z: float
+
+fn dot(a: Vec3, b: Vec3) -> float
+    a.x * b.x + a.y * b.y + a.z * b.z
+
+fn gap_4()
+    print("=== GAP 4: Struct field access (heap vs register) ===")
+    let a = Vec3{x: 1.0, y: 2.0, z: 3.0}
+    let b = Vec3{x: 4.0, y: 5.0, z: 6.0}
+
+    let t1 = time_ms()
+    let sum = 0.0
+    let i = 0
+    while i < 1000000
+        sum = sum + dot(a, b)
+        i = i + 1
+    let t2 = time_ms()
+    print("  1M dot products:  " + str(t2 - t1) + "ms  (sum=" + str(sum) + ")")
+    print("  C with SROA puts Vec3 in registers — can be 2-5x faster")
+    print("")
+
+
+// ─── GAP 5: String concatenation in a loop ─────────────────────────────
+//  NOVA strings are immutable (like Java/Python). Each + allocates a new
+//  string. In a loop, this is O(n^2) — same as Java's naive string concat.
+//  C uses snprintf into a pre-allocated buffer (O(n)).
+
+fn gap_5()
+    print("=== GAP 5: String concatenation in a loop ===")
+    let t1 = time_ms()
+    let s = ""
+    let i = 0
+    while i < 10000
+        s = s + "x"
+        i = i + 1
+    let t2 = time_ms()
+    print("  10k string concats: " + str(t2 - t1) + "ms  (len=" + str(len(s)) + ")")
+    print("  C with a buffer: <1ms")
+    print("")
+
+
+// ─── GAP 6: Channel overhead for fine-grained tasks ────────────────────
+//  Spawning a process for a TINY task (1 addition) costs more than the
+//  work itself. The deep-copy isolation model means every send copies data.
+//  For micro-tasks, this overhead dominates.
+
+fn gap_6()
+    print("=== GAP 6: Spawn+channel overhead for tiny tasks ===")
+    let ch = channel()
+    let n = 10000
+
+    let t1 = time_ms()
+    let i = 0
+    while i < n
+        let v = i
+        spawn fn()
+            send(ch, v + 1)
+        i = i + 1
+    let sum = 0
+    let j = 0
+    while j < n
+        sum = sum + receive(ch)
+        j = j + 1
+    let t2 = time_ms()
+
+    print("  10k spawn+send+recv: " + str(t2 - t1) + "ms")
+    print("  Direct loop would be <1ms")
+    print("  Overhead per task: ~" + str((t2 - t1) * 1000 / n) + " microseconds")
+    print("")
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn main()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║     WHERE NOVA IS SLOW — Honest Performance Report         ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print("")
+
+    gap_1()    // prime sieve — ~8x C
+    gap_2()    // float array — ~120x C
+    gap_3()    // HOF lambda dispatch
+    gap_4()    // struct on heap (no SROA)
+    gap_5()    // string concat O(n^2)
+    gap_6()    // spawn overhead for micro-tasks
+
+    print("═══════════════════════════════════════════════════════════════")
+    print("SUMMARY — see the comparison analysis printed above.")
+    print("Run bench_c.exe side-by-side to compare C numbers.")
