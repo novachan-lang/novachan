@@ -27720,6 +27720,36 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let frt = {}
     for ti_fname in keys(ti_state.ti_fn_types)
         frt[ti_fname] = ti_state.ti_fn_types[ti_fname]
+    // IMPORTED `-> bool`. ti_fn_types only covers the module being inferred, so a function from an
+    // IMPORTED module never reaches frt -- its call result stays untyped and `str()` falls to the
+    // int path, printing 1/0 instead of true/false. Reproduced minimally: a local `-> bool` gives
+    // str="true", the identical `-> bool` imported from forge_anagram gives str="1". The VALUE is
+    // fine either way (`== true` and truthiness both work) -- this is purely the static label that
+    // str() dispatches on. It accounted for 7 of the 18 silently-failing gated tests
+    // (forge_anagram/collatz/cuckoofilter/fasthash/huffman/lzw/manacher), each asserting
+    // str(bool) == "true".
+    //
+    // b.ir_fn_returns carries the DECLARED return type for every lowered function, imports
+    // included, so it is the right source. Two deliberate restrictions:
+    //   - only names ABSENT from frt, so TI's own inference is never overridden (TI widens a
+    //     genuinely heterogeneous return to `any` on purpose, and ti_fn_hetero exists to protect
+    //     that; clobbering it would mis-dispatch the non-primary returns);
+    //   - only `bool`. Seeding `float` here would be the dangerous one: frt saying "float" is read
+    //     elsewhere as a representation claim, and a declared `-> float` can still return a BOX on
+    //     some path (std/linalg's determinant does) -- that is exactly the trap that made the 3.1
+    //     unbox work unshippable. bool has no such raw/boxed split; it only selects bool_to_str.
+    // A DECLARED `-> bool` WINS over whatever TI concluded. The absent-only version of this did
+    // nothing, which located the real problem: frt already held an entry for the imported function,
+    // just not a bool one. If a function is annotated `-> bool` and TI decided otherwise, TI is
+    // either wrong or the function is heterogeneous -- and a heterogeneous `-> bool` is a type error
+    // the checker owes us, not something to paper over here. Restricted to bool for the reason
+    // above: bool is a pure str()-dispatch label with no raw/boxed split, so promoting it cannot
+    // create a representation mismatch the way promoting float would.
+    let _decl_bool = {}
+    for _br_fn in keys(b.ir_fn_returns)
+        if b.ir_fn_returns[_br_fn] == "bool"
+            frt[_br_fn] = "bool"
+            _decl_bool[_br_fn] = 1
     // EXTERNS. ti returns nt_unit() for `extern_fn` without recording a signature, so an
     // extern never reached ti_fn_types and therefore never reached frt -- its call result
     // stayed untyped and `str()` lowered to any_to_str, which runs find_tag on raw double
@@ -27819,7 +27849,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     // conflict) must STAY `any` — do not refine it to a first-return concrete type, or
                     // callers mis-dispatch print/box on the non-primary-type returns. (Incomplete-`any`
                     // fns are NOT in ti_fn_hetero, so the IR may still refine those for perf.)
-                    if new_type != old_type and new_type != "any" and not contains(ti_state.ti_fn_hetero, fname)
+                    // A DECLARED `-> bool` is not up for re-derivation. ir_analyze_return_type reads
+                    // the IR, where a bool IS an i64, so it concludes "int" and clobbers the seeded
+                    // "bool" -- which is why seeding alone changed nothing and the emitted IR still
+                    // showed nova_rt_int_to_str. Same shape as fpt_decl protecting declared floats
+                    // from call-site narrowing: an annotation the author wrote outranks a type the
+                    // compiler re-inferred from a representation that cannot distinguish the two.
+                    if new_type != old_type and new_type != "any" and not contains(ti_state.ti_fn_hetero, fname) and not contains(_decl_bool, fname)
                         frt[fname] = new_type
                         changed = true
     fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map, fpt, _pfpt_chg)

@@ -70,6 +70,10 @@ $track7_tests = @(
 
 # Phase 12-14 new tests
 $new_tests = @(
+    # cross-module `-> bool` keeps its representation (str -> true/false, not 1/0). Fails on
+    # the pre-fix compiler with "got=1 want=true"; it broke 7 gated tests while CI stayed
+    # green, because they print FAIL and exit 0. See SUSPECT-OUTFAIL in _test_worker.ps1.
+    '_kat_crossmod_bool',
     'phase12_wasm_gpu_test',
     'phase13_web_test',
     'phase13_ai_test',
