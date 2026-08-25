@@ -1087,6 +1087,50 @@ the array read.
 Note the array fix also changed `ck_flist`'s `got[i] * 1.0` codegen, so this experiment must be
 re-run against current HEAD rather than reasoning from yesterday's IR.
 
+**EXPERIMENT RUN 2026-08-26 — four hypotheses tested, three ELIMINATED.**
+
+Rebuilt the change as four independent toggles rather than one patch, so each claim could be tested
+on its own. Reproducer narrowed to THREE tests: `_polyderiv_test`, `_polyinterp_test`,
+`optimizers_lib_test`.
+
+| # | configuration | result |
+|---|---|---|
+| 1 | control (nothing on) | all 10 clean |
+| 2 | call-site normalisation, keyed on the ARGUMENT being float-typed | all 10 clean |
+| 3 | + callee-side param-slot marked raw | **6 broken** |
+| 4 | normalisation keyed on the PARAM type (the correct rule) | **3 broken** |
+| 5 | 4, but without `rt[nmr] = "float"` | 3 broken (same) |
+| 6 | 5, but instruction typed `any` instead of `float` | 3 broken (same) |
+
+What this establishes, and it is the opposite of what the revert note assumed:
+
+* **The callee-side marking is what needs normalisation** (row 3): with the callee still unboxing,
+  narrow normalisation is harmless; the moment the callee assumes raw, six tests break. So the
+  call-site coverage is the real problem, exactly as the "whole-program obligation" lesson said.
+* **Normalisation must be keyed on the PARAM type, not the argument type.** Row 2 looked clean only
+  because it did almost nothing -- an `any`-typed argument reaching a float param got no
+  normalisation at all, which is precisely the hole.
+* **Three suspects are ELIMINATED.** Rows 4/5/6 are identical, so the breakage is NOT the `rt[]`
+  float marking, NOT the instruction's IR type, and NOT the two combined. The provenance theory from
+  2026-08-25 was reasonable -- it is what the float-array bug turned out to be -- but it is wrong
+  here, and the toggles say so unambiguously.
+
+**What is left, and the next experiment.** A bare `nova_rt_unbox` is semantically a NO-OP on a
+non-box (`if (cannot_be_box) return handle;`), so inserting one cannot change a value. Yet inserting
+it breaks three tests. The remaining candidate is therefore not the value but the OWNERSHIP: the
+inserted SSA temp holds a heap pointer and is tagged `effect = "pure"`, and the RC pass inserts
+drops for temps. A `rc_drop_temp` on that new register would free a value still live through the
+original register -- which would present exactly like this, as a use-after-free that only shows up
+in float-heavy code where the same value flows through several calls.
+
+Next: emit the normalisation with a non-droppable effect tag (or exclude `%wnorm*` from the RC
+temp-drop set) and re-run rows 4-6. If that clears them, the whole 3.1 scalar path is unblocked,
+because rows 2/3 already show the rest of the mechanism works.
+
+**Also relevant:** the array fix of 2026-08-25 changed the codegen of `got[i] * 1.0`, and the
+2026-08-25 "unexplained #4" no longer reproduces at all under row 2. So do NOT reason from
+yesterday's IR dumps; re-measure.
+
 **STILL OPEN — the float ARRAY half.** ~1.7x, a different mechanism (element representation, not the
 call boundary), untouched by any of this. The reading was taken with an arc running (167/247/176 ms
 spread) so it needs a quiet machine before being trusted.
