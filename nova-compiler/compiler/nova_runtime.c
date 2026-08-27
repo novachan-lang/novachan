@@ -8863,11 +8863,27 @@ int64_t nova_rt_gen_collect(int64_t handle) {
    compiler-generated prologue at all. */
 #define NOVA_A64_FRAME  160
 #define NOVA_A64_LR_OFF 88        /* x30 slot -- the initial frame seeds the trampoline here */
+/* Mach-O vs ELF assembler, two differences that are BOTH hard failures on macOS:
+     1. .type/.size are GNU-as/ELF directives. The Mach-O assembler rejects them outright
+        with "unknown directive" -- which is precisely how this was found.
+     2. Mach-O prefixes every C symbol with an underscore, so the label must be
+        _nova_asm_switch. That one produces no compile error at all: it would have
+        surfaced as an undefined-symbol LINK failure only after (1) was fixed. Both are
+        handled here so macOS does not cost a second CI round-trip to discover. */
+#if defined(__APPLE__)
+#  define NOVA_ASM_SW   "_nova_asm_switch"
+#  define NOVA_ASM_TYPE ""
+#  define NOVA_ASM_SIZE ""
+#else
+#  define NOVA_ASM_SW   "nova_asm_switch"
+#  define NOVA_ASM_TYPE ".type nova_asm_switch,%function\n"
+#  define NOVA_ASM_SIZE ".size nova_asm_switch,.-nova_asm_switch\n"
+#endif
 __asm__(
     ".text\n"
-    ".globl nova_asm_switch\n"
-    ".type nova_asm_switch,%function\n"
-    "nova_asm_switch:\n"
+    ".globl " NOVA_ASM_SW "\n"
+    NOVA_ASM_TYPE
+    NOVA_ASM_SW ":\n"
     "   sub  sp, sp, #160\n"
     "   stp  x19, x20, [sp, #0]\n"
     "   stp  x21, x22, [sp, #16]\n"
@@ -8895,7 +8911,7 @@ __asm__(
     "   ldp  d14, d15, [sp, #144]\n"
     "   add  sp, sp, #160\n"
     "   ret\n"
-    ".size nova_asm_switch,.-nova_asm_switch\n"
+    NOVA_ASM_SIZE
 );
 void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp);   /* body is the asm above */
 #else
