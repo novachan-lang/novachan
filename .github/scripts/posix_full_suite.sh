@@ -71,34 +71,64 @@ if [ -f "$SQLITE_SRC" ]; then
   fi
 fi
 
-# ── enumerate tests ────────────────────────────────────────────────────────────────────────
-# A test is a .nova with its own main(). Everything else in this directory is a helper MODULE
-# that is imported, not run -- compiling those as programs would produce meaningless failures.
-: > "$OUT/_tests.txt"
-for f in *.nova; do
-  [ -f "$f" ] || continue
-  t="${f%.nova}"
-  grep -qE '^fn main\(' "$f" || continue
-  case "$t" in
-    # Known-broken and EXCLUDED ON WINDOWS TOO (see _remote_gate.ps1) -- they hang or assume a
-    # spawn-dispatch protocol node_recv does not provide. Excluding them here keeps this job
-    # measuring the port, not re-reporting a defect Windows already tracks separately.
-    distributed_serialize_test|distributed_spawn_test) continue ;;
-  esac
-  echo "$t" >> "$OUT/_tests.txt"
-done
+# ── enumerate tests: use the SAME canonical list Windows runs ──────────────────────────────
+# The first version of this script globbed every .nova with its own main(). That was wrong, and
+# the first macOS run proved it: 3771 "tests" discovered vs the 3590 Windows actually runs, and
+# 205 failures dominated by files that are NOT positive tests --
+#   * NEGATIVE tests (_aroute_nopath_neg, _atest_paramneg, _enum_payload_bad_test) where a
+#     COMPILE FAILURE IS THE PASS CONDITION, scored here as a failure
+#   * benchmarks (_bench_dispatch, _hof_bench, _cyc_overhead) that blow a 25s cap by design
+#   * probes and scratch programs never meant to be gated
+# The explicit arrays in _run_final_regression.ps1 exist precisely to make those distinctions.
+# Reproducing the heuristic was never going to work; read the real list instead, so POSIX and
+# Windows gate the IDENTICAL set and a difference in results means a platform difference.
+python3 - "$NOVA_HOME/test_programs" > "$OUT/_tests.txt" <<'PYEOF'
+import re, sys, os
+tp = sys.argv[1]
+src = open(os.path.join(tp, '_run_final_regression.ps1'), encoding='utf-8', errors='ignore').read()
+names = []
+for arr in ('core_tests','track7_tests','new_tests','domain_tests','concurrency_tests','server_tests'):
+    m = re.search(r'\$' + arr + r'\s*=\s*@\((.*?)\)', src, re.S)
+    if not m:
+        continue
+    names += [a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", m.group(1))]
+mf = os.path.join(tp, '_orphan_coverage_manifest.txt')
+if os.path.isfile(mf):
+    for line in open(mf, encoding='utf-8', errors='ignore'):
+        n = line.strip()
+        if n and not n.startswith('#'):
+            names.append(n)
+# Excluded on Windows too (see _remote_gate.ps1): these hang or assume a spawn-dispatch
+# protocol node_recv does not provide. Keeping them out means this job measures THE PORT
+# rather than re-reporting a defect Windows already tracks separately.
+skip = {'distributed_serialize_test', 'distributed_spawn_test'}
+seen = set()
+for n in names:
+    if n in skip or n in seen:
+        continue
+    if not os.path.isfile(os.path.join(tp, n + '.nova')):
+        continue          # absent source: Windows fails these loudly; here it is not our subject
+    seen.add(n)
+    print(n)
+PYEOF
 TOTAL=$(wc -l < "$OUT/_tests.txt" | tr -d ' ')
-echo "discovered $TOTAL runnable tests"
+echo "canonical test list: $TOTAL tests (same source of truth as the Windows harness)"
+[ "$TOTAL" -gt 3000 ] || { echo "::error title=posix-full::only $TOTAL tests resolved -- list extraction is broken, refusing to report a misleadingly small run"; exit 1; }
 
 # ── run one test ───────────────────────────────────────────────────────────────────────────
+# Timeouts MATCH the Windows worker (_test_worker.ps1) rather than being invented here:
+# compile 150s, link 300s, run 60s. The first run used 25s for the run stage and reported
+# TIMEOUT for tests that are simply SLOW BY DESIGN -- argon2 is a deliberately expensive KDF,
+# and the benchmarks exist to burn CPU. A cap tighter than the reference harness does not
+# measure the platform, it measures the cap.
 run_one() {
   local t="$1"
   local ll="$OUT/$t.ll" exe="$OUT/$t.bin" log="$OUT/$t.log"
-  if ! "$NOVA" compile -o "$ll" "$t.nova" >"$log" 2>&1; then echo "COMPILE" >"$OUT/$t.res"; return; fi
-  if ! clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $SQLITE_OBJ $LINKF -w >>"$log" 2>&1; then
+  if ! TMO 150 "$NOVA" compile -o "$ll" "$t.nova" >"$log" 2>&1; then echo "COMPILE" >"$OUT/$t.res"; return; fi
+  if ! TMO 300 clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $SQLITE_OBJ $LINKF -w >>"$log" 2>&1; then
     echo "LINK" >"$OUT/$t.res"; return
   fi
-  if TMO 25 "./$exe" >>"$log" 2>&1; then
+  if TMO 60 "./$exe" >>"$log" 2>&1; then
     if grep -q "FAIL assert" "$log" 2>/dev/null; then echo "ASSERT" >"$OUT/$t.res"; else echo "PASS" >"$OUT/$t.res"; fi
   else
     local c=$?
