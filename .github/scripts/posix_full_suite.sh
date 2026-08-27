@@ -195,6 +195,13 @@ xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$OUT/_tests.txt"
 # SERVER tests strictly one at a time, exactly as the Windows harness does. Each spins up its own
 # in-process green TCP server plus client; several at once starve the green scheduler and they
 # time out despite passing fine given the machine to themselves.
+# PROGRESS MARKER. A step that hits its timeout is KILLED and emits NO annotation at all -- the
+# ubuntu run died at exactly 180.2 min and reported nothing, which is indistinguishable from a
+# crash. Printing the parallel-phase tally as an annotation means even a later timeout leaves
+# evidence of how far it actually got.
+PDONE=$(ls "$OUT"/*.res 2>/dev/null | wc -l | tr -d ' ')
+echo "::notice title=posix parallel phase done::$PDONE results after the parallel batch on $(uname -s)"
+
 if [ -s "$OUT/_serial.txt" ]; then
   echo "running $(wc -l < "$OUT/_serial.txt" | tr -d ' ') SERVER tests serially ..."
   while read -r st; do [ -n "$st" ] && run_one "$st"; done < "$OUT/_serial.txt"
