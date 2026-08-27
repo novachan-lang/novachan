@@ -99,7 +99,17 @@ $testScript = {
     Remove-Item $exe,$ll -Force -ErrorAction SilentlyContinue
 
     if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
-    elseif ($rr.X -ne 0) { $r.Status = "FAIL"; $r.Detail = "RUN exit=$($rr.X)" }
+    elseif ($rr.X -ne 0) {
+        # CARRY A STDERR EXCERPT. The exit code alone is often not enough to act on: the CI-only
+        # 0xC0000005 in overflow_recovery_test/_stackovf_test is either a guard page that was never
+        # restored (the runtime now prints guard_restored=0) or an overflow that skipped the guard
+        # entirely -- and those need OPPOSITE fixes. $rr.E already held the answer and was being
+        # thrown away, so every occurrence cost a full round-trip and still did not distinguish them.
+        $tail = ""
+        if ($rr.E) { $tail = (($rr.E -split "`r?`n" | Where-Object { $_ -ne "" } | Select-Object -Last 2) -join " ; ") }
+        if ($tail.Length -gt 180) { $tail = $tail.Substring(0, 180) }
+        $r.Status = "FAIL"; $r.Detail = "RUN exit=$($rr.X)" + $(if ($tail) { " | $tail" } else { "" })
+    }
     elseif ($rr.E -match 'FAIL assert') { $r.Status = "FAIL"; $r.Detail = "ASSERT FAIL" }
 
     # STDOUT failure reports: a test that prints its own "FAIL ..." and returns 0 currently PASSES,
