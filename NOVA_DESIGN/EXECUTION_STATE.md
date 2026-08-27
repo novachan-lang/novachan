@@ -8,7 +8,37 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
-## ▶ CURRENT FOCUS (2026-08-27, later) — CROSS-PLATFORM: Linux ✅ · macOS ✅ · Windows CI open
+## ▶ CURRENT FOCUS (2026-08-28) — NOVA SELF-HOSTS ON FOUR PLATFORM/ARCH COMBINATIONS
+
+**The compiler compiles ITSELF to a byte-identical fixpoint on all four**, gated in CI on every push:
+
+| target | object format / libc | reconverge |
+|---|---|---|
+| `x86_64-pc-windows-msvc` | PE / MSVCRT | ✅ (local arc) |
+| `x86_64-unknown-linux-gnu` | ELF / glibc | ✅ CI |
+| `aarch64-apple-darwin` | Mach-O / libSystem | ✅ CI (3-pass) |
+| `aarch64-unknown-linux-gnu` | ELF / glibc | ✅ CI (3-pass) |
+
+That closes **5.1**, **5.2** and **5.7**. "Needs hardware" was wrong for all of them —
+`macos-latest` is Apple Silicon and `ubuntu-24.04-arm` is free for public repos.
+
+**Linux-ARM64 passed on its FIRST run with zero porting work.** A proactive sweep had already
+confirmed no x86 intrinsics, no `immintrin.h`, and correctly arch-guarded asm — the AAPCS64
+fiber-switch was the only arch-specific code and was already correct. Contrast macOS, which took
+four real bugs (`st_mtim`, `epoll`→kqueue, Mach-O asm, and the bitwise pointer bug).
+
+**TIER 3 STARTED — `NOVA_T8_FULLRC` now runs in CI and is BLOCKING on Windows** (3592 PASS / 0
+FAIL on its first run). It had zero CI coverage on any platform before 2026-08-28. Still Windows
+only; POSIX runs NORMAL alone, and Windows CI still never reconverges.
+
+**TIER 2 IN PROGRESS — the full ~3,571-test suite on POSIX.** macOS: 205 → **59 fails (98.3%)**.
+Every failure diagnosed so far has been the HARNESS, not NOVA: a glob that scored negative tests
+as failures, a 25s cap on deliberately-slow crypto, ignored FFI link directives, and server tests
+run concurrently that starved their own green schedulers. Linux hit the 180m cap (now 330m).
+
+---
+
+## ▶ PREVIOUS FOCUS (2026-08-27, later) — CROSS-PLATFORM: Linux ✅ · macOS ✅ · Windows CI open
 
 **NOVA now builds, SELF-HOSTS to a byte-identical fixpoint, and passes its core suite on Linux
 x86_64 and macOS ARM64 — gated in GitHub Actions, not claimed.** This closes plan items **5.1**
