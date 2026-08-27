@@ -8,6 +8,127 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
+## ▶ CURRENT FOCUS (2026-08-27) — WEAPON PARITY: the last 8 items, THROUGH THE FULL ARC ✅
+
+Owner directive: develop 1.6 → 5.6 without stopping, then ONE full arc for all of it. **DONE.** All eight
+are implemented, gated, and have now cleared the arc: reconverge `gen5.ll == gen6.ll` byte-identical
+(23,186,075 bytes; gen3_test.exe reinstalled from gen5), then `nova_ci.ps1` ALL GREEN — every sub-gate
+plus the full regression in **BOTH** memory modes, **3592 PASS / 0 FAIL / 0 SKIP** each
+(NORMAL + `NOVA_T8_FULLRC`), wall time 1468.9 s for the FULLRC leg.
+
+| # | item | state |
+|---|---|---|
+| 1.6 | null ≠ 0 | **✅ DONE 2026-08-27** — the 4-day-old unexplained cause FOUND. Gate `_null_absence_gate` 5/5 (CI 2m) |
+| 1.7 | RC cycle collector | **✅ DONE 2026-08-27** — exit reclamation + proof-gated `cycle_collect()`. Gate 7/7 (CI 2m2) |
+| 2.5 | extended `@comptime` | **✅ DONE 2026-08-27** — lists/for/break/builtins/str+list folding. Gate 9/9 (CI 2m3) |
+| 3.1 | scalar float parity | **✅ DONE 2026-08-27** — 3 experiment flags removed, now default. Gate 9/9 (CI 2k9) |
+| 4.3 | preemptive scheduling | **✅ DONE 2026-08-27** — green-reachable loops only; spawn-free code stays UNinstrumented so GATE 4/5 is unaffected. Gate 5/5 (CI 2m4) |
+| 4.7 | distributed channels | **✅ DONE 2026-08-27** — was already built; wire format converged onto the lossless term codec + version byte. Gate 7/7 (CI 2m5) |
+| 5.5 | bundled toolchain | **✅ DONE 2026-08-27** — resolver (`nova_find_clang()`) already existed from `ba86be42`, no compiler change needed; this pass finished `tools/bundle_toolchain.{ps1,sh}` and `_toolchain_bundle_gate.ps1` (6/6 cases incl. PATH-scrubbed build), now wired into `nova_ci.ps1` as stage 2m6 and ALL GREEN there. Dev bundle 202.0 MB, shipping release bundle 81 MB (unchanged) |
+| 5.6 | Prism → Canvas | **✅ DONE 2026-08-27** — renderer + native KAT + JS decoder + gate all green |
+
+**Known non-failures in the CI tail** (unchanged from before this campaign, and NOT regressions):
+`SUSPECT-OUTFAIL` lists `_kat_null_absence` because the regression runs it WITHOUT
+`NOVA_FIRSTCLASS_NULL=1`, so printing `FAIL` there is the correct behaviour — the gate that *does* set
+the flag passes 5/5. `_kat_http_redirect` / `_kat_http_cookie` and the two `SUSPECT` (no-stdout) entries
+predate this work. Also excluded from the orphan manifest as pre-existing broken (never gated, tracked
+for a separate fix): `distributed_serialize_test` (hangs — no network peer) and `distributed_spawn_test`
+(assumes a spawn-dispatch protocol `node_recv` does not provide) — the same two `_remote_gate.ps1` skips.
+
+### 1.6 — the "cause still unidentified" was ONE LINE, and it was not where anyone looked
+
+Four days of investigation attributed 11 tree/list TIMEOUTs to the `dict_get` absent-value producer.
+Three theories were built on that and all three were falsified; the producer change was reverted as
+having made things *worse* (28 FAIL → 32 FAIL). The actual cause was in `nova_rt_truthy`:
+
+```c
+if (nova_is_box(v)) {
+    if (bx->kind == NOVA_BOX_FLOAT) { ... }
+    return 1;                      // <-- a NULL box is TRUTHY
+}
+```
+
+A null box is a non-NULL heap pointer, so `while cur` over an absent `next` never terminated. The
+producers were never the bug. **The lesson is the one this project keeps re-learning: the failing
+assertion named the wrong place.** The 2026-08-25 float work reached the identical conclusion from the
+opposite direction ("diff the whole module, not the function the error points at").
+
+**What made the two "irreconcilable" requirements reconcilable.** The plan recorded these as a
+contradiction in the representation:
+
+    let z = 0;  z == null      must be FALSE
+    node.next == null (unset)  must be TRUE
+
+They only conflict if `==` is the sole operation considered. Absence keeps its own identity under `==`
+while COERCING to zero everywhere a number is wanted — falsy, arithmetic-zero, orders-as-zero. That is
+Python/Ruby/JS/Lua semantics for nil plus JS's arithmetic coercion, and it makes both hold at once.
+Fixing truthiness and arithmetic FIRST is what makes the producer change safe; doing the producers
+first is exactly what measured worse.
+
+Also landed: `nova_rt_dict_get_abs` / `nova_rt_field_get_abs` / `nova_rt_index_get_abs`, each a thin
+wrapper over a SHARED probe core (`nova_dict_get_or`, `nova_field_get_or`) so the legacy and
+absent-as-null readers cannot drift about what "found" means. Selected at COMPILE time via the emitted
+symbol, not by a runtime env read — a shipped binary has one definite behaviour.
+
+### 1.7 — detection and collection need DIFFERENT predicates, and that is the whole design
+
+The refcount test ("is every reference internal?") is useless for FINDING a cycle here: an escaping
+local is never dropped, so a live A↔B pair measures rc=2/internal=1 and reads as clean. Detection
+therefore uses Tarjan, as before.
+
+But the same test is exactly right for AUTHORISING a free, because it errs in the safe direction — a
+stale count pushes `sum_rc` ABOVE `internal`, so the SCC is KEPT. Under-collection is a leak we already
+had; over-collection is a use-after-free. So:
+
+* **exit-time reclamation** (`NOVA_CYCLE_COLLECT=1`) frees every detected cycle — sound because
+  nothing is reachable once main returns, and requiring the proof there would reclaim almost nothing;
+* **`cycle_collect()`** works mid-program and REQUIRES the per-SCC proof. It refuses (returns −1) when
+  the detector is unarmed or when >1 carrier is running — the analysis reads every live object's
+  fields while another carrier may be mutating them, and NOVA has no safepoint to stop the world at.
+
+Freeing order is made irrelevant by severing every intra-SCC edge across the whole set BEFORE any
+free; interleaving sever-and-free per object would reopen the use-after-free window. The traversal was
+generalised to hand the visitor the SLOT ADDRESS so severing reuses it — a near-copy of a walk that
+must stay structurally identical to `nova_rc_free` is precisely the duplicate that drifts and, once it
+can WRITE, corrupts.
+
+### 4.3 — why this is affordable, which is the only interesting part
+
+The runtime's own comment said NOVA does not instrument every loop because it would tax the C-level hot
+path. That is right, and it is why the compiler emits the check ONLY into functions reachable from a
+`spawn`. Code that cannot run in a green task cannot starve one. Same reasoning that keeps
+`nova_rt_stack_enter` out of native prologues, and the gate asserts the negative directly: a spawn-free
+compute program must emit ZERO checks.
+
+`spawn f(...)` never names `f` in the emitted call — it lifts the call into a nested function and
+spawns that, so the root is recovered by walking `nova_rt_spawn` → `field_get __fn_ptr` →
+`make_closure` backwards. Propagation follows DIRECT calls only; an indirect call is not followed,
+which is a fairness gap, not a correctness one.
+
+**Second capability, not a side effect:** `kill()` on a compute-bound task previously could not take
+effect — the runtime documented that. The preempt check reaches `nova_rt_reschedule`, which carries the
+kill safepoint, so it now does.
+
+### 4.7 — it was already built, TWICE, and the second copy was better
+
+The plan had this as TODO/XL. The runtime already had connect/listen/bind/accept/send/recv/close/spawn
+plus **nine** test programs — **six of which were never in the regression manifest.** Implemented but
+ungated, for the fifth time in this campaign.
+
+The one real defect was the wire format. `remote_send` framed through JSON, which has ONE number type,
+so an integral float came back an int, an integer past 2^53 came back rounded, `bytes` could not cross,
+and `null` was indistinguishable from `0` — flattening on a remote channel exactly the distinction 1.6
+exists to establish. A *second* transport (`node_send`) already used the lossless binary term codec.
+Converged `remote_*` onto that codec rather than adding a third format, with a version byte so an
+incompatible peer gets a clean protocol error instead of a term-decode of JSON text into plausible
+garbage.
+
+Two smaller finds: both transports leaked their encode buffer (one bytes object per message), and
+`node_connect`/`node_listen` were each registered TWICE in the builtin table — the dead earlier pair
+advertising a one-argument `node_connect` the runtime cannot serve.
+
+---
+
 ## BATCH ATTEMPT 2026-08-03 (late) — three items probed, ALL REVERTED, findings kept
 
 Attempted as one batch. Every one produced a real finding; none produced code I was willing to

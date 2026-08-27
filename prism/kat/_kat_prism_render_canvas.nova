@@ -1,0 +1,223 @@
+// KAT for prism/backend/canvas/prism_render_canvas.nova (WEAPON PARITY 5.6).
+//
+// This is the THIRD backend's correctness proof, and it is deliberately depth-first: one small,
+// fully hand-computed tree whose entire draw-command stream is asserted EXACTLY (every x/y/w/h,
+// every packed colour, every text byte) is worth far more than a large tree nothing verifies --
+// a renderer can walk a big tree and still emit plausible garbage; it cannot pass an exact-value
+// assertion by accident. A second, broader tree then proves BREADTH separately: all 22 primitives
+// render without error, but only structurally (Result is Ok + the framing verifies) -- it never
+// substitutes for the exact-value proof.
+//
+// SECTIONS
+//   1. The small tree: Stack([Label("Hi"), Press("Go")]) at a 200x100 surface, default light theme.
+//      Every word of the resulting stream is hand-derived in this file's comments and asserted via
+//      prism_canvas_dump (content, not exit code) AND by indexing specific words directly.
+//   2. Self-describing framing: THREE independent truncation/corruption detections, each isolated
+//      to prove it fires on its own -- not "verify() returns Err somewhere", but the SPECIFIC check.
+//   3. Hit-testing and event resolution against the small tree's HIT record.
+//   4. The broad tree: all 22 PrismNodeKind primitives in one tree, structural pass only.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME = the nova-compiler/ root, NOVA_NO_CACHE=1):
+//   ./gen3_test.exe _kat_prism_render_canvas.nova
+//   clang -O2 -o _kat_prism_render_canvas.exe _kat_prism_render_canvas.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_structure
+import prism_render_canvas as pc
+
+let FAILED = [0]
+
+fn _check(label: string, got: string, want: string)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        print("        got  = " + got)
+        print("        want = " + want)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_int(label: string, got: int, want: int)
+    if got == want
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + "  got=" + str(got) + " want=" + str(want))
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool)
+    if cond
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label)
+        FAILED[0] = FAILED[0] + 1
+
+fn _check_err_contains(label: string, r, needle: string)
+    if not is_err(r)
+        print("  FAIL  " + label + " -- expected Err, got Ok")
+        FAILED[0] = FAILED[0] + 1
+        return
+    let msg = unwrap_err(r)
+    if find(msg, needle) >= 0
+        print("  pass  " + label)
+    else
+        print("  FAIL  " + label + " -- error message did not mention '" + needle + "'")
+        print("        got = " + msg)
+        FAILED[0] = FAILED[0] + 1
+
+// ── The small tree ────────────────────────────────────────────────────────────────────────────
+// Stack([Label("Hi"), Press("Go", [])]), theme_light(), 200x100 surface. Both text runs are pure
+// ASCII (2 chars each, every byte < 0x80) so the default advance-width measurer is exact and the
+// geometry below is not an approximation -- it is arithmetic, done by hand in this comment block:
+//
+//   theme_light(): font_px=14 line_px=20 pad_px=8 gap_px=6 stroke_px=1
+//   on_surface = rgba(26,26,26,255)   = 437918463
+//   primary    = rgba(79,70,229,255)  = 1330046463
+//   on_primary = rgba(255,255,255,255)= 4294967295
+//   surface    = rgba(255,255,255,255)= 4294967295
+//   measure("Hi",14) = measure("Go",14) = (2*14*55)/100 = 15
+//   label box   = (15, 20)                       [_size_label_text]
+//   press box   = (15+2*8, 20+2*8) = (31, 36)     [_size_boxed_text]
+//   stack box   = (max(15,31), 20+36+gap(6)) = (31, 62)
+//
+// Paint walk (pre-order index: root stack=0, label=1, press=2):
+//   background fill   : fill_rect 0,0,200,100,4294967295
+//   label "Hi"         : text 0,0,437918463,14,0,0 "Hi"                    (align=left(0) weight=0)
+//   press HIT          : hit  0,26,200,36,2,1           (role=press=1, width is the parent's FULL
+//                         200, not the press's own 31 -- _paint_stack hands every child the parent
+//                         width, exactly like the HTML/ANSI backends' block layout)
+//   press bg           : fill_rect   0,26,200,36,1330046463
+//   press border        : stroke_rect 0,26,200,36,1330046463,1
+//   press label "Go"    : text 100,34,4294967295,14,1,1 "Go"               (centered, x+w/2, bold)
+//
+// 6 records total.
+fn _small_tree() -> PrismNode
+    unwrap(prism_arrange.prism_stack([
+        unwrap(prism_content.prism_label("Hi")),
+        unwrap(prism_interact.prism_press("Go", []))
+    ]))
+
+fn main()
+    print("== 1. the small tree: exact geometry, colour and text ==")
+    let words = unwrap(pc.prism_canvas_render(_small_tree(), 200, 100))
+
+    let verified = pc.prism_canvas_verify(words)
+    _check_true("verify: buffer is well-formed", not is_err(verified))
+    _check_int("verify: reports 6 commands", unwrap(verified), 6)
+
+    // The final "end <checksum>" line is NOT hand-computed (DJB2 over 60 words is not something a
+    // human should hand-verify) -- its correctness is instead proven the honest way, by the
+    // ALGORITHM: prism_canvas_verify above independently recomputes the checksum and confirms it
+    // matches, and section 2b below proves that check actually rejects a wrong one. Every OTHER
+    // field in this dump -- every x, y, w, h, packed colour and text byte -- is hand arithmetic
+    // from this file's header comment, so the dump match below is a real end-to-end proof, not a
+    // renderer-compared-to-itself tautology.
+    let expected_dump = join([
+        "surface 200x100 cmds 6",
+        "fill_rect 0,0,200,100,4294967295",
+        "text 0,0,437918463,14,0,0 \"Hi\"",
+        "hit 0,26,200,36,2,1",
+        "fill_rect 0,26,200,36,1330046463",
+        "stroke_rect 0,26,200,36,1330046463,1",
+        "text 100,34,4294967295,14,1,1 \"Go\"",
+        "end " + str(words[len(words) - 1])
+    ], "\n")
+    _check("dump matches the hand-derived stream EXACTLY", unwrap(pc.prism_canvas_dump(words)), expected_dump)
+
+    // Belt-and-suspenders: index straight into the word buffer too, so this test does not rest
+    // entirely on prism_canvas_dump being correct -- a bug shared between the emitter and the
+    // dumper would slip past a dump-only comparison.
+    _check_int("header: magic", words[0], pc.prism_canvas_magic())
+    _check_int("header: version", words[1], pc.prism_canvas_version())
+    _check_int("header: word_count", words[2], len(words))
+    _check_int("header: cmd_count", words[3], 6)
+    _check_int("header: surface width", words[4], 200)
+    _check_int("header: surface height", words[5], 100)
+    _check_int("word 17: label colour is on_surface, not on_primary", words[17], 437918463)
+    _check_int("word 30: press HIT node index is 2 (root=0, label=1, press=2)", words[30], 2)
+    _check_int("word 31: press HIT role is press()", words[31], pc.prism_canvas_role_press())
+    _check_int("total length is 61 words (6 header + 52 body + end(2) + checksum(1))", len(words), 61)
+
+    print("== 2. self-describing framing: three independent detections ==")
+
+    // 2a. Plain truncation -- drop the trailing END+checksum, as a short network read would. The
+    // header's own declared word_count (still 61) now disagrees with the shorter buffer -- caught
+    // by check 1 before any record is even walked.
+    let dropped_tail = [words[i] for i in 0..(len(words) - 3)]
+    _check_err_contains("2a. dropped END+checksum -> header/length disagreement", pc.prism_canvas_verify(dropped_tail), "TRUNCATED or padded")
+
+    // 2b. A single flipped word deep inside a record's fixed args (the label's colour, word 17),
+    // framing untouched (argc still correct, record count still 6). Only the checksum can catch
+    // this -- proves check 3 is load-bearing on its own, not redundant with checks 1/2.
+    let corrupted = [w for w in words]
+    corrupted[17] = corrupted[17] + 1
+    _check_err_contains("2b. one word flipped, framing intact -> checksum-only detection", pc.prism_canvas_verify(corrupted), "checksum")
+
+    // 2c. The interesting case: a buffer that is internally CONSISTENT (header word_count matches
+    // its own length, checksum matches its own content) but was cut off mid-record, with no END.
+    // This is what a truncated buffer looks like if a naive re-checksum were the only guard -- it
+    // would look "clean". Forged here to prove check 2 (per-record argc framing) is the one that
+    // actually catches it, independently of check 1 and check 3.
+    let cut = [words[i] for i in 0..20]     // header(6) + fill_rect(7) + text's op,argc,5-of-9 args
+    cut[2] = len(cut)                        // header now agrees with the (still truncated) length
+    let fake_sum = pc.prism_canvas_checksum(cut, len(cut) - 1)
+    cut[len(cut) - 1] = fake_sum             // checksum now agrees too -- only framing can catch this
+    _check_err_contains("2c. header+checksum forged consistent, mid-record cut -> per-record detection", pc.prism_canvas_verify(cut), "TRUNCATED")
+
+    print("== 3. hit-testing and event resolution ==")
+    _check_int("point inside the press rect resolves to node 2", pc.prism_canvas_hit_test(words, 50, 30), 2)
+    _check_int("point above the press rect (over the label) resolves to nothing", pc.prism_canvas_hit_test(words, 50, 10), -1)
+    _check_int("point inside resolves the press role", pc.prism_canvas_hit_role(words, 50, 30), pc.prism_canvas_role_press())
+
+    let down_code = pc.prism_canvas_event_kind_code(pc.prism_canvas_kind_pointer_down())
+    let ev_hit = unwrap(pc.prism_canvas_event_of(words, down_code, 50, 30, 0))
+    _check_int("pointer_down inside press -> target 2", ev_hit.pcv_target, 2)
+    _check_int("pointer_down inside press -> role press()", ev_hit.pcv_role, pc.prism_canvas_role_press())
+    let ev_miss = unwrap(pc.prism_canvas_event_of(words, down_code, 50, 10, 0))
+    _check_int("pointer_down over the label -> target -1 (not interactive)", ev_miss.pcv_target, -1)
+    _check_true("an unknown event code is a typed error, not a silent default", is_err(pc.prism_canvas_event_kind_of_code(99)))
+
+    print("== 4. the broad tree: all 22 primitives render without error ==")
+    let broad = unwrap(prism_arrange.prism_stack([
+        unwrap(prism_content.prism_label("body text")),
+        unwrap(prism_interact.prism_press("Go", [])),
+        unwrap(prism_interact.prism_link("Docs", prism_interact.prism_link_target_url("https://example.com"))),
+        unwrap(prism_interact.prism_entry("Name", prism_interact.prism_entry_kind_text(), "abc")),
+        unwrap(prism_interact.prism_flag("Active", true)),
+        unwrap(prism_interact.prism_range("Vol", 0, 10, 1, 5)),
+        unwrap(prism_content.prism_glyph(prism_content.prism_icon_check())),
+        unwrap(prism_content.prism_art("/img/logo.png")),
+        unwrap(prism_content.prism_draw(fn(s) s)),
+        unwrap(prism_arrange.prism_gap(some(8))),
+        unwrap(prism_interact.prism_pick([prism_interact.prism_pick_option("a", "A")], "a")),
+        unwrap(prism_arrange.prism_band([unwrap(prism_content.prism_label("x")), unwrap(prism_content.prism_label("y"))])),
+        unwrap(prism_arrange.prism_layer([unwrap(prism_content.prism_label("z"))])),
+        unwrap(prism_arrange.prism_mesh([prism_arrange.prism_track_fixed(50)], [unwrap(prism_content.prism_label("m"))])),
+        unwrap(prism_arrange.prism_flow([unwrap(prism_content.prism_label("f"))])),
+        unwrap(prism_arrange.prism_pane(unwrap(prism_content.prism_label("p")))),
+        unwrap(prism_structure.prism_sheet(unwrap(prism_content.prism_label("s")), false)),
+        unwrap(prism_structure.prism_hint("tip", unwrap(prism_content.prism_label("anchor")))),
+        unwrap(prism_structure.prism_each(["p", "q"], fn(i) i, fn(i) prism_content.prism_label(i))),
+        unwrap(prism_structure.prism_grid(["r1"], fn(i) i, ["c1"], fn(i, c) prism_content.prism_label(i))),
+        unwrap(prism_structure.prism_tabs([prism_structure.prism_tab_panel("T1", unwrap(prism_content.prism_label("panel1")))], 0))
+    ]))
+    // 22 distinct kinds appear above (stack + the 21 listed children) -- the full PrismNodeKind
+    // vocabulary (prism_node.prism_node_kind_all() asserts len == 22 in its own KAT).
+    let rendered = pc.prism_canvas_render(broad, 400, 800)
+    _check_true("every primitive maps to SOME canvas encoding (Result is Ok)", not is_err(rendered))
+    if not is_err(rendered)
+        let bwords = unwrap(rendered)
+        let bverified = pc.prism_canvas_verify(bwords)
+        _check_true("broad tree's stream is self-consistent (verify Ok)", not is_err(bverified))
+        // pane's CLIP_PUSH/CLIP_POP balance is checked INSIDE verify() (a corrupt balance is a
+        // hard error there) -- an Ok result already proves the pane in this tree balanced.
+        _check_true("broad tree has more than the small tree's 6 commands", is_err(bverified) or unwrap(bverified) > 6)
+
+    if FAILED[0] == 0
+        print("")
+        print("_kat_prism_render_canvas: ALL PASS")
+    else
+        print("")
+        print("_kat_prism_render_canvas: " + str(FAILED[0]) + " FAILURE(S)")
+        exit(1)

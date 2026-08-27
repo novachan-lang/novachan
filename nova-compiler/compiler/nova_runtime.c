@@ -1511,13 +1511,16 @@ static void nova_rt_oddballs_init(void) {
 /* First-class null / bool values (Stage 0: dead from any NOVA program; reached from json_decode in Stage 1). */
 int64_t nova_rt_null(void) { nova_rt_oddballs_init(); return g_null_box; }
 
-/* ABSENT (missing dict key, unknown field, out-of-range index) DELIBERATELY stays raw 0,
-   even under NOVA_FIRSTCLASS_NULL. Measured, not assumed: routing absent through the null
-   singleton took the blast radius from 28 FAIL to 32 FAIL (2026-08-22). `0`-as-absent is
-   load-bearing across the stdlib -- `d["count"] + 1` on a missing key must be 1, not
-   arithmetic on a box pointer, and the codecs check absence with `== 0`. Making ABSENT
-   first-class null is a whole-stdlib semantic migration, NOT part of 1.6; 1.6 is scoped to
-   the `null` LITERAL (JSON null vs 0 fidelity). See WEAPON_PARITY_PLAN.md 1.6. */
+/* ABSENT (missing dict key, unknown field) is first-class null under NOVA_FIRSTCLASS_NULL=1,
+   via nova_rt_dict_get_abs / nova_rt_field_get_abs. It stays raw 0 by DEFAULT.
+
+   The 2026-08-22 measurement (28 FAIL -> 32 FAIL when absent was routed through the
+   singleton) is superseded, and its diagnosis was backwards: the regressions were not
+   caused by the producers but by the singleton being TRUTHY and arithmetic on it computing
+   on a heap pointer. Both are fixed -- see the NULL VALUE MODEL note above
+   nova_is_null_box -- so `d["count"] + 1` is 1 and `while node` terminates. An
+   out-of-range LIST index deliberately still returns 0: a dense list has no notion of an
+   absent element, and an index past the end is closer to an error than to absence. */
 int64_t nova_rt_bool(int64_t v) { nova_rt_oddballs_init(); return v ? g_true_box : g_false_box; }
 
 /* Container element read (list_get/dict_get/inline index): a FLOAT box is kept
@@ -1573,6 +1576,58 @@ static double nova_elem_to_double(int64_t elem) {
     }
     return (double)elem;              /* normal int value */
 }
+
+/* ===========================================================================
+   1.6 -- THE NULL VALUE MODEL, stated once, in one place.
+
+   NOVA's `null` is ABSENCE. That single sentence fixes the semantics of every
+   operation below, and it is what makes the two requirements that looked
+   IRRECONCILABLE both hold at the same time:
+
+       let z = 0;  z == null        must be FALSE   (0 is a value, not absence)
+       node.next == null (unset)    must be TRUE    (never set IS absence)
+
+   The earlier attempt treated these as a contradiction in the representation.
+   They are not -- they are a contradiction only if `==` is the ONLY operation
+   considered. The resolution is that absence has its own identity for `==`
+   while COERCING to zero everywhere a number is wanted:
+
+     | operation        | null behaves as | rationale                          |
+     |------------------|-----------------|------------------------------------|
+     | truthiness       | FALSE           | absent is not a thing; and this is |
+     |                  |                 | what made 11 tree/list tests HANG  |
+     | arithmetic       | 0               | `d["count"] + 1` on a missing key  |
+     |                  |                 | must be 1, never pointer + 1       |
+     | ordering < >     | 0               | keeps sorts total, no panic        |
+     | == / !=          | ONLY itself     | the whole point of the item        |
+     | str()            | "null"          | JSON fidelity (already correct)    |
+     | unbox            | 0               | payload is 0 by construction       |
+
+   Every mainstream language with a first-class nil agrees on falsy-and-not-
+   equal-to-zero: Python None, Ruby nil, JS null, Lua nil. NOVA additionally
+   takes JS's arithmetic coercion (`null + 1 === 1`) rather than Python's
+   TypeError, because NOVA has no exceptions on the arithmetic path and a hard
+   panic on a missing dict key would be a far bigger behaviour change than a
+   zero.
+
+   WHY THE 2026-08-22 ATTEMPT MEASURED WORSE (28 FAIL -> 32 FAIL): it routed
+   ABSENT through the singleton without first making the singleton behave like
+   a zero. So every consumer that did arithmetic on a missing key started
+   computing on a heap POINTER, and every `while node` loop over an absent
+   `next` ran forever -- because nova_rt_truthy returned 1 for any non-float
+   box. The producers were never the bug; the singleton's own arithmetic and
+   truthiness were. Fix those FIRST and the producer change becomes safe.
+   =========================================================================== */
+static inline int nova_is_null_box(int64_t v) {
+    if (v == 0) return 0;                  /* raw 0 is the LEGACY null, deliberately not this */
+    if (!nova_is_box(v)) return 0;
+    return ((NovaBox*)(uintptr_t)v)->kind == NOVA_BOX_NULL;
+}
+
+/* Coerce absence to the number zero. Used at the top of every DYNAMIC (any-typed)
+   arithmetic entry point. Statically-typed int/float arithmetic is compiled to raw
+   add/fadd and never reaches these functions, so this costs nothing on the hot path. */
+static inline int64_t nova_null0(int64_t v) { return nova_is_null_box(v) ? 0 : v; }
 
 void nova_rt_track_raw(void* ptr) {
     (void)ptr;
@@ -4914,8 +4969,13 @@ int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
     return nova_rt_dict_set(handle, key, val);
 }
 
-int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
-    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> 0, no wild deref */
+/* ONE probe, TWO absent conventions. `missing` is what a key-not-found returns, and it is
+   the only difference between the legacy reader and the 1.6 absent-as-null reader. Written
+   as a shared core rather than two copies on purpose: a second copy of a hash probe is a
+   second place to drift about what "found" means, and a reader that disagreed with
+   nova_rt_dict_has about presence is exactly the silent-wrong-data class. */
+static int64_t nova_dict_get_or(int64_t handle, int64_t key, int64_t missing) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return missing;  /* SOUNDNESS: non-dict handle, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
     uint64_t h = nova_dict_keyhash(key, key_is_str);
@@ -4926,7 +4986,30 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
             return nova_rt_unbox_elem(d->vals[ei]);
         slot = (slot + 1) & (d->idx_cap - 1);
     }
-    return 0;   /* missing key -> 0. See the ABSENT note near nova_rt_bool: intentional. */
+    return missing;
+}
+
+int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
+    /* LEGACY absent convention: missing key -> raw 0. Kept as the default because
+       `d["count"] + 1 == 1` and `if d["flag"]` both depend on it across the stdlib, and
+       because every internal runtime caller below wants the old behaviour. */
+    return nova_dict_get_or(handle, key, 0);
+}
+
+/* 1.6 ABSENT-AS-NULL. Emitted for `d[k]` instead of nova_rt_dict_get when the program is
+   compiled with NOVA_FIRSTCLASS_NULL=1. This is the HALF of 1.6 that the 2026-08-22
+   attempt got right and then abandoned, because at the time the singleton was truthy and
+   arithmetic on it computed on a pointer -- see the NULL VALUE MODEL note. With those
+   fixed, absence now behaves as zero everywhere a number is wanted and as itself under
+   `==`, which is what makes `node.next == null` on an unset key finally TRUE while
+   `let z = 0; z == null` stays FALSE.
+
+   A compile-time choice, NOT a runtime env read: the emitted symbol differs, so a built
+   binary has ONE definite behaviour and the flag cannot change what a shipped program
+   does. Also keeps oddball minting lazy -- with the flag off this symbol is never
+   referenced, so nothing calls nova_rt_null() and the three cells are never allocated. */
+int64_t nova_rt_dict_get_abs(int64_t handle, int64_t key) {
+    return nova_dict_get_or(handle, key, nova_rt_null());
 }
 
 /* dict.get(d, key, default): the value for key, or `deflt` if the key is absent (Python/JS dict.get).
@@ -6828,6 +6911,13 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_BOX: {
             NovaBox* bx = (NovaBox*)ptr;
             if (bx->kind == NOVA_BOX_BOOL) return nova_rt_create_string((void*)(bx->payload ? "true" : "false"));
+            /* 1.6: a NULL box renders as "null". Without this it fell through to the float
+               renderer and a null printed as "0.0" -- the payload of the null cell is 0, so
+               the wrong answer is a PLAUSIBLE one, which is what let it hide. This is the
+               same trap nova_rt_term_encode already carries a comment about ("else null
+               would mis-encode as float 0.0"); the render path had it unfixed. Any new
+               box-kind dispatch needs an explicit NULL arm for the same reason. */
+            if (bx->kind == NOVA_BOX_NULL) return nova_rt_create_string((void*)"null");
             return nova_rt_float_to_str(bx->payload);
         }
         default:
@@ -6854,6 +6944,13 @@ int64_t nova_rt_elem_to_str(int64_t val) {
     if (tag == NOVA_MEM_BOX) {
         NovaBox* bx = (NovaBox*)ptr;
         if (bx->kind == NOVA_BOX_BOOL) return nova_rt_create_string((void*)(bx->payload ? "true" : "false"));
+        /* 1.6: a NULL box renders as "null". Without this it fell through to the float
+           renderer and a null printed as "0.0" -- the payload of the null cell is 0, so
+           the wrong answer is a PLAUSIBLE one, which is what let it hide. This is the
+           same trap nova_rt_term_encode already carries a comment about ("else null
+           would mis-encode as float 0.0"); the render path had it unfixed. Any new
+           box-kind dispatch needs an explicit NULL arm for the same reason. */
+        if (bx->kind == NOVA_BOX_NULL) return nova_rt_create_string((void*)"null");
         return nova_rt_float_to_str(bx->payload);
     }
     if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return val;
@@ -6969,9 +7066,14 @@ int64_t nova_rt_field_types(int64_t val) {
     }
     return lst;
 }
-int64_t nova_rt_field_get(int64_t val, int64_t name) {
-    if (!nova_rt_is_struct_value(val)) return 0;          /* null */
-    if ((uint64_t)name <= 0x10000ULL) return 0;
+/* ONE field walk, TWO absent conventions -- same reasoning as nova_dict_get_or above.
+   Note that a NON-struct receiver and a bad name pointer also return `missing`: from the
+   caller's point of view "this value has no such field" is the same answer as "this struct
+   has no such field", and returning 0 for one and null for the other would make the
+   distinction depend on the receiver's type rather than on presence. */
+static int64_t nova_field_get_or(int64_t val, int64_t name, int64_t missing) {
+    if (!nova_rt_is_struct_value(val)) return missing;
+    if ((uint64_t)name <= 0x10000ULL) return missing;
     const char* want = (const char*)(uintptr_t)name;      /* NOVA string: NUL-terminated */
     int64_t h = ((const int64_t*)(uintptr_t)val)[0];
     int fc = nova_rt_field_count(val, h);
@@ -6988,7 +7090,16 @@ int64_t nova_rt_field_get(int64_t val, int64_t name) {
             return fv;                                    /* int/string/struct/list/dict/boxed pass through */
         }
     }
-    return 0;   /* unknown field -> 0. See the ABSENT note near nova_rt_bool: intentional. */
+    return missing;
+}
+
+int64_t nova_rt_field_get(int64_t val, int64_t name) {
+    return nova_field_get_or(val, name, 0);            /* LEGACY: unknown field -> raw 0 */
+}
+
+/* 1.6 ABSENT-AS-NULL field read. See nova_rt_dict_get_abs. */
+int64_t nova_rt_field_get_abs(int64_t val, int64_t name) {
+    return nova_field_get_or(val, name, nova_rt_null());
 }
 
 int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
@@ -7039,6 +7150,9 @@ static inline int64_t nova_from_double(double d) {
 }
 
 int64_t nova_rt_add(int64_t a, int64_t b) {
+    /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
+       Without this, `d["missing"] + 1` computes on a heap POINTER. */
+    a = nova_null0(a); b = nova_null0(b);
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
@@ -7057,12 +7171,18 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
 }
 
 int64_t nova_rt_sub(int64_t a, int64_t b) {
+    /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
+       Without this, `d["missing"] + 1` computes on a heap POINTER. */
+    a = nova_null0(a); b = nova_null0(b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) - nova_to_double(b)));
     return a - b;
 }
 
 int64_t nova_rt_mul(int64_t a, int64_t b) {
+    /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
+       Without this, `d["missing"] + 1` computes on a heap POINTER. */
+    a = nova_null0(a); b = nova_null0(b);
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
@@ -7087,6 +7207,9 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
 }
 
 int64_t nova_rt_div(int64_t a, int64_t b) {
+    /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
+       Without this, `d["missing"] + 1` computes on a heap POINTER. */
+    a = nova_null0(a); b = nova_null0(b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) / nova_to_double(b)));
     if (b == 0) return 0;                                 /* CORE_GAP 0.2: x/0 is defined 0, never UB */
@@ -7098,6 +7221,9 @@ int64_t nova_rt_div(int64_t a, int64_t b) {
    float division) so `%` on an `any`/boxed value is never a srem on pointer bits; and x%0 / INT64_MIN%-1 are
    defined (0) rather than UB. For raw ints this returns exactly a%b -- identical to the old inline srem. */
 int64_t nova_rt_mod(int64_t a, int64_t b) {
+    /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
+       Without this, `d["missing"] + 1` computes on a heap POINTER. */
+    a = nova_null0(a); b = nova_null0(b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(fmod(nova_to_double(a), nova_to_double(b))));
     if (b == 0) return 0;
@@ -7109,6 +7235,7 @@ int64_t nova_rt_mod(int64_t a, int64_t b) {
    POINTER = garbage); a boxed bool negates its int value. For raw ints this is -a with a defined two's-complement
    wrap for INT64_MIN (matching the old `sub i64 0, x`, which also wrapped). */
 int64_t nova_rt_neg(int64_t a) {
+    a = nova_null0(a);   /* 1.6: -null == 0, see the NULL VALUE MODEL note */
     if (nova_is_likely_float(a))
         return nova_rt_box_float(nova_from_double(-nova_to_double(a)));
     return (int64_t)(0ULL - (uint64_t)a);
@@ -7125,6 +7252,17 @@ int64_t nova_rt_truthy(int64_t v) {
     if (nova_is_box(v)) {
         NovaBox* bx = (NovaBox*)(uintptr_t)v;
         if (bx->kind == NOVA_BOX_FLOAT) { double d; memcpy(&d, &bx->payload, 8); return d != 0.0 ? 1 : 0; }
+        /* 1.6: ABSENCE IS FALSY. This one line is the root cause of the 11 tree/list
+           TIMEOUTs recorded as "cause still unidentified" on 2026-08-22. A null box is a
+           non-NULL heap pointer, so it fell into the `return 1` below and
+
+               while node            // node = h["next"] on an unset key
+                   node = node.next
+
+           looped forever. Nothing about the dict_get producer was wrong; the singleton's
+           own truthiness was. Falsy nil is also universal (Python/Ruby/JS/Lua), so this is
+           the semantic every developer already expects. */
+        if (bx->kind == NOVA_BOX_NULL) return 0;
         return 1;
     }
     return v != 0 ? 1 : 0;
@@ -7180,14 +7318,6 @@ int64_t nova_rt_le(int64_t a, int64_t b) { return nova_rt_cmp(a, b) <= 0 ? 1 : 0
 int64_t nova_rt_gt(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >  0 ? 1 : 0; }
 int64_t nova_rt_ge(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >= 0 ? 1 : 0; }
 
-/* 1.6: is this handle the first-class null singleton (NOVA_BOX_NULL)? Raw 0 is NOT --
-   that is the legacy language-level null, and conflating the two here would defeat the
-   whole point. Cheap: a non-zero guard, then the same box test every unbox already does. */
-static int nova_is_null_box(int64_t v) {
-    if (v == 0) return 0;
-    if (!nova_is_box(v)) return 0;
-    return ((NovaBox*)(uintptr_t)v)->kind == NOVA_BOX_NULL;
-}
 
 int64_t nova_rt_eq(int64_t a, int64_t b) {
     /* 1.6 FIRST-CLASS NULL -- this test MUST come before the unbox below. The null
@@ -7473,6 +7603,7 @@ typedef struct {
    channel op, it PARKS (yields to the single carrier) instead of blocking the
    OS thread — so thousands of green tasks coordinate on one thread. */
 static int  nova_sched_in_task(void);          /* 1 if running inside a green task */
+static void nova_preempt_init(void);           /* 4.3: eager NOVA_REDUCTIONS resolve */
 static void nova_sched_park_on(NovaChannel* ch);   /* park current task on ch->green_waiters (recv; caller holds the lock) */
 static void nova_sched_park_send(NovaChannel* ch);  /* park current task on ch->green_send_waiters (send; caller holds the lock) */
 static void nova_sched_yield_now(void);            /* yield to the carrier (caller already parked on a waiter list) */
@@ -9539,6 +9670,70 @@ int64_t nova_rt_reschedule(void) {
     return 0;
 }
 
+/* ── 4.3 PREEMPTIVE SCHEDULING -- reduction counting at loop headers ─────────────────
+   The problem this solves: v1 scheduling was purely cooperative, so a green task in a
+   CPU-bound loop with no channel or I/O operation never yielded. One such task starves
+   every other task sharing its carrier -- and starvation is not a slowdown, it is a
+   liveness bug: a timer never fires, a health check never answers, a supervisor never
+   notices.
+
+   Erlang's answer is the reduction count, and it is the right one: a process is
+   descheduled after a fixed amount of work rather than at an arbitrary instruction. That
+   distinction is load-bearing. TRUE (signal-based) preemption would interrupt a task
+   mid-operation, where it may hold a scheduler lock or be midway through an RC update, so
+   the runtime already documents asynchronous kill as unsafe for exactly that reason. A
+   loop header is a safe point by construction: no lock is held across it, and every RC
+   invariant holds.
+
+   WHY IT IS NOT INSTRUMENTED EVERYWHERE, which is the whole design:
+   the compiler emits this call ONLY into functions reachable from a `spawn`. Code that
+   can never run inside a green task cannot starve one, so instrumenting it would be a
+   permanent throughput tax on exactly the benchmarks that carry the "match C" promise.
+   That is the same reasoning that keeps nova_rt_stack_enter out of native prologues.
+
+   COST, stated honestly: one call per loop iteration in green-reachable code. An inline
+   decrement-and-branch would be cheaper and is the obvious next step, but it needs a
+   thread-local global accessed from hand-written LLVM IR -- a per-platform TLS-model
+   problem -- and the project's own rule from the 1.4 work applies: ship the correct
+   version, optimise on evidence. */
+#ifndef NOVA_REDS_DEFAULT
+#define NOVA_REDS_DEFAULT 4000          /* Erlang's quantum, for the same reasons */
+#endif
+static int64_t g_nova_reds_quantum = NOVA_REDS_DEFAULT;
+#ifdef _WIN32
+static __declspec(thread) int64_t g_nova_reds = NOVA_REDS_DEFAULT;
+#else
+static __thread int64_t g_nova_reds = NOVA_REDS_DEFAULT;
+#endif
+
+/* Resolved EAGERLY from nova_rt_init, never per call: a getenv on a per-iteration path
+   would cost more than the yield it is deciding about. Same discipline as the cycle
+   detector's g_cyc_on, and for the same measured reason. */
+static void nova_preempt_init(void) {
+    const char* e = getenv("NOVA_REDUCTIONS");
+    if (e && e[0]) {
+        long v = strtol(e, NULL, 10);
+        /* 0 or a negative value DISABLES preemption rather than yielding on every
+           iteration -- an escape hatch for measuring the instrumentation's own cost, and
+           the sane reading of "no reductions". */
+        if (v <= 0) g_nova_reds_quantum = 0;
+        else g_nova_reds_quantum = (int64_t)v;
+    }
+    g_nova_reds = g_nova_reds_quantum;
+}
+
+int64_t nova_rt_preempt_check(void) {
+    if (g_nova_reds_quantum == 0) return 0;          /* disabled */
+    if (--g_nova_reds > 0) return 0;                 /* the common case: one dec + one branch */
+    g_nova_reds = g_nova_reds_quantum;
+    /* Outside a green task this is a no-op. The main thread and the OS worker pool are
+       preempted by the operating system already, and yielding there would hand control to
+       a scheduler that is not running. */
+    if (!nova_sched_in_task()) return 0;
+    nova_rt_reschedule();                            /* carries the kill safepoint with it */
+    return 1;
+}
+
 /* nova_rt_kill(pid): request termination of a green task (LOCK-5).
    Returns 1 if the request was recorded, 0 if the PID is stale/invalid (a finished task's
    handle derefs to NULL by generation check -> graceful no-op, never a wrong task).
@@ -11515,6 +11710,7 @@ void nova_rt_init(void) {
     /* 1.7: resolve the cycle-detector flag ONCE, here, so the allocator hot path only ever
        tests `g_cyc_on > 0` and never calls into the resolver. */
     (void)nova_cyc_enabled();
+    nova_preempt_init();          /* 4.3: resolve NOVA_REDUCTIONS once, never per iteration */
 #ifdef _WIN32
     /* TIMER RESOLUTION. Windows' default timer granularity is 15.6 ms, and the netpoller thread
        idles on Sleep(1) (see the poller loop below), which ROUNDS UP to a full tick. A green task
@@ -12309,6 +12505,7 @@ int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(nova_float_arg(x), 
 int64_t nova_rt_round(int64_t x) { return (int64_t)round(nova_float_arg(x)); }
 int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(nova_float_arg(x))); }
 int64_t nova_rt_pow(int64_t x, int64_t y) {
+    x = nova_null0(x); y = nova_null0(y);   /* 1.6: absence coerces to zero */
     int x_box = nova_is_box(x), y_box = nova_is_box(y);
     if (!x_box && !y_box) {
         uint64_t ux = (uint64_t)x, uy = (uint64_t)y;
@@ -13974,7 +14171,12 @@ static long nova_cyc_slot_of(void* p) {
    heap refs; feeding a double's bit pattern to find_tag is precisely the bug that
    exclusion exists to prevent). Any divergence here would misreport, so it is kept
    structurally identical rather than re-derived. */
-typedef void (*nova_cyc_visit_fn)(void* ctx, long child_slot);
+/* `at` is the ADDRESS of the field/element that holds the child. Counting and CSR-fill
+   ignore it; the collector uses it to BREAK the edge in place. Passing the address rather
+   than adding a second severing traversal is deliberate -- this walk has to stay
+   structurally identical to nova_rc_free, and a near-copy of it is exactly the kind of
+   duplicate that drifts and then misreports (or, once it can also WRITE, corrupts). */
+typedef void (*nova_cyc_visit_fn)(void* ctx, long child_slot, int64_t* at);
 static void nova_cyc_walk(void* obj, nova_cyc_visit_fn visit, void* ctx) {
     NovaMemTag tag = NOVA_RC_TAG(obj);
     if ((tag & 0x7) == NOVA_MEM_STRUCT) {
@@ -13987,7 +14189,7 @@ static void nova_cyc_walk(void* obj, nova_cyc_visit_fn visit, void* ctx) {
         for (int64_t i = 1; i < lim; i++) {
             if (!((mask >> (uint64_t)i) & 1ull)) continue;
             long s = nova_cyc_slot_of((void*)(uintptr_t)slots[i]);
-            if (s >= 0) visit(ctx, s);
+            if (s >= 0) visit(ctx, s, &slots[i]);
         }
         return;
     }
@@ -13996,7 +14198,7 @@ static void nova_cyc_walk(void* obj, nova_cyc_visit_fn visit, void* ctx) {
         if (l->elem_kind == 2) return;
         for (int64_t i = 0; i < l->size; i++) {
             long s = nova_cyc_slot_of((void*)(uintptr_t)l->data[i]);
-            if (s >= 0) visit(ctx, s);
+            if (s >= 0) visit(ctx, s, &l->data[i]);
         }
         return;
     }
@@ -14004,20 +14206,48 @@ static void nova_cyc_walk(void* obj, nova_cyc_visit_fn visit, void* ctx) {
         NovaDict* d = (NovaDict*)obj;
         for (int64_t i = 0; i < d->size; i++) {
             long sk = nova_cyc_slot_of((void*)(uintptr_t)d->keys[i]);
-            if (sk >= 0) visit(ctx, sk);
+            if (sk >= 0) visit(ctx, sk, &d->keys[i]);
             long sv = nova_cyc_slot_of((void*)(uintptr_t)d->vals[i]);
-            if (sv >= 0) visit(ctx, sv);
+            if (sv >= 0) visit(ctx, sv, &d->vals[i]);
         }
         return;
     }
     /* RAW / BYTES / typed-array / fat string: no managed children. */
 }
 
-static void nova_cyc_v_count(void* ctx, long slot) { (void)slot; (*(int64_t*)ctx)++; }
+static void nova_cyc_v_count(void* ctx, long slot, int64_t* at) { (void)slot; (void)at; (*(int64_t*)ctx)++; }
 typedef struct { int32_t* to; int64_t n; } NovaCycFill;
-static void nova_cyc_v_fill(void* ctx, long slot) {
+static void nova_cyc_v_fill(void* ctx, long slot, int64_t* at) {
+    (void)at;
     NovaCycFill* f = (NovaCycFill*)ctx;
     f->to[f->n++] = (int32_t)slot;
+}
+
+/* ── 1.7 COLLECTOR support ────────────────────────────────────────────────────
+   SEVER: zero every edge that lands INSIDE the same SCC. After this pass no member of
+   the cycle references another member, so the members can then be released in ANY order
+   without nova_rc_free recursing into storage we have already handed back -- which is the
+   one way a cycle collector turns a leak into a use-after-free.
+
+   Edges leaving the SCC are deliberately LEFT INTACT: nova_rc_free must still decrement
+   them, or freeing the cycle would leak everything it referenced. Those targets cannot
+   point back into the SCC (if they did, Tarjan would have put them in it), so releasing
+   them cannot re-enter the cycle. */
+typedef struct { const int32_t* sccid; int32_t mine; int64_t nbroken; } NovaCycSever;
+static void nova_cyc_v_sever(void* ctx, long slot, int64_t* at) {
+    NovaCycSever* v = (NovaCycSever*)ctx;
+    if (v->sccid[slot] != v->mine) return;   /* leaves the SCC -- rc_free must still dec it */
+    *at = 0;
+    v->nbroken++;
+}
+
+/* Count edges whose target is in the SAME SCC. This is the `internal` half of the
+   reachability proof used by the on-demand collector. */
+typedef struct { const int32_t* sccid; int32_t mine; int64_t n; } NovaCycInt;
+static void nova_cyc_v_internal(void* ctx, long slot, int64_t* at) {
+    (void)at;
+    NovaCycInt* v = (NovaCycInt*)ctx;
+    if (v->sccid[slot] == v->mine) v->n++;
 }
 
 static const char* nova_cyc_typename(void* o) {
@@ -14037,17 +14267,41 @@ static const char* nova_cyc_typename(void* o) {
 }
 
 #define NOVA_CYC_MAX_KINDS 64
-static void nova_cyc_report(void) {
+
+/* ── 1.7 DETECT + COLLECT, one graph build ───────────────────────────────────────────
+   `report`       -- print the human-readable diagnosis.
+   `do_collect`   -- actually RECLAIM the cycles found.
+   `need_proof`   -- require a per-SCC unreachability PROOF before freeing.
+
+   The proof is the classic refcount test: an SCC is unreachable iff the sum of its
+   members' refcounts equals the number of edges that stay INSIDE the SCC, i.e. every
+   reference to the group comes from within the group.
+
+   That test is famously useless for DETECTION in NOVA -- a real A<->B cycle measures
+   rc=2/internal=1 per node, because the compiler conservatively emits no drop for a local
+   that escapes, so a dead stack slot still holds a count. Detection therefore uses Tarjan.
+   But for COLLECTION the same test is exactly right, because it errs in the SAFE
+   direction: a stale count makes sum_rc EXCEED internal, so the SCC is KEPT. The failure
+   mode is under-collection (a leak we already had), never freeing something reachable.
+   This is why detection and collection use different predicates rather than one.
+
+   AT EXIT the proof is not needed and is deliberately skipped: nothing is reachable from
+   anywhere once main has returned, so every cycle is garbage by construction -- and
+   requiring the proof there would reclaim almost nothing, since it is precisely the
+   never-dropped stack slots that keep the counts high.
+
+   Returns the number of objects reclaimed. */
+static int64_t nova_cyc_analyze(int report, int do_collect, int need_proof) {
 #ifndef NOVA_NO_SYSHEADERS
-    if (g_cyc_on < 1 || !g_cyc_cap) return;
+    if (g_cyc_on < 1 || !g_cyc_cap) return 0;
     if (g_cyc_used == 0) {
-        fprintf(stderr, "=== NOVA cycle detector: no live objects at exit -- no cycles ===\n");
-        return;
+        if (report) fprintf(stderr, "=== NOVA cycle detector: no live objects at exit -- no cycles ===\n");
+        return 0;
     }
     if (g_cyc_used > 4000000u) {
-        fprintf(stderr, "=== NOVA cycle detector: %llu live objects, too many to analyse ===\n",
+        if (report) fprintf(stderr, "=== NOVA cycle detector: %llu live objects, too many to analyse ===\n",
                 (unsigned long long)g_cyc_used);
-        return;
+        return 0;
     }
     size_t cap = g_cyc_cap;
 
@@ -14072,15 +14326,19 @@ static void nova_cyc_report(void) {
     int32_t* xlow  = (int32_t*)calloc(cap, sizeof(int32_t));
     unsigned char* onstk = (unsigned char*)calloc(cap, 1);
     unsigned char* incyc = (unsigned char*)calloc(cap, 1);
+    /* SCC identity, 1-based; 0 == "not in a cycle". The collector needs GROUPS, not just
+       the in-a-cycle bit: the proof is per-SCC, and severing must distinguish an edge that
+       stays inside this cycle (break it) from one that leaves (rc_free must still dec it). */
+    int32_t* sccid = (int32_t*)calloc(cap, sizeof(int32_t));
     int32_t* sstk  = (int32_t*)calloc(cap, sizeof(int32_t));
     int32_t* wv    = (int32_t*)calloc(cap, sizeof(int32_t));
     int64_t* wi    = (int64_t*)calloc(cap, sizeof(int64_t));
-    if (!eoff || !eto || !xidx || !xlow || !onstk || !incyc || !sstk || !wv || !wi) {
-        fprintf(stderr, "=== NOVA cycle detector: OOM building graph (%llu live) ===\n",
+    if (!eoff || !eto || !xidx || !xlow || !onstk || !incyc || !sccid || !sstk || !wv || !wi) {
+        if (report) fprintf(stderr, "=== NOVA cycle detector: OOM building graph (%llu live) ===\n",
                 (unsigned long long)g_cyc_used);
         free(eoff); free(eto); free(xidx); free(xlow);
-        free(onstk); free(incyc); free(sstk); free(wv); free(wi);
-        return;
+        free(onstk); free(incyc); free(sccid); free(sstk); free(wv); free(wi);
+        return 0;
     }
     {   /* prefix sums, then fill */
         int64_t run = 0;
@@ -14138,7 +14396,10 @@ static void nova_cyc_report(void) {
                             if (eto[e] == v) { self_loop = 1; break; }
                     if (members > 1 || self_loop) {
                         nscc++;
-                        for (int64_t k = sp; k < base; k++) incyc[sstk[k]] = 1;
+                        for (int64_t k = sp; k < base; k++) {
+                            incyc[sstk[k]] = 1;
+                            sccid[sstk[k]] = (int32_t)nscc;   /* 1-based; 0 stays "acyclic" */
+                        }
                     }
                 }
             }
@@ -14154,7 +14415,7 @@ static void nova_cyc_report(void) {
         void* o = g_cyc_tab[i];
         if (!o || o == NOVA_CYC_TOMB) continue;
         total_live++;
-        if (g_cyc_on >= 2) {
+        if (report && g_cyc_on >= 2) {   /* the per-object dump belongs to the REPORT, not to a silent collect */
             NovaMemTag _vt = NOVA_RC_TAG(o);
             fprintf(stderr, "    [live] %p  %-20s rc=%-5d out=%-4lld %s%s\n",
                     o, nova_cyc_typename(o), (int)NOVA_RC_COUNT(o),
@@ -14170,22 +14431,136 @@ static void nova_cyc_report(void) {
         if (k == nkinds && nkinds < NOVA_CYC_MAX_KINDS) { names[nkinds] = nm; counts[nkinds] = 0; nkinds++; }
         if (k < NOVA_CYC_MAX_KINDS) counts[k]++;
     }
-    fprintf(stderr, "=== NOVA cycle detector ===\n");
-    fprintf(stderr, "  live objects at exit : %lld\n", (long long)total_live);
-    fprintf(stderr, "  objects in cycles    : %lld  (in %lld distinct cycle%s)\n",
-            (long long)total_cyc, (long long)nscc, nscc == 1 ? "" : "s");
-    if (g_cyc_oom)
-        fprintf(stderr, "  WARNING: registry hit OOM -- this report is PARTIAL\n");
-    if (total_cyc > 0) {
-        fprintf(stderr, "  by type:\n");
-        for (int k = 0; k < nkinds; k++)
-            fprintf(stderr, "    %-24s %lld\n", names[k], (long long)counts[k]);
-        fprintf(stderr, "  Reference counting can NEVER free these. Break the cycle with a weak\n");
-        fprintf(stderr, "  reference: weak_create(obj) / weak_upgrade(w) / weak_alive(w).\n");
+    if (report) {
+        fprintf(stderr, "=== NOVA cycle detector ===\n");
+        fprintf(stderr, "  live objects at exit : %lld\n", (long long)total_live);
+        fprintf(stderr, "  objects in cycles    : %lld  (in %lld distinct cycle%s)\n",
+                (long long)total_cyc, (long long)nscc, nscc == 1 ? "" : "s");
+        if (g_cyc_oom)
+            fprintf(stderr, "  WARNING: registry hit OOM -- this report is PARTIAL\n");
+        if (total_cyc > 0) {
+            fprintf(stderr, "  by type:\n");
+            for (int k = 0; k < nkinds; k++)
+                fprintf(stderr, "    %-24s %lld\n", names[k], (long long)counts[k]);
+            if (!do_collect) {
+                fprintf(stderr, "  Reference counting can NEVER free these. Break the cycle with a weak\n");
+                fprintf(stderr, "  reference: weak_create(obj) / weak_upgrade(w) / weak_alive(w), or set\n");
+                fprintf(stderr, "  NOVA_CYCLE_COLLECT=1 to reclaim them at exit.\n");
+            }
+        }
     }
+
+    /* ── COLLECT ─────────────────────────────────────────────────────────────────── */
+    int64_t collected = 0;
+    if (do_collect && nscc > 0) {
+        unsigned char* take = (unsigned char*)calloc((size_t)nscc + 1, 1);
+        void** victims = (void**)calloc(total_cyc > 0 ? (size_t)total_cyc : 1, sizeof(void*));
+        if (take && victims) {
+            /* Pass A -- decide. */
+            if (!need_proof) {
+                for (int64_t k = 1; k <= nscc; k++) take[k] = 1;
+            } else {
+                int64_t* sum_rc = (int64_t*)calloc((size_t)nscc + 1, sizeof(int64_t));
+                int64_t* internal = (int64_t*)calloc((size_t)nscc + 1, sizeof(int64_t));
+                if (sum_rc && internal) {
+                    for (size_t i = 0; i < cap; i++) {
+                        void* o = g_cyc_tab[i];
+                        if (!o || o == NOVA_CYC_TOMB || !sccid[i]) continue;
+                        sum_rc[sccid[i]] += (int64_t)NOVA_RC_COUNT(o);
+                        NovaCycInt ci; ci.sccid = sccid; ci.mine = sccid[i]; ci.n = 0;
+                        nova_cyc_walk(o, nova_cyc_v_internal, &ci);
+                        internal[sccid[i]] += ci.n;
+                    }
+                    /* sum_rc < internal is impossible for a consistent graph; treat it as
+                       "do not touch" rather than asserting, because a corrupt count must
+                       never be the thing that authorises a free. */
+                    for (int64_t k = 1; k <= nscc; k++)
+                        if (sum_rc[k] == internal[k]) take[k] = 1;
+                }
+                free(sum_rc); free(internal);
+            }
+
+            /* Pass B -- SEVER every intra-SCC edge of every taken cycle, across the WHOLE
+               set, BEFORE anything is freed. Doing this first is what makes the free order
+               irrelevant: afterwards no victim references another victim, so nova_rc_free
+               cannot follow a pointer into storage already handed back. Interleaving
+               sever-and-free per object would reintroduce exactly that window. */
+            for (size_t i = 0; i < cap; i++) {
+                void* o = g_cyc_tab[i];
+                if (!o || o == NOVA_CYC_TOMB) continue;
+                int32_t sid = sccid[i];
+                if (!sid || !take[sid]) continue;
+                NovaCycSever sv; sv.sccid = sccid; sv.mine = sid; sv.nbroken = 0;
+                nova_cyc_walk(o, nova_cyc_v_sever, &sv);
+            }
+
+            /* Pass C -- SNAPSHOT the victims. nova_rc_free calls nova_cyc_untrack, which
+               writes tombstones into g_cyc_tab, so freeing while iterating that table
+               would skip or revisit entries. */
+            int64_t nv = 0;
+            for (size_t i = 0; i < cap && nv < total_cyc; i++) {
+                void* o = g_cyc_tab[i];
+                if (!o || o == NOVA_CYC_TOMB) continue;
+                int32_t sid = sccid[i];
+                if (!sid || !take[sid]) continue;
+                victims[nv++] = o;
+            }
+
+            /* Pass D -- release. nova_rc_free is unconditional (it does not consult the
+               refcount), which is what we want: the refcounts are inflated by definition
+               here, and unreachability has already been established either by the proof or
+               by being at exit. It still dec's the surviving OUTBOUND edges, so whatever
+               the cycle referenced is released rather than leaked. */
+            for (int64_t k = 0; k < nv; k++) {
+                nova_rc_free(victims[k]);
+                collected++;
+            }
+        }
+        free(take); free(victims);
+        if (report && collected > 0)
+            fprintf(stderr, "  RECLAIMED             : %lld object%s held only by cycles\n",
+                    (long long)collected, collected == 1 ? "" : "s");
+    }
+
     free(eoff); free(eto); free(xidx); free(xlow);
-    free(onstk); free(incyc); free(sstk); free(wv); free(wi);
+    free(onstk); free(incyc); free(sccid); free(sstk); free(wv); free(wi);
+    return collected;
+#else
+    (void)report; (void)do_collect; (void)need_proof;
+    return 0;
 #endif
+}
+
+/* ── 1.7 exit-time reclamation + the on-demand entry point ──────────────────────── */
+static void nova_cyc_report(void) {
+    /* NOVA_CYCLE_COLLECT=1 additionally RECLAIMS. Kept as a separate variable from
+       NOVA_CYCLE_DETECT so "tell me" and "fix it" are independent choices -- for a
+       language that prizes predictability, being told about a cycle is often the more
+       useful of the two, and collecting silently would hide a design bug. */
+    const char* ce = getenv("NOVA_CYCLE_COLLECT");
+    int collect = (ce && ce[0] && ce[0] != '0') ? 1 : 0;
+    (void)nova_cyc_analyze(1, collect, 0);   /* no proof needed: nothing is reachable at exit */
+}
+
+/* cycle_collect() -- reclaim cycles NOW, mid-program. Returns the number of objects
+   freed, or -1 when it refuses.
+
+   It refuses in two situations, and both refusals are the feature working:
+     * the detector is not armed (NOVA_CYCLE_DETECT unset) -- there is no live-object
+       registry to analyse, so there is nothing to be correct about;
+     * more than one carrier is running -- the analysis reads every live object's fields
+       while another carrier may be mutating them, and a graph that changes underneath
+       Tarjan can yield an SCC that is no longer a cycle. Freeing on that basis is a
+       use-after-free, so the answer is a hard refusal rather than a best effort. NOVA has
+       no safepoint mechanism to stop the world at, which is exactly why this is a refusal
+       and not a lock.
+
+   Unlike the exit path this REQUIRES the per-SCC refcount proof, because mid-program
+   there certainly are reachable cycles and freeing one would be catastrophic. */
+int64_t nova_rt_cycle_collect(void) {
+    if (nova_cyc_enabled() < 1) return -1;
+    if (g_carrier_count > 1) return -1;
+    return nova_cyc_analyze(0, 1, 1);
 }
 
 void nova_rt_cleanup(void) {
@@ -15928,18 +16303,49 @@ int64_t nova_rt_remote_accept(int64_t listener_val) {
     return nova_rt_tcp_accept(listener_val);
 }
 
+/* ── 4.7 DISTRIBUTED CHANNEL WIRE FORMAT ────────────────────────────────────────────
+   Frame:  [4-byte BE length][1-byte version][term-encoded payload]
+           where length counts the version byte plus the payload.
+
+   THIS REPLACED JSON, and the reason is type fidelity rather than speed. JSON has ONE
+   number type, so a NOVA float whose value happens to be integral came back as an int, a
+   64-bit integer beyond 2^53 came back rounded, and `bytes` could not cross at all. Worst
+   of all, JSON cannot distinguish `null` from `0` on the wire -- which is precisely the
+   distinction item 1.6 exists to establish, so a value that survived a local channel
+   correctly was silently flattened by a remote one. A distributed channel that changes
+   your data is not a channel.
+
+   The binary term codec already existed and was already used by the node_* transport
+   (nova_rt_node_send). This function was the SECOND, worse implementation of the same
+   idea. Converging on the codec removes the divergence rather than adding a third format --
+   two wire formats in one runtime is two things to keep in sync and one of them will drift.
+
+   THE VERSION BYTE is what makes the change safe to make at all. A peer still speaking the
+   old JSON framing sends a payload starting with '{' (0x7B), '[' or '"', none of which is
+   1 -- so a mismatch is REPORTED as a protocol error instead of being term-decoded into
+   plausible garbage. Getting a clean failure from an incompatible peer is worth one byte
+   per message. */
+#define NOVA_REMOTE_WIRE_V 1
+
 int64_t nova_rt_remote_send(int64_t sock_val, int64_t value) {
-    int64_t json = nova_rt_json_encode(value);
-    const char* str = (const char*)(uintptr_t)json;
-    if (!str) str = "null";
-    int len = (int)strlen(str);
-    unsigned char hdr[4];
+    int64_t encoded = nova_rt_term_encode(value);
+    if (!encoded) return -1;
+    NovaBytes* nb = (NovaBytes*)(uintptr_t)encoded;
+    uint32_t plen = (uint32_t)nb->size;
+    uint32_t len = plen + 1;                       /* + the version byte */
+    unsigned char hdr[5];
     hdr[0] = (unsigned char)((len >> 24) & 0xff);
     hdr[1] = (unsigned char)((len >> 16) & 0xff);
     hdr[2] = (unsigned char)((len >> 8) & 0xff);
     hdr[3] = (unsigned char)(len & 0xff);
-    if (nova_remote_io(sock_val, (char*)hdr, 4, 1) < 0) return -1;
-    if (len > 0 && nova_remote_io(sock_val, (char*)str, len, 1) < 0) return -1;
+    hdr[4] = (unsigned char)NOVA_REMOTE_WIRE_V;
+    /* Header and version go in ONE write so a partial send cannot leave a peer blocked on
+       a version byte that never arrives. */
+    if (nova_remote_io(sock_val, (char*)hdr, 5, 1) < 0) { nova_rc_dec(encoded); return -1; }
+    if (plen > 0 && nova_remote_io(sock_val, (char*)nb->data, (int)plen, 1) < 0) {
+        nova_rc_dec(encoded); return -1;
+    }
+    nova_rc_dec(encoded);   /* transient encode buffer; balances nova_rt_bytes_create */
     return 0;
 }
 
@@ -15947,13 +16353,25 @@ int64_t nova_rt_remote_recv(int64_t sock_val) {
     unsigned char hdr[4];
     if (nova_remote_io(sock_val, (char*)hdr, 4, 0) < 0) return 0;   /* 0 = closed/error */
     long len = ((long)hdr[0] << 24) | ((long)hdr[1] << 16) | ((long)hdr[2] << 8) | (long)hdr[3];
-    if (len < 0 || len > (64L * 1024 * 1024)) return 0;            /* 64MB sanity cap */
-    char* buf = (char*)malloc((size_t)len + 1);
-    if (!buf) return 0;
-    if (len > 0 && nova_remote_io(sock_val, buf, (int)len, 0) < 0) { free(buf); return 0; }
-    buf[len] = '\0';
-    int64_t result = nova_rt_json_decode((int64_t)(uintptr_t)buf);
-    free(buf);
+    if (len < 1 || len > (64L * 1024 * 1024)) return 0;             /* 64MB sanity cap */
+    unsigned char ver = 0;
+    if (nova_remote_io(sock_val, (char*)&ver, 1, 0) < 0) return 0;
+    if (ver != NOVA_REMOTE_WIRE_V) {
+        /* An incompatible peer. Say so rather than decoding whatever arrived -- a term
+           decoder fed JSON text produces a value, not an error, and that value would flow
+           on as real data. */
+        nova_set_error("remote_recv: unsupported wire version (peer speaks a different NOVA protocol)");
+        return 0;
+    }
+    long plen = len - 1;
+    int64_t bytes = nova_rt_bytes_create((int64_t)plen);
+    if (!bytes) return 0;
+    NovaBytes* nb = (NovaBytes*)(uintptr_t)bytes;
+    if (plen > 0 && nova_remote_io(sock_val, (char*)nb->data, (int)plen, 0) < 0) {
+        nova_rc_dec(bytes); return 0;
+    }
+    int64_t result = nova_rt_term_decode(bytes);
+    nova_rc_dec(bytes);     /* transient receive buffer */
     return result;
 }
 
@@ -18460,6 +18878,24 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
         return nova_rt_str_char_at(obj, index);
     }
     return 0;
+}
+
+/* 1.6 ABSENT-AS-NULL for the DYNAMIC index path. Emitted for `x[k]` instead of
+   nova_rt_index_get when compiled with NOVA_FIRSTCLASS_NULL=1.
+
+   ONLY the dict case changes. Deliberately narrow, and each exclusion is a decision:
+     - a LIST index past the end stays 0 -- a dense list has no absent element, and an
+       out-of-range index is closer to a bug than to absence, so turning it into a null
+       that silently flows on would HIDE the error rather than report it;
+     - a STRUCT still panics (the L8 "type not statically known" diagnostic);
+     - a STRING char_at, BYTES and TARRAY reads are unchanged;
+     - a non-indexable value still returns 0.
+   Delegating to nova_rt_index_get for all of those means there is one implementation of
+   each, not two. */
+int64_t nova_rt_index_get_abs(int64_t obj, int64_t index) {
+    if (nova_mem_find_tag((void*)(uintptr_t)obj) == NOVA_MEM_DICT)
+        return nova_rt_dict_get_abs(obj, index);
+    return nova_rt_index_get(obj, index);
 }
 
 int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
@@ -25005,13 +25441,22 @@ int64_t nova_rt_node_send(int64_t node_handle, int64_t value) {
     int64_t encoded = nova_rt_term_encode(value);
     if (!encoded) return 0;
     NovaBytes* nb = (NovaBytes*)(uintptr_t)encoded;
-    uint32_t len = (uint32_t)nb->size;
-    uint8_t hdr[4];
+    uint32_t plen = (uint32_t)nb->size;
+    uint32_t len = plen + 1;                 /* + the version byte */
+    /* SAME FRAME as nova_rt_remote_send. The two families are one protocol, not two:
+       a program may legitimately serve with node_accept and connect with remote_connect
+       (distributed_spawn_test does exactly that), and before this they silently disagreed
+       by one byte -- the receiver read the version as payload and term-decoded garbage
+       into real values. Converging the FORMAT is what makes converging the CODEC mean
+       anything. */
+    uint8_t hdr[5];
     hdr[0] = (uint8_t)(len >> 24); hdr[1] = (uint8_t)(len >> 16);
     hdr[2] = (uint8_t)(len >> 8);  hdr[3] = (uint8_t)len;
+    hdr[4] = (uint8_t)NOVA_REMOTE_WIRE_V;
     NOVA_SOCKET fd = (NOVA_SOCKET)node_handle;
-    if (!nova_send_all(fd, (const char*)hdr, 4)) return 0;
-    if (len && !nova_send_all(fd, (const char*)nb->data, (size_t)len)) return 0;
+    if (!nova_send_all(fd, (const char*)hdr, 5)) { nova_rc_dec(encoded); return 0; }
+    if (plen && !nova_send_all(fd, (const char*)nb->data, (size_t)plen)) { nova_rc_dec(encoded); return 0; }
+    nova_rc_dec(encoded);   /* transient encode buffer -- this was leaking one per message */
     return (int64_t)len;
 }
 
@@ -25024,12 +25469,21 @@ int64_t nova_rt_node_recv(int64_t node_handle, int64_t max_bytes) {
     uint8_t hdr[4];
     if (!nova_recv_exact(fd, (char*)hdr, 4)) return 0;
     uint32_t len = ((uint32_t)hdr[0]<<24)|((uint32_t)hdr[1]<<16)|((uint32_t)hdr[2]<<8)|(uint32_t)hdr[3];
-    if (len > 64u*1024u*1024u) return 0; /* sanity guard */
-    int64_t bytes = nova_rt_bytes_create((int64_t)len);
+    if (len < 1u || len > 64u*1024u*1024u) return 0; /* sanity guard */
+    uint8_t ver = 0;
+    if (!nova_recv_exact(fd, (char*)&ver, 1)) return 0;
+    if (ver != NOVA_REMOTE_WIRE_V) {
+        nova_set_error("node_recv: unsupported wire version (peer speaks a different NOVA protocol)");
+        return 0;
+    }
+    uint32_t plen = len - 1u;
+    int64_t bytes = nova_rt_bytes_create((int64_t)plen);
     if (!bytes) return 0;
     NovaBytes* nb = (NovaBytes*)(uintptr_t)bytes;
-    if (len && !nova_recv_exact(fd, (char*)nb->data, (size_t)len)) return 0;
-    return nova_rt_term_decode(bytes);
+    if (plen && !nova_recv_exact(fd, (char*)nb->data, (size_t)plen)) { nova_rc_dec(bytes); return 0; }
+    int64_t out = nova_rt_term_decode(bytes);
+    nova_rc_dec(bytes);
+    return out;
 }
 
 /* nova_rt_node_close: Close connection to a remote node. */

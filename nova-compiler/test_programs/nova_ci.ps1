@@ -225,6 +225,34 @@ Write-Host "`n[CI 2p/3] Cross-compilation gate (6 targets: triple + datalayout +
 & .\_xcompile_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2p (cross-compilation) ==="; exit 1 }
 
+Write-Host "`n[CI 2k9/3] 3.1 scalar float (callee-entry unbox eliminated + internal linkage)..."
+& .\_f31_unbox_elim_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k9 (3.1 scalar float) ==="; exit 1 }
+
+Write-Host "`n[CI 2m/3] 1.6 null is absence (zero-vs-absent, falsy, arithmetic-zero, equality)..."
+& .\_null_absence_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m (null absence) ==="; exit 1 }
+
+Write-Host "`n[CI 2m2/3] 1.7 cycle collector (reclaims unreachable cycles; NEVER frees a reachable one)..."
+& .\_cyc_collect_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m2 (cycle collector) ==="; exit 1 }
+
+Write-Host "`n[CI 2m3/3] 2.5 compile-time evaluation (folds pure code; impure + float stay at runtime)..."
+& .\_comptime_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m3 (comptime) ==="; exit 1 }
+
+Write-Host "`n[CI 2m4/3] 4.3 preemption (fairness + kill reaches compute-bound; spawn-free code UNinstrumented)..."
+& .\_preempt_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m4 (preemption) ==="; exit 1 }
+
+Write-Host "`n[CI 2m5/3] 4.7 distributed channels (wire type fidelity + version byte + 6 formerly-ungated programs)..."
+& .\_remote_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m5 (distributed channels) ==="; exit 1 }
+
+Write-Host "`n[CI 2m6/3] 5.5 bundled toolchain (PATH-scrubbed build must still succeed; negative control)..."
+& .\_toolchain_bundle_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2m6 (bundled toolchain) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1

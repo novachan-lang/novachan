@@ -1,0 +1,90 @@
+// KAT 4.7 — DISTRIBUTED CHANNEL TYPE FIDELITY.
+//
+// A distributed channel that changes your data is not a channel. remote_send/remote_recv
+// used to serialize through JSON, and JSON has exactly ONE number type, so:
+//
+//   * a float whose value is integral came back as an INT   (3.0 -> 3)
+//   * an integer past 2^53 came back ROUNDED                (…993 -> …992)
+//   * `null` and `0` were indistinguishable on the wire     (the whole point of item 1.6)
+//
+// None of that fails loudly. The program keeps running with the wrong value, which is the
+// silent-wrong-data class this project treats as the worst outcome. The transport now uses
+// the binary term codec, which carries the type tag with the value.
+//
+// EVERY assertion below is chosen so that the OLD behaviour would FAIL it. A round-trip
+// test that only sent small ints would pass equally against JSON and prove nothing.
+//
+// Shape: server in main, client in a spawned green task, over loopback -- the same shape
+// remote_test.nova established.
+
+fn expect(label: str, cond: bool, ok: int, fail: int) -> list
+    if cond
+        return [ok + 1, fail]
+    print("FAIL " + label)
+    [ok, fail + 1]
+
+fn client(port: int) -> int
+    let ch = remote_connect("127.0.0.1", port)
+
+    // 1. an INTEGRAL float. The discriminator is division, not equality: if this arrived
+    //    as the integer 3 then 3 / 4 is 0 under integer division, not 0.75.
+    remote_send(ch, 3.0)
+
+    // 2. an integer beyond the 2^53 mantissa. A JSON round-trip through a double silently
+    //    lands on ...992.
+    remote_send(ch, 9007199254740993)
+
+    // 3. a negative float with a fractional part
+    remote_send(ch, -2.75)
+
+    // 4. nesting, mixed kinds, and a float buried inside a container -- the case where a
+    //    lossy codec does the most damage because nothing near the call site looks wrong
+    remote_send(ch, {"n": 7, "f": 1.5, "xs": [1, 2.5, "three"], "b": true})
+
+    // 5. a string carrying bytes JSON would have to escape
+    remote_send(ch, "quote\" backslash\\ tab\t end")
+
+    let verdict = remote_recv(ch)
+    remote_close(ch)
+    verdict
+
+fn main()
+    let ok = 0
+    let fail = 0
+    let port = 19923
+    spawn client(port)
+    let ch = remote_listen(port)
+
+    let f = remote_recv(ch)
+    let r1 = expect("1: integral float arrived as an int (JSON's number collapse)", f / 4 == 0.75, ok, fail)
+    ok = r1[0]
+    fail = r1[1]
+
+    let big = remote_recv(ch)
+    let r2 = expect("2: int past 2^53 was rounded — got " + str(big), big == 9007199254740993, ok, fail)
+    ok = r2[0]
+    fail = r2[1]
+
+    let neg = remote_recv(ch)
+    let r3 = expect("3: negative fractional float — got " + str(neg), neg * 4 == -11.0, ok, fail)
+    ok = r3[0]
+    fail = r3[1]
+
+    let d = remote_recv(ch)
+    let r4 = expect("4: nested container lost a type", d["n"] == 7 and d["f"] * 2 == 3.0 and d["xs"][2] == "three" and d["xs"][1] * 2 == 5.0, ok, fail)
+    ok = r4[0]
+    fail = r4[1]
+
+    let sv = remote_recv(ch)
+    let r5 = expect("5: string with escapes — got " + sv, sv == "quote\" backslash\\ tab\t end", ok, fail)
+    ok = r5[0]
+    fail = r5[1]
+
+    remote_send(ch, ok)
+    remote_close(ch)
+
+    print("REMOTE_FIDELITY ok=" + str(ok) + " fail=" + str(fail))
+    if fail == 0
+        print("REMOTE_FIDELITY PASS")
+    else
+        print("REMOTE_FIDELITY FAIL")

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NOVA Prism -&gt; Canvas2D harness</title>
+<!--
+  prism_canvas_harness.html -- the browser-side proof for WEAPON PARITY 5.6 (Prism -> Canvas).
+
+  RUN (once _wasm_canvas_probe.wasm exists -- see the status note below):
+    serve THIS DIRECTORY over HTTP (instantiateStreaming needs a real application/wasm response,
+    which file:// does not provide), e.g. from prism/backend/canvas/:
+      python -m http.server 8080
+    then open http://localhost:8080/prism_canvas_harness.html
+
+  WHAT THIS PAGE PROVES: the wasm module -- prism_render_canvas.nova compiled to wasm32, linked
+  against the FULL value-model runtime -- BUILDS the same Stack([Label("Hi"), Press("Go")]) tree
+  the native KAT (_kat_prism_render_canvas.nova) hand-verifies, renders it to a draw-command
+  stream ENTIRELY INSIDE wasm (no DOM, no markup -- Prism's identity, restated for this medium in
+  prism_render_canvas.nova's header), and this page paints that stream onto ONE <canvas> element
+  using prism_canvas_host.js's canvas2DSink Canvas2D adapter. Nothing here builds HTML from the
+  tree; the only thing the DOM sees is fillRect/strokeRect/fillText/etc. calls.
+
+  ── STATUS, STATED PLAINLY (do not remove this note until it is no longer true) ─────────────────
+  As of this writing, `prism/backend/canvas/prism_render_canvas.nova` and `prism_canvas_host.js`
+  are BOTH DONE and independently verified: the native KAT proves the draw-command stream exactly,
+  and `_prism_canvas_gate.ps1` proves the wasm COMPILE surface is clean (every runtime symbol the
+  wasm output needs is a `nova_rt_*`/value-model primitive -- no sockets, files, or threads) using
+  a program-object-only link. What does NOT work today is producing `_wasm_canvas_probe.wasm`
+  itself: the value-model wasm runtime carve (`nova-compiler/compiler/nova_runtime_wasm.c`, dated
+  2026-06-28) has drifted behind `nova_runtime.c`'s subsequent growth and fails to compile (missing
+  `sigjmp_buf`/`pthread_once`/`lgamma`/`erf`/`getpeername`/socket-option constants and more once
+  those are added -- a pre-existing infrastructure gap, unrelated to this renderer's own code, and
+  out of THIS task's scope to fix). This page is written against the WORKING contract
+  (canvas_len()/canvas_word(i) exports, as _wasm_canvas_probe.nova already provides and already
+  compiles to wasm32 IR) so it will run unmodified the moment that carve is resynced -- see
+  NOVA_DESIGN/WEAPON_PARITY_PLAN.md item 5.6 for the full status and what "resync" concretely means.
+-->
+<style>
+  body { font: 16px system-ui; margin: 2rem; }
+  #status { font: 13px ui-monospace, monospace; white-space: pre-wrap; background: #f4f4f4; padding: .75rem; border-radius: 6px; max-width: 640px; }
+  canvas { border: 1px solid #ccc; margin-top: 1rem; }
+  .ok { color: #146c2e; } .bad { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>NOVA Prism &rarr; Canvas2D</h1>
+<p>The tree below (a <code>stack</code> holding a <code>label</code> and a <code>press</code> button)
+is built and laid out entirely inside NOVA-compiled WebAssembly; this page only paints the resulting
+draw-command stream onto a <code>&lt;canvas&gt;</code>.</p>
+<div id="status">loading…</div>
+<canvas id="surface" width="200" height="100"></canvas>
+<script src="prism_canvas_host.js"></script>
+<script type="module">
+const statusEl = document.getElementById('status');
+function setStatus(html, cls) { statusEl.innerHTML = html; statusEl.className = cls || ''; }
+
+async function main() {
+  let mod;
+  try {
+    const resp = await fetch('_wasm_canvas_probe.wasm');
+    if (!resp.ok) throw new Error(`fetch failed: HTTP ${resp.status}`);
+    mod = await WebAssembly.compile(await resp.arrayBuffer());
+  } catch (e) {
+    setStatus(
+      'Could not load _wasm_canvas_probe.wasm -- expected today.\n\n' +
+      'This harness is complete and correct against the contract _wasm_canvas_probe.nova already\n' +
+      'exports (canvas_len/canvas_word), but producing the .wasm itself needs the value-model wasm\n' +
+      'runtime carve (nova-compiler/compiler/nova_runtime_wasm.c) resynced against the current\n' +
+      'nova_runtime.c first -- see this file\'s <!-- STATUS --> comment and\n' +
+      'NOVA_DESIGN/WEAPON_PARITY_PLAN.md item 5.6.\n\n' +
+      'Fetch/compile error: ' + e.message,
+      'bad'
+    );
+    return;
+  }
+
+  // Every import this module needs is a nova_rt_*/nova_rc_* value-model primitive (verified by
+  // _prism_canvas_gate.ps1's import-list check) that a CORRECT runtime resolves INTERNALLY at
+  // wasm-ld link time -- none of them should still be host imports once the module links against a
+  // working nova_runtime_wasm.o. This Proxy exists only as a safety net (so a genuinely-missing
+  // symbol traps with a clear name instead of an opaque LinkError) and logs anything it had to stub.
+  const stubbed = [];
+  const env = new Proxy({}, {
+    get(_t, name) {
+      stubbed.push(String(name));
+      return () => 0n;
+    }
+  });
+  const instance = await WebAssembly.instantiate(mod, { env });
+  if (stubbed.length) console.warn('prism_canvas_harness: stubbed imports (should be empty on a correctly-linked build):', stubbed);
+
+  const words = PrismCanvasHost.pullWordsFromWasmExports(instance.exports);
+  const v = PrismCanvasHost.verify(words);
+  if (!v.ok) { setStatus('wasm produced an INVALID draw-command stream:\n' + v.error, 'bad'); return; }
+
+  const ctx = document.getElementById('surface').getContext('2d');
+  ctx.clearRect(0, 0, 200, 100);
+  const sink = PrismCanvasHost.canvas2DSink(ctx);
+  const cmdCount = PrismCanvasHost.decode(words, sink);
+
+  document.getElementById('surface').addEventListener('click', (ev) => {
+    const rect = ev.target.getBoundingClientRect();
+    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+    const hit = sink.hits.slice().reverse().find(h => px >= h.x && px < h.x + h.w && py >= h.y && py < h.y + h.h);
+    setStatus(`clicked at (${px | 0},${py | 0}) -> ${hit ? `node ${hit.nodeIndex}, role ${hit.role}` : 'nothing interactive'}`, 'ok');
+  });
+
+  setStatus(`painted ${cmdCount} draw commands from a wasm-verified ${words.length}-word stream.\nClick the button to hit-test it.`, 'ok');
+}
+
+main().catch(e => setStatus('harness error: ' + (e && e.stack || e), 'bad'));
+</script>
+</body>
+</html>

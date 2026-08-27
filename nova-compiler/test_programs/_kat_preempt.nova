@@ -1,0 +1,80 @@
+// KAT 4.3 -- PREEMPTIVE SCHEDULING.
+//
+// Before this, NOVA's green scheduler was purely cooperative: a task yielded only at a
+// channel or I/O operation. A CPU-bound task that touched neither NEVER yielded, so it
+// monopolised its carrier until it finished. That is not a slowdown, it is a LIVENESS bug --
+// a co-scheduled timer never fires, a health check never answers, and `kill()` on that task
+// was documented as having no effect at all.
+//
+// Both sections run with NOVA_CARRIERS=1 (set by the gate) so there is exactly ONE carrier
+// to compete for. With more carriers the tasks would simply land on different ones and the
+// test would pass without preemption existing -- which is the trap that makes a fairness
+// test look green while proving nothing.
+//
+// IMPORTANT: recv_timeout does NOT have a green-task path -- it blocks the carrier with an
+// OS-level sleep, so no other green task can run while it waits. This test uses recv (which
+// DOES park the green task and yield the carrier) for fairness, and try_recv + sleep_ms for
+// kill. The gate's Invoke-Timed timeout is the safety net if preemption fails entirely.
+
+fn spin(rounds: int) -> int
+    let acc = 0
+    let i = 0
+    while i < rounds
+        acc = acc + (i % 7)
+        i = i + 1
+    acc
+
+fn main()
+    let ok = 0
+    let fail = 0
+
+    // ---- 1. FAIRNESS: a hog must not starve a co-scheduled task ------------------
+    // The hog is spawned FIRST and does far more work than the reporter. Without
+    // preemption it holds the carrier to completion and the recv hangs (caught by the
+    // gate's timeout). With preemption, the hog yields every 4000 reductions and the
+    // sender gets a turn.
+    let ch = channel()
+    let hog = spawn spin(20000000000)
+    spawn send(ch, 42)
+
+    let got = recv(ch)
+    if got == 42
+        ok = ok + 1
+        print("FAIR ok: the reporter ran while a CPU-bound task held the carrier")
+    else
+        fail = fail + 1
+        print("FAIR FAIL: got " + str(got) + ", want 42")
+    kill(hog)
+
+    // ---- 2. kill() reaches a compute-bound task ---------------------------------
+    // A safepoint lives inside the same check, so a kill request is now observed at the
+    // next loop header. Previously this task ran to completion regardless and the runtime
+    // said so in its own comment.
+    //
+    // Approach: spawn the victim, let it start running (sleep_ms is green-aware and
+    // yields the carrier), then kill it. After a brief wait, try_recv checks if it
+    // completed. If kill worked, the channel is empty ([0, _]). If kill failed, the
+    // victim finished its 2B iterations and sent its result ([1, value]).
+    let done = channel()
+    let victim = spawn spin_forever(done)
+    sleep(50)
+    kill(victim)
+    sleep(3000)
+    let result = try_recv(done)
+    if result[0] == 0
+        ok = ok + 1
+        print("KILL ok: a compute-bound task observed the kill and never reported")
+    else
+        fail = fail + 1
+        print("KILL FAIL: task completed anyway (" + str(result[1]) + ") -- no safepoint reached")
+
+    print("PREEMPT ok=" + str(ok) + " fail=" + str(fail))
+    if fail == 0
+        print("PREEMPT PASS")
+    else
+        print("PREEMPT FAIL")
+
+fn spin_forever(out: channel<int>) -> int
+    let r = spin(2000000000)
+    send(out, r)
+    r

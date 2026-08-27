@@ -1,0 +1,1043 @@
+// prism_render_canvas -- node tree -> a flat integer DRAW-COMMAND STREAM. Prism's THIRD backend.
+//
+// WEAPON PARITY item 5.6. What this is, stated precisely so nobody has to guess:
+//
+//   * It is a **Canvas2D** backend, not WebGL. Nothing here emits a shader, a vertex buffer, or a
+//     GPU handle. The commands are fills, strokes, lines, text runs and clips -- exactly the
+//     Canvas2D verb set. Calling it "WebGL" would be a lie; the GPU backend is a different
+//     milestone (prism/backend/gpu/, Phase 6) and this file is not a down payment on it.
+//   * It renders with **no HTML, no CSS, no DOM**. The browser gets ONE element -- a `<canvas>` --
+//     and everything inside it is painted from this stream. That is Prism's identity (§0 of
+//     PRISM_UNIVERSAL_UI_PLAN.md) and the reason a `div`-based shortcut was not taken.
+//   * It is the FIRST backend that needs GEOMETRY. The HTML renderer defers layout to CSS and the
+//     ANSI renderer to the terminal's grid; a canvas has neither, so a minimal single-pass
+//     box-constraint layout lives here (see LAYOUT below). It is v1-shaped: integer device pixels,
+//     no baseline alignment, no bidi, no line-breaking beyond the ANSI backend's greedy wrap.
+//
+// ── THIS IS A THIRD BACKEND OVER THE SAME TREE, NOT A NEW TREE ────────────────────────────────
+// Same contract as prism_render_html.nova and backend/ansi/prism_render_ansi.nova:
+//   * walk `PrismNode` via prism_node's accessors only -- never reach into `.attrs` directly for
+//     anything the typed getters cover;
+//   * dispatch on `prism_node_kind_str(n)` (the STRING tag) with a LOUD default arm, NOT on the
+//     enum. PRISM_SPEC §17A.3b, re-verified by the HTML renderer: a wildcard-free enum match is
+//     exhaustiveness-checked ONLY inside the file declaring the enum. Cross-module it compiles
+//     silently and an unmatched variant yields an empty string. Here that would mean primitive #23
+//     silently painting NOTHING. `prism_node_kind_name`'s match (in prism_node.nova, beside the
+//     enum) is the checked half; the `_` arm below is the loud half.
+//   * every one of the 22 primitives maps. Two degrade honestly rather than pretend: `art` (no
+//     image decoder crosses this boundary in v1) and `draw` (its paint callback is host-side by
+//     definition) both paint a labelled placeholder box, the same choice the ANSI backend made.
+//
+// ── IMPORT SURFACE IS DELIBERATELY EXACTLY ONE MODULE ─────────────────────────────────────────
+// `import prism_node` and nothing else. prism_color.nova would be the obvious dependency for the
+// palette -- it is NOT imported, for the reason prism_render_ansi.nova recorded from a measured
+// incident: NOVA's field-name -> slot table is global and last-registration-wins, and widening a
+// backend's import surface is exactly the condition that made `PrismNode.kind` read the wrong slot
+// and every label render as an empty string on 2026-08-16. The stream needs a PACKED int per colour
+// anyway, so the bridge is one line at the call site and costs nothing:
+//     prism_canvas_rgba(prism_color_r(c), prism_color_g(c), prism_color_b(c), prism_color_a(c))
+// Every field on every struct here is prefixed (`pcv_*`) for the same global-slot-table reason.
+//
+// ── THE ENCODING, AND WHY IT IS A FLAT INT LIST WITH INLINE UTF-8 BYTES ───────────────────────
+// Three candidates were considered. The choice is not a preference; on this project one of them is
+// actively unsafe.
+//
+//   (1) FLAT NUMERIC LIST. Fast across the wasm boundary -- the host reads i64 words straight out
+//       of linear memory with zero per-command crossings (Bet 5). Opaque to a human. Cannot carry
+//       text, which is the one thing every UI needs.
+//   (2) STRING PROTOCOL ("rect 10 20 100 40 #4f46e5;..."). Debuggable, and slow -- but the
+//       disqualifying problem is not speed. Building it means routing coordinates through `+`, and
+//       the wasm host runtime is UNTAGGED: it decides string-vs-int by inspecting the byte at the
+//       value's address (see _wasm_runtime.cjs's `isLikelyString`). Coordinates above 256 are
+//       precisely the values that land on a printable data-section byte and get misread as string
+//       pointers. That is a SILENT WRONG PIXEL with no error anywhere. Rejected on soundness.
+//   (3) FLAT NUMERIC LIST + TEXT INLINED AS ONE UTF-8 BYTE PER WORD.  <-- CHOSEN.
+//
+// (3) wins on the property that matters most here: **every word in the buffer is unambiguously an
+// integer, so no pointer ever crosses the boundary and the untagged-value heuristic never runs at
+// all.** The silent-divergence class is designed OUT rather than mitigated. It also keeps the
+// buffer a single self-contained artifact -- one crossing, one thing to checksum, one thing to
+// hash in a gate -- and removes the entire bug class a side string-table would introduce (an index
+// into a table that was truncated or reordered independently of the stream that references it).
+//
+// HONEST COST, recorded rather than buried: one 8-byte word per text BYTE is 8x the space text
+// actually needs. A 200-label screen averaging 20 characters costs ~4000 words = 32 KB. That is
+// acceptable next to any DOM and irrelevant next to a framebuffer, but it is not free. The fix,
+// when it matters, is packing 8 bytes per word -- a v2 change confined to _emit_text and the
+// host's text decoder, and it does not disturb the framing.
+//
+// ── SELF-DESCRIBING FRAMING: A TRUNCATED BUFFER IS DETECTABLE, NEVER MIS-RENDERED ─────────────
+// A draw-command stream that can be silently truncated is worse than one that fails: a half-drawn
+// frame looks like a layout bug and sends you hunting in the wrong file. THREE independent checks,
+// so no single lost word can pass:
+//
+//   1. The header declares `word_count`. A short buffer disagrees with its own header.
+//   2. Every record is `[opcode, argc, arg...]`. The decoder consumes exactly argc words; if fewer
+//      than argc remain, that is a truncation at the record level -- caught even if the header
+//      itself were the part that got lost.
+//   3. The stream ends with an explicit END record carrying a DJB2 checksum over every preceding
+//      word. Truncation, reordering and single-word corruption all change it.
+//
+// Checks 1 and 3 catch loss; check 2 makes the failure LOCAL (it names the record) instead of
+// producing a plausible-looking short frame. `prism_canvas_verify` runs all three.
+//
+// ── LAYOUT (v1, deliberately small) ───────────────────────────────────────────────────────────
+// Flutter's single-pass box-constraint model, the one PRISM_UNIVERSAL_UI_PLAN §7 recommends:
+// constraints descend, sizes ascend, the parent positions the child. O(n) per frame and layout
+// thrash is structurally impossible because no child can read its own final position mid-layout.
+// v1 scope, stated plainly: integer device pixels, no baseline alignment, no bidi, no RTL
+// mirroring, `flexible` gaps do not expand, and scrolling is not implemented (a `pane` clips).
+//
+// ── TEXT: Canvas2D fillText, and what that costs ──────────────────────────────────────────────
+// A TEXT record carries position/colour/size/weight/alignment and the bytes. The host issues
+// `fillText`. That is the pragmatic v1 choice and it buys the browser's complete shaping, bidi,
+// font fallback and colour emoji for free. What it costs, precisely:
+//   * NO GLYPH-LEVEL CONTROL. We cannot position an individual glyph, so no caret placement inside
+//     a run, no per-glyph hit-testing for selection, no letter-spacing.
+//   * HOST FONT DEPENDENCE. The rendered advance widths are the browser's, not ours, so our
+//     measurement and the host's disagree and a `band` of text can overflow its measured box.
+//     Mitigated, not solved, by making measurement a PARAMETER (see `prism_canvas_render_with`):
+//     a browser host can pass a closure backed by `measureText` and the disagreement goes to zero.
+//     The default measure function here is an advance-width approximation and will be wrong for
+//     any proportional font.
+//   * NO SUBPIXEL POSITIONING and no control over hinting or AA.
+// The eventual answer is PRISM_UNIVERSAL_UI_PLAN §9's glyph atlas -- rasterize each glyph ONCE
+// through the browser's own fillText into an offscreen canvas, upload to a GPU texture, then draw
+// cached glyphs as quads keyed by (glyph, size, weight, subpixel offset). That inherits the same
+// free shaping while regaining glyph-level control, and costs one crossing per NEW glyph and zero
+// for cached. It needs a GPU context, so it belongs with backend/gpu/, not here.
+//
+// ── EVENTS: THE HTML RENDERER'S CONTRACT, RESTATED FOR THIS MEDIUM ────────────────────────────
+// prism_render_html.nova's binding rule 2 is: *no `on*` attributes, ever -- interactivity binds
+// against node identity at runtime, it is never smuggled through markup.* The same rule holds here
+// and it is the reason there is no "callback" opcode. The stream carries only GEOMETRY plus
+// IDENTITY: a HIT record per interactive node, with the node's pre-order index and its semantic
+// ROLE. Nothing executable is encoded. The host turns a pointer position into a node index; the
+// app decides what that means.
+//
+// Which nodes get a HIT record is DERIVED FROM THE WIDGET KIND, not annotated -- Bet 2 in
+// practice. `press`/`link`/`flag`/`entry`/`range`/`pick`/`tabs` are interactive because of what
+// they ARE; `label`/`gap`/`stack` are not. A developer cannot forget to make a button clickable and
+// cannot accidentally make a caption clickable.
+//
+// AND IT DISSOLVES A DOCUMENTED BLOCKER. PRISM_UNIVERSAL_UI_PLAN §12 Blocker 1 says handlers are
+// inexpressible because host->NOVA callbacks are by EXPORT-NAME STRING only, so `press "+" -> ...`
+// would need one wasm export per handler. Dispatching on an INTEGER NODE INDEX inside NOVA needs
+// exactly ONE export for the whole application (`prism_canvas_event`-shaped), no matter how many
+// handlers exist, because the fan-out happens in NOVA where closures already work. The blocker is
+// a real constraint on arbitrary host callbacks; it is NOT a constraint on UI event delivery.
+//
+// PUBLIC API
+//   Colour + theme
+//     prism_canvas_rgba(r, g, b, a)                 -> int    packed 0xRRGGBBAA
+//     prism_canvas_theme_light() / _dark()          -> PrismCanvasTheme
+//   Render
+//     prism_canvas_render(node, w, h)               -> Result<list>   default theme + measure
+//     prism_canvas_render_with(node, w, h, theme, measure) -> Result<list>
+//     prism_canvas_measure_default(text, size)      -> int
+//   Verify / inspect (the gate's and the host's shared decoder)
+//     prism_canvas_verify(words)                    -> Result<int>    -> command count
+//     prism_canvas_checksum(words, upto)            -> int
+//     prism_canvas_dump(words)                      -> Result<string> one line per record
+//     prism_canvas_hit_test(words, x, y)            -> int            topmost node index, or -1
+//   Events (identity-bound, integer-only across the boundary)
+//     prism_canvas_event_of(words, kind_code, x, y, code) -> PrismCanvasEvent
+//     prism_canvas_event_kind_name(k)               -> string
+//   Opcode / role constants
+//     prism_canvas_op_*()   prism_canvas_role_*()   prism_canvas_magic()  prism_canvas_version()
+
+import prism_node
+
+// ── Framing constants ─────────────────────────────────────────────────────────────────────────
+// "PRC1" big-endian: 0x50 0x52 0x43 0x31. A magic word is what lets a host reject a buffer that is
+// not one of ours BEFORE it starts issuing draw calls off garbage.
+fn prism_canvas_magic() -> int
+    1347552049
+
+fn prism_canvas_version() -> int
+    1
+
+// Header is 6 words: magic, version, word_count, cmd_count, surface_w, surface_h.
+fn prism_canvas_header_words() -> int
+    6
+
+// ── Opcodes ───────────────────────────────────────────────────────────────────────────────────
+// Zero-argument accessor functions rather than module-level `let`s: a module-level `let` holding a
+// computed initializer silently read back as 0 in every function when the module was imported
+// (verified compiler bug, fixed 2026-08-20 -- but a plain `fn` was never affected and costs
+// nothing, so the safer form is kept). See prism/style/prism_palette.nova's header for the probe.
+fn prism_canvas_op_end() -> int
+    0
+fn prism_canvas_op_fill_rect() -> int
+    1
+fn prism_canvas_op_stroke_rect() -> int
+    2
+fn prism_canvas_op_line() -> int
+    3
+fn prism_canvas_op_text() -> int
+    4
+fn prism_canvas_op_clip_push() -> int
+    5
+fn prism_canvas_op_clip_pop() -> int
+    6
+fn prism_canvas_op_hit() -> int
+    7
+
+fn prism_canvas_op_name(op: int) -> string
+    match op
+        0 => "end"
+        1 => "fill_rect"
+        2 => "stroke_rect"
+        3 => "line"
+        4 => "text"
+        5 => "clip_push"
+        6 => "clip_pop"
+        7 => "hit"
+        _ => "op{op}"
+
+// ── Semantic roles (derived from the widget kind -- Bet 2) ─────────────────────────────────────
+fn prism_canvas_role_none() -> int
+    0
+fn prism_canvas_role_press() -> int
+    1
+fn prism_canvas_role_link() -> int
+    2
+fn prism_canvas_role_flag() -> int
+    3
+fn prism_canvas_role_entry() -> int
+    4
+fn prism_canvas_role_range() -> int
+    5
+fn prism_canvas_role_pick() -> int
+    6
+fn prism_canvas_role_tab() -> int
+    7
+
+fn prism_canvas_role_name(role: int) -> string
+    match role
+        0 => "none"
+        1 => "press"
+        2 => "link"
+        3 => "flag"
+        4 => "entry"
+        5 => "range"
+        6 => "pick"
+        7 => "tab"
+        _ => "role{role}"
+
+// Text alignment inside a TEXT record's origin box.
+fn prism_canvas_align_left() -> int
+    0
+fn prism_canvas_align_center() -> int
+    1
+fn prism_canvas_align_right() -> int
+    2
+
+// ── Colour ────────────────────────────────────────────────────────────────────────────────────
+// Packed 0xRRGGBBAA in ONE word. Four separate words per colour would be 4x the traffic for a
+// value that is universally handled as a single 32-bit unit by every graphics API in existence.
+// Components are clamped rather than rejected: a colour is not a security boundary, and a hard
+// error here would make an off-by-one in a theme table fail the whole frame.
+fn _clamp_byte(v: int) -> int
+    0 if v < 0 else (255 if v > 255 else v)
+
+fn prism_canvas_rgba(r: int, g: int, b: int, a: int) -> int
+    (_clamp_byte(r) * 16777216) + (_clamp_byte(g) * 65536) + (_clamp_byte(b) * 256) + _clamp_byte(a)
+
+// ── Theme + metrics ───────────────────────────────────────────────────────────────────────────
+// Colours AND metrics together, because on a canvas they are the same kind of thing: both are
+// inputs the layout needs before it can produce a coordinate. Splitting them would mean threading
+// two values through every layout function for no gain.
+type PrismCanvasTheme
+    pcv_surface: int
+    pcv_on_surface: int
+    pcv_primary: int
+    pcv_on_primary: int
+    pcv_border: int
+    pcv_muted: int
+    pcv_font_px: int
+    pcv_line_px: int
+    pcv_pad_px: int
+    pcv_gap_px: int
+    pcv_radius_px: int
+    pcv_stroke_px: int
+
+fn prism_canvas_theme_light() -> PrismCanvasTheme
+    PrismCanvasTheme(prism_canvas_rgba(255, 255, 255, 255), prism_canvas_rgba(26, 26, 26, 255), prism_canvas_rgba(79, 70, 229, 255), prism_canvas_rgba(255, 255, 255, 255), prism_canvas_rgba(203, 213, 225, 255), prism_canvas_rgba(100, 116, 139, 255), 14, 20, 8, 6, 6, 1)
+
+fn prism_canvas_theme_dark() -> PrismCanvasTheme
+    PrismCanvasTheme(prism_canvas_rgba(17, 24, 39, 255), prism_canvas_rgba(249, 250, 251, 255), prism_canvas_rgba(129, 140, 248, 255), prism_canvas_rgba(17, 24, 39, 255), prism_canvas_rgba(55, 65, 81, 255), prism_canvas_rgba(148, 163, 184, 255), 14, 20, 8, 6, 6, 1)
+
+// ── Default text measurement ──────────────────────────────────────────────────────────────────
+// UTF-8 aware, because len() counts BYTES (len("中") == 3) and charging 3 advances for a character
+// that occupies 2 is the same defect std/text/wcwidth.nova has. Lead byte >= 0xE0 is treated as
+// double-advance (the CJK/Hangul/Kana blocks all encode as 3-byte sequences), everything else as
+// single -- the identical rule prism_render_ansi.nova arrived at for terminal cells, reused here
+// with a pixel advance instead of a cell count.
+//
+// 0.55 em per single-advance character is a monospace-ish approximation, and it IS an
+// approximation: for a proportional font an 'i' and a 'W' differ by more than 3x. It exists so the
+// renderer is self-contained and testable with no host; a browser host should pass its own
+// measureText-backed closure to prism_canvas_render_with. Recorded as a v1 limitation, not a
+// solution.
+// A boolean-guard `match true` form was tried here first and rejected: it parses cleanly on its
+// own but corrupts this compiler's parse state for everything AFTER it in the same file (every
+// subsequent top-level `fn` fails with a cascading "expected ','" error far downstream -- verified
+// by bisecting this file line-by-line; `match true` with comparison-expression arms has no other
+// user anywhere in this codebase, including the 22k-line self-hosted compiler). An if-chain is the
+// proven idiom (prism_render_ansi.nova's `_ansi_seq_len` uses exactly this shape).
+fn _utf8_seq_len(b: int) -> int
+    if b >= 240
+        return 4
+    if b >= 224
+        return 3
+    if b >= 192
+        return 2
+    1
+
+fn _utf8_advances(s: string) -> int
+    let total = 0
+    let i = 0
+    while i < len(s)
+        let b = ord(s[i])
+        total += 2 if b >= 224 else 1
+        i += _utf8_seq_len(b)
+    total
+
+fn prism_canvas_measure_default(text: string, size_px: int) -> int
+    (_utf8_advances(text) * size_px * 55) / 100
+
+// ── The emit sink ─────────────────────────────────────────────────────────────────────────────
+// One growable `list` of words threaded through the whole walk, appended in place. The alternative
+// -- every node returning its own word list and the parent splicing with `[...a, ...b]` -- reads
+// well but is O(depth x total) because each level recopies everything below it; with a 256-deep
+// bound and a 100k-node bound that is a real cliff for something that runs every frame. A single
+// append-only sink is O(1) amortized per word.
+//
+// Records are `[op, argc, args...]`. `argc` is written from `len(args)` and never from a literal,
+// so a record whose argument list changes cannot get an out-of-date count -- the framing check in
+// prism_canvas_verify would otherwise start rejecting valid buffers, or worse, accept a
+// mis-framed one.
+fn _emit(ws: list, op: int, args: list)
+    push(ws, op)
+    push(ws, len(args))
+    for a in args
+        push(ws, a)
+
+fn _emit_fill(ws: list, x: int, y: int, w: int, h: int, rgba: int)
+    _emit(ws, prism_canvas_op_fill_rect(), [x, y, w, h, rgba])
+
+fn _emit_stroke(ws: list, x: int, y: int, w: int, h: int, rgba: int, lw: int)
+    _emit(ws, prism_canvas_op_stroke_rect(), [x, y, w, h, rgba, lw])
+
+fn _emit_line(ws: list, x0: int, y0: int, x1: int, y1: int, rgba: int, lw: int)
+    _emit(ws, prism_canvas_op_line(), [x0, y0, x1, y1, rgba, lw])
+
+fn _emit_hit(ws: list, x: int, y: int, w: int, h: int, node_index: int, role: int)
+    _emit(ws, prism_canvas_op_hit(), [x, y, w, h, node_index, role])
+
+// TEXT is the only variable-length record. Args are the six fixed fields, then the byte count,
+// then that many bytes -- so `argc` is 7 + nbytes and the decoder never needs to know anything
+// about text specifically to skip the record correctly. That is the point of a uniform argc: a
+// host that does not implement text can still walk past it.
+fn _emit_text(ws: list, x: int, y: int, rgba: int, size_px: int, align: int, weight: int, text: string)
+    let bytes = [ord(text[i]) for i in 0..len(text)]
+    _emit(ws, prism_canvas_op_text(), [x, y, rgba, size_px, align, weight, len(bytes), ...bytes])
+
+// ── Checksum ──────────────────────────────────────────────────────────────────────────────────
+// DJB2 over words -- the same h*33 + x the compiler uses for its own type hashes, so there is one
+// hash idiom in the codebase rather than two. Masked to 31 bits so the value is positive and
+// identical on every target regardless of how i64 overflow is treated; an unmasked accumulator
+// would let a wrap difference between native and wasm show up as a checksum mismatch and send
+// someone hunting a truncation that never happened.
+fn prism_canvas_checksum(words: list, upto: int) -> int
+    let h = 5381
+    let i = 0
+    while i < upto and i < len(words)
+        h = ((h * 33) + words[i]) % 2147483647
+        i += 1
+    h
+
+// ── Layout: the box a node occupies ───────────────────────────────────────────────────────────
+// Sizes ascend as a value; positions descend as parameters. A node never learns its own final
+// position during measurement, which is what makes thrash structurally impossible.
+type PrismCanvasBox
+    pcv_w: int
+    pcv_h: int
+
+// The walk's shared, read-only context. Bundled into one struct so adding (say) a hover state
+// later does not change the signature of every layout and paint function.
+type PrismCanvasCtx
+    pcv_theme: PrismCanvasTheme
+    pcv_measure: any
+
+fn _measure(ctx: PrismCanvasCtx, text: string, size_px: int) -> int
+    let m = ctx.pcv_measure
+    m(text, size_px)
+
+// ── Interactivity is DERIVED, never declared ──────────────────────────────────────────────────
+// The single source of truth for "is this node interactive, and as what". Both the HIT emission
+// and the a11y-facing role come from here, so they cannot disagree.
+fn _role_of(kind: string) -> int
+    match kind
+        "press" => prism_canvas_role_press()
+        "link" => prism_canvas_role_link()
+        "flag" => prism_canvas_role_flag()
+        "entry" => prism_canvas_role_entry()
+        "range" => prism_canvas_role_range()
+        "pick" => prism_canvas_role_pick()
+        _ => prism_canvas_role_none()
+
+// ── Measurement pass ──────────────────────────────────────────────────────────────────────────
+// Every kind must appear. The `_` arm is a LOUD error for the same reason the HTML renderer's is:
+// a silent fallthrough would give primitive #23 a zero-sized box and it would paint nothing while
+// the frame still "succeeded".
+fn _size_of(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let t = ctx.pcv_theme
+    match prism_node.prism_node_kind_str(n)
+        "stack" => _size_stack(n, ctx)
+        "each" => _size_stack(n, ctx)
+        "sheet" => _size_padded(n, ctx)
+        "pane" => _size_padded(n, ctx)
+        "band" => _size_band(n, ctx)
+        "flow" => _size_band(n, ctx)
+        "mesh" => _size_band(n, ctx)
+        "grid" => _size_stack(n, ctx)
+        "layer" => _size_layer(n, ctx)
+        "tabs" => _size_tabs(n, ctx)
+        "hint" => _size_stack(n, ctx)
+        "gap" => _size_gap(n, ctx)
+        "label" => _size_label(n, ctx)
+        "glyph" => ok(PrismCanvasBox(t.pcv_font_px, t.pcv_line_px))
+        "art" => _size_placeholder(n, ctx)
+        "draw" => _size_placeholder(n, ctx)
+        "press" => _size_boxed_text(prism_node.prism_node_attr_str(n, "text", ""), ctx)
+        "link" => _size_label_text(prism_node.prism_node_attr_str(n, "text", ""), ctx)
+        "entry" => _size_field(n, ctx)
+        "pick" => _size_field(n, ctx)
+        "flag" => _size_flag(n, ctx)
+        "range" => _size_range(n, ctx)
+        _ => err("prism_canvas: no canvas mapping for node kind '{prism_node.prism_node_kind_str(n)}' -- a primitive was added to PrismNodeKind without teaching the canvas backend about it (PRISM_SPEC.md Part III)")
+
+// Children's boxes, collected with an explicit loop rather than `.map(...)`: the mapper returns a
+// Result, and `?` inside a lambda SILENTLY SWALLOWS the error and leaks the raw Result struct into
+// the list (verified 2026-08-18, reference_question_mark_in_lambda_silently_corrupts). This is the
+// one documented exception to the map-everything rule, and getting it wrong here would put a
+// Result struct where a box is expected and produce garbage geometry.
+fn _child_boxes(n: PrismNode, ctx: PrismCanvasCtx) -> Result<list>
+    let out = []
+    for c in prism_node.prism_node_children(n)
+        let b = _size_of(c, ctx)
+        if is_err(b)
+            return err(unwrap_err(b))
+        push(out, unwrap(b))
+    ok(out)
+
+fn _size_stack(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let boxes = _child_boxes(n, ctx)?
+    let gaps = ctx.pcv_theme.pcv_gap_px * (len(boxes) - 1 if len(boxes) > 0 else 0)
+    ok(PrismCanvasBox(_max_w(boxes), boxes.map(fn(b) b.pcv_h).sum() + gaps))
+
+fn _size_band(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let boxes = _child_boxes(n, ctx)?
+    let gaps = ctx.pcv_theme.pcv_gap_px * (len(boxes) - 1 if len(boxes) > 0 else 0)
+    ok(PrismCanvasBox(boxes.map(fn(b) b.pcv_w).sum() + gaps, _max_h(boxes)))
+
+fn _size_layer(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let boxes = _child_boxes(n, ctx)?
+    ok(PrismCanvasBox(_max_w(boxes), _max_h(boxes)))
+
+fn _max_w(boxes: list) -> int
+    0 if len(boxes) == 0 else max(boxes.map(fn(b) b.pcv_w))
+
+fn _max_h(boxes: list) -> int
+    0 if len(boxes) == 0 else max(boxes.map(fn(b) b.pcv_h))
+
+fn _size_padded(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let inner = _size_stack(n, ctx)?
+    let p = ctx.pcv_theme.pcv_pad_px * 2
+    ok(PrismCanvasBox(inner.pcv_w + p, inner.pcv_h + p))
+
+fn _size_tabs(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let bar = _tab_bar_size(n, ctx)
+    let sel = _selected_panel(n)
+    match sel
+        None => ok(bar)
+        Some(p) => _size_tabs_with(p, bar, ctx)
+
+fn _size_tabs_with(panel: PrismNode, bar: PrismCanvasBox, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let body = _size_of(panel, ctx)?
+    ok(PrismCanvasBox(max([bar.pcv_w, body.pcv_w]), bar.pcv_h + ctx.pcv_theme.pcv_gap_px + body.pcv_h))
+
+// Tab heads are measured, not laid out, here -- no Result, because a tab head is always a plain
+// label string and cannot fail.
+fn _tab_bar_size(n: PrismNode, ctx: PrismCanvasCtx) -> PrismCanvasBox
+    let t = ctx.pcv_theme
+    let labels = prism_node.prism_node_children(n).map(fn(p) prism_node.prism_node_attr_str(p, "tab_label", ""))
+    let widths = labels.map(fn(s) _measure(ctx, s, t.pcv_font_px) + (t.pcv_pad_px * 2))
+    let gaps = t.pcv_gap_px * (len(widths) - 1 if len(widths) > 0 else 0)
+    PrismCanvasBox(widths.sum() + gaps, t.pcv_line_px + (t.pcv_pad_px * 2))
+
+fn _selected_panel(n: PrismNode) -> PrismNode?
+    let sel = prism_node.prism_node_attr_int(n, "selected", 0)
+    let kids = prism_node.prism_node_children(n)
+    some(kids[sel]) if sel >= 0 and sel < len(kids) else none()
+
+fn _size_gap(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    // A `flexible` gap should expand to consume the parent's slack. It does not in v1 -- that needs
+    // a second constraint pass to redistribute leftover space, which is the layout engine
+    // (prism/layout/, Phase 2), not this backend. It measures as the theme gap so a flexible gap is
+    // visible-but-not-expanding rather than collapsing to nothing and silently changing a layout.
+    let sz = prism_node.prism_node_attr_int(n, "size", ctx.pcv_theme.pcv_gap_px)
+    ok(PrismCanvasBox(sz, sz))
+
+fn _size_label(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    _size_label_text(prism_node.prism_node_attr_str(n, "text", ""), ctx)
+
+fn _size_label_text(s: string, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    ok(PrismCanvasBox(_measure(ctx, s, ctx.pcv_theme.pcv_font_px), ctx.pcv_theme.pcv_line_px))
+
+fn _size_boxed_text(s: string, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let t = ctx.pcv_theme
+    ok(PrismCanvasBox(_measure(ctx, s, t.pcv_font_px) + (t.pcv_pad_px * 2), t.pcv_line_px + (t.pcv_pad_px * 2)))
+
+fn _size_field(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    // A field's width is its own, not its content's: an input that grows as you type is a layout
+    // bug, not a feature. 16 average advances is the v1 default.
+    let t = ctx.pcv_theme
+    ok(PrismCanvasBox(_measure(ctx, "0000000000000000", t.pcv_font_px) + (t.pcv_pad_px * 2), t.pcv_line_px + (t.pcv_pad_px * 2)))
+
+fn _size_flag(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let t = ctx.pcv_theme
+    let label = prism_node.prism_node_attr_str(n, "label", "")
+    ok(PrismCanvasBox(t.pcv_line_px + t.pcv_gap_px + _measure(ctx, label, t.pcv_font_px), t.pcv_line_px))
+
+fn _size_range(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let t = ctx.pcv_theme
+    ok(PrismCanvasBox(_measure(ctx, "00000000000000000000", t.pcv_font_px), t.pcv_line_px))
+
+fn _size_placeholder(n: PrismNode, ctx: PrismCanvasCtx) -> Result<PrismCanvasBox>
+    let t = ctx.pcv_theme
+    ok(PrismCanvasBox(_measure(ctx, "0000000000", t.pcv_font_px) + (t.pcv_pad_px * 2), (t.pcv_line_px * 2) + (t.pcv_pad_px * 2)))
+
+// ── Paint pass ────────────────────────────────────────────────────────────────────────────────
+// `idx` is a one-element list used as a mutable pre-order counter. A plain int parameter cannot
+// carry a count back out of a recursive walk, and the counter must be shared by every node in the
+// tree because it IS the node identity events bind against -- two nodes with the same index would
+// make a click ambiguous. A one-element list is the smallest thing NOVA has with the right
+// aliasing behaviour; the alternative (returning the next index from every paint function) would
+// thread a second return value through a dozen signatures for the same effect.
+fn _next_index(idx: list) -> int
+    let v = idx[0]
+    idx[0] = v + 1
+    v
+
+fn _paint(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let my = _next_index(idx)
+    let kind = prism_node.prism_node_kind_str(n)
+    let role = _role_of(kind)
+    // HIT before the paint records, so the host sees identity even for a node whose own paint is a
+    // placeholder. Emitted only for kinds the vocabulary says are interactive -- derived, not
+    // declared (Bet 2).
+    if role != prism_canvas_role_none()
+        _emit_hit(ws, x, y, w, h, my, role)
+    match kind
+        "stack" => _paint_stack(n, ctx, ws, idx, x, y, w, h)
+        "each" => _paint_stack(n, ctx, ws, idx, x, y, w, h)
+        "grid" => _paint_stack(n, ctx, ws, idx, x, y, w, h)
+        "hint" => _paint_hint(n, ctx, ws, idx, x, y, w, h)
+        "band" => _paint_band(n, ctx, ws, idx, x, y, w, h)
+        "flow" => _paint_band(n, ctx, ws, idx, x, y, w, h)
+        "mesh" => _paint_band(n, ctx, ws, idx, x, y, w, h)
+        "layer" => _paint_layer(n, ctx, ws, idx, x, y, w, h)
+        "pane" => _paint_pane(n, ctx, ws, idx, x, y, w, h)
+        "sheet" => _paint_sheet(n, ctx, ws, idx, x, y, w, h)
+        "tabs" => _paint_tabs(n, ctx, ws, idx, x, y, w, h)
+        "gap" => ok(0)
+        "label" => _paint_label(n, ctx, ws, x, y)
+        "glyph" => _paint_glyph(n, ctx, ws, x, y)
+        "art" => _paint_placeholder(n, ctx, ws, x, y, w, h, "image")
+        "draw" => _paint_placeholder(n, ctx, ws, x, y, w, h, "draw")
+        "press" => _paint_press(n, ctx, ws, x, y, w, h)
+        "link" => _paint_link(n, ctx, ws, x, y, w, h)
+        "entry" => _paint_entry(n, ctx, ws, x, y, w, h)
+        "pick" => _paint_pick(n, ctx, ws, x, y, w, h)
+        "flag" => _paint_flag(n, ctx, ws, x, y, w, h)
+        "range" => _paint_range(n, ctx, ws, x, y, w, h)
+        _ => err("prism_canvas: no canvas paint for node kind '{kind}'")
+
+// Children stacked vertically at the parent's x, each given the parent's full width so a child
+// that centres itself has something to centre in.
+fn _paint_stack(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let boxes = _child_boxes(n, ctx)?
+    let cy = y
+    for i, c in prism_node.prism_node_children(n)
+        let b = boxes[i]
+        let r = _paint(c, ctx, ws, idx, x, cy, w, b.pcv_h)
+        if is_err(r)
+            return err(unwrap_err(r))
+        cy += b.pcv_h + ctx.pcv_theme.pcv_gap_px
+    ok(0)
+
+fn _paint_band(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let boxes = _child_boxes(n, ctx)?
+    let cx = x
+    for i, c in prism_node.prism_node_children(n)
+        let b = boxes[i]
+        let r = _paint(c, ctx, ws, idx, cx, y, b.pcv_w, b.pcv_h)
+        if is_err(r)
+            return err(unwrap_err(r))
+        cx += b.pcv_w + ctx.pcv_theme.pcv_gap_px
+    ok(0)
+
+// A layer draws every child at the SAME origin, in source order, so later children composite on
+// top. That is the only z-ordering Prism has and it is positional, not a z-index -- which means it
+// is always statically knowable and can never fight itself.
+fn _paint_layer(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let boxes = _child_boxes(n, ctx)?
+    for i, c in prism_node.prism_node_children(n)
+        let b = boxes[i]
+        let r = _paint(c, ctx, ws, idx, x, y, b.pcv_w, b.pcv_h)
+        if is_err(r)
+            return err(unwrap_err(r))
+    ok(0)
+
+// A pane is Prism's clipping/surface primitive, so it is the one place CLIP_PUSH/CLIP_POP is
+// emitted. The pair is emitted around the children unconditionally -- a host that receives a push
+// with no matching pop has a corrupt buffer, and prism_canvas_verify checks the balance.
+fn _paint_pane(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_fill(ws, x, y, w, h, t.pcv_surface)
+    _emit_stroke(ws, x, y, w, h, t.pcv_border, t.pcv_stroke_px)
+    _emit(ws, prism_canvas_op_clip_push(), [x, y, w, h])
+    let r = _paint_stack_at(n, ctx, ws, idx, x + t.pcv_pad_px, y + t.pcv_pad_px, w - (t.pcv_pad_px * 2))
+    _emit(ws, prism_canvas_op_clip_pop(), [])
+    r
+
+fn _paint_sheet(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_fill(ws, x, y, w, h, t.pcv_surface)
+    _emit_stroke(ws, x, y, w, h, t.pcv_primary, t.pcv_stroke_px)
+    _paint_stack_at(n, ctx, ws, idx, x + t.pcv_pad_px, y + t.pcv_pad_px, w - (t.pcv_pad_px * 2))
+
+fn _paint_stack_at(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int) -> Result<int>
+    let boxes = _child_boxes(n, ctx)?
+    let cy = y
+    for i, c in prism_node.prism_node_children(n)
+        let b = boxes[i]
+        let r = _paint(c, ctx, ws, idx, x, cy, w, b.pcv_h)
+        if is_err(r)
+            return err(unwrap_err(r))
+        cy += b.pcv_h + ctx.pcv_theme.pcv_gap_px
+    ok(0)
+
+// The tooltip text is painted as a sibling BELOW the anchored children, muted. The HTML renderer
+// makes it a real sibling span wired by aria-describedby; the canvas equivalent of "wired by" is
+// the shared node index, which the HIT records already carry.
+fn _paint_hint(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    let r = _paint_stack(n, ctx, ws, idx, x, y, w, h)
+    if is_err(r)
+        return r
+    _emit_text(ws, x, y + h - t.pcv_line_px, t.pcv_muted, t.pcv_font_px, prism_canvas_align_left(), 0, prism_node.prism_node_attr_str(n, "text", ""))
+    ok(0)
+
+// Only the SELECTED panel is painted. A canvas has no hidden-but-present concept, so painting all
+// of them would show all of them at once -- visibly wrong, not merely unstyled. Same call the ANSI
+// backend made, for the same reason.
+fn _paint_tabs(n: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    let sel = prism_node.prism_node_attr_int(n, "selected", 0)
+    let bar = _tab_bar_size(n, ctx)
+    let cx = x
+    for i, panel in prism_node.prism_node_children(n)
+        let label = prism_node.prism_node_attr_str(panel, "tab_label", "")
+        let tw = _measure(ctx, label, t.pcv_font_px) + (t.pcv_pad_px * 2)
+        let active = i == sel
+        _emit_fill(ws, cx, y, tw, bar.pcv_h, t.pcv_primary if active else t.pcv_surface)
+        _emit_stroke(ws, cx, y, tw, bar.pcv_h, t.pcv_border, t.pcv_stroke_px)
+        _emit_text(ws, cx + (tw / 2), y + t.pcv_pad_px, t.pcv_on_primary if active else t.pcv_on_surface, t.pcv_font_px, prism_canvas_align_center(), 1 if active else 0, label)
+        // A tab head is interactive, and its identity is the PANEL's index so the app receives the
+        // same identity whether the user clicked the head or reached it by keyboard.
+        _emit_hit(ws, cx, y, tw, bar.pcv_h, idx[0] + i, prism_canvas_role_tab())
+        cx += tw + t.pcv_gap_px
+    match _selected_panel(n)
+        None => ok(0)
+        Some(p) => _paint_selected_panel(p, ctx, ws, idx, x, y + bar.pcv_h + t.pcv_gap_px, w, sel)
+
+// The pre-order counter must advance past EVERY panel, not just the painted one, or an unselected
+// panel's absence would shift every later node's index and break identity across a tab switch.
+// That is the subtle bug a canvas backend invites and a markup backend cannot have.
+fn _paint_selected_panel(panel: PrismNode, ctx: PrismCanvasCtx, ws: list, idx: list, x: int, y: int, w: int, sel: int) -> Result<int>
+    let b = _size_of(panel, ctx)?
+    _paint(panel, ctx, ws, idx, x, y, w, b.pcv_h)
+
+fn _paint_label(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_text(ws, x, y, t.pcv_on_surface, t.pcv_font_px, prism_canvas_align_left(), 0, prism_node.prism_node_attr_str(n, "text", ""))
+    ok(0)
+
+// The 12 closed PrismIcon names -> one ASCII character, the same mapping the ANSI backend uses.
+// ASCII rather than an icon font on purpose: a font the host may not have is a blank box, and a
+// blank box is indistinguishable from a bug.
+fn _glyph_char(icon: string) -> string
+    match icon
+        "check" => "+"
+        "close" => "x"
+        "search" => "?"
+        "menu" => "="
+        "plus" => "+"
+        "minus" => "-"
+        "chevron_up" => "^"
+        "chevron_down" => "v"
+        "chevron_left" => "<"
+        "chevron_right" => ">"
+        "warning" => "!"
+        "info" => "i"
+        _ => "*"
+
+fn _paint_glyph(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_text(ws, x, y, t.pcv_on_surface, t.pcv_font_px, prism_canvas_align_left(), 0, _glyph_char(prism_node.prism_node_attr_str(n, "icon", "")))
+    ok(0)
+
+// `art` and `draw` degrade to a labelled box. Honest: no image decoder and no user paint callback
+// crosses this boundary in v1, and painting nothing would look like a layout bug.
+fn _paint_placeholder(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int, what: string) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_stroke(ws, x, y, w, h, t.pcv_border, t.pcv_stroke_px)
+    _emit_line(ws, x, y, x + w, y + h, t.pcv_border, t.pcv_stroke_px)
+    _emit_text(ws, x + (w / 2), y + (h / 2) - (t.pcv_line_px / 2), t.pcv_muted, t.pcv_font_px, prism_canvas_align_center(), 0, what)
+    ok(0)
+
+fn _paint_press(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_fill(ws, x, y, w, h, t.pcv_primary)
+    _emit_stroke(ws, x, y, w, h, t.pcv_primary, t.pcv_stroke_px)
+    _emit_text(ws, x + (w / 2), y + t.pcv_pad_px, t.pcv_on_primary, t.pcv_font_px, prism_canvas_align_center(), 1, prism_node.prism_node_attr_str(n, "text", ""))
+    ok(0)
+
+// A link gets an underline rather than only a colour: colour alone fails WCAG 1.4.1 (use of
+// colour), and on a canvas there is no user stylesheet to add one back.
+fn _paint_link(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_text(ws, x, y, t.pcv_primary, t.pcv_font_px, prism_canvas_align_left(), 0, prism_node.prism_node_attr_str(n, "text", ""))
+    _emit_line(ws, x, y + t.pcv_line_px - 1, x + w, y + t.pcv_line_px - 1, t.pcv_primary, t.pcv_stroke_px)
+    ok(0)
+
+// A password's characters are NEVER emitted -- the stream is a serialized artifact that a host may
+// log, cache or replay for time-travel debugging, so the same rule the ANSI backend applies to
+// terminal scrollback applies here for exactly the same reason.
+fn _paint_entry(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    let kind = prism_node.prism_node_attr_str(n, "kind", "text")
+    let raw = prism_node.prism_node_attr_str(n, "value", "")
+    let shown = _mask(len(raw)) if kind == "password" else raw
+    _emit_fill(ws, x, y, w, h, t.pcv_surface)
+    _emit_stroke(ws, x, y, w, h, t.pcv_border, t.pcv_stroke_px)
+    let text = shown if shown != "" else prism_node.prism_node_attr_str(n, "prompt", "")
+    let colour = t.pcv_on_surface if shown != "" else t.pcv_muted
+    _emit_text(ws, x + t.pcv_pad_px, y + t.pcv_pad_px, colour, t.pcv_font_px, prism_canvas_align_left(), 0, text)
+    ok(0)
+
+fn _mask(n: int) -> string
+    join(["*" for i in 0..n], "")
+
+fn _paint_pick(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    _emit_fill(ws, x, y, w, h, t.pcv_surface)
+    _emit_stroke(ws, x, y, w, h, t.pcv_border, t.pcv_stroke_px)
+    _emit_text(ws, x + t.pcv_pad_px, y + t.pcv_pad_px, t.pcv_on_surface, t.pcv_font_px, prism_canvas_align_left(), 0, prism_node.prism_node_attr_str(n, "selected_value", ""))
+    _emit_text(ws, x + w - t.pcv_pad_px, y + t.pcv_pad_px, t.pcv_muted, t.pcv_font_px, prism_canvas_align_right(), 0, "v")
+    ok(0)
+
+fn _paint_flag(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    let on = prism_node.prism_node_attr_bool(n, "state", false)
+    let bx = t.pcv_line_px
+    _emit_fill(ws, x, y, bx, bx, t.pcv_primary if on else t.pcv_surface)
+    _emit_stroke(ws, x, y, bx, bx, t.pcv_border, t.pcv_stroke_px)
+    if on
+        _emit_text(ws, x + (bx / 2), y, t.pcv_on_primary, t.pcv_font_px, prism_canvas_align_center(), 1, "+")
+    _emit_text(ws, x + bx + t.pcv_gap_px, y, t.pcv_on_surface, t.pcv_font_px, prism_canvas_align_left(), 0, prism_node.prism_node_attr_str(n, "label", ""))
+    ok(0)
+
+fn _paint_range(n: PrismNode, ctx: PrismCanvasCtx, ws: list, x: int, y: int, w: int, h: int) -> Result<int>
+    let t = ctx.pcv_theme
+    let lo = prism_node.prism_node_attr_int(n, "min", 0)
+    let hi = prism_node.prism_node_attr_int(n, "max", 100)
+    let v = prism_node.prism_node_attr_int(n, "value", 0)
+    let span = hi - lo
+    // Integer arithmetic, clamped before the divide. A zero span would be a divide-by-zero, which
+    // NOVA defines as 0 rather than trapping -- but relying on that would paint a full-width fill
+    // for a degenerate range, so it is handled explicitly.
+    let frac = 0 if span <= 0 else ((v - lo) * w) / span
+    let fill_w = 0 if frac < 0 else (w if frac > w else frac)
+    let track_y = y + (t.pcv_line_px / 2) - 2
+    _emit_fill(ws, x, track_y, w, 4, t.pcv_border)
+    _emit_fill(ws, x, track_y, fill_w, 4, t.pcv_primary)
+    ok(0)
+
+// ── Public render ─────────────────────────────────────────────────────────────────────────────
+fn prism_canvas_render(node: PrismNode, width: int, height: int) -> Result<list>
+    prism_canvas_render_with(node, width, height, prism_canvas_theme_light(), fn(s, sz) prism_canvas_measure_default(s, sz))
+
+// `measure` is a CLOSURE PARAMETER, not a fixed function, because the honest fix for the
+// host-font-dependence problem in the header is to let the host supply its own measurement. A
+// browser passes a measureText-backed closure and our geometry stops disagreeing with the pixels
+// the browser actually draws; a headless gate passes the deterministic default so the expected
+// buffer is stable.
+fn prism_canvas_render_with(node: PrismNode, width: int, height: int, theme: PrismCanvasTheme, measure) -> Result<list>
+    if width <= 0 or height <= 0
+        return err("prism_canvas_render: surface must be positive, got {width}x{height}")
+    let ctx = PrismCanvasCtx(theme, measure)
+    let body = []
+    let idx = [0]
+    let root = _size_of(node, ctx)?
+    // The surface is cleared first, unconditionally. A frame that inherits the previous frame's
+    // pixels is the classic canvas bug and it looks exactly like a damage-tracking bug in the
+    // renderer; damage tracking is a later optimization and must be opt-in, never implicit.
+    _emit_fill(body, 0, 0, width, height, theme.pcv_surface)
+    let painted = _paint(node, ctx, body, idx, 0, 0, width, root.pcv_h)
+    if is_err(painted)
+        return err(unwrap_err(painted))
+    _frame(body, width, height)
+
+// Header + trailer. `cmd_count` is DERIVED by walking the body rather than counted while emitting:
+// a separate counter is a second source of truth that can drift from the content it describes,
+// and the whole point of the framing is that the buffer cannot lie about itself.
+fn _frame(body: list, width: int, height: int) -> Result<list>
+    let counted = _count_records(body)
+    if is_err(counted)
+        return err(unwrap_err(counted))
+    // header(6) + body + END record(2 + 1 checksum word)
+    let total = prism_canvas_header_words() + len(body) + 3
+    let head = [prism_canvas_magic(), prism_canvas_version(), total, unwrap(counted), width, height]
+    let words = [...head, ...body, prism_canvas_op_end(), 1]
+    push(words, prism_canvas_checksum(words, len(words)))
+    ok(words)
+
+// Walks the record framing without interpreting any opcode. Doubles as the emitter's own
+// self-check: if _emit ever wrote an argc that did not match its argument list, this walk would
+// run off the end and report it here, at build time, rather than in a host decoder.
+fn _count_records(body: list) -> Result<int>
+    let i = 0
+    let n = 0
+    while i < len(body)
+        if i + 1 >= len(body)
+            return err("prism_canvas: record at word {i} has an opcode but no argc -- emitter framing is broken")
+        let argc = body[i + 1]
+        if argc < 0
+            return err("prism_canvas: record at word {i} has negative argc {argc}")
+        if i + 2 + argc > len(body)
+            return err("prism_canvas: record at word {i} declares {argc} args but only {len(body) - i - 2} remain")
+        i += 2 + argc
+        n += 1
+    ok(n)
+
+// ── Verification: the decoder every consumer shares ───────────────────────────────────────────
+// Returns the command count on success. Runs all three framing checks from the header plus the
+// clip-balance check, in the order that makes a failure most diagnostic: magic (is this even ours)
+// -> version -> declared length -> per-record framing -> checksum -> clip balance.
+fn prism_canvas_verify(words: list) -> Result<int>
+    if len(words) < prism_canvas_header_words() + 3
+        return err("prism_canvas_verify: buffer of {len(words)} words is shorter than the minimum framed buffer")
+    if words[0] != prism_canvas_magic()
+        return err("prism_canvas_verify: bad magic {words[0]} (expected {prism_canvas_magic()}) -- this is not a Prism canvas buffer")
+    if words[1] != prism_canvas_version()
+        return err("prism_canvas_verify: unsupported stream version {words[1]} (this build speaks {prism_canvas_version()})")
+    if words[2] != len(words)
+        return err("prism_canvas_verify: header declares {words[2]} words but the buffer holds {len(words)} -- TRUNCATED or padded")
+    let expect = prism_canvas_checksum(words, len(words) - 1)
+    if words[len(words) - 1] != expect
+        return err("prism_canvas_verify: checksum {words[len(words) - 1]} != computed {expect} -- the buffer is corrupt or reordered")
+    let walked = _walk_records(words)
+    if is_err(walked)
+        return err(unwrap_err(walked))
+    if unwrap(walked) != words[3]
+        return err("prism_canvas_verify: header declares {words[3]} commands but {unwrap(walked)} records were framed")
+    ok(words[3])
+
+// Framing walk over the whole buffer (header skipped), also checking that clips balance. An
+// unbalanced clip is not a cosmetic problem: a push with no pop leaves the host's context clipped
+// for every subsequent frame, so the SECOND frame is the one that looks broken.
+fn _walk_records(words: list) -> Result<int>
+    let i = prism_canvas_header_words()
+    let n = 0
+    let depth = 0
+    let saw_end = false
+    while i < len(words)
+        if i + 1 >= len(words)
+            return err("prism_canvas_verify: record at word {i} has an opcode but no argc -- TRUNCATED")
+        let op = words[i]
+        let argc = words[i + 1]
+        if argc < 0
+            return err("prism_canvas_verify: record at word {i} has negative argc {argc}")
+        if i + 2 + argc > len(words)
+            return err("prism_canvas_verify: record at word {i} (op {prism_canvas_op_name(op)}) declares {argc} args but only {len(words) - i - 2} remain -- TRUNCATED")
+        if op == prism_canvas_op_clip_push()
+            depth += 1
+        if op == prism_canvas_op_clip_pop()
+            depth -= 1
+            if depth < 0
+                return err("prism_canvas_verify: clip_pop at word {i} with no matching clip_push")
+        if op == prism_canvas_op_end()
+            saw_end = true
+            i += 2 + argc
+            if i != len(words)
+                return err("prism_canvas_verify: {len(words) - i} words follow the END record -- the buffer has trailing garbage")
+            break
+        i += 2 + argc
+        n += 1
+    if not saw_end
+        return err("prism_canvas_verify: no END record -- the buffer is TRUNCATED (a short read is indistinguishable from a short frame without this check)")
+    if depth != 0
+        return err("prism_canvas_verify: {depth} clip_push record(s) never popped -- every later frame would render clipped")
+    ok(n)
+
+// ── Human-readable dump: what the gate diffs and what a developer reads ───────────────────────
+// One line per record, `op arg,arg,...`, text rendered back to its characters. Verified first, so
+// a dump of a corrupt buffer says so instead of printing plausible nonsense.
+fn prism_canvas_dump(words: list) -> Result<string>
+    let checked = prism_canvas_verify(words)
+    if is_err(checked)
+        return err(unwrap_err(checked))
+    let lines = ["surface {words[4]}x{words[5]} cmds {words[3]}"]
+    let i = prism_canvas_header_words()
+    while i < len(words)
+        let op = words[i]
+        let argc = words[i + 1]
+        let args = [words[i + 2 + k] for k in 0..argc]
+        push(lines, _dump_record(op, args))
+        i += 2 + argc
+    ok(join(lines, "\n"))
+
+fn _dump_record(op: int, args: list) -> string
+    // A TEXT record's tail is characters, not numbers; printing 84,101,120,116 would make the one
+    // field a human most wants to check the one field they cannot read.
+    if op == prism_canvas_op_text() and len(args) >= 7
+        let head = [args[k] for k in 0..6]
+        let body = join([chr(args[7 + k]) for k in 0..args[6]], "")
+        return "text {join(head.map(fn(v) str(v)), \",\")} \"{body}\""
+    "{prism_canvas_op_name(op)} {join(args.map(fn(v) str(v)), \",\")}"
+
+// ── Hit testing ───────────────────────────────────────────────────────────────────────────────
+// Implemented HERE, in NOVA, rather than only in the JS host, for two reasons that both matter:
+// the same answer must come out on every backend (a native GPU backend gets it for free), and it
+// is testable in a KAT without a browser. The host may still do its own for latency, but this is
+// the reference.
+//
+// LAST match wins, because records are emitted in paint order and later paint composites on top --
+// so the topmost node is the last HIT record containing the point. Scanning forward and keeping
+// the last match is O(records) with no allocation; scanning backward would need a reverse index
+// the flat stream deliberately does not have.
+fn prism_canvas_hit_test(words: list, px: int, py: int) -> int
+    let found = -1
+    let i = prism_canvas_header_words()
+    while i + 1 < len(words)
+        let op = words[i]
+        let argc = words[i + 1]
+        if i + 2 + argc > len(words)
+            break
+        if op == prism_canvas_op_hit() and argc == 6
+            let x = words[i + 2]
+            let y = words[i + 3]
+            let w = words[i + 4]
+            let h = words[i + 5]
+            if px >= x and px < x + w and py >= y and py < y + h
+                found = words[i + 6]
+        i += 2 + argc
+    found
+
+fn prism_canvas_hit_role(words: list, px: int, py: int) -> int
+    let role = prism_canvas_role_none()
+    let i = prism_canvas_header_words()
+    while i + 1 < len(words)
+        let op = words[i]
+        let argc = words[i + 1]
+        if i + 2 + argc > len(words)
+            break
+        if op == prism_canvas_op_hit() and argc == 6
+            if px >= words[i + 2] and px < words[i + 2] + words[i + 4] and py >= words[i + 3] and py < words[i + 3] + words[i + 5]
+                role = words[i + 7]
+        i += 2 + argc
+    role
+
+// ── Events ────────────────────────────────────────────────────────────────────────────────────
+// The event that crosses the boundary is INTEGERS ONLY -- kind, position, key code -- and the
+// target is resolved on THIS side from the stream the app already has. Nothing executable, and no
+// string, crosses. That is what makes one export sufficient for a whole application (see the
+// header on Blocker 1).
+enum PrismCanvasEventKind
+    PointerDown()
+    PointerUp()
+    PointerMove()
+    KeyDown()
+    KeyUp()
+    Wheel()
+
+fn prism_canvas_kind_pointer_down() -> PrismCanvasEventKind
+    PointerDown()
+fn prism_canvas_kind_pointer_up() -> PrismCanvasEventKind
+    PointerUp()
+fn prism_canvas_kind_pointer_move() -> PrismCanvasEventKind
+    PointerMove()
+fn prism_canvas_kind_key_down() -> PrismCanvasEventKind
+    KeyDown()
+fn prism_canvas_kind_key_up() -> PrismCanvasEventKind
+    KeyUp()
+fn prism_canvas_kind_wheel() -> PrismCanvasEventKind
+    Wheel()
+
+// EXHAUSTIVE, no wildcard: this match is in the same file as the enum, so adding a 7th event kind
+// without teaching this function is a compile error here (E1009). Same two-halves trick
+// prism_node.nova uses for the widget vocabulary -- the checked half lives beside the enum.
+fn prism_canvas_event_kind_name(k: PrismCanvasEventKind) -> string
+    match k
+        PointerDown() => "pointer_down"
+        PointerUp() => "pointer_up"
+        PointerMove() => "pointer_move"
+        KeyDown() => "key_down"
+        KeyUp() => "key_up"
+        Wheel() => "wheel"
+
+fn prism_canvas_event_kind_code(k: PrismCanvasEventKind) -> int
+    match k
+        PointerDown() => 1
+        PointerUp() => 2
+        PointerMove() => 3
+        KeyDown() => 4
+        KeyUp() => 5
+        Wheel() => 6
+
+// The host sends a CODE, not a name -- an integer is the only thing that crosses a wasm boundary
+// without an allocation. An unknown code is an error rather than a silent default: a host and a
+// module that disagree about the event vocabulary is a version skew, and defaulting it would
+// deliver every unknown event as a pointer_move.
+fn prism_canvas_event_kind_of_code(code: int) -> Result<PrismCanvasEventKind>
+    match code
+        1 => ok(PointerDown())
+        2 => ok(PointerUp())
+        3 => ok(PointerMove())
+        4 => ok(KeyDown())
+        5 => ok(KeyUp())
+        6 => ok(Wheel())
+        _ => err("prism_canvas: unknown event kind code {code} -- host and module disagree about the event vocabulary")
+
+type PrismCanvasEvent
+    pcv_kind: PrismCanvasEventKind
+    pcv_target: int
+    pcv_role: int
+    pcv_x: int
+    pcv_y: int
+    pcv_code: int
+
+// The app-facing entry point: an integer event from the host becomes a typed event with its target
+// node resolved. A keyboard event carries no position, so its target is whatever the app is
+// focusing -- resolved by the app, which is why target is -1 here rather than a guess.
+fn prism_canvas_event_of(words: list, kind_code: int, px: int, py: int, code: int) -> Result<PrismCanvasEvent>
+    let kind = prism_canvas_event_kind_of_code(kind_code)?
+    let positional = kind_code >= 1 and kind_code <= 3 or kind_code == 6
+    let target = prism_canvas_hit_test(words, px, py) if positional else -1
+    let role = prism_canvas_hit_role(words, px, py) if positional else prism_canvas_role_none()
+    ok(PrismCanvasEvent(kind, target, role, px, py, code))
