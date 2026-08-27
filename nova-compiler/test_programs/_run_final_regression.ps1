@@ -580,8 +580,14 @@ Write-Host "Runtime pre-compiled in $([math]::Round($sw.Elapsed.TotalSeconds, 1)
 $sqliteObj = "$PSScriptRoot\output\sqlite3_test.o"
 if (Test-Path $sqliteSrc) {
     Write-Host "Pre-compiling sqlite3.c -> sqlite3_test.o ..."
-    $sqc = Invoke-Timed -FilePath $ClangPath -Arguments "-c -O2 -DSQLITE_THREADSAFE=0 `"$sqliteSrc`" -o `"$sqliteObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 240000 -WorkingDirectory $PSScriptRoot
-    if (!(Test-Path $sqliteObj)) { Write-Host "WARN: sqlite pre-compile failed (exit=$($sqc.ExitCode)); sqlite FFI tests may fail to link" }
+    # 240s was tuned on a fast dev box. sqlite3.c is a ~250k-line amalgamation, and a 2-core
+    # hosted CI runner is far slower -- if this times out the object is silently absent and
+    # every sqlite FFI test fails downstream, with only a WARN to explain it. 600s costs
+    # nothing when the compile is fast (it exits as soon as clang does) and removes a false
+    # failure mode on slow machines.
+    $sqc = Invoke-Timed -FilePath $ClangPath -Arguments "-c -O2 -DSQLITE_THREADSAFE=0 `"$sqliteSrc`" -o `"$sqliteObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 600000 -WorkingDirectory $PSScriptRoot
+    if (!(Test-Path $sqliteObj)) { Write-Host "WARN: sqlite pre-compile failed (exit=$($sqc.ExitCode)) timedout=$($sqc.TimedOut); sqlite FFI tests may fail to link" }
+    else { Write-Host "sqlite3_test.o ready" }
 }
 Write-Host ""
 
