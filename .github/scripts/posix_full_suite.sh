@@ -102,16 +102,32 @@ if os.path.isfile(mf):
 # protocol node_recv does not provide. Keeping them out means this job measures THE PORT
 # rather than re-reporting a defect Windows already tracks separately.
 skip = {'distributed_serialize_test', 'distributed_spawn_test'}
+# SERVER tests must run SERIALLY. _run_final_regression.ps1 separates them for a documented
+# reason: "they each run their OWN in-process green TCP server + client (real I/O). Running
+# many concurrently starves the green server's scheduling under CPU load -> intermittent
+# failures (they each pass reliably given the box to themselves)."
+# Running them in the parallel pool is what produced the TIMEOUT cluster (demo_http_server_test,
+# real_http_api, forge_ws_echo_test, forge_p256_test...) in the first clean POSIX run.
+srv = re.search(r'\$server_tests\s*=\s*@\((.*?)\)', src, re.S)
+server = set()
+if srv:
+    server = {a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", srv.group(1))}
 seen = set()
+par, ser = [], []
 for n in names:
     if n in skip or n in seen:
         continue
     if not os.path.isfile(os.path.join(tp, n + '.nova')):
         continue          # absent source: Windows fails these loudly; here it is not our subject
     seen.add(n)
+    (ser if n in server else par).append(n)
+with open(os.path.join(tp, '_posix_res', '_serial.txt'), 'w') as f:
+    f.write("\n".join(ser) + ("\n" if ser else ""))
+sys.stderr.write("parallel=%d serial=%d\n" % (len(par), len(ser)))
+for n in par:
     print(n)
 PYEOF
-TOTAL=$(wc -l < "$OUT/_tests.txt" | tr -d ' ')
+TOTAL=$(( $(wc -l < "$OUT/_tests.txt" | tr -d ' ') + $(wc -l < "$OUT/_serial.txt" 2>/dev/null | tr -d ' ') ))
 echo "canonical test list: $TOTAL tests (same source of truth as the Windows harness)"
 [ "$TOTAL" -gt 3000 ] || { echo "::error title=posix-full::only $TOTAL tests resolved -- list extraction is broken, refusing to report a misleadingly small run"; exit 1; }
 
@@ -172,9 +188,18 @@ export OUT NOVA LINKF EXTRA_CFLAGS SQLITE_OBJ
 export -f TMO 2>/dev/null || true
 
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-echo "running with $JOBS parallel workers ..."
+echo "running $(wc -l < "$OUT/_tests.txt" | tr -d ' ') tests with $JOBS parallel workers ..."
 # `xargs -P` because a SERIAL pass over ~3,500 tests would run for hours and risk the job cap.
 xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$OUT/_tests.txt"
+
+# SERVER tests strictly one at a time, exactly as the Windows harness does. Each spins up its own
+# in-process green TCP server plus client; several at once starve the green scheduler and they
+# time out despite passing fine given the machine to themselves.
+if [ -s "$OUT/_serial.txt" ]; then
+  echo "running $(wc -l < "$OUT/_serial.txt" | tr -d ' ') SERVER tests serially ..."
+  while read -r st; do [ -n "$st" ] && run_one "$st"; done < "$OUT/_serial.txt"
+  cat "$OUT/_serial.txt" >> "$OUT/_tests.txt"
+fi
 
 # ── tally ──────────────────────────────────────────────────────────────────────────────────
 PASS=0; FAIL=0; FAILED=""
