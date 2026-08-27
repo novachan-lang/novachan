@@ -1571,13 +1571,13 @@ command both begins and ends with a quote — the bare form exits 1 in ~45 ms be
 
 | # | Feature | From | Effort | Status |
 |---|---------|------|--------|--------|
-| 5.1 | Linux native build | Go/Rust/all | M | WSL-once exists |
-| 5.2 | macOS native build | Swift/all | L | needs hardware |
+| 5.1 | Linux native build | Go/Rust/all | M | **✅ DONE 2026-08-27 — CI-GATED** (`ca1542a1`). `linux-selfhosted` on `ubuntu-latest`: builds from the checked-in bootstrap IR, asserts the native host resolves to `x86_64-unknown-linux-gnu` (not the Windows triple), **reconverges gen5 == gen6 byte-identical**, and passes the 60-test core suite. Was red on stale seeds — the seeds are generated artifacts and MUST be regenerated whenever codegen changes |
+| 5.2 | macOS native build | Swift/all | L | **✅ DONE 2026-08-27 — CI-GATED** (`ca1542a1`). `macos-selfhosted` on `macos-latest` = **real Apple Silicon**, so no hardware was ever needed. **RECONVERGED gen5 == gen6 byte-identical (3-pass)** + **62 PASS / 0 FAIL / 0 SKIP**. macOS had NEVER built before this date; it took 4 real bugs — `st_mtim`→`st_mtimespec`, an `epoll`→**kqueue** netpoller port, Mach-O asm (ELF `.type`/`.size` + the underscore symbol prefix), and the **bitwise type bug** (see below) |
 | 5.3 | WASM compilation target (LLVM wasm32) | JS/Rust | L | **✅ SUBSTANTIALLY EXISTS** — 9 WASM CI gates incl. native-vs-wasm agreement |
 | 5.4 | Cross-compilation (target triple param) | Go/Zig/Rust | M | **DONE 2026-08-25** — 6 targets emit correct triple+datalayout; IR lowers to a valid target OBJECT from any host with no sysroot; `nova emit --obj`; cross-link refuses with the real reason + `NOVA_SYSROOT` escape hatch. Gate 2p, 13/13 |
 | 5.5 | Single-command toolchain (bundle clang) | Go/Zig | M | **DONE 2026-08-26** — `nova_find_clang()`/`nova toolchain status` resolve `NOVA_CLANG` → `NOVA_HOME`-relative → install-relative → PATH → clear error (already landed in `ba86be42` alongside 5.4; this session verified it end-to-end). Dev bundler `tools/bundle_toolchain.{ps1,sh}` + gate `_toolchain_bundle_gate.ps1`, 6/6 cases incl. a PATH-scrubbed build, ALL GREEN. Dev bundle 202.0 MB (stock LLVM, PATH-independent, not zero-dep); shipping RELEASE bundle (llvm-mingw, zero-dep) already 81 MB Windows / 86 MB Linux via `install.ps1`/`install.sh` |
 | 5.6 | Prism → Canvas for browser (NOT WebGL — see below) | JS | XL | **✅ DONE 2026-08-27** — renderer + native KAT + JS decoder + `_prism_canvas_gate` all green through the full arc. (Live *wasm* execution of this path remains blocked by an unrelated, pre-existing runtime-carve gap — tracked separately; the Canvas backend itself is complete and gated natively.) |
-| 5.7 | ARM/AArch64 native | Go/Rust/all | L | needs hardware |
+| 5.7 | ARM/AArch64 native | Go/Rust/all | L | **🟡 SUBSTANTIALLY CLOSED 2026-08-27** — "needs hardware" was WRONG: `macos-latest` is arm64, so 5.2's green run **is** native AArch64 evidence. NOVA builds, self-hosts to a byte-identical fixpoint and passes its core suite on real ARM64 (`aarch64-apple-darwin`, Apple clang 21). The AAPCS64 fiber-switch asm is exercised by every one of those tests. REMAINING for a full ✅: **linux-aarch64**, which needs no hardware either — `ubuntu-24.04-arm` runners are free for public repos |
 
 ---
 

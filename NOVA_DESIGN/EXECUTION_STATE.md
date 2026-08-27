@@ -8,7 +8,54 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
-## ▶ CURRENT FOCUS (2026-08-27) — WEAPON PARITY: the last 8 items, THROUGH THE FULL ARC ✅
+## ▶ CURRENT FOCUS (2026-08-27, later) — CROSS-PLATFORM: Linux ✅ · macOS ✅ · Windows CI open
+
+**NOVA now builds, SELF-HOSTS to a byte-identical fixpoint, and passes its core suite on Linux
+x86_64 and macOS ARM64 — gated in GitHub Actions, not claimed.** This closes plan items **5.1**
+and **5.2** and substantially closes **5.7**.
+
+| job | runner | result (`ca1542a1`) |
+|---|---|---|
+| `linux-selfhosted` | ubuntu-latest | ✅ build · native triple · **reconverge gen5==gen6** · core suite |
+| `macos-selfhosted` | macos-latest (**real Apple Silicon**) | ✅ **reconverge byte-identical (3-pass)** · **62 PASS / 0 FAIL / 0 SKIP** |
+| `windows-full-regression` | windows-latest | ❌ full 3,590 suite fails at ~35 min (NOT a timeout) — diagnostics only just landed |
+
+**"Needs hardware" was never true.** GitHub's `macos-latest` is arm64, so it supplies both the
+macOS and the AArch64 evidence for free. `ubuntu-24.04-arm` (also free for public repos) would
+close linux-aarch64 and finish 5.7.
+
+**macOS had NEVER built before this date.** Four real bugs, each hidden behind the previous FATAL
+clang error — which is why they could only be found one CI round-trip at a time:
+
+1. `st_mtim` → `st_mtimespec` (Darwin predates POSIX.1-2008)
+2. `<sys/epoll.h>` does not exist on Darwin → a **kqueue netpoller**. Not mechanical: kqueue
+   reports one event per *(fd, FILTER)* where epoll reports one combined mask per fd, so results
+   must be COALESCED or the netpoller double-wakes its task
+3. Mach-O asm: ELF `.type`/`.size` are rejected outright, **and** Mach-O underscore-prefixes every
+   C symbol — the second produces NO compile error and would have been a link failure one round later
+4. **The bitwise type bug — the real one.** All five bitwise ops were absent from `ir_infer_one`,
+   so results stayed untyped and downstream `+` fell into `nova_rt_add`, which decides
+   int-vs-pointer by ADDRESS RANGE and *dereferences*. `+` on two ints could return a STRING
+   POINTER. Latent on every platform; x86_64 only ever guessed right because its heap sits ~10^14,
+   while macOS ARM64 maps the arena at ~4*10^10 — the same range as an ordinary bitmap.
+   Fixed `7ffeaf6c`, full arc green (reconverge byte-identical, 3592/0 both modes). Also a PERF
+   fix: every shift/mask-derived add was a function call instead of one instruction.
+
+**Two bugs, one shape.** The bitwise bug hid on x86_64 because the heap happened to sit far from
+integer data; the `timeout` bug hid on Linux because coreutils happened to be installed. Both were
+latent everywhere and needed a *different platform* to expose them. A green suite on one platform
+cannot catch this class — 3592 tests × 2 memory modes × a byte-identical fixpoint all passed while
+the bitwise bug was live.
+
+**Scope honesty:** Linux/macOS run the **60-test core suite**, not the full 3,590. So the defensible
+claim is *"the NOVA compiler builds, self-hosts and runs correctly on Windows, Linux and
+macOS-ARM64"* — NOT "the whole stack works everywhere". The full suite is Windows-only today; the
+runner is nearly portable (only `$NovaLinkFlags = "-lws2_32 -ladvapi32"` is Windows-specific), so
+full parity is a tractable follow-up, not a rewrite.
+
+---
+
+## ▶ PREVIOUS FOCUS (2026-08-27) — WEAPON PARITY: the last 8 items, THROUGH THE FULL ARC ✅
 
 Owner directive: develop 1.6 → 5.6 without stopping, then ONE full arc for all of it. **DONE.** All eight
 are implemented, gated, and have now cleared the arc: reconverge `gen5.ll == gen6.ll` byte-identical
