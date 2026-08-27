@@ -72,8 +72,11 @@ jobs:
           $fails = @($all | Where-Object { $_ -match '^(FAIL|TIMEOUT)' } | Select-Object -First 20)
           if ($fails.Count -gt 0) {
             Write-Host "::error title=Windows regression FAILS ($($fails.Count) shown)::$(($fails -join ' | '))"
-          } else {
-            Write-Host "::notice title=Windows regression::exit=$code but no FAIL lines matched -- suite likely died early; see summary above"
+          } elseif ($code -ne 0) {
+            # ONLY meaningful when the run actually failed. This branch used to fire on SUCCESS
+            # too, so a clean 3592 PASS / 0 FAIL was reported as "suite likely died early" --
+            # a false alarm that would teach a future reader to distrust a genuine green.
+            Write-Host "::error title=Windows regression::exit=$code but no FAIL line matched -- the suite died before reporting; see the setup notice above"
           }
           exit $code
         timeout-minutes: 90
@@ -497,3 +500,41 @@ jobs:
           if [ $FAIL -gt 0 ]; then exit 1; fi
 
   # ─── macOS (Kotlin bootstrap, legacy reference) ───────
+
+  # ─── TIER 2: the FULL suite on POSIX. NON-BLOCKING until it is green. ───────────────
+  # The selfhosted jobs above run a hand-listed 60-test core suite, because they never synced
+  # forge/ + prism/ into $NOVA_HOME/lib -- so anything doing `import forge...` could not resolve.
+  # Windows runs all ~3,590. This job closes that gap and turns "the COMPILER works on three
+  # platforms" into "NOVA works on three platforms".
+  #
+  # continue-on-error: TRUE ON PURPOSE. Linux and macOS are green today; this suite has never run
+  # on POSIX, so its first pass will surface real unknowns (macOS took four genuine bugs to go
+  # from "never built" to green). Reporting them WITHOUT turning the board red is the point --
+  # flip this to blocking once it passes.
+  posix-full-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y clang lld
+
+      - name: Build self-hosted compiler from the checked-in seed
+        run: |
+          cd nova-compiler/compiler
+          if [ "$(uname -s)" = "Darwin" ]; then
+            clang -O2 -o nova nova_compiler_macos.ll nova_runtime.c -lm -Wno-everything -D_DARWIN_C_SOURCE
+          else
+            clang -O2 -o nova nova_compiler_linux.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          fi
+          ./nova --version || true
+
+      - name: Run FULL suite
+        run: bash .github/scripts/posix_full_suite.sh
+        timeout-minutes: 180
