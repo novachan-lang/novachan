@@ -56,6 +56,22 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath -- Darwin has no /proc/self/exe */
+#include <stdlib.h>        /* realpath */
+#endif
+/* mmap flag spellings differ. Darwin's historical name is MAP_ANON (MAP_ANONYMOUS is a
+   later alias), and MAP_NORESERVE is a Linux extension that not every platform defines.
+   Both fallbacks are no-ops where the real flag exists: MAP_NORESERVE is only a hint not
+   to reserve swap, so 0 is a correct and safe substitute. */
+#ifndef MAP_ANONYMOUS
+#  ifdef MAP_ANON
+#    define MAP_ANONYMOUS MAP_ANON
+#  endif
+#endif
+#ifndef MAP_NORESERVE
+#  define MAP_NORESERVE 0
+#endif
 #include <signal.h>   /* hoisted: the fiber stack-overflow guard below needs sigaction/sigaltstack,
                          and the pre-existing include sat ~2500 lines AFTER the fiber code */
 #include <fcntl.h>
@@ -17401,6 +17417,27 @@ int64_t nova_rt_self_exe_path(void) {
     if (!result) return (int64_t)(uintptr_t)"";
     WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, result, u8len, NULL, NULL);
     result[u8len] = '\0';
+    return (int64_t)(uintptr_t)result;
+#elif defined(__APPLE__)
+    /* Darwin has NO /proc, so the readlink path below returns -1 and this function would
+       hand back "" -- silently, with no error. That breaks every executable-relative
+       lookup (NOVA_HOME, and nova_find_clang()'s install-relative probe for the bundled
+       toolchain) in a way nothing reports. _NSGetExecutablePath is the Darwin equivalent. */
+    char raw[4096];
+    uint32_t rawlen = (uint32_t)sizeof(raw);
+    if (_NSGetExecutablePath(raw, &rawlen) != 0) return (int64_t)(uintptr_t)"";
+    /* _NSGetExecutablePath may return a path containing symlinks or ".." components;
+       realpath canonicalises it to match what /proc/self/exe already yields on Linux. */
+    char buf[4096];
+    if (!realpath(raw, buf)) {
+        size_t rl = strlen(raw);                 /* realpath failing is not fatal -- the raw */
+        if (rl >= sizeof(buf)) return (int64_t)(uintptr_t)"";  /* path still locates the binary */
+        memcpy(buf, raw, rl + 1);
+    }
+    size_t n = strlen(buf);
+    char* result = (char*)nova_heap_alloc(n + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, buf, n + 1);
     return (int64_t)(uintptr_t)result;
 #else
     char buf[4096];
