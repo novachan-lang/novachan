@@ -8736,10 +8736,25 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
            page at the reserve boundary (verified repeatable). Report a
            contained crash exactly like nova_panic, then fall through to the normal
            fiber-exit path so the carrier survives and runs the remaining tasks. */
-        _resetstkoflw();
+        /* _resetstkoflw RETURNS A STATUS and it can FAIL. Ignoring it was a real gap: on
+           failure the guard page is NOT restored, so the NEXT overflow on this stack faults
+           straight into unmapped memory as an ACCESS VIOLATION (0xC0000005) rather than a
+           catchable EXCEPTION_STACK_OVERFLOW -- and an AV is uncontainable, so the whole
+           process dies instead of one task. That is exactly the signature seen intermittently
+           on the CI runner (overflow_recovery_test / _stackovf_test, exit=-1073741819) while
+           30/30 local runs pass, so the failing path is environment-sensitive and must be
+           OBSERVABLE before it can be diagnosed. Reporting it does not change behaviour on the
+           success path; it only stops a failed reset from being silently indistinguishable
+           from a successful one. */
+        int _rso = _resetstkoflw();
         f->task.crashed = 1;
         nova_set_error("stack overflow");
-        fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\"\n");
+        if (!_rso) {
+            fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\" guard_restored=0"
+                            " note=\"_resetstkoflw FAILED; a further overflow on this stack would be an uncontainable AV\"\n");
+        } else {
+            fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\"\n");
+        }
         fflush(stderr);
     }
     f->task.fault_active = 0;
