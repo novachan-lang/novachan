@@ -1,0 +1,146 @@
+// ADVERSARIAL RE-VERIFICATION (independent of the fixer's own KAT additions):
+// forge_grpc's HPACK header-block decoder (grpc_hpack_decode_headers /
+// _grpc_hpack_decode_string), re-derived from RFC 7541 with an attacker/MITM
+// h2c threat model. Targets the exact claimed defect: a truncated/OOB literal
+// NAME or VALUE string must NEVER fabricate a header, and — critically — must
+// NEVER let the decoder loop resume scanning the leftover/undersized bytes as
+// a fresh HPACK opcode (that resumption is what turns "truncated data" into
+// "attacker-controlled spoofed header"). Exercises BOTH literal branches
+// (Literal w/ Incremental Indexing 0x40 prefix, and Literal without Indexing
+// 0x00 prefix) independently — they are separate code paths in
+// grpc_hpack_decode_headers and a fix to one does not guarantee the other.
+import forge_grpc
+
+fn mkb(xs: list) -> bytes
+    let out = bytes(0)
+    let i = 0
+    while i < len(xs)
+        out = bytes_append(out, xs[i])
+        i = i + 1
+    out
+
+fn main()
+    // ── 1. Literal w/ Incremental Indexing (0x40), truncated NAME ──────────────
+    //      0x40 + name-length=5 but only 2 bytes ('a','b') follow before EOF.
+    let t1 = bytes(0)
+    t1 = bytes_append(t1, 0x40)
+    t1 = bytes_concat(t1, mkb([5, 0x61, 0x62]))
+    let d1 = grpc_hpack_decode_headers(t1, 0)
+    if len(d1) != 0
+        print("FAIL 1: 0x40-branch truncated NAME fabricated headers: " + str(d1))
+        exit(1)
+
+    // ── 2. Literal w/ Incremental Indexing (0x40), valid NAME, truncated VALUE ──
+    //      0x40 + name="ab" (len2) + value-length=9 but only 1 byte follows.
+    let t2 = bytes(0)
+    t2 = bytes_append(t2, 0x40)
+    t2 = bytes_concat(t2, mkb([2, 0x61, 0x62]))
+    t2 = bytes_concat(t2, mkb([9, 0x63]))
+    let d2 = grpc_hpack_decode_headers(t2, 0)
+    if len(d2) != 0
+        print("FAIL 2: 0x40-branch truncated VALUE fabricated headers: " + str(d2))
+        exit(1)
+
+    // ── 3. Literal without Indexing (0x00), NAME's own length-prefix is itself ──
+    //      truncated (multi-byte HPACK-int continuation with no continuation
+    //      byte present) -- distinct from "declared length runs past buf": here
+    //      the LENGTH ENCODING never finishes at all. 0x00 + 0x7F (all 7 prefix
+    //      bits set -> signals a continuation byte follows) + nothing.
+    let t3 = mkb([0x00, 0x7F])
+    let d3 = grpc_hpack_decode_headers(t3, 0)
+    if len(d3) != 0
+        print("FAIL 3: 0x00-branch truncated length-PREFIX fabricated headers: " + str(d3))
+        exit(1)
+
+    // ── 4. Exact-boundary fit must SUCCEED (regression guard against an ────────
+    //      off-by-one over-correction): 0x40 + name="a"(len1) + value="b"(len1),
+    //      buffer ends EXACTLY where the value ends -- must decode fine, not be
+    //      mistaken for truncation.
+    let t4 = mkb([0x40, 1, 0x61, 1, 0x62])
+    let d4 = grpc_hpack_decode_headers(t4, 0)
+    if len(d4) != 1
+        print("FAIL 4: exact-boundary header wrongly rejected: " + str(d4))
+        exit(1)
+    if d4[0][0] != "a" or d4[0][1] != "b"
+        print("FAIL 4b: exact-boundary header content wrong: " + str(d4))
+        exit(1)
+
+    // ── 5. Partial-result preservation: header #1 valid, header #2 truncated ───
+    //      must return exactly the 1 valid header, not 0 (over-eager) and not a
+    //      fabricated 2nd (under-checked). 0x00+"ok"(2)+"go"(2) then
+    //      0x00+len5+"xy" (2 bytes present, claims 5).
+    let t5 = bytes(0)
+    t5 = bytes_append(t5, 0x00)
+    t5 = bytes_concat(t5, mkb([2, 0x6F, 0x6B]))
+    t5 = bytes_concat(t5, mkb([2, 0x67, 0x6F]))
+    t5 = bytes_append(t5, 0x00)
+    t5 = bytes_concat(t5, mkb([5, 0x78, 0x79]))
+    let d5 = grpc_hpack_decode_headers(t5, 0)
+    if len(d5) != 1
+        print("FAIL 5: partial-result count wrong: " + str(d5))
+        exit(1)
+    if d5[0][0] != "ok" or d5[0][1] != "go"
+        print("FAIL 5b: partial-result first header corrupted: " + str(d5))
+        exit(1)
+
+    // ── 6. THE EXPLOIT SHAPE: truncated NAME immediately followed by bytes that ──
+    //      spell out a well-formed Indexed Header Field (0x82 = index 2 =
+    //      (":method","GET")). Before the fix, a truncation returned next_pos
+    //      UNCHANGED, so the scan resumed and reinterpreted leftover/adjacent
+    //      bytes as a fresh opcode -- an attacker who controls what follows the
+    //      truncation point could get a header fabricated from THEIR chosen
+    //      bytes. Must decode to ZERO headers: the scan must stop dead at the
+    //      truncation and never look at the 0x82 at all.
+    let t6 = bytes(0)
+    t6 = bytes_append(t6, 0x00)
+    t6 = bytes_concat(t6, mkb([5, 0x61, 0x62]))
+    t6 = bytes_append(t6, 0x82)
+    let d6 = grpc_hpack_decode_headers(t6, 0)
+    if len(d6) != 0
+        print("FAIL 6: truncation + trailing spoof opcode fabricated headers: " + str(d6))
+        exit(1)
+
+    // ── 7. Same exploit shape, VALUE side, with the trailing spoof opcode ───────
+    //      encoding a DIFFERENT indexed field (0x84 = index 4 = (":path","/")).
+    let t7 = bytes(0)
+    t7 = bytes_append(t7, 0x00)
+    t7 = bytes_concat(t7, mkb([2, 0x61, 0x62]))
+    t7 = bytes_concat(t7, mkb([9, 0x63]))
+    t7 = bytes_append(t7, 0x84)
+    let d7 = grpc_hpack_decode_headers(t7, 0)
+    if len(d7) != 0
+        print("FAIL 7: value-truncation + trailing spoof opcode fabricated headers: " + str(d7))
+        exit(1)
+
+    // ── 8. END-TO-END through the actual attacker-reachable entry point: build ──
+    //      a trailers-only gRPC response whose grpc-status literal VALUE is
+    //      truncated, with a trailing byte shaped like a legit continuation of
+    //      a "grpc-status: 0" (OK) spoof. grpc_client_parse_response must NOT
+    //      report a fabricated/spoofed status -- it must stay at the documented
+    //      sentinel -1 (no valid trailer seen), never a fake 0 (OK) or any
+    //      other attacker-chosen value.
+    let trailer_body = bytes(0)
+    trailer_body = bytes_append(trailer_body, 0x00)
+    trailer_body = bytes_concat(trailer_body, mkb([11, 0x67, 0x72, 0x70, 0x63, 0x2D, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73]))
+    // value length claims 20 bytes, only "0" (1 byte) present -> truncated
+    trailer_body = bytes_concat(trailer_body, mkb([20, 0x30]))
+    // build the frame header by hand to match the exact truncated body length
+    let resp = bytes(0)
+    // HEADERS frame: length = bytes_len(trailer_body), type=1 (HEADERS), flags=0x5 (END_STREAM|END_HEADERS), stream_id=1
+    let blen = bytes_len(trailer_body)
+    resp = bytes_append(resp, (blen >> 16) & 0xFF)
+    resp = bytes_append(resp, (blen >> 8) & 0xFF)
+    resp = bytes_append(resp, blen & 0xFF)
+    resp = bytes_append(resp, 1)
+    resp = bytes_append(resp, 0x5)
+    resp = bytes_append(resp, 0)
+    resp = bytes_append(resp, 0)
+    resp = bytes_append(resp, 0)
+    resp = bytes_append(resp, 1)
+    resp = bytes_concat(resp, trailer_body)
+    let parsed = grpc_client_parse_response(resp)
+    if parsed["status"] != 0 - 1
+        print("FAIL 8: end-to-end spoofed/fabricated grpc-status: got " + str(parsed["status"]) + " want sentinel -1")
+        exit(1)
+
+    print("PASS forge_grpc_hpack_adv_kat")

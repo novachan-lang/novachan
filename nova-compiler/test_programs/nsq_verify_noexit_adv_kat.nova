@@ -1,0 +1,116 @@
+// INDEPENDENT adversarial re-verification of the forge_nsq.nova fix (HIGH: command builders used to
+// exit(1) via _nsq_check_token on a bad caller-supplied topic/channel/id, killing the whole host process).
+// Written from scratch against the NSQ wire-protocol spec (https://nsq.io/clients/tcp_protocol_spec.html)
+// and the module's own stated injection-defense contract (block "\n"/"\r"/" "/"\t" -- the four characters
+// that have syntactic meaning in the line-based command format), WITHOUT trusting the fixer's own KAT.
+//
+// Attacks:
+//   1. Every one of the six token-validating builders (sub/pub/mpub/fin/req/touch), each with a DIFFERENT
+//      invalid character class (space, "\n", "\r", "\t", empty string, and a non-delimiter control char
+//      0x01 which the module's contract does NOT promise to reject -- probing the documented boundary).
+//   2. Proof the process survives: BEFORE/AFTER markers bracket every bad call; final exit code must be 0.
+//   3. Every builder's VALID-input happy path still produces byte-exact wire frames (fix must not have
+//      collaterally damaged the correct-input path via the added guard).
+//   4. A multi-bad-call sequence back-to-back (no single-fault masking another).
+
+import forge_nsq as nsq
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn beq(a: any, b: any) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    let ok = true
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = false
+        i = i + 1
+    ok
+
+fn main()
+    print("MARKER_START")
+
+    // ── attack 1: SUB with space-poisoned channel (would splice a 3rd SUB argument) ─────────────────
+    let r1 = nsq.nsq_cmd_sub("orders", "ch annel")
+    print("MARKER_AFTER_SUB_SPACE")
+    check("sub_space_channel_sentinel", bytes_len(r1) == 0)
+
+    // ── attack 2: PUB with newline-poisoned topic (would inject a bogus second command line) ────────
+    let r2 = nsq.nsq_cmd_pub("evil\nRDY 99999", "payload")
+    print("MARKER_AFTER_PUB_NEWLINE")
+    check("pub_newline_topic_sentinel", bytes_len(r2) == 0)
+
+    // ── attack 3: MPUB with CR-poisoned topic ────────────────────────────────────────────────────────
+    let r3 = nsq.nsq_cmd_mpub("orders\rdemo", ["a", "b"])
+    print("MARKER_AFTER_MPUB_CR")
+    check("mpub_cr_topic_sentinel", bytes_len(r3) == 0)
+
+    // ── attack 4: FIN with tab-poisoned id ───────────────────────────────────────────────────────────
+    let r4 = nsq.nsq_cmd_fin("id1\tid2")
+    print("MARKER_AFTER_FIN_TAB")
+    check("fin_tab_id_sentinel", bytes_len(r4) == 0)
+
+    // ── attack 5: REQ with empty-string id (empty is also invalid per nsq_valid_token) ──────────────
+    let r5 = nsq.nsq_cmd_req("", 5000)
+    print("MARKER_AFTER_REQ_EMPTY")
+    check("req_empty_id_sentinel", bytes_len(r5) == 0)
+
+    // ── attack 6: TOUCH with a plain space in the id ─────────────────────────────────────────────────
+    let r6 = nsq.nsq_cmd_touch("id 1")
+    print("MARKER_AFTER_TOUCH_SPACE")
+    check("touch_space_id_sentinel", bytes_len(r6) == 0)
+
+    // ── attack 7: back-to-back bad calls with no valid call between (no single-fault masking) ────────
+    let r7a = nsq.nsq_cmd_pub("a b", "x")
+    let r7b = nsq.nsq_cmd_sub("c\nd", "e\tf")
+    let r7c = nsq.nsq_cmd_fin("g\rh")
+    print("MARKER_AFTER_TRIPLE_BAD")
+    check("triple_bad_1", bytes_len(r7a) == 0)
+    check("triple_bad_2", bytes_len(r7b) == 0)
+    check("triple_bad_3", bytes_len(r7c) == 0)
+
+    // ── boundary probe: a non-delimiter control byte (0x01). The module's OWN documented contract only
+    // promises to reject "\n"/"\r"/" "/"\t" (the wire-syntax delimiters), not general control chars -- so
+    // this is expected to be ACCEPTED (not a regression; documents the actual boundary rather than
+    // assuming the diagnostic-message wording "whitespace/control chars" means every control byte).
+    let ctrl_topic = "orders" + chr(1) + "x"
+    let r8 = nsq.nsq_cmd_pub(ctrl_topic, "y")
+    print("MARKER_AFTER_CTRL_BYTE")
+    check("ctrl_byte_0x01_topic_accepted_per_documented_contract", bytes_len(r8) != 0)
+
+    print("MARKER_ALL_BAD_CALLS_SURVIVED")
+
+    // ── happy-path exactness for ALL SIX builders (guard must not corrupt/short-circuit valid input) ──
+    check("sub_valid_exact", beq(nsq.nsq_cmd_sub("t1", "c1"), str_to_bytes("SUB t1 c1\n")))
+
+    // "PUB t1\n" (7 bytes) + BE32 len=2 (4 bytes) + "hi" (2 bytes) = 13 bytes total.
+    let pub_good = nsq.nsq_cmd_pub("t1", "hi")
+    check("pub_valid_len", bytes_len(pub_good) == 13)
+    check("pub_valid_head", beq(bytes_slice(pub_good, 0, 3), str_to_bytes("PUB")))
+    check("pub_valid_body", beq(bytes_slice(pub_good, 11, 13), str_to_bytes("hi")))
+
+    let mpub_good = nsq.nsq_cmd_mpub("t1", ["ab", "c"])
+    // "MPUB t1\n" (8) + BE32 total-inner-size (4) + BE32 num=2 (4) + BE32 len=2(4)+"ab"(2) + BE32 len=1(4)+"c"(1)
+    check("mpub_valid_len", bytes_len(mpub_good) == 8 + 4 + 4 + 4 + 2 + 4 + 1)
+    check("mpub_valid_head", beq(bytes_slice(mpub_good, 0, 8), str_to_bytes("MPUB t1\n")))
+
+    check("fin_valid_exact", beq(nsq.nsq_cmd_fin("mid1"), str_to_bytes("FIN mid1\n")))
+    check("req_valid_exact", beq(nsq.nsq_cmd_req("mid1", 3000), str_to_bytes("REQ mid1 3000\n")))
+    check("touch_valid_exact", beq(nsq.nsq_cmd_touch("mid1"), str_to_bytes("TOUCH mid1\n")))
+
+    print("MARKER_END")
+
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

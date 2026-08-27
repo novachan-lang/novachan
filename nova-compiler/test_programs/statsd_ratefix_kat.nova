@@ -1,0 +1,46 @@
+// KAT: forge_statsd fix verification -- proves two confirmed defects are gone.
+// 1. HIGH: rate parameter silently mis-sampled when the caller passed an int literal
+//    (e.g. rate=1) instead of a float, because comparing a float-typed var that still holds
+//    int bits against a float literal is unsound in NOVA. Fixed by coercing `rate * 1.0`
+//    before any comparison/formatting in both _statsd_clamp_rate and _statsd_line.
+// 2. MEDIUM: statsd_format_gauge for a NEGATIVE value emitted a line beginning with "-",
+//    which every real StatsD server interprets as a relative DECREMENT, never an absolute
+//    set -- making an absolute negative gauge set indistinguishable from a delta. Fixed by
+//    guarding statsd_format_gauge to clamp a negative value to "0" and directing callers who
+//    want a decrement to statsd_format_gauge_delta.
+import forge_statsd
+
+fn main()
+    // ── defect 1: int-literal rate must behave identically to the equivalent float rate ─────
+    // rate=1 (int literal) must mean "no sampling" -- no |@ suffix -- exactly like rate=1.0.
+    assert_eq(statsd_format_counter("req", 1, 1, []), "req:1|c")
+    assert_eq(statsd_format_timer("req", 5, 1, []), "req:5|ms")
+    assert_eq(statsd_format_histogram("req", 5, 1, []), "req:5|h")
+    // rate=0.1 (a genuine sub-1.0 float) must still emit the |@0.1 suffix correctly -- proves
+    // the coercion didn't break the real sampling path while fixing the int-literal footgun.
+    assert_eq(statsd_format_counter("req", 1, 0.1, []), "req:1|c|@0.1")
+    // rate=0 (int literal, the zero-sampling extreme) must clamp to the epsilon floor and
+    // still carry the |@ suffix -- not silently vanish and not silently omit it.
+    assert_eq(statsd_format_counter("req", 1, 0, []), "req:1|c|@0.0001")
+    // A float rate of exactly 1.0 -- the control case -- must still omit the suffix.
+    assert_eq(statsd_format_counter("req", 1, 1.0, []), "req:1|c")
+
+    // ── defect 2: negative absolute gauge set must not read as a decrement ──────────────────
+    // An absolute set of a negative value is unrepresentable on the wire; the module must
+    // guard it (clamp to 0) rather than emit a line indistinguishable from a delta.
+    let neg_set = statsd_format_gauge("temp", -12, [])
+    assert_eq(neg_set, "temp:0|g")
+    // The dedicated delta formatter is the unambiguous way to actually decrement: it always
+    // carries an explicit sign, so it can never be confused with the (now-guarded) set path.
+    let dec = statsd_format_gauge_delta("temp", -12, [])
+    assert_eq(dec, "temp:-12|g")
+    // The two must never collide -- that collision was the exact ambiguity being fixed.
+    assert_eq(neg_set == dec, false)
+    // A non-negative absolute set is unaffected by the guard.
+    assert_eq(statsd_format_gauge("temp", 12, []), "temp:12|g")
+    assert_eq(statsd_format_gauge("temp", 0, []), "temp:0|g")
+    // Float negative value through the same guard (str() first-byte check, not a numeric
+    // comparison, so it must work identically for float and int).
+    assert_eq(statsd_format_gauge("temp", -3.5, []), "temp:0|g")
+
+    print("statsd ratefix kat passed")

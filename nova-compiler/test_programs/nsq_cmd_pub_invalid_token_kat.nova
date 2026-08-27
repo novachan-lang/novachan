@@ -1,0 +1,84 @@
+// KAT proving the forge_nsq.nova fix: an invalid (whitespace/control-char-bearing) caller-supplied
+// topic/channel/id no longer crashes the host process via exit(1) -- it now returns an in-band empty
+// `bytes()` sentinel from the command builder, and the calling process keeps running normally. A valid
+// topic must still produce the exact correct wire bytes (the fix must not weaken the happy path).
+//
+// Proof technique: print a marker BEFORE the bad call and another marker AFTER it. If the old exit(1)
+// behavior were still present, the process would terminate mid-call and "AFTER_BAD_CALL" + "ALL PASS"
+// would never be printed, and the process exit code would be nonzero (_run1.ps1 reports "run exit=...").
+
+import forge_nsq as nsq
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn bytes_eq(a: any, b: any) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    let ok = true
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = false
+        i = i + 1
+    ok
+
+fn main()
+    print("BEFORE_BAD_CALL")
+
+    // ── 1. nsq_cmd_pub with a topic containing a space -> empty sentinel, process survives ──────────
+    let bad_space = nsq.nsq_cmd_pub("orders demo", "hello")
+    check("pub_space_topic_returns_empty_sentinel", bytes_len(bad_space) == 0)
+
+    print("AFTER_BAD_CALL")
+
+    // ── 2. nsq_cmd_pub with a topic containing a newline -> empty sentinel, process survives ────────
+    let bad_nl = nsq.nsq_cmd_pub("orders\ndemo", "hello")
+    check("pub_newline_topic_returns_empty_sentinel", bytes_len(bad_nl) == 0)
+
+    // ── 3. nsq_cmd_pub with a topic containing a tab / CR -> empty sentinel too ──────────────────────
+    let bad_tab = nsq.nsq_cmd_pub("orders\tdemo", "hello")
+    check("pub_tab_topic_returns_empty_sentinel", bytes_len(bad_tab) == 0)
+    let bad_cr = nsq.nsq_cmd_pub("orders\rdemo", "hello")
+    check("pub_cr_topic_returns_empty_sentinel", bytes_len(bad_cr) == 0)
+
+    // ── 4. nsq_cmd_pub with an empty topic -> also invalid -> empty sentinel ────────────────────────
+    let bad_empty = nsq.nsq_cmd_pub("", "hello")
+    check("pub_empty_topic_returns_empty_sentinel", bytes_len(bad_empty) == 0)
+
+    // ── 5. a VALID topic still produces the exact correct bytes (fix does not weaken the happy path) ─
+    // "PUB orders\n" (11 bytes) + BE32 len=5 (00 00 00 05) + "hello" (5 bytes) = 20 bytes total.
+    let good = nsq.nsq_cmd_pub("orders", "hello")
+    check("pub_valid_topic_not_empty", bytes_len(good) != 0)
+    check("pub_valid_topic_total_len_20", bytes_len(good) == 20)
+    check("pub_valid_topic_head_exact", bytes_eq(bytes_slice(good, 0, 11), str_to_bytes("PUB orders\n")))
+    check("pub_valid_topic_body_exact", bytes_eq(bytes_slice(good, 15, 20), str_to_bytes("hello")))
+
+    // ── 6. the other five command builders that validate a token also return the empty sentinel ─────
+    // (not exit(1)) for the same class of bad input -- confirms the fix was applied uniformly, not just
+    // to nsq_cmd_pub.
+    check("sub_bad_channel_returns_empty_sentinel", bytes_len(nsq.nsq_cmd_sub("orders", "bad channel")) == 0)
+    check("mpub_bad_topic_returns_empty_sentinel", bytes_len(nsq.nsq_cmd_mpub("bad topic", ["a"])) == 0)
+    check("fin_bad_id_returns_empty_sentinel", bytes_len(nsq.nsq_cmd_fin("bad\nid")) == 0)
+    check("req_bad_id_returns_empty_sentinel", bytes_len(nsq.nsq_cmd_req("bad id", 1000)) == 0)
+    check("touch_bad_id_returns_empty_sentinel", bytes_len(nsq.nsq_cmd_touch("bad\tid")) == 0)
+
+    // ── 7. and their valid-input happy paths still work correctly too ───────────────────────────────
+    check("sub_valid_still_correct", bytes_eq(nsq.nsq_cmd_sub("orders", "ch"), str_to_bytes("SUB orders ch\n")))
+    check("fin_valid_still_correct", bytes_eq(nsq.nsq_cmd_fin("id1"), str_to_bytes("FIN id1\n")))
+
+    print("PROCESS_STILL_ALIVE_AFTER_ALL_BAD_CALLS")
+
+    // ── summary ──
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

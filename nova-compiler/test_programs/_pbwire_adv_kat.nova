@@ -1,0 +1,195 @@
+// Independent adversarial verification KAT for std/encoding/protobuf.
+// Re-derives expected values from the protobuf spec independently of the
+// module author's own KAT. Probes cases the author's KAT did NOT cover.
+import std/encoding/protobuf
+import std/encoding/varint
+import std/bits/zigzag
+
+fn _pt_bytes_eq(a, b) -> int
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn _pt_make_bytes(lst) -> any
+    let buf = bytes(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn ckb(label, got, want_list) -> int
+    let want = _pt_make_bytes(want_list)
+    if _pt_bytes_eq(got, want) == 0
+        print("FAIL " + label + ": got len=" + str(bytes_len(got)) + " want len=" + str(bytes_len(want)))
+        exit(1)
+    0
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+// ── ADV 1: THE canonical protobuf spec example — field 1, varint 150 ────────
+// developers.google.com/protocol-buffers/docs/encoding worked example:
+//   0000 1000 0000 1001 0110 0001  =>  08 96 01
+fn adv_spec_varint150() -> int
+    let enc = pb_encode_varint_field(1, 150)
+    ckb("field1=150 (spec canonical example)", enc, [0x08, 0x96, 0x01])
+    let dec = pb_decode_varint_field(enc, 0)
+    cki("decode field1 num", dec[0], 1)
+    cki("decode field1 value", dec[1], 150)
+
+// ── ADV 2: multi-byte tag — field number requiring a 2-byte tag varint ──────
+// field 16, wiretype VARINT(0): tag = (16<<3)|0 = 128 -> varint needs 2 bytes: 80 01
+fn adv_multibyte_tag() -> int
+    ckb("tag(16,VARINT)", pb_encode_tag(16, pb_wire_varint()), [0x80, 0x01])
+    let tg = pb_read_tag(_pt_make_bytes([0x80, 0x01, 0x2A]), 0)
+    cki("read multibyte tag num", tg[0], 16)
+    cki("read multibyte tag wiretype", tg[1], pb_wire_varint())
+    cki("read multibyte tag next_pos", tg[2], 2)
+    // field 1000000, wiretype LEN(2): tag = (1000000<<3)|2 = 8000002
+    let tag2 = pb_encode_tag(1000000, pb_wire_len())
+    let rt = pb_read_tag(tag2, 0)
+    cki("field 1000000 roundtrip num", rt[0], 1000000)
+    cki("field 1000000 roundtrip wt", rt[1], pb_wire_len())
+
+// ── ADV 3: int32/int64 boundary negatives beyond -1/-2 ──────────────────────
+// int32 min (-2147483648) sign-extended to 64-bit two's complement must
+// still produce the canonical 10-byte varint (bit 63 set via sign extension).
+fn adv_int32_min_boundary() -> int
+    let n = 0 - 2147483648
+    let enc = pb_encode_int_field(3, n)
+    cki("int32min wire byte count", bytes_len(enc), 11)  // 1 tag + 10 data
+    let dec = pb_decode_int_field(enc, 0)
+    cki("int32min roundtrip", dec[1], n)
+    // int64 near-min extreme (large magnitude negative, not just -1/-2)
+    let n2 = 0 - 9223372036854775807
+    let enc2 = pb_encode_int_field(3, n2)
+    let dec2 = pb_decode_int_field(enc2, 0)
+    cki("int64 near-min roundtrip", dec2[1], n2)
+
+// ── ADV 4: sint zigzag at int32 boundary values ──────────────────────────────
+fn adv_sint_int32_boundary() -> int
+    let vals = [2147483647, -2147483648, 2147483648, -2147483649]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_sint_field(2, n)
+        let dec = pb_decode_sint_field(enc, 0)
+        cki("sint boundary roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    0
+
+// ── ADV 5: pb_read_len_delim with pos EXACTLY at buffer end (no bytes left) ─
+fn adv_len_delim_at_exact_end() -> int
+    let buf = _pt_make_bytes([0x00])  // varint length=0, then nothing
+    let r = pb_read_len_delim(buf, 0)
+    cki("exact-end payload len", bytes_len(r[0]), 0)
+    cki("exact-end next_pos", r[1], 1)
+    0
+
+// ── ADV 6: pb_read_len_delim / pb_read_tag with pos WAY PAST buffer end ─────
+// (pos > bytes_len(buf), not just == ) must not crash, must clamp safely.
+fn adv_pos_past_end() -> int
+    let buf = _pt_make_bytes([0x41, 0x42, 0x43])
+    let tg = pb_read_tag(buf, 50)
+    cki("pos-past-end tag field_num", tg[0], 0)
+    cki("pos-past-end tag next_pos", tg[2], 50)
+    let r = pb_read_len_delim(buf, 50)
+    cki("pos-past-end len_delim payload", bytes_len(r[0]), 0)
+    0
+
+// ── ADV 7: multiple LEN fields back-to-back with embedded empty ones ────────
+fn adv_multi_len_fields() -> int
+    let msg = bytes(0)
+    msg = bytes_concat(msg, pb_encode_string_field(1, "a"))
+    msg = bytes_concat(msg, pb_encode_string_field(2, ""))
+    msg = bytes_concat(msg, pb_encode_string_field(3, "bcd"))
+    let total = bytes_len(msg)
+
+    let pos = 0
+    let d1 = pb_decode_string_field(msg, pos)
+    cki("multi f1 num", d1[0], 1)
+    if d1[1] != "a"
+        print("FAIL multi f1 value")
+        exit(1)
+    pos = d1[2]
+
+    let d2 = pb_decode_string_field(msg, pos)
+    cki("multi f2 num", d2[0], 2)
+    if d2[1] != ""
+        print("FAIL multi f2 value should be empty")
+        exit(1)
+    pos = d2[2]
+
+    let d3 = pb_decode_string_field(msg, pos)
+    cki("multi f3 num", d3[0], 3)
+    if d3[1] != "bcd"
+        print("FAIL multi f3 value")
+        exit(1)
+    pos = d3[2]
+    cki("multi fully consumed", pos, total)
+    0
+
+// ── ADV 8: fixed64 negative round trip byte-exact (not just value roundtrip) ─
+// fixed64(-1) must be all-FF (8 bytes), tag for field 11 wiretype I64 = (11<<3)|1=89=0x59
+fn adv_fixed64_neg1_bytes() -> int
+    let enc = pb_encode_fixed64_field(11, 0 - 1)
+    ckb("fixed64(-1) bytes", enc, [0x59, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    0
+
+// ── ADV 9: bytes field containing ALL possible byte values incl. 0x00/0xFF ──
+// stresses binary-safety across the full byte range, not just one 0x00.
+fn adv_full_byte_range() -> int
+    let raw = bytes(0)
+    let i = 0
+    while i < 256
+        raw = bytes_append(raw, i)
+        i = i + 1
+    let enc = pb_encode_bytes_field(8, raw)
+    let dec = pb_decode_bytes_field(enc, 0)
+    cki("full byte range decode len", bytes_len(dec[1]), 256)
+    let j = 0
+    let ok = 1
+    while j < 256
+        if bytes_get(dec[1], j) != j
+            ok = 0
+        j = j + 1
+    cki("full byte range roundtrip exact", ok, 1)
+    0
+
+// ── ADV 10: varint width-boundary encode/decode against hand-derived bytes ──
+// 16383 (2^14-1) = 2-byte; 16384 (2^14) = 3-byte; 2097151 (2^21-1) = 3-byte;
+// 2097152 (2^21) = 4-byte.
+fn adv_varint_width_boundaries() -> int
+    ckb("varint(16383)", vi_encode(16383), [0xFF, 0x7F])
+    ckb("varint(16384)", vi_encode(16384), [0x80, 0x80, 0x01])
+    ckb("varint(2097151)", vi_encode(2097151), [0xFF, 0xFF, 0x7F])
+    ckb("varint(2097152)", vi_encode(2097152), [0x80, 0x80, 0x80, 0x01])
+    // 2^32 - 1 and 2^32 (5-byte crossover)
+    ckb("varint(4294967295)", vi_encode(4294967295), [0xFF, 0xFF, 0xFF, 0xFF, 0x0F])
+    ckb("varint(4294967296)", vi_encode(4294967296), [0x80, 0x80, 0x80, 0x80, 0x10])
+    0
+
+fn main() -> int
+    adv_spec_varint150()
+    adv_multibyte_tag()
+    adv_int32_min_boundary()
+    adv_sint_int32_boundary()
+    adv_len_delim_at_exact_end()
+    adv_pos_past_end()
+    adv_multi_len_fields()
+    adv_fixed64_neg1_bytes()
+    adv_full_byte_range()
+    adv_varint_width_boundaries()
+    print("_pbwire_adv_kat passed")
+    0

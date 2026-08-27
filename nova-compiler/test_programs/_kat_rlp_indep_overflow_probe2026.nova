@@ -1,0 +1,161 @@
+// INDEPENDENT adversarial re-verification KAT for std/encoding/rlp's
+// overflow-sentinel fix (fixer claim: next_pos == -1 EXACTLY, never a
+// wrapped negative, for a long-form declared length near 2^63-1).
+//
+// Written FRESH, not copied from _kat_rlp_overflow_sentinel.nova. Attacks
+// cases the fixer's own KAT does not cover:
+//   - long-string AND long-list overflow, each with a NON-trivial buffer
+//     tail after the header (not just the bare 9-byte header), to catch
+//     any bug where "extra" trailing bytes confuse the remainder math.
+//   - the exact top-bit boundary 0x8000000000000000 (first declared-length
+//     byte 0x80, which IS negative as int64) on top of the near-max
+//     0x7fffffffffffffff case, to make sure BOTH sides of the int64 sign
+//     boundary are rejected the same way.
+//   - all-0xFF (declared length 0xFFFFFFFFFFFFFFFF) long-list form.
+//   - overflow nested as the SECOND item of a list (not the first), where
+//     a valid sibling precedes it, to check pos-threading doesn't mask it.
+//   - overflow nested inside a LONG list wrapper (not just a short list).
+//   - a large (1MB) real buffer with a still-huge (2^62) declared length,
+//     to confirm the remainder check isn't fooled by a non-trivial blen.
+//   - positive-control: a 255-byte and a 56-byte long-form string still
+//     round-trip byte-for-byte with the correct next_pos (proves the fix
+//     didn't turn valid long-form input into false rejections).
+// KAT INTEGRITY: pass/total explicitly threaded through every check as a
+// returned [pass, total] list (no shared-counter-in-closure antipattern).
+import std/encoding/rlp
+import std/encoding/hex
+
+fn ck_int(label: string, got: int, want: int, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        return [pass, total]
+
+fn ck_true(label: string, got: bool, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got false, want true")
+        return [pass, total]
+
+fn ck_bytes_eq(label: string, a: any, b: any, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if hex_encode(a) == hex_encode(b)
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + hex_encode(a) + " want=" + hex_encode(b))
+        return [pass, total]
+
+fn main()
+    let state = [0, 0]
+
+    // ── long-string, declared len = 0x7fffffffffffffff, with an extra
+    // trailing byte after the header (buffer is 10 bytes, not exactly 9) ──
+    let a1 = hex_decode("bf7fffffffffffffff00")
+    let r1 = rlp_decode(a1, 0)
+    state = ck_int("longstr_near_2pow63_with_tail_next_exactly_neg1", r1[1], -1, state)
+    state = ck_int("longstr_near_2pow63_with_tail_safe_default_empty", bytes_len(r1[0]), 0, state)
+
+    // ── long-list, declared len = 0x7fffffffffffffff, with extra tail ────
+    let a2 = hex_decode("ff7fffffffffffffff0102")
+    let r2 = rlp_decode(a2, 0)
+    state = ck_int("longlist_near_2pow63_with_tail_next_exactly_neg1", r2[1], -1, state)
+
+    // ── exact top-bit boundary: 0x8000000000000000 (first length byte is
+    // 0x80 -> negative as int64) must ALSO reject to exactly -1, same as
+    // the 0x7fff... case just under the boundary ─────────────────────────
+    let a3 = hex_decode("bf8000000000000000")
+    let r3 = rlp_decode(a3, 0)
+    state = ck_int("longstr_exact_2pow63_boundary_next_exactly_neg1", r3[1], -1, state)
+
+    // ── all-0xFF (0xFFFFFFFFFFFFFFFF, i.e. -1 as int64) long-LIST form ────
+    let a4 = hex_decode("ffffffffffffffffff")
+    let r4 = rlp_decode(a4, 0)
+    state = ck_int("longlist_all_ff_next_exactly_neg1", r4[1], -1, state)
+
+    // ── overflow-crafted item as the SECOND element of a short list, after
+    // a valid sibling ("cat"), to confirm pos-threading through
+    // _rlp_decode_list_items doesn't mask/alter the sentinel ─────────────
+    // payload = rlp("cat") . [bf 7f ff ff ff ff ff ff ff]  = 4 + 9 = 13 bytes
+    // list header for 13-byte payload (short list, <=55): 0xc0+13 = 0xcd
+    let catenc = rlp_encode("cat")
+    let payload5 = bytes_concat(catenc, a1)
+    let payload5_trim = bytes_slice(payload5, 0, bytes_len(catenc) + 9)
+    let hdr5 = bytes_create(1)
+    bytes_set(hdr5, 0, 0xC0 + bytes_len(payload5_trim))
+    let a5 = bytes_concat(hdr5, payload5_trim)
+    let r5 = rlp_decode(a5, 0)
+    state = ck_int("overflow_as_second_list_item_next_exactly_neg1", r5[1], -1, state)
+    state = ck_int("overflow_as_second_list_item_partial_items_has_first", len(r5[0]), 1, state)
+
+    // ── overflow nested inside a LONG list wrapper (payload > 55 bytes so
+    // the outer list itself must use the long-list long-form) ────────────
+    let padding = bytes_create(60)
+    let pi = 0
+    while pi < 60
+        bytes_set(padding, pi, 0x61)
+        pi = pi + 1
+    let padenc = rlp_encode_bytes(padding)  // long-form string, 62 bytes total
+    let outer_payload = bytes_concat(padenc, a1)
+    let outer_hdr = bytes_create(2)
+    bytes_set(outer_hdr, 0, 0xF8)
+    bytes_set(outer_hdr, 1, bytes_len(outer_payload))
+    let a6 = bytes_concat(outer_hdr, outer_payload)
+    let r6 = rlp_decode(a6, 0)
+    state = ck_int("overflow_nested_in_long_list_wrapper_next_exactly_neg1", r6[1], -1, state)
+
+    // ── large real buffer (1MB), declared length 2^62, to make sure the
+    // remainder check isn't fooled when blen is non-trivial ──────────────
+    let big = bytes_create(1048576)
+    let bi = 0
+    while bi < 1048576
+        bytes_set(big, bi, 0x42)
+        bi = bi + 1
+    let hdr7 = hex_decode("bf4000000000000000")  // len-of-len=8, value = 2^62
+    let a7 = bytes_concat(hdr7, big)
+    let r7 = rlp_decode(a7, 0)
+    state = ck_int("huge_declared_len_vs_1MB_real_buffer_next_exactly_neg1", r7[1], -1, state)
+
+    // ── POSITIVE CONTROLS: valid long-form strings must still round-trip
+    // byte-for-byte with the correct next_pos (fix must not over-reject) ──
+    let s255 = bytes_create(255)
+    let si = 0
+    while si < 255
+        bytes_set(s255, si, si & 0xFF)
+        si = si + 1
+    let enc255 = rlp_encode(s255)
+    let dr255 = rlp_decode(enc255, 0)
+    state = ck_bytes_eq("valid_255byte_longform_roundtrips", dr255[0], s255, state)
+    state = ck_int("valid_255byte_longform_next_pos_correct", dr255[1], bytes_len(enc255), state)
+
+    let s56 = bytes_create(56)
+    let ti = 0
+    while ti < 56
+        bytes_set(s56, ti, 0x39)
+        ti = ti + 1
+    let enc56b = rlp_encode(s56)
+    let dr56b = rlp_decode(enc56b, 0)
+    state = ck_bytes_eq("valid_56byte_longform_roundtrips", dr56b[0], s56, state)
+    state = ck_int("valid_56byte_longform_next_pos_correct", dr56b[1], bytes_len(enc56b), state)
+
+    // ── rlp_decode_ok must agree with the sentinel across the board ───────
+    state = ck_true("ok_helper_rejects_overflow_case", rlp_decode_ok(r1[1]) == false, state)
+    state = ck_true("ok_helper_accepts_valid_255", rlp_decode_ok(dr255[1]), state)
+
+    let pass = state[0]
+    let total = state[1]
+    print("RESULT " + str(pass) + "/" + str(total))
+    if pass == total
+        print("PASS")
+    else
+        print("FAIL")
+        exit(1)

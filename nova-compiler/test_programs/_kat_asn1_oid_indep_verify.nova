@@ -1,0 +1,91 @@
+import std/encoding/asn1
+import std/encoding/hex
+
+fn ck(label: string, got: string, want: string)
+    let ok = "FAIL"
+    if got == want
+        ok = "ok"
+    print(label + "=" + ok + " (got=" + got + " want=" + want + ")")
+
+fn ck_str(label: string, got: string, want: string)
+    let ok = "FAIL"
+    if got == want
+        ok = "ok"
+    print(label + "=" + ok + " (got='" + got + "' want='" + want + "')")
+
+// INDEPENDENT adversarial re-verification of the asn1_decode_oid multi-byte
+// first-identifier fix. Every expected byte string below was hand-derived
+// from X.690 8.19.4 (base-128 chaining of combined=40*arc1+arc2) WITHOUT
+// looking at the fixer's own test file, then cross-checked against it.
+fn main()
+    // 1) The textbook multi-byte-first-identifier case: 2.999.3
+    //    combined = 40*2+999 = 1079 = 0x437 -> 7-bit groups: hi=8 (1079>>7),
+    //    lo=55 (1079&0x7F) -> 0x88 0x37 (continuation set on first byte).
+    //    arc 3 -> single byte 0x03. content=88 37 03, tag 06 len 03.
+    let a = asn1_encode_oid("2.999.3")
+    ck("oid_2_999_3_der", hex_encode(a), "0603883703")
+    let da = asn1_decode_oid(a, 0)
+    ck_str("oid_2_999_3_roundtrip", da[0], "2.999.3")
+
+    // 2) Exact boundary: combined == 128 (smallest value needing 2 bytes).
+    //    OID 2.48 -> combined=128 -> hi=1,lo=0 -> 0x81 0x00.
+    let b = asn1_encode_oid("2.48")
+    ck("oid_2_48_der", hex_encode(b), "06028100")
+    let db = asn1_decode_oid(b, 0)
+    ck_str("oid_2_48_roundtrip", db[0], "2.48")
+
+    // 3) Just below boundary: combined == 127, must stay single-byte and
+    //    round-trip, isolating that the bug is specifically the >=128 case.
+    let c = asn1_encode_oid("2.47")
+    ck("oid_2_47_der", hex_encode(c), "06017f")
+    let dc = asn1_decode_oid(c, 0)
+    ck_str("oid_2_47_roundtrip", dc[0], "2.47")
+
+    // 4) Exact boundary of the 2-byte -> 3-byte transition for the FIRST
+    //    identifier: combined == 16383 (0x3FFF, needs exactly 2 bytes:
+    //    127,127 -> 0xFF 0x7F) vs combined == 16495 (needs exactly 3 bytes).
+    //    2.16303 -> combined = 40*2+16303 = 16383.
+    let d = asn1_encode_oid("2.16303")
+    ck("oid_2_16303_der", hex_encode(d), "0602ff7f")
+    let dd = asn1_decode_oid(d, 0)
+    ck_str("oid_2_16303_roundtrip", dd[0], "2.16303")
+
+    // 5) A genuine THREE-byte first identifier, with a further arc after
+    //    it, exercising both "the first identifier itself needs 3 bytes"
+    //    and "subsequent-arc decoding resumes at the right cursor".
+    //    2.16415.9 -> combined = 40*2+16415 = 16495 = 0x406F.
+    //    Hand-derived base-128 chain (v=16495): v&0x7F=111,v>>=7 -> v=128;
+    //    v&0x7F=0,v>>=7 -> v=1; v&0x7F=1,v>>=7 -> v=0. digits(LSB->MSB)=
+    //    [111,0,1] -> emitted MSB-first with continuation on all but last:
+    //    0x81 0x80 0x6F. Then arc 9 -> single byte 0x09.
+    //    content = 81 80 6f 09 (4 bytes), tag 06 len 04.
+    let e = asn1_encode_oid("2.16415.9")
+    ck("oid_2_16415_9_der", hex_encode(e), "060481806f09")
+    let de = asn1_decode_oid(e, 0)
+    ck_str("oid_2_16415_9_roundtrip", de[0], "2.16415.9")
+
+    // 6) Malformed/hostile input: an OID whose content is entirely
+    //    continuation bytes (high bit set on every byte, no terminal byte
+    //    ever appears within the declared length). This is a library
+    //    boundary contract check: decode must NOT crash / hang / exit the
+    //    process on bad input -- it must degrade gracefully in-band. The
+    //    decode loop is bounded by clen (from the DER length field), so a
+    //    never-terminating continuation chain must still terminate the
+    //    loop at i==clen and return control to the caller.
+    let hostile = bytes_create(5)
+    bytes_set(hostile, 0, 0x06)
+    bytes_set(hostile, 1, 0x03)
+    bytes_set(hostile, 2, 0x81)
+    bytes_set(hostile, 3, 0x81)
+    bytes_set(hostile, 4, 0x81)
+    let dh = asn1_decode_oid(hostile, 0)
+    print("hostile_no_terminal_byte_survived=ok (result='" + dh[0] + "' next=" + str(dh[1]) + ")")
+
+    // 7) Malformed/hostile input: zero-length OID content must not crash.
+    let hostile2 = bytes_create(2)
+    bytes_set(hostile2, 0, 0x06)
+    bytes_set(hostile2, 1, 0x00)
+    let dh2 = asn1_decode_oid(hostile2, 0)
+    ck_str("hostile_zero_len_survived", dh2[0], "")
+
+    print("DONE")
