@@ -125,7 +125,37 @@ run_one() {
   local t="$1"
   local ll="$OUT/$t.ll" exe="$OUT/$t.bin" log="$OUT/$t.log"
   if ! TMO 150 "$NOVA" compile -o "$ll" "$t.nova" >"$log" 2>&1; then echo "COMPILE" >"$OUT/$t.res"; return; fi
-  if ! TMO 300 clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $SQLITE_OBJ $LINKF -w >>"$log" 2>&1; then
+
+  # HONOUR THE FFI LINK DIRECTIVES the compiler emits into the .ll. The regression links
+  # manually rather than shelling to nova_link, so it must obey the same markers -- exactly as
+  # _test_worker.ps1 does on Windows. Omitting them is why the first macOS run reported LINK
+  # failures for every FFI test (_kat_cdecl, _ffi_byval, _kat_ffi_float_ret, _kat_lfu_cache):
+  # their C side was simply never compiled in. That was my harness, not the platform.
+  local xsrc="" xlib="" sp obj op lb
+  while IFS= read -r sp; do
+    [ -f "$sp" ] || continue
+    obj="$OUT/$(basename "$sp").o"
+    # Rebuild only when the source is newer, matching the Windows semantics: an existence-only
+    # check silently links a STALE object and surfaces as a misleading "undefined symbol".
+    if [ ! -f "$obj" ] || [ "$sp" -nt "$obj" ]; then
+      TMO 60 clang -c -O2 $EXTRA_CFLAGS "$sp" -o "$obj" -w >>"$log" 2>&1 || true
+    fi
+    [ -f "$obj" ] && xsrc="$xsrc $obj"
+  done < <(sed -n 's/^; LINK_SOURCE: *//p' "$ll" | tr -d '\r')
+  while IFS= read -r op; do
+    [ -f "$op" ] && xsrc="$xsrc $op"
+  done < <(sed -n 's/^; LINK_OBJECT: *//p' "$ll" | tr -d '\r')
+  while IFS= read -r lb; do
+    case "$lb" in m|pthread|dl|rt) continue ;; esac   # same skip list as the Windows worker
+    xlib="$xlib -l$lb"
+  done < <(sed -n 's/^; LINK_LIB: *//p' "$ll" | tr -d '\r')
+
+  # sqlite3 is linked ONLY when the IR actually references it, mirroring Windows. Linking a
+  # ~250k-line object into all 3,500 binaries otherwise is pure waste.
+  local sq=""
+  if [ -n "$SQLITE_OBJ" ] && grep -q '@sqlite3_' "$ll" 2>/dev/null; then sq="$SQLITE_OBJ"; fi
+
+  if ! TMO 300 clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $sq $xsrc $LINKF $xlib -w >>"$log" 2>&1; then
     echo "LINK" >"$OUT/$t.res"; return
   fi
   if TMO 60 "./$exe" >>"$log" 2>&1; then
