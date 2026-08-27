@@ -22,12 +22,17 @@ jobs:
           clang --version
           Write-Host "CPU: $([System.Environment]::ProcessorCount) cores"
 
-      - name: Run full regression suite (114 tests)
+      # The step ran bare `_run_final_regression.ps1`, which is the FULL suite (3,590 tests as of
+      # 2026-08-27), not the 114 the old label claimed. One mode takes ~25 min on a fast dev box,
+      # so a 20-minute cap could never pass -- every run died on the clock, not on a test. The
+      # hosted runner has fewer cores than a dev machine, hence 90. GitHub's hard job ceiling is
+      # 6 h, so this is still well inside it.
+      - name: Run full regression suite (all ~3,590 tests, NORMAL mode)
         shell: pwsh
         run: |
           Set-Location nova-compiler/test_programs
           & .\\_run_final_regression.ps1
-        timeout-minutes: 20
+        timeout-minutes: 90
 
       - name: Run benchmark suite
         shell: pwsh
@@ -251,6 +256,41 @@ jobs:
           echo "Built native macOS compiler:"
           ls -la nova
           ./nova --version || true
+
+      # A native host must pick its OWN triple, exactly as the Linux job asserts. Without this a
+      # macOS build that silently emitted the Windows triple would still pass the test suite by
+      # running through Rosetta-ish luck, and we would not learn until someone shipped.
+      - name: Native host targeting
+        run: |
+          cd nova-compiler/compiler
+          printf 'fn main()\n    print(os_name())\n' > /tmp/hostprobe.nova
+          ./nova compile -o /tmp/hostprobe.ll /tmp/hostprobe.nova
+          grep -q 'target triple = "aarch64-apple-darwin' /tmp/hostprobe.ll \
+            || { echo "::error title=macOS targeting::native build did not target arm64-macOS: $(grep '^target ' /tmp/hostprobe.ll)"; exit 1; }
+          echo "::notice title=macOS targeting::OK, native host resolves to aarch64-apple-darwin"
+
+      # THE strongest test that exists for a self-hosting compiler: it must compile ITSELF to a
+      # byte-identical fixpoint on this OS. Linux has had this; macOS never did, so "macOS works"
+      # rested only on ~60 core tests. Mirrors the Linux step exactly.
+      - name: Reconverge check (gen5 == gen6)
+        run: |
+          cd nova-compiler/compiler
+          export NOVA_NO_CACHE=1
+          echo "=== gen5: compile compiler with itself ==="
+          ./nova nova_compiler.nova gen5.ll
+          echo "=== Build gen5 binary ==="
+          clang -O2 -o nova_gen5 gen5.ll nova_runtime.c -lm -Wno-everything -D_DARWIN_C_SOURCE
+          echo "=== gen6: compile compiler with gen5 ==="
+          ./nova_gen5 nova_compiler.nova gen6.ll
+          echo "=== Compare gen5 vs gen6 ==="
+          if diff -q gen5.ll gen6.ll; then
+            echo "::notice title=macOS reconverge::RECONVERGED gen5 == gen6 (byte-identical)"
+          else
+            echo "::error title=macOS reconverge::DIVERGED -- $(diff gen5.ll gen6.ll | head -5 | paste -sd ' ' -)"
+            exit 1
+          fi
+          rm -f nova_gen5 gen5.ll gen6.ll
+        timeout-minutes: 40
 
       - name: Run core test suite
         run: |

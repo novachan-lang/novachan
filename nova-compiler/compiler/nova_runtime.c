@@ -23607,6 +23607,11 @@ static int64_t file_mtime_ms(const char* path) {
     if (stat(path, &st) != 0) return -1;
 #ifdef _WIN32
     return (int64_t)st.st_mtime * 1000;
+#elif defined(__APPLE__)
+    /* Darwin predates POSIX.1-2008 and spells the nanosecond-resolution field
+       st_mtimespec. Identical layout to st_mtim -- this is a rename, not a loss
+       of precision. Without it macOS fails to COMPILE, which is how it was found. */
+    return (int64_t)st.st_mtimespec.tv_sec * 1000 + (int64_t)st.st_mtimespec.tv_nsec / 1000000;
 #else
     return (int64_t)st.st_mtim.tv_sec * 1000 + (int64_t)st.st_mtim.tv_nsec / 1000000;
 #endif
@@ -25647,13 +25652,27 @@ int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
 }
 
 #else
-/* Linux/POSIX epoll-based poller */
+/* POSIX poller. Linux has epoll; Darwin and the BSDs have kqueue instead and do NOT
+   ship <sys/epoll.h> at all -- macOS failed with a hard "file not found", so this is a
+   compile-time split, not a runtime one. Both sides present the identical contract to
+   the netpoller above: a list of [fd, flags] pairs, ONE entry per ready fd. */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+#define NOVA_POLL_KQUEUE 1
+#endif
+
 #ifndef NOVA_NO_SYSHEADERS   /* epoll API shimmed in nova_runtime_wasm.c (netpoller is dead in wasm) */
+#ifdef NOVA_POLL_KQUEUE
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#else
 #include <sys/epoll.h>
+#endif
 #endif
 
 typedef struct {
-    int epfd;
+    int epfd;   /* the kqueue() fd on BSD/Darwin, the epoll fd on Linux */
     int valid;
 } NovaPollHandle;
 
@@ -25663,7 +25682,11 @@ static int g_poller_count = 0;
 
 int64_t nova_rt_io_poll_create(void) {
     if (g_poller_count >= NOVA_MAX_POLLERS) return -1;
+#ifdef NOVA_POLL_KQUEUE
+    int epfd = kqueue();
+#else
     int epfd = epoll_create1(0);
+#endif
     if (epfd < 0) return -1;
     int idx = g_poller_count++;
     g_pollers[idx].epfd = epfd;
@@ -25674,6 +25697,19 @@ int64_t nova_rt_io_poll_create(void) {
 int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
     int idx = (int)poller_id;
     if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+#ifdef NOVA_POLL_KQUEUE
+    /* kqueue has NO combined-interest mask: read and write are SEPARATE filters, so a
+       fd wanting both needs two registrations in one changelist. EV_CLEAR is kqueue's
+       edge-triggered mode, matching EPOLLET on the Linux side. */
+    struct kevent ch[2];
+    int n = 0;
+    if (events & NOVA_POLL_READ)
+        EV_SET(&ch[n++], (uintptr_t)fd_val, EVFILT_READ,  EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (events & NOVA_POLL_WRITE)
+        EV_SET(&ch[n++], (uintptr_t)fd_val, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (n == 0) return 0;   /* nothing requested is not an error, same as an empty epoll mask */
+    return kevent(g_pollers[idx].epfd, ch, n, NULL, 0, NULL) < 0 ? -1 : 0;
+#else
     struct epoll_event ev;
     ev.events = 0;
     if (events & NOVA_POLL_READ)  ev.events |= EPOLLIN;
@@ -25681,9 +25717,54 @@ int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
     ev.events |= EPOLLET;
     ev.data.fd = (int)fd_val;
     return epoll_ctl(g_pollers[idx].epfd, EPOLL_CTL_ADD, (int)fd_val, &ev) == 0 ? 0 : -1;
+#endif
 }
 
 static int64_t nova_poll_blocking(int idx, int64_t timeout_ms) {
+#ifdef NOVA_POLL_KQUEUE
+    struct kevent events[NOVA_MAX_POLL_EVENTS];
+    struct timespec ts;
+    struct timespec* tsp = NULL;      /* NULL blocks forever, matching epoll's -1 */
+    if (timeout_ms >= 0) {
+        ts.tv_sec  = (time_t)(timeout_ms / 1000);
+        ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
+        tsp = &ts;
+    }
+    int n = kevent(g_pollers[idx].epfd, NULL, 0, events, NOVA_MAX_POLL_EVENTS, tsp);
+    /* THE ONE REAL SEMANTIC GAP. kqueue returns one event per (fd, FILTER), so a socket
+       ready to both read and write arrives as TWO entries; epoll returns a single combined
+       bitmask per fd. The netpoller above is written against the epoll shape, so coalesce
+       by fd here -- otherwise it would see the same fd twice and double-wake its task.
+       Linear scan is fine: NOVA_MAX_POLL_EVENTS is 256 and the ready set is normally tiny. */
+    int     cfd[NOVA_MAX_POLL_EVENTS];
+    int64_t cfl[NOVA_MAX_POLL_EVENTS];
+    int cn = 0;
+    for (int i = 0; i < n; i++) {          /* n < 0 (error) simply yields an empty list, as epoll does */
+        int fd = (int)events[i].ident;
+        int64_t flags = 0;
+        if (events[i].filter == EVFILT_READ)  flags |= NOVA_POLL_READ;
+        if (events[i].filter == EVFILT_WRITE) flags |= NOVA_POLL_WRITE;
+        if (events[i].flags & EV_ERROR)       flags |= NOVA_POLL_ERROR;
+        if (events[i].flags & EV_EOF)         flags |= NOVA_POLL_HUP;
+        int slot = -1;
+        for (int j = 0; j < cn; j++) { if (cfd[j] == fd) { slot = j; break; } }
+        if (slot < 0) {
+            if (cn >= NOVA_MAX_POLL_EVENTS) continue;
+            slot = cn++;
+            cfd[slot] = fd;
+            cfl[slot] = 0;
+        }
+        cfl[slot] |= flags;
+    }
+    int64_t result = nova_rt_list_create();
+    for (int j = 0; j < cn; j++) {
+        int64_t ev = nova_rt_list_create();
+        nova_rt_list_append(ev, (int64_t)cfd[j]);
+        nova_rt_list_append(ev, cfl[j]);
+        nova_rt_list_append(result, ev);
+    }
+    return result;
+#else
     struct epoll_event events[NOVA_MAX_POLL_EVENTS];
     int n = epoll_wait(g_pollers[idx].epfd, events, NOVA_MAX_POLL_EVENTS, (int)timeout_ms);
     int64_t result = nova_rt_list_create();
@@ -25699,12 +25780,28 @@ static int64_t nova_poll_blocking(int idx, int64_t timeout_ms) {
         nova_rt_list_append(result, ev);
     }
     return result;
+#endif
 }
 
 int64_t nova_rt_io_poll_remove(int64_t poller_id, int64_t fd_val) {
     int idx = (int)poller_id;
     if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+#ifdef NOVA_POLL_KQUEUE
+    /* EPOLL_CTL_DEL drops ALL interest in one call; kqueue deletes per filter. We do not
+       track which filters a fd registered, so both deletes are attempted and ENOENT ("that
+       filter was never registered") is NOT an error -- treating it as one would make every
+       read-only socket fail to unregister. Separate calls, because with a NULL eventlist
+       kevent reports the FIRST failing change via errno and abandons the rest. */
+    struct kevent ch;
+    int rc = 0;
+    EV_SET(&ch, (uintptr_t)fd_val, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    if (kevent(g_pollers[idx].epfd, &ch, 1, NULL, 0, NULL) < 0 && errno != ENOENT) rc = -1;
+    EV_SET(&ch, (uintptr_t)fd_val, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    if (kevent(g_pollers[idx].epfd, &ch, 1, NULL, 0, NULL) < 0 && errno != ENOENT) rc = -1;
+    return rc;
+#else
     return epoll_ctl(g_pollers[idx].epfd, EPOLL_CTL_DEL, (int)fd_val, NULL) == 0 ? 0 : -1;
+#endif
 }
 
 int64_t nova_rt_io_poll_close(int64_t poller_id) {
