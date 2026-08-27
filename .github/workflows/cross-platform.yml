@@ -538,3 +538,89 @@ jobs:
       - name: Run FULL suite
         run: bash .github/scripts/posix_full_suite.sh
         timeout-minutes: 180
+
+  # ─── 5.7: Linux on AArch64. NO HARDWARE NEEDED — the plan's "needs hardware" was wrong. ───
+  # GitHub's ubuntu-24.04-arm runners are free for public repos. macOS already proves the
+  # aarch64 CODEGEN path (macos-latest is arm64); this proves aarch64 + ELF + glibc, which is a
+  # genuinely different combination: different object format, different libc, different syscall
+  # ABI. Non-blocking until green, same discipline as the Tier 2 job.
+  linux-arm64-selfhosted:
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld
+          echo "::notice title=linux-arm64 runner::arch=$(uname -m) clang=$(clang --version | head -1)"
+
+      - name: Build self-hosted compiler from the aarch64 Linux seed
+        run: |
+          cd nova-compiler/compiler
+          test -f nova_compiler_linux_arm64.ll || { echo "::error::aarch64 bootstrap IR missing"; exit 1; }
+          grep -q 'aarch64-unknown-linux-gnu' nova_compiler_linux_arm64.ll \
+            || { echo "::error::seed is not aarch64-linux-targeted"; exit 1; }
+          clang -O2 -o nova nova_compiler_linux_arm64.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          ./nova --version || true
+
+      - name: Native host targeting
+        run: |
+          cd nova-compiler/compiler
+          printf 'fn main()\n    print(os_name())\n' > /tmp/hostprobe.nova
+          ./nova compile -o /tmp/hostprobe.ll /tmp/hostprobe.nova
+          grep -q 'target triple = "aarch64-unknown-linux-gnu"' /tmp/hostprobe.ll \
+            || { echo "::error title=arm64 targeting::did not target aarch64-linux: $(grep '^target ' /tmp/hostprobe.ll)"; exit 1; }
+          echo "::notice title=linux-arm64 targeting::OK aarch64-unknown-linux-gnu"
+
+      # The canonical 3-pass, matching CLAUDE.md and the macOS job. The seed is cross-produced by
+      # the WINDOWS-hosted compiler, so generation 1 still carries the producing host's behaviour
+      # and needs one more pass to wash out -- exactly what caught macOS out at 2 passes.
+      - name: Reconverge check (3-pass, gen5 == gen6)
+        run: |
+          cd nova-compiler/compiler
+          export NOVA_NO_CACHE=1
+          CC="nova_runtime.c -lpthread -ldl -lm -Wno-everything"
+          ./nova nova_compiler.nova gen4.ll && clang -O2 -o nova_gen4 gen4.ll $CC
+          ./nova_gen4 nova_compiler.nova gen5.ll && clang -O2 -o nova_gen5 gen5.ll $CC
+          ./nova_gen5 nova_compiler.nova gen6.ll
+          if diff -q gen5.ll gen6.ll; then
+            echo "::notice title=linux-arm64 reconverge::RECONVERGED gen5 == gen6 (byte-identical, 3-pass)"
+          else
+            D45=$(diff gen4.ll gen5.ll | grep -c '^<' || true); D56=$(diff gen5.ll gen6.ll | grep -c '^<' || true)
+            echo "::error title=linux-arm64 reconverge::DIVERGED. drift gen4->gen5=$D45 gen5->gen6=$D56. First: $(diff gen5.ll gen6.ll | head -4 | paste -sd ' ' -)"
+            exit 1
+          fi
+          rm -f nova_gen4 nova_gen5 gen4.ll gen5.ll gen6.ll
+        timeout-minutes: 60
+
+      - name: Run FULL suite
+        run: bash .github/scripts/posix_full_suite.sh
+        timeout-minutes: 180
+
+  # ─── TIER 3: NOVA_T8_FULLRC (leak-checking) — currently ZERO CI coverage anywhere ─────
+  # The local arc runs BOTH memory modes, but CI has only ever run NORMAL, on any platform.
+  # FULLRC exercises a different refcount path and historically catches a different bug class
+  # (use-after-free, leaks) that NORMAL cannot see. Separate job rather than a second pass in
+  # the existing one, so it runs in PARALLEL instead of doubling that job's wall time.
+  windows-fullrc:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run full regression (NOVA_T8_FULLRC)
+        shell: pwsh
+        run: |
+          Set-Location nova-compiler/test_programs
+          $env:NOVA_T8_FULLRC = "1"
+          $env:PGPASSWORD = ""     # same reason as the NORMAL job: the image exports it with the service stopped
+          pwsh -NoProfile -File .\_run_final_regression.ps1 2>&1 | Tee-Object -FilePath fullrc.log
+          $code = $LASTEXITCODE
+          $all = @(Get-Content fullrc.log -ErrorAction SilentlyContinue)
+          $summary = @($all | Where-Object { $_ -match 'RESULTS:' }) -join ' '
+          if ($summary) { Write-Host "::notice title=Windows FULLRC summary::$summary" }
+          $fails = @($all | Where-Object { $_ -match '^(FAIL|TIMEOUT)' } | Select-Object -First 20)
+          if ($fails.Count -gt 0) { Write-Host "::error title=Windows FULLRC FAILS::$(($fails -join ' | '))" }
+          exit $code
+        timeout-minutes: 120
