@@ -102,6 +102,15 @@ if os.path.isfile(mf):
 # protocol node_recv does not provide. Keeping them out means this job measures THE PORT
 # rather than re-reporting a defect Windows already tracks separately.
 skip = {'distributed_serialize_test', 'distributed_spawn_test'}
+# ARCH-SCOPED EXCLUSION. _asm_inline_test embeds x86 AT&T assembly ("mov $$42, $0") via the 7.1
+# inline-asm feature. Inline asm is ASSEMBLED REGARDLESS OF REACHABILITY, so it cannot be made
+# portable by branching on arch_name() -- an unreachable x86 template still fails to assemble in
+# an aarch64 module, and NOVA deliberately has no #if to exclude it lexically. The test is
+# inherently x86-only; running it on arm64 measures the architecture, not the compiler.
+# NOTE a real gap this leaves: inline asm is consequently UNGATED on arm64. Closing it needs a
+# separate arm64-flavoured test file, not a change to this one.
+if os.uname().machine not in ('x86_64', 'amd64'):
+    skip.add('_asm_inline_test')
 # SERVER tests must run SERIALLY. _run_final_regression.ps1 separates them for a documented
 # reason: "they each run their OWN in-process green TCP server + client (real I/O). Running
 # many concurrently starves the green server's scheduling under CPU load -> intermittent

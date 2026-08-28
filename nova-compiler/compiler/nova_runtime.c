@@ -1744,6 +1744,61 @@ static int nova_addr_in_module(uintptr_t a) {
         if (a >= g_mod_lo[i] && a < g_mod_hi[i]) return 1;
     return 0;
 }
+#elif defined(__APPLE__) && !defined(NOVA_FREESTANDING)
+/* EXACT module ranges on Darwin — the missing third leg. Windows has the PE range and Linux has
+   dl_iterate_phdr, but macOS fell back to nova_probe_cstr, which SCANS for a NUL terminator. That
+   is not merely an overrun risk, it is a WRONG-ANSWER bug: a large integer that happens to address
+   readable, NUL-terminated memory is classified as a string, so nova_rt_add performs STRING
+   CONCATENATION on two numbers. int_ptr_soundness_repro -- the regression guard written for exactly
+   this class -- FAILS on macOS with a bad checksum while passing on Windows and Linux.
+   It is far likelier to fire on Darwin/arm64 than elsewhere because the heap is mapped near 4e10,
+   squarely inside the range ordinary integer results occupy, whereas x86_64 maps it around 1e14.
+
+   dyld exposes the loaded images precisely, so membership needs no probing and cannot overrun.
+   Only READ-ONLY segments are accepted, mirroring the Linux !PF_W rule: string literals live in
+   __TEXT/__const, never in writable data. */
+#include <mach-o/loader.h>
+#ifndef VM_PROT_READ
+#define VM_PROT_READ  0x01
+#endif
+#ifndef VM_PROT_WRITE
+#define VM_PROT_WRITE 0x02
+#endif
+#define NOVA_MOD_MAX 64
+static uintptr_t g_mod_lo[NOVA_MOD_MAX], g_mod_hi[NOVA_MOD_MAX];
+static int g_mod_n = 0;
+static volatile int g_mod_ready = 0;
+static void nova_mod_capture_darwin(void) {
+    uint32_t nimg = _dyld_image_count();
+    for (uint32_t im = 0; im < nimg && g_mod_n < NOVA_MOD_MAX; im++) {
+        const struct mach_header* mh = _dyld_get_image_header(im);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;      /* 64-bit images only */
+        intptr_t slide = _dyld_get_image_vmaddr_slide(im);  /* ASLR offset for this image */
+        const struct mach_header_64* mh64 = (const struct mach_header_64*)mh;
+        const struct load_command* lc = (const struct load_command*)(mh64 + 1);
+        for (uint32_t c = 0; c < mh64->ncmds && g_mod_n < NOVA_MOD_MAX; c++) {
+            if (lc->cmdsize == 0) break;                    /* malformed: never loop forever */
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64* sg = (const struct segment_command_64*)lc;
+                if ((sg->initprot & VM_PROT_WRITE) == 0 && (sg->initprot & VM_PROT_READ) != 0) {
+                    g_mod_lo[g_mod_n] = (uintptr_t)sg->vmaddr + (uintptr_t)slide;
+                    g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)sg->vmsize;
+                    g_mod_n++;
+                }
+            }
+            lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+        }
+    }
+}
+static int nova_addr_in_module(uintptr_t a) {
+    if (!__atomic_load_n(&g_mod_ready, __ATOMIC_ACQUIRE)) {
+        nova_mod_capture_darwin();                     /* idempotent; re-running is harmless */
+        __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
+    }
+    for (int i = 0; i < g_mod_n; i++)
+        if (a >= g_mod_lo[i] && a < g_mod_hi[i]) return 1;
+    return 0;
+}
 #endif
 #endif
 
@@ -1777,8 +1832,10 @@ static int nova_is_readable_str(const void* ptr) {
     return nova_addr_in_module(a);                             /* wasm: data-segment literal (below __heap_base) */
 #elif defined(__linux__)
     return nova_addr_in_module(a);                             /* EXACT: dl_iterate_phdr ranges, no scanning */
+#elif defined(__APPLE__)
+    return nova_addr_in_module(a);                             /* EXACT: dyld LC_SEGMENT_64 ranges, no scanning */
 #else
-    /* Other POSIX (macOS): module capture not implemented yet, so the bounded scan
+    /* Remaining POSIX (BSD): module capture not implemented, so the bounded scan
        remains. It can still overrun a non-NUL-terminated foreign block — tracked. */
     return nova_probe_cstr((const char*)ptr);
 #endif
