@@ -527,7 +527,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-24.04-arm joins here rather than running its own unsharded pass. It had the whole
+        # ~3,570-test suite on ONE runner and hit the 330-minute cap at 3525/3570 -- roughly 200
+        # minutes in the parallel phase before it even reached the serial server tests. Sharded
+        # four ways it gets the same wall-clock budget as every other platform.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
     continue-on-error: true
@@ -544,11 +548,24 @@ jobs:
       - name: Build self-hosted compiler from the checked-in seed
         run: |
           cd nova-compiler/compiler
-          if [ "$(uname -s)" = "Darwin" ]; then
-            clang -O2 -o nova nova_compiler_macos.ll nova_runtime.c -lm -Wno-everything -D_DARWIN_C_SOURCE
-          else
-            clang -O2 -o nova nova_compiler_linux.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
-          fi
+          # Branch on ARCH as well as OS. This used to test only `uname -s`, so an aarch64 Linux
+          # runner would have been handed the x86_64 seed -- a triple mismatch that fails at the
+          # first instruction selection, with an error naming clang rather than the seed.
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/*)          SEED=nova_compiler_macos.ll;       LINK="-lm -D_DARWIN_C_SOURCE" ;;
+            Linux/aarch64|Linux/arm64) SEED=nova_compiler_linux_arm64.ll; LINK="-lpthread -ldl -lm" ;;
+            *)                 SEED=nova_compiler_linux.ll;       LINK="-lpthread -ldl -lm" ;;
+          esac
+          echo "::notice title=seed::$(uname -s)/$(uname -m) -> $SEED :: $(grep -m1 'target triple' $SEED)"
+          # Guard the triple, exactly as the per-platform selfhosted jobs do: a seed emitted for the
+          # wrong target is the one failure mode this whole step exists to avoid.
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/*)                  WANT=aarch64-apple-darwin ;;
+            Linux/aarch64|Linux/arm64) WANT=aarch64-unknown-linux-gnu ;;
+            *)                         WANT=x86_64-unknown-linux-gnu ;;
+          esac
+          grep -q "$WANT" "$SEED" || { echo "::error title=seed::$SEED is not $WANT-targeted"; exit 1; }
+          clang -O2 -o nova "$SEED" nova_runtime.c $LINK -Wno-everything
           ./nova --version || true
 
       - name: Run FULL suite
@@ -611,9 +628,9 @@ jobs:
           rm -f nova_gen4 nova_gen5 gen4.ll gen5.ll gen6.ll
         timeout-minutes: 60
 
-      - name: Run FULL suite
-        run: bash .github/scripts/posix_full_suite.sh
-        timeout-minutes: 330
+      # The full suite moved to the sharded posix-full-suite matrix (see its `os:` list). This job
+      # keeps the thing only it can prove: that aarch64+ELF+glibc reaches a byte-identical
+      # fixpoint. Leaving an unsharded copy here would just re-time-out and mask that result.
 
   # ─── TIER 3: NOVA_T8_FULLRC (leak-checking) — currently ZERO CI coverage anywhere ─────
   # The local arc runs BOTH memory modes, but CI has only ever run NORMAL, on any platform.
