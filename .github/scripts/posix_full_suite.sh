@@ -71,6 +71,20 @@ if [ -f "$SQLITE_SRC" ]; then
   fi
 fi
 
+# ── build the hot-reload plugins natively ──────────────────────────────────────────────────
+# hot_reload_test dlopen()s _hot_plugin / _hot_plugin_v2 / _hot_args. Only the WINDOWS .dll is
+# committed (a PE binary, unloadable here), while the .c sources ARE tracked -- so on POSIX the
+# shared objects simply did not exist and the test failed on a missing file rather than on
+# anything about hot reloading. Build them with the platform's own extension.
+DLEXT=".so"; DLFLAGS="-shared -fPIC"
+if [ "$(uname -s)" = "Darwin" ]; then DLEXT=".dylib"; DLFLAGS="-dynamiclib"; fi
+for hp in _hot_plugin _hot_plugin_v2 _hot_args; do
+  if [ -f "$hp.c" ]; then
+    clang -O2 $DLFLAGS "$hp.c" -o "$hp$DLEXT" -w 2>>"$OUT/_hot.log" \
+      && echo "  built $hp$DLEXT" || echo "  WARN: $hp$DLEXT failed to build"
+  fi
+done
+
 # ── enumerate tests: use the SAME canonical list Windows runs ──────────────────────────────
 # The first version of this script globbed every .nova with its own main(). That was wrong, and
 # the first macOS run proved it: 3771 "tests" discovered vs the 3590 Windows actually runs, and
