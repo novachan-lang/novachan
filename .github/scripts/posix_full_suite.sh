@@ -254,8 +254,15 @@ run_one() {
   # 60s cap is marginal rather than generous -- a slower runner turns "slow but correct" into
   # TIMEOUT. They get 150s; everything else keeps the Windows-matching 60s.
   local rtmo="${2:-60}"
+  # RUN(1) failures print their own diagnosis to stdout/stderr; keep the first meaningful line.
   if TMO "$rtmo" "./$exe" >>"$log" 2>&1; then
-    if grep -q "FAIL assert" "$log" 2>/dev/null; then echo "ASSERT" >"$OUT/$t.res"; else echo "PASS" >"$OUT/$t.res"; fi
+    if grep -q "FAIL assert" "$log" 2>/dev/null; then
+      # Carry the assertion text. "ASSERT" alone cannot distinguish a slightly-wrong number from
+      # a wildly-wrong one, and that difference is the whole diagnosis: a corrupted large integer
+      # looks nothing like an off-by-one. Two theories have already died for want of this.
+      echo "ASSERT[$(grep -m1 'FAIL assert' "$log" 2>/dev/null | tr '
+' '  ' | cut -c1-120)]" >"$OUT/$t.res"
+    else echo "PASS" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t ok" >>"$OUT/_times.txt"
   else
     local c=$?
@@ -264,7 +271,8 @@ run_one() {
       # A bare "TIMEOUT" says nothing about WHERE it stopped -- whether the server never bound,
       # never accepted, or simply ran long. The last log line usually distinguishes those.
       echo "TIMEOUT[$(tail -c 90 "$log" 2>/dev/null | tr '\n\r' '  ')]" >"$OUT/$t.res"
-    else echo "RUN($c)" >"$OUT/$t.res"; fi
+    else echo "RUN($c)[$(grep -m1 -iE 'fail|expect|got|error' "$log" 2>/dev/null | tr '
+' '  ' | cut -c1-120)]" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t rc=$c" >>"$OUT/_times.txt"
   fi
   rm -f "$ll" "$exe"
