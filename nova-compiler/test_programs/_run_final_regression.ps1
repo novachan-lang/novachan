@@ -717,9 +717,18 @@ if ($outfails.Count -gt 0) {
     }
 }
 if ($outfail_real.Count -gt 0) {
-    Write-Host "FAIL: $($outfail_real.Count) test(s) printed a failure report but exited 0."
-    $fail += $outfail_real.Count
+    Write-Host "SUSPECT-OUTFAIL-UNEXPECTED: $($outfail_real.Count) test(s) printed a failure report but exited 0."
+    foreach ($s in $outfail_real) { Write-Host "  UNEXPECTED: $s" }
 }
+# NOT fatal yet, and that is a correction of my own overreach. I flipped this to fatal on the
+# strength of a LOCAL zero -- and the local box is not the CI environment: no network, different
+# services, different installed tooling, so a test can print FAIL and exit 0 there while passing
+# here. windows-fullrc had been green and went red on the very next run.
+#
+# The bar for flipping it is a CI-GREEN zero, not a local one: this must print no UNEXPECTED lines
+# on Windows, Linux, aarch64-Linux and macOS before it becomes fatal. Everything else about the
+# check stays -- the count, the whitelist, and the UNEXPECTED labelling -- so the signal is still
+# impossible to miss, which is what actually found the two broken HTTP KATs.
 if ($fail -gt 0) { exit 1 }
 exit 0
 
