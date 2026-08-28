@@ -115,6 +115,14 @@ if os.path.isfile(mf):
 # Excluded on Windows too (see _remote_gate.ps1): these hang or assume a spawn-dispatch
 # protocol node_recv does not provide. Keeping them out means this job measures THE PORT
 # rather than re-reporting a defect Windows already tracks separately.
+# SHARDING. Linux ran the full list for 330 MINUTES without even finishing the parallel phase,
+# while macOS completes the same 3571 tests in 49. GitHub's hard job ceiling is 360 minutes, so
+# raising the cap cannot fix that -- the work has to be split across MACHINES, not just cores.
+# Each shard takes every Nth test, which spreads slow tests evenly instead of clumping them the
+# way a contiguous range would.
+SHARD_I = int(os.environ.get('NOVA_SHARD_INDEX', '0'))
+SHARD_N = int(os.environ.get('NOVA_SHARD_TOTAL', '1'))
+
 skip = {'distributed_serialize_test', 'distributed_spawn_test'}
 # ARCH-SCOPED EXCLUSION. _asm_inline_test embeds x86 AT&T assembly ("mov $$42, $0") via the 7.1
 # inline-asm feature. Inline asm is ASSEMBLED REGARDLESS OF REACHABILITY, so it cannot be made
@@ -137,12 +145,18 @@ if srv:
     server = {a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", srv.group(1))}
 seen = set()
 par, ser = [], []
+ordinal = 0
 for n in names:
     if n in skip or n in seen:
         continue
     if not os.path.isfile(os.path.join(tp, n + '.nova')):
         continue          # absent source: Windows fails these loudly; here it is not our subject
     seen.add(n)
+    # Shard AFTER dedup/skip so the split is stable and every test lands in exactly one shard.
+    if ordinal % SHARD_N != SHARD_I:
+        ordinal += 1
+        continue
+    ordinal += 1
     (ser if n in server else par).append(n)
 with open(os.path.join(tp, '_posix_res', '_serial.txt'), 'w') as f:
     f.write("\n".join(ser) + ("\n" if ser else ""))
@@ -151,8 +165,18 @@ for n in par:
     print(n)
 PYEOF
 TOTAL=$(( $(wc -l < "$OUT/_tests.txt" | tr -d ' ') + $(wc -l < "$OUT/_serial.txt" 2>/dev/null | tr -d ' ') ))
-echo "canonical test list: $TOTAL tests (same source of truth as the Windows harness)"
-[ "$TOTAL" -gt 3000 ] || { echo "::error title=posix-full::only $TOTAL tests resolved -- list extraction is broken, refusing to report a misleadingly small run"; exit 1; }
+SHARD_N="${NOVA_SHARD_TOTAL:-1}"; SHARD_I="${NOVA_SHARD_INDEX:-0}"
+echo "canonical test list: $TOTAL tests in shard $SHARD_I/$SHARD_N (same source of truth as the Windows harness)"
+# Guard scaled to the shard: a broken extractor must never masquerade as a small clean run.
+MIN_EXPECT=$(( 3000 / SHARD_N ))
+[ "$TOTAL" -gt "$MIN_EXPECT" ] || { echo "::error title=posix-full::only $TOTAL tests resolved for shard $SHARD_I/$SHARD_N (expected >$MIN_EXPECT) -- extraction is broken, refusing to report a misleadingly small run"; exit 1; }
+
+# PROGRESS TICKER. Both the 180m and 330m Linux runs were KILLED at the cap having emitted
+# nothing at all, so "how far did it get" was unanswerable and every diagnosis was a guess.
+# A heartbeat every 5 minutes means even a killed job leaves a trail.
+( while true; do sleep 300; echo "::notice title=posix progress::shard $SHARD_I/$SHARD_N -- $(ls "$OUT"/*.res 2>/dev/null | wc -l | tr -d ' ')/$TOTAL done"; done ) &
+TICKER_PID=$!
+trap 'kill $TICKER_PID 2>/dev/null' EXIT
 
 # ── run one test ───────────────────────────────────────────────────────────────────────────
 # Timeouts MATCH the Windows worker (_test_worker.ps1) rather than being invented here:
