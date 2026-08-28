@@ -49,6 +49,21 @@ fi
 mkdir -p "$NOVA_HOME/lib"
 cp -f "$REPO_ROOT"/forge/*.nova "$NOVA_HOME/lib/" 2>/dev/null || true
 find "$REPO_ROOT/prism" -name '*.nova' -exec cp -f {} "$NOVA_HOME/lib/" \; 2>/dev/null || true
+
+# SYNC std/ TOO. I previously assumed nova-compiler/std was complete because it is tracked, and
+# skipped this -- _proc_util.ps1 does NOT skip it: it bundles <repo>/std into $NOVA_HOME/std on
+# every run, PRESERVING SUBDIRS. The assumption was wrong by exactly one file:
+# std/core/version.nova is tracked canonically but its installed copy never was, so
+# `import std/core/version` could not resolve on a clean clone and _version_test failed to
+# COMPILE. Copying the canonical tree over the installed one makes that whole class impossible
+# rather than fixing the one file that happened to be missing today.
+if [ -d "$REPO_ROOT/std" ]; then
+  ( cd "$REPO_ROOT/std" && find . -name '*.nova' -print0 \
+      | while IFS= read -r -d '' f; do
+          mkdir -p "$NOVA_HOME/std/$(dirname "$f")"
+          cp -f "$f" "$NOVA_HOME/std/$f"
+        done ) 2>/dev/null || true
+fi
 echo "lib/ modules: $(ls "$NOVA_HOME"/lib/*.nova 2>/dev/null | wc -l)  std/ modules: $(find "$NOVA_HOME/std" -name '*.nova' 2>/dev/null | wc -l)"
 
 cd "$NOVA_HOME/test_programs"
@@ -226,13 +241,22 @@ run_one() {
   if ! TMO 300 clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $sq $xsrc $LINKF $xlib -w >>"$log" 2>&1; then
     echo "LINK" >"$OUT/$t.res"; echo "$((SECONDS-t0)) $t LINK" >>"$OUT/_times.txt"; return
   fi
-  if TMO 60 "./$exe" >>"$log" 2>&1; then
+  # Server/demo tests do ~40s of REAL I/O each by design (their own harness says so), so a flat
+  # 60s cap is marginal rather than generous -- a slower runner turns "slow but correct" into
+  # TIMEOUT. They get 150s; everything else keeps the Windows-matching 60s.
+  local rtmo="${2:-60}"
+  if TMO "$rtmo" "./$exe" >>"$log" 2>&1; then
     if grep -q "FAIL assert" "$log" 2>/dev/null; then echo "ASSERT" >"$OUT/$t.res"; else echo "PASS" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t ok" >>"$OUT/_times.txt"
   else
     local c=$?
     # 124 = GNU timeout, 142 = 128+SIGALRM from the perl fallback. Both mean "hung".
-    if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then echo "TIMEOUT" >"$OUT/$t.res"; else echo "RUN($c)" >"$OUT/$t.res"; fi
+    if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then
+      # A bare "TIMEOUT" says nothing about WHERE it stopped -- whether the server never bound,
+      # never accepted, or simply ran long. The last log line usually distinguishes those.
+      echo "TIMEOUT[$(tail -c 90 "$log" 2>/dev/null | tr '
+' ' ' | tr -d '')]" >"$OUT/$t.res"
+    else echo "RUN($c)" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t rc=$c" >>"$OUT/_times.txt"
   fi
   rm -f "$ll" "$exe"
@@ -258,7 +282,7 @@ echo "::notice title=posix parallel phase done::$PDONE results after the paralle
 
 if [ -s "$OUT/_serial.txt" ]; then
   echo "running $(wc -l < "$OUT/_serial.txt" | tr -d ' ') SERVER tests serially ..."
-  while read -r st; do [ -n "$st" ] && run_one "$st"; done < "$OUT/_serial.txt"
+  while read -r st; do [ -n "$st" ] && run_one "$st" 150; done < "$OUT/_serial.txt"
   cat "$OUT/_serial.txt" >> "$OUT/_tests.txt"
 fi
 
