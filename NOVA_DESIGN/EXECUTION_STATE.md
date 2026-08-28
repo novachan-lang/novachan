@@ -31,10 +31,36 @@ four real bugs (`st_mtim`, `epoll`→kqueue, Mach-O asm, and the bitwise pointer
 FAIL on its first run). It had zero CI coverage on any platform before 2026-08-28. Still Windows
 only; POSIX runs NORMAL alone, and Windows CI still never reconverges.
 
-**TIER 2 IN PROGRESS — the full ~3,571-test suite on POSIX.** macOS: 205 → **59 fails (98.3%)**.
-Every failure diagnosed so far has been the HARNESS, not NOVA: a glob that scored negative tests
-as failures, a 25s cap on deliberately-slow crypto, ignored FFI link directives, and server tests
-run concurrently that starved their own green schedulers. Linux hit the 180m cap (now 330m).
+**TIER 2 IN PROGRESS — the full ~3,571-test suite on POSIX.** macOS: 205 → 59 → **45 fails**.
+Early failures were all HARNESS, not NOVA (a glob scoring negative tests as failures, a 25s cap on
+deliberately-slow crypto, ignored FFI link directives, server tests run concurrently that starved
+their own green schedulers). **The residue was NOT the harness — it was two real soundness bugs,
+both now fixed** (`da9e1752`, 2026-08-28):
+
+1. **`e897e4e3` + `7077d90b` — an integer landing in the program image was read as a STRING.**
+   `nova_is_readable_str` decided int-vs-string by ADDRESS RANGE. macOS loads the image at
+   4.295e9, inside the range programs compute in, so ~1,076 dynamic ops per run of
+   `int_ptr_soundness_repro` were string-concatenated instead of added. Windows (1.4e14) and Linux
+   (9.4e13) load far above it, so the identical latent bug was simply **unreachable** — they passed
+   *by luck of the loader*, not by soundness. Grepping the bug's SHAPE found **three** such range
+   tests, not one (image 5.4 MB, `nova_strpool_contains` 256 KB, small-int cache 80 KB); all three
+   now identify strings by an 8-byte magic prefix, i.e. by CONTENT. All three POSIX seeds
+   regenerated — they carry the compiler's own emitter, so a stale seed would have made the fix
+   look ineffective on macOS for a third time.
+2. **`83572125` — SIGPIPE was KILLING every POSIX server test.** `send()` to a hung-up peer
+   terminates the process by default; the client then waited for a reply that could never come, so
+   it presented as a client TIMEOUT. Windows has no SIGPIPE, which is why the whole class was
+   invisible locally. Proof it was a kill and not slowness: raising the cap 60s→150s changed nothing.
+
+**Method note, learned expensively:** two prior theories died from reasoning instead of measuring
+(one relocated the *arena* when the collision was with the *executable*). What worked was a 20-line
+C probe that `#include`s `nova_runtime.c` and calls the suspect function directly — it reproduced
+the macOS bug **on Windows** in three minutes. The platform decides only whether a bug is
+REACHABLE, never whether it exists.
+
+Linux hit the 180m cap (now 330m); `linux-arm64-selfhosted` reconverged byte-identical but its
+unsharded full suite stalled at 3525/3570 on exactly the serial server tests — i.e. the SIGPIPE
+cluster, so (2) is the expected fix. Awaiting the CI run for `da9e1752` to confirm both.
 
 ---
 
