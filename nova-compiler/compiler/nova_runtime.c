@@ -579,8 +579,34 @@ static int nova_oa_reserve(void) {
     void* p = VirtualAlloc(NULL, NOVA_OA_RESERVE_BYTES, MEM_RESERVE, PAGE_READWRITE);
     if (!p) return 0;
 #else
-    void* p = mmap(NULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
+    /* PLACE THE ARENA NUMERICALLY OUT OF THE WAY OF ORDINARY INTEGERS.
+       nova_is_box() decides int-vs-pointer by testing membership of [g_box_lo, g_box_hi] and
+       then reading a tag at that address. That is only safe while no plausible INTEGER VALUE
+       can equal a live box address -- and where the kernel puts this reservation decides
+       whether that holds.
+
+       x86_64 Linux/Windows map it around 1e14, comfortably above ordinary data. macOS ARM64
+       maps it near 4e10, and that is squarely inside the range real programs compute in.
+       int_ptr_soundness_repro accumulates its total to 1.68e13, so it passes STRAIGHT THROUGH
+       the 4e10..5.7e10 window on the way there; at that instant the integer IS a valid box
+       address, gets read as a box, and the sum silently corrupts. That test -- the project's own
+       regression guard for this exact class -- fails on macOS and passes everywhere else.
+
+       Asking for a high base moves the window to ~7e13, above anything the suite computes and
+       above almost all real integer data, while staying inside the 47-bit user VA that both
+       macOS-arm64 and Linux provide. MAP_FIXED is deliberately NOT used: a hint that cannot be
+       honoured must degrade to the kernel's choice, never fail or clobber an existing mapping.
+
+       HONEST LIMIT: this is a MITIGATION, not a proof. A program computing integers above ~7e13
+       can still collide. The only complete fixes are value tagging or never sniffing at all
+       (which is what the bitwise type-propagation fix achieved for statically-typed code); both
+       are recorded in the design notes. This shrinks the exposed window by ~1700x today. */
+    void* p = mmap((void*)(uintptr_t)0x0000400000000000ULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        p = mmap(NULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    }
     if (p == MAP_FAILED) return 0;
 #endif
     /* Align the usable base up to an arena boundary so arena ids stay exact. */
