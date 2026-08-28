@@ -11841,6 +11841,26 @@ void nova_rt_init(void) {
        tests `g_cyc_on > 0` and never calls into the resolver. */
     (void)nova_cyc_enabled();
     nova_preempt_init();          /* 4.3: resolve NOVA_REDUCTIONS once, never per iteration */
+#ifndef _WIN32
+    /* IGNORE SIGPIPE. On POSIX, send()/write() to a socket whose peer has closed delivers SIGPIPE,
+       and its DEFAULT ACTION IS TO TERMINATE THE PROCESS. A server that writes to a client which
+       hung up therefore dies outright -- no error return, no exception, no chance to handle it.
+       Windows has no SIGPIPE at all (WinSock reports WSAECONNRESET/WSAECONNABORTED from send), which
+       is exactly why every server test passes there and the POSIX runs showed demo_http_server_test,
+       real_http_api, http_offload_test, demo_forge_* and friends TIMING OUT: the server process was
+       killed mid-exchange and the client waited for a reply that could never come. Raising the run
+       cap from 60s to 150s did not help, which is what proved these were kills rather than slowness.
+
+       Ignoring it makes send() return -1/EPIPE instead, which the existing socket paths already
+       treat as a normal write failure. This is the standard behaviour for every network server; the
+       alternative (SO_NOSIGPIPE per socket, or MSG_NOSIGNAL per send) is Darwin/Linux-specific and
+       would have to be threaded through every call site. Process-wide and set once is both simpler
+       and harder to get wrong.
+
+       Deliberately does NOT disturb the SIGSEGV/SIGBUS handlers installed for the fiber
+       stack-overflow guard -- different signals, different mechanism. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
 #ifdef _WIN32
     /* TIMER RESOLUTION. Windows' default timer granularity is 15.6 ms, and the netpoller thread
        idles on Sleep(1) (see the poller loop below), which ROUNDS UP to a full tick. A green task

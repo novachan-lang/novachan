@@ -260,8 +260,7 @@ run_one() {
       # Carry the assertion text. "ASSERT" alone cannot distinguish a slightly-wrong number from
       # a wildly-wrong one, and that difference is the whole diagnosis: a corrupted large integer
       # looks nothing like an off-by-one. Two theories have already died for want of this.
-      echo "ASSERT[$(grep -m1 'FAIL assert' "$log" 2>/dev/null | tr '
-' '  ' | cut -c1-120)]" >"$OUT/$t.res"
+      echo "ASSERT[$(grep -m1 'FAIL assert' "$log" 2>/dev/null | tr '\n\r' '  ' | cut -c1-120)]" >"$OUT/$t.res"
     else echo "PASS" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t ok" >>"$OUT/_times.txt"
   else
@@ -270,9 +269,8 @@ run_one() {
     if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then
       # A bare "TIMEOUT" says nothing about WHERE it stopped -- whether the server never bound,
       # never accepted, or simply ran long. The last log line usually distinguishes those.
-      echo "TIMEOUT[$(tail -c 90 "$log" 2>/dev/null | tr '\n\r' '  ')]" >"$OUT/$t.res"
-    else echo "RUN($c)[$(grep -m1 -iE 'fail|expect|got|error' "$log" 2>/dev/null | tr '
-' '  ' | cut -c1-120)]" >"$OUT/$t.res"; fi
+      echo "TIMEOUT[$(grep -viE 'alarm clock|perl -e|exec @ARGV|_suite\.sh' "$log" 2>/dev/null | tail -c 90 | tr '\n\r' '  ')]" >"$OUT/$t.res"
+    else echo "RUN($c)[$(grep -m1 -iE 'fail|expect|got|error' "$log" 2>/dev/null | tr '\n\r' '  ' | cut -c1-120)]" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t rc=$c" >>"$OUT/_times.txt"
   fi
   rm -f "$ll" "$exe"
