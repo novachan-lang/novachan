@@ -70,6 +70,15 @@ cd "$NOVA_HOME/test_programs"
 OUT=_posix_res
 rm -rf "$OUT"; mkdir -p "$OUT"
 
+# DB CREDENTIALS: the runner images export these while running NO SERVER, which DEFEATS the
+# tests' own skip guards. _mysql_test does exactly the right thing --
+#     let pw = env("MYSQLPASSWORD")
+#     if len(pw) == 0 -> print "skipped" and return
+# -- but an exported password makes it conclude a database exists, connect to nothing, and fail.
+# Identical to the PostgreSQL trap already handled in the Windows job. Clearing them lets each
+# test take the skip path its author wrote, instead of failing against an absent server.
+export MYSQLPASSWORD="" PGPASSWORD=""
+
 # ── pre-compile the shared objects once ────────────────────────────────────────────────────
 # Same reason the PowerShell harness does it: recompiling nova_runtime.c (and the ~250k-line
 # sqlite3 amalgamation) per test would dominate wall time entirely.
