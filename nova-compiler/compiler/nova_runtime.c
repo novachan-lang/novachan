@@ -866,10 +866,27 @@ static void nova_fast_free(void* ptr, size_t size) { (void)size; nova_oa_free(pt
 
 /* ── String Pool (ultra-fast alloc/free for short strings, bypasses HT) ─── */
 
+/* Identity prefix shared by every header-less NOVA string: compiler-emitted literals, the
+   runtime's own NOVA_LIT() literals, the string pool below, and the small-int string cache.
+   Declared here because the string pool is the earliest user. */
+static const unsigned char nova_strlit_magic[8] = { 0xAB,'N','O','V','S','T','R',0xCD };
+#if defined(__GNUC__) || defined(__clang__)
+#define NOVA_ALIGN8 __attribute__((aligned(8)))
+#else
+#define NOVA_ALIGN8
+#endif
+
 #define NOVA_STRPOOL_SLOT_SIZE 16
 #define NOVA_STRPOOL_COUNT     16384
 
-static char     nova_strpool_data[NOVA_STRPOOL_COUNT][NOVA_STRPOOL_SLOT_SIZE];
+/* Each slot is [8-byte magic][NOVA_STRPOOL_SLOT_SIZE usable bytes]. The stride stays a
+   multiple of 8, so every pointer handed out is 8-aligned and its magic sits at ptr[-8]. */
+#define NOVA_STRPOOL_PREFIX 8
+#define NOVA_STRPOOL_STRIDE (NOVA_STRPOOL_PREFIX + NOVA_STRPOOL_SLOT_SIZE)
+static char     nova_strpool_data[NOVA_STRPOOL_COUNT][NOVA_STRPOOL_STRIDE] NOVA_ALIGN8;
+#define NOVA_STRPOOL_SLOT(i) (nova_strpool_data[i] + NOVA_STRPOOL_PREFIX)
+#define NOVA_STRPOOL_BASE    (nova_strpool_data[0] + NOVA_STRPOOL_PREFIX)
+#define NOVA_STRPOOL_END     ((const char*)nova_strpool_data[0] + sizeof(nova_strpool_data))
 static int32_t  nova_strpool_rc[NOVA_STRPOOL_COUNT];
 static int      nova_strpool_stack[NOVA_STRPOOL_COUNT];
 static int      nova_strpool_top = -1;
@@ -919,8 +936,12 @@ static void nova_strpool_init(void) {
 }
 
 static inline int nova_strpool_contains(const void* ptr) {
-    return (const char*)ptr >= nova_strpool_data[0] &&
-           (const char*)ptr < nova_strpool_data[0] + sizeof(nova_strpool_data);
+    /* CONTENT, not address. A bare integer whose value lands in this 256 KB array used to be
+       reported as NOVA_MEM_RAW -- i.e. "this is a string" -- which is the same unsoundness that
+       made macOS string-concatenate integers. The magic makes membership exact. */
+    const char* p = (const char*)ptr;
+    if (p < NOVA_STRPOOL_BASE || p >= NOVA_STRPOOL_END) return 0;
+    return memcmp(p - NOVA_STRPOOL_PREFIX, nova_strlit_magic, NOVA_STRPOOL_PREFIX) == 0;
 }
 
 static inline char* nova_strpool_alloc(void) {
@@ -929,14 +950,15 @@ static inline char* nova_strpool_alloc(void) {
     if (nova_strpool_top < 0) { nova_strpool_release(); return NULL; }
     int idx = nova_strpool_stack[nova_strpool_top--];
     nova_strpool_rc[idx] = 1;
-    char* result = nova_strpool_data[idx];
+    memcpy(nova_strpool_data[idx], nova_strlit_magic, NOVA_STRPOOL_PREFIX);
+    char* result = NOVA_STRPOOL_SLOT(idx);
     nova_strpool_release();
     return result;
 }
 
 static inline void nova_strpool_free(char* ptr) {
     nova_strpool_acquire();
-    int idx = (int)((ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
+    int idx = (int)((ptr - NOVA_STRPOOL_BASE) / NOVA_STRPOOL_STRIDE);
     nova_strpool_rc[idx] = 0;
     nova_strpool_stack[++nova_strpool_top] = idx;
     nova_strpool_release();
@@ -944,14 +966,14 @@ static inline void nova_strpool_free(char* ptr) {
 
 static inline void nova_strpool_rc_inc(const void* ptr) {
     nova_strpool_acquire();
-    int idx = (int)(((const char*)ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
+    int idx = (int)(((const char*)ptr - NOVA_STRPOOL_BASE) / NOVA_STRPOOL_STRIDE);
     nova_strpool_rc[idx]++;
     nova_strpool_release();
 }
 
 static inline int nova_strpool_rc_dec(const void* ptr) {
     nova_strpool_acquire();
-    int idx = (int)(((const char*)ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
+    int idx = (int)(((const char*)ptr - NOVA_STRPOOL_BASE) / NOVA_STRPOOL_STRIDE);
     int freed = 0;
     /* CORE_GAP 0.5: only free on the 1->0 transition, and NEVER re-push an already-freed slot.
        The old `--rc <= 0` re-pushed a slot on every double-dec (handing the same slot out twice AND
@@ -1277,7 +1299,13 @@ void nova_rc_inc(int64_t val);
 void nova_rc_dec(int64_t val);
 
 /* Forward declarations for int_to_str cache (needed by nova_mem_find_tag) */
-static char     nova_int_str_cache[10000][8];
+/* Same layout rule as the string pool: [8-byte magic][8 usable bytes] (4 digits + NUL max). */
+#define NOVA_INTSTR_PREFIX 8
+#define NOVA_INTSTR_STRIDE 16
+static char     nova_int_str_cache[10000][NOVA_INTSTR_STRIDE] NOVA_ALIGN8;
+#define NOVA_INTSTR_SLOT(i) (nova_int_str_cache[i] + NOVA_INTSTR_PREFIX)
+#define NOVA_INTSTR_BASE    (nova_int_str_cache[0] + NOVA_INTSTR_PREFIX)
+#define NOVA_INTSTR_END     ((const char*)nova_int_str_cache[0] + sizeof(nova_int_str_cache))
 static uint64_t nova_int_str_cache_hash[10000];
 static int      nova_int_str_cache_inited;
 
@@ -1859,8 +1887,6 @@ static int nova_addr_in_module(uintptr_t a) {
    literals announces itself via nova_rt_strlit_strict(); a module built by an older compiler
    never calls it and keeps the legacy behaviour. The permissive path retires once no supported
    seed predates the magic. */
-static const unsigned char nova_strlit_magic[8] = { 0xAB,'N','O','V','S','T','R',0xCD };
-
 /* THE RUNTIME HAS LITERALS TOO. 97 sites hand a plain C literal back as a NOVA string value
    (`return NOVA_LIT("list")` in nova_rt_type_name, the "" returned on degenerate
    input, and so on). Those are just as header-less as a compiler-emitted literal, so under a
@@ -1909,8 +1935,8 @@ static int nova_is_readable_str(const void* ptr) {
        every value under 10000, while working on Windows, so the CI never saw it. The table is
        static, always NUL-terminated by nova_int_str_cache_init, and never freed. */
     if (nova_int_str_cache_inited &&
-        (const char*)ptr >= nova_int_str_cache[0] &&
-        (const char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
+        (const char*)ptr >= NOVA_INTSTR_BASE && (const char*)ptr < NOVA_INTSTR_END &&
+        memcmp((const char*)ptr - NOVA_INTSTR_PREFIX, nova_strlit_magic, NOVA_INTSTR_PREFIX) == 0)
         return 1;
 #if defined(_WIN32) || defined(NOVA_FREESTANDING) || defined(__linux__) || defined(__APPLE__)
     /* Exact module ranges on every supported target: PE header (Windows), __heap_base (wasm),
@@ -2012,9 +2038,8 @@ static const char* nova_intern_h(const char* s, uint64_t* out_hash) {
     }
     uint64_t h;
     if (nova_int_str_cache_inited &&
-        s >= nova_int_str_cache[0] &&
-        s < nova_int_str_cache[0] + sizeof(nova_int_str_cache)) {
-        int idx = (int)((s - nova_int_str_cache[0]) / 8);
+        s >= NOVA_INTSTR_BASE && s < NOVA_INTSTR_END) {
+        int idx = (int)((s - NOVA_INTSTR_BASE) / NOVA_INTSTR_STRIDE);
         h = nova_int_str_cache_hash[idx];
     } else {
         NovaMemTag tag = nova_mem_find_tag((void*)s);
@@ -2989,9 +3014,10 @@ int64_t nova_rt_str_concat(int64_t a, int64_t b) {
 
 static void nova_int_str_cache_init(void) {
     for (int i = 0; i < 10000; i++) {
-        snprintf(nova_int_str_cache[i], 8, "%d", i);
+        memcpy(nova_int_str_cache[i], nova_strlit_magic, NOVA_INTSTR_PREFIX);
+        snprintf(NOVA_INTSTR_SLOT(i), NOVA_INTSTR_STRIDE - NOVA_INTSTR_PREFIX, "%d", i);
         uint64_t h = 14695981039346656037ULL;
-        for (const char* p = nova_int_str_cache[i]; *p; p++) {
+        for (const char* p = NOVA_INTSTR_SLOT(i); *p; p++) {
             h ^= (uint64_t)(unsigned char)*p;
             h *= 1099511628211ULL;
         }
@@ -3003,7 +3029,7 @@ static void nova_int_str_cache_init(void) {
 int64_t nova_rt_int_to_str(int64_t v) {
     if (v >= 0 && v < 10000) {
         if (!nova_int_str_cache_inited) nova_int_str_cache_init();
-        return (int64_t)(uintptr_t)nova_int_str_cache[v];
+        return (int64_t)(uintptr_t)NOVA_INTSTR_SLOT(v);
     }
     char tmp[32];
     int len = snprintf(tmp, 32, "%lld", (long long)v);
