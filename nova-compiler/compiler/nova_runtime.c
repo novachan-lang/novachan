@@ -1828,13 +1828,73 @@ static int nova_addr_in_module(uintptr_t a) {
 #endif
 #endif
 
-/* SOUND int-vs-string discrimination. Every runtime-created string now carries an RC
-   header (nova_mem_find_tag -> RAW/FAT_STR); the only header-less string is a static
-   literal, which lives in the program image (Windows: exact PE range; POSIX: a
-   page-guarded text probe). A bare integer carries no header and is not in the image,
-   so it can NEVER be mistaken for a string here — closing the CVE-class wild read
-   where untyped (`any`) `+`/`*` strlen()'d a large integer as a string. See
-   NOVA_DESIGN/INT_POINTER_SOUNDNESS.md. */
+/* ---------------------------------------------------------------------------------------
+   STRING-LITERAL IDENTITY: content, not address.
+
+   The rule below used to be "a header-less address inside the program image is a string
+   literal". That is unsound, and the old comment here asserted the opposite ("a bare integer
+   ... can NEVER be mistaken for a string"). An integer whose VALUE lands inside the image is,
+   by definition, inside the image. Whether a program can REACH such a value is decided purely
+   by where the loader put the executable:
+
+       macOS arm64   image at 0x100000000 = 4.295e9   <- inside the range programs compute in
+       Windows x64   image at ~0x7ff6…    = 1.407e14  <- 28,000x above it
+       Linux PIE     image at ~0x5555…    = 9.38e13   <- above it
+
+   int_ptr_soundness_repro performs 1,000,000 dynamic ops whose values sweep [0, 5.02e9]. On
+   macOS ~1,076 of them hit the image and are string-concatenated instead of added; on Windows
+   and Linux zero do, so those platforms passed by LUCK OF THE LOADER, not by soundness.
+   Confirmed by driving nova_rt_add() directly with a literal's address ON WINDOWS: it returned
+   the string, not the sum. (Two earlier fixes missed because they were reasoned rather than
+   measured; one relocated the ARENA when the collision was with the EXECUTABLE.)
+
+   The fix is to stop asking WHERE a pointer is and start asking WHAT is in front of it. Every
+   compiler-emitted literal now carries an 8-byte magic prefix, so classification depends on
+   content and a stray integer must match 64 specific bits to be misread (2^-64), on every
+   platform, regardless of load address.
+
+   STRICT MODE EXISTS FOR THE BOOTSTRAP. The seed compiler emits pre-magic literals, yet the
+   binary it produces links THIS runtime. If the magic were required unconditionally, that one
+   generation would be broken and self-hosting could not proceed. So a module that emits magic
+   literals announces itself via nova_rt_strlit_strict(); a module built by an older compiler
+   never calls it and keeps the legacy behaviour. The permissive path retires once no supported
+   seed predates the magic. */
+static const unsigned char nova_strlit_magic[8] = { 0xAB,'N','O','V','S','T','R',0xCD };
+
+/* THE RUNTIME HAS LITERALS TOO. 97 sites hand a plain C literal back as a NOVA string value
+   (`return NOVA_LIT("list")` in nova_rt_type_name, the "" returned on degenerate
+   input, and so on). Those are just as header-less as a compiler-emitted literal, so under a
+   content-based rule they must carry the same prefix or type_name() would stop returning
+   strings the moment strict mode came on. NOVA_LIT() gives them one.
+
+   The static lives inside a statement expression, so it has static storage duration and a
+   stable address, is initialised at compile time, needs no lock, and costs nothing at runtime
+   -- while still reading as an ordinary literal at the use site. aligned(8) makes `.t` 8-aligned
+   (the magic occupies exactly the 8 bytes in front of it), which the strict test requires.
+
+   A compiler without statement expressions cannot build the prefix this way, so it also never
+   turns strict mode on and keeps today's behaviour exactly. We build with clang everywhere. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NOVA_HAVE_STRLIT_MAGIC 1
+#define NOVA_LIT(s) (__extension__({                                              \
+    static const struct { unsigned char m[8]; char t[sizeof(s)]; }                \
+        __attribute__((aligned(8))) _nl =                                         \
+        { { 0xAB,'N','O','V','S','T','R',0xCD }, s };                             \
+    (int64_t)(uintptr_t)_nl.t; }))
+#else
+#define NOVA_HAVE_STRLIT_MAGIC 0
+#define NOVA_LIT(s) ((int64_t)(uintptr_t)(s))
+#endif
+
+static int g_strlit_strict = 0;
+/* Called by main() in every module the CURRENT compiler emits. A module built by an older seed
+   compiler never calls it, so that generation keeps the legacy address test and the bootstrap
+   is never broken by this change. */
+void nova_rt_strlit_strict(void) { g_strlit_strict = NOVA_HAVE_STRLIT_MAGIC; }
+
+/* SOUND int-vs-string discrimination. Every runtime-created string carries an RC header
+   (nova_mem_find_tag -> RAW/FAT_STR); the only header-less string is a static literal, which
+   is identified by its magic prefix (see above). */
 static int nova_is_readable_str(const void* ptr) {
     uintptr_t a = (uintptr_t)ptr;
     if (a < 0x10000ULL) return 0;
@@ -1852,17 +1912,25 @@ static int nova_is_readable_str(const void* ptr) {
         (const char*)ptr >= nova_int_str_cache[0] &&
         (const char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
         return 1;
-#ifdef _WIN32
-    return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
-#elif defined(NOVA_FREESTANDING)
-    return nova_addr_in_module(a);                             /* wasm: data-segment literal (below __heap_base) */
-#elif defined(__linux__)
-    return nova_addr_in_module(a);                             /* EXACT: dl_iterate_phdr ranges, no scanning */
-#elif defined(__APPLE__)
-    return nova_addr_in_module(a);                             /* EXACT: dyld LC_SEGMENT_64 ranges, no scanning */
+#if defined(_WIN32) || defined(NOVA_FREESTANDING) || defined(__linux__) || defined(__APPLE__)
+    /* Exact module ranges on every supported target: PE header (Windows), __heap_base (wasm),
+       dl_iterate_phdr (Linux), dyld LC_SEGMENT_64 (Darwin). No scanning anywhere. */
+    if (!nova_addr_in_module(a)) return 0;
+    if (!g_strlit_strict) return 1;      /* pre-magic module (bootstrap seed) -> legacy behaviour */
+
+    /* Literals are emitted `align 8`, so an unaligned address cannot be one. Cheap, and it
+       rejects the large majority of colliding integers before any memory is touched. */
+    if (a & 7) return 0;
+
+    /* Read the 8 bytes IN FRONT of the pointer. Guarded by a second module-membership test so
+       the read is always of mapped memory: a genuine literal's magic lies in the same segment,
+       and an integer that merely happens to land at a segment start is rejected rather than
+       faulting. */
+    if (a < 8 || !nova_addr_in_module(a - 8)) return 0;
+    return memcmp((const void*)(uintptr_t)(a - 8), nova_strlit_magic, 8) == 0;
 #else
-    /* Remaining POSIX (BSD): module capture not implemented, so the bounded scan
-       remains. It can still overrun a non-NUL-terminated foreign block — tracked. */
+    /* Remaining POSIX (BSD): module capture is not implemented, so the bounded scan remains and
+       the magic cannot be bounds-checked against a segment. Unchanged, and still tracked. */
     return nova_probe_cstr((const char*)ptr);
 #endif
 }
@@ -3842,7 +3910,7 @@ int64_t nova_rt_to_hex(int64_t val) {
     char buf[24];
     int len = snprintf(buf, sizeof(buf), "%llx", (unsigned long long)(uint64_t)val);
     char* out = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"0";
+    if (!out) return NOVA_LIT("0");
     memcpy(out, buf, len + 1);
     return (int64_t)(uintptr_t)out;
 }
@@ -3884,7 +3952,7 @@ int64_t nova_rt_str_between(int64_t s, int64_t start_delim, int64_t end_delim) {
     }
     size_t rlen = end - begin;
     char* out = (char*)nova_heap_alloc(rlen + 1, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     memcpy(out, begin, rlen);
     out[rlen] = '\0';
     return (int64_t)(uintptr_t)out;
@@ -4200,7 +4268,7 @@ int64_t nova_rt_list_flatten_deep(int64_t handle) {
 int64_t nova_rt_str_truncate(int64_t s, int64_t max_len) {
     const char* str = nova_str_safe(s);
     size_t slen = strlen(str);
-    if (max_len <= 0) return (int64_t)(uintptr_t)"";
+    if (max_len <= 0) return NOVA_LIT("");
     if ((size_t)max_len >= slen) return s;
     if (max_len <= 3) {
         char* out = (char*)nova_heap_alloc(max_len + 1, NOVA_MEM_RAW);
@@ -5789,7 +5857,7 @@ int64_t nova_rt_proc_write_stdin(int64_t handle, int64_t data_str) {
 
 int64_t nova_rt_proc_read_stdout(int64_t handle) {
     NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
-    if (!ph) return (int64_t)(uintptr_t)"";
+    if (!ph) return NOVA_LIT("");
     char buf[4096]; DWORD avail = 0;
     if (!PeekNamedPipe(ph->hStdoutRead, NULL, 0, NULL, &avail, NULL) || avail == 0) {
         DWORD n; if (!ReadFile(ph->hStdoutRead, buf, 1, &n, NULL) || n == 0)
@@ -5860,7 +5928,7 @@ int64_t nova_rt_proc_write_stdin(int64_t handle, int64_t data_str) {
 
 int64_t nova_rt_proc_read_stdout(int64_t handle) {
     NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
-    if (!ph) return (int64_t)(uintptr_t)"";
+    if (!ph) return NOVA_LIT("");
     char buf[4096]; ssize_t n = read(ph->stdout_fd, buf, 4095);
     if (n <= 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
     buf[n] = 0;
@@ -5987,10 +6055,10 @@ int64_t nova_rt_read_line(void) {
 
 /* Read exactly N bytes from stdin. Returns a heap-tracked string. */
 int64_t nova_rt_stdin_read_n(int64_t n) {
-    if (n <= 0) return (int64_t)(uintptr_t)"";
+    if (n <= 0) return NOVA_LIT("");
     size_t want = (size_t)n;
     char* buf = (char*)nova_heap_alloc(want + 1, NOVA_MEM_RAW);
-    if (!buf) return (int64_t)(uintptr_t)"";
+    if (!buf) return NOVA_LIT("");
     size_t got = 0;
     while (got < want) {
         size_t r = fread(buf + got, 1, want - got, stdin);
@@ -7001,7 +7069,7 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_LIST:     return nova_rt_list_to_str(val);
         case NOVA_MEM_DICT:     return nova_rt_json_stringify(val);
         case NOVA_MEM_STRUCT:   return nova_struct_to_str(val);
-        case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"<iter>";
+        case NOVA_MEM_ITER:     return NOVA_LIT("<iter>");
         case NOVA_MEM_BYTES: {
             NovaBytes* bb = (NovaBytes*)ptr;
             char tmp[48]; snprintf(tmp, sizeof(tmp), "<bytes:%lld>", (long long)bb->size);
@@ -7084,7 +7152,7 @@ static int64_t nova_struct_to_str(int64_t val) {
     int64_t h = ((const int64_t*)ptr)[0];
     int fc = nova_struct_meta_fcount(h);
     const char* nm = nova_struct_meta_name(h);
-    if (fc <= 0 || !nm) return (int64_t)(uintptr_t)"<struct>";
+    if (fc <= 0 || !nm) return NOVA_LIT("<struct>");
     const int64_t* slots = (const int64_t*)ptr;
     JsonBuf b; jbuf_init(&b);
     jbuf_append(&b, nm, (int64_t)strlen(nm));
@@ -7600,33 +7668,33 @@ int64_t nova_rt_type_hash(int64_t val) {
 }
 
 int64_t nova_rt_type_of(int64_t val) {
-    if (val == 0) return (int64_t)(uintptr_t)"int";
+    if (val == 0) return NOVA_LIT("int");
     void* ptr = (void*)(uintptr_t)val;
     NovaMemTag tag = nova_mem_find_tag(ptr);
     switch (tag) {
-        case NOVA_MEM_LIST:     return (int64_t)(uintptr_t)"list";
-        case NOVA_MEM_DICT:     return (int64_t)(uintptr_t)"dict";
-        case NOVA_MEM_CHANNEL:  return (int64_t)(uintptr_t)"channel";
-        case NOVA_MEM_RAW:      return (int64_t)(uintptr_t)"string";
-        case NOVA_MEM_FAT_STR:  return (int64_t)(uintptr_t)"string";
-        case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"struct";
-        case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"iter";
-        case NOVA_MEM_BYTES:    return (int64_t)(uintptr_t)"bytes";  /* consistent with nova_rt_type_name */
+        case NOVA_MEM_LIST:     return NOVA_LIT("list");
+        case NOVA_MEM_DICT:     return NOVA_LIT("dict");
+        case NOVA_MEM_CHANNEL:  return NOVA_LIT("channel");
+        case NOVA_MEM_RAW:      return NOVA_LIT("string");
+        case NOVA_MEM_FAT_STR:  return NOVA_LIT("string");
+        case NOVA_MEM_STRUCT:   return NOVA_LIT("struct");
+        case NOVA_MEM_ITER:     return NOVA_LIT("iter");
+        case NOVA_MEM_BYTES:    return NOVA_LIT("bytes");  /* consistent with nova_rt_type_name */
         case NOVA_MEM_BOX: {
             /* Any-boxed scalar (float/bool/null widened to Any and read back from a dict/list/
                any-slot). The box carries its kind, so return the TRUE type instead of "int" —
                raw i64 slots are indistinguishable, but a boxed value is not. This completes the
                compile-time type_of fold (which handles statically-typed values). */
             NovaBox* bx = (NovaBox*)ptr;
-            if (bx->kind == NOVA_BOX_FLOAT) return (int64_t)(uintptr_t)"float";
-            if (bx->kind == NOVA_BOX_BOOL)  return (int64_t)(uintptr_t)"bool";
-            if (bx->kind == NOVA_BOX_NULL)  return (int64_t)(uintptr_t)"null";
-            return (int64_t)(uintptr_t)"int";
+            if (bx->kind == NOVA_BOX_FLOAT) return NOVA_LIT("float");
+            if (bx->kind == NOVA_BOX_BOOL)  return NOVA_LIT("bool");
+            if (bx->kind == NOVA_BOX_NULL)  return NOVA_LIT("null");
+            return NOVA_LIT("int");
         }
         default:
             if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr))
-                return (int64_t)(uintptr_t)"string";
-            return (int64_t)(uintptr_t)"int";
+                return NOVA_LIT("string");
+            return NOVA_LIT("int");
     }
 }
 
@@ -11963,10 +12031,10 @@ int64_t nova_rt_args(void) {
 int64_t nova_rt_env(int64_t name_ptr) {
     const char* name = (const char*)(uintptr_t)name_ptr;
     const char* val = getenv(name);
-    if (!val) return (int64_t)(uintptr_t)"";
+    if (!val) return NOVA_LIT("");
     size_t len = strlen(val);
     char* copy = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!copy) return (int64_t)(uintptr_t)"";
+    if (!copy) return NOVA_LIT("");
     memcpy(copy, val, len + 1);
     return (int64_t)(uintptr_t)copy;
 }
@@ -12050,12 +12118,12 @@ int64_t nova_rt_random_float(void) {
 int64_t nova_rt_path_parent(int64_t path_ptr) {
     const char* p = (const char*)(uintptr_t)path_ptr;
     size_t len = strlen(p);
-    if (len == 0) return (int64_t)(uintptr_t)"";
+    if (len == 0) return NOVA_LIT("");
     size_t i = len - 1;
     while (i > 0 && p[i] != '/' && p[i] != '\\') i--;
-    if (i == 0 && p[0] != '/' && p[0] != '\\') return (int64_t)(uintptr_t)"";
+    if (i == 0 && p[0] != '/' && p[0] != '\\') return NOVA_LIT("");
     char* result = (char*)nova_heap_alloc(i + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, p, i);
     result[i] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -12069,7 +12137,7 @@ int64_t nova_rt_path_name(int64_t path_ptr) {
     const char* name = p + i;
     size_t nlen = len - i;
     char* result = (char*)nova_heap_alloc(nlen + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, name, nlen + 1);
     return (int64_t)(uintptr_t)result;
 }
@@ -12079,11 +12147,11 @@ int64_t nova_rt_path_ext(int64_t path_ptr) {
     size_t len = strlen(p);
     size_t i = len;
     while (i > 0 && p[i-1] != '.' && p[i-1] != '/' && p[i-1] != '\\') i--;
-    if (i == 0 || p[i-1] != '.') return (int64_t)(uintptr_t)"";
+    if (i == 0 || p[i-1] != '.') return NOVA_LIT("");
     const char* ext = p + i - 1;
     size_t elen = len - i + 1;
     char* result = (char*)nova_heap_alloc(elen + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, ext, elen + 1);
     return (int64_t)(uintptr_t)result;
 }
@@ -12098,7 +12166,7 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
 #endif
     if (!fp) {
         nova_set_error("shell: failed to execute command");
-        return (int64_t)(uintptr_t)"";
+        return NOVA_LIT("");
     }
     size_t cap = 1024, len = 0;
     char* buf = (char*)malloc(cap);
@@ -12108,7 +12176,7 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
 #else
         pclose(fp);
 #endif
-        return (int64_t)(uintptr_t)"";
+        return NOVA_LIT("");
     }
     size_t n;
     while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
@@ -12120,7 +12188,7 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
 #else
     pclose(fp);
 #endif
-    if (!buf) return (int64_t)(uintptr_t)"";
+    if (!buf) return NOVA_LIT("");
     buf[len] = '\0';
     /* Trim trailing newline */
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
@@ -15649,22 +15717,22 @@ int64_t nova_rt_regex_match(int64_t text_ptr, int64_t pattern_ptr) {
 int64_t nova_rt_regex_find(int64_t text_ptr, int64_t pattern_ptr) {
     const char* text = (const char*)(uintptr_t)text_ptr;
     const char* pattern = (const char*)(uintptr_t)pattern_ptr;
-    if (!text || !pattern) return (int64_t)(uintptr_t)"";
+    if (!text || !pattern) return NOVA_LIT("");
 
     ReProg prog;
     memset(&prog, 0, sizeof(prog));
     if (re_compile(pattern, &prog) != 0) {
         nova_set_error("regex: invalid pattern");
         re_free(&prog);
-        return (int64_t)(uintptr_t)"";
+        return NOVA_LIT("");
     }
     const char* saves[2] = {NULL, NULL};
     int found = re_exec(&prog, text, saves, 2);
     re_free(&prog);
-    if (!found || !saves[0] || !saves[1]) return (int64_t)(uintptr_t)"";
+    if (!found || !saves[0] || !saves[1]) return NOVA_LIT("");
     size_t mlen = saves[1] - saves[0];
     char* result = (char*)nova_heap_alloc(mlen + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, saves[0], mlen);
     result[mlen] = 0;
     return (int64_t)(uintptr_t)result;
@@ -15742,7 +15810,7 @@ int64_t nova_rt_regex_split(int64_t text_ptr, int64_t pattern_ptr) {
         cur = saves[1];
         if (*cur == 0) {
             /* Pattern matched at end — add empty string */
-            nova_rt_list_append(list, (int64_t)(uintptr_t)"");
+            nova_rt_list_append(list, NOVA_LIT(""));
             break;
         }
     }
@@ -16170,13 +16238,13 @@ int64_t nova_rt_tcp_recv(int64_t sock_val) {
                 buf[n] = '\0';
                 char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
                 if (result) { memcpy(result, buf, (size_t)n + 1); return (int64_t)(uintptr_t)result; }
-                return (int64_t)(uintptr_t)"";
+                return NOVA_LIT("");
             }
-            if (n == 0) return (int64_t)(uintptr_t)"";
+            if (n == 0) return NOVA_LIT("");
 #ifdef _WIN32
-            if (WSAGetLastError() != WSAEWOULDBLOCK) return (int64_t)(uintptr_t)"";
+            if (WSAGetLastError() != WSAEWOULDBLOCK) return NOVA_LIT("");
 #else
-            if (errno != EAGAIN && errno != EWOULDBLOCK) return (int64_t)(uintptr_t)"";
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return NOVA_LIT("");
 #endif
             nova_sched_park_io(sock_val, NOVA_POLL_READ);
         }
@@ -16189,7 +16257,7 @@ int64_t nova_rt_tcp_recv(int64_t sock_val) {
     size_t cap = 8192;
     size_t used = 0;
     char* buf = (char*)malloc(cap);
-    if (!buf) return (int64_t)(uintptr_t)"";
+    if (!buf) return NOVA_LIT("");
     for (;;) {
         if (used + 4096 + 1 > cap) {
             size_t nc = cap * 2;
@@ -16207,10 +16275,10 @@ int64_t nova_rt_tcp_recv(int64_t sock_val) {
         if (r <= 0) break;
         if (!FD_ISSET(sock, &rfds)) break;
     }
-    if (used == 0) { free(buf); return (int64_t)(uintptr_t)""; }
+    if (used == 0) { free(buf); return NOVA_LIT(""); }
     buf[used] = 0;
     char* result = (char*)nova_heap_alloc(used + 1, NOVA_MEM_RAW);
-    if (!result) { free(buf); return (int64_t)(uintptr_t)""; }
+    if (!result) { free(buf); return NOVA_LIT(""); }
     memcpy(result, buf, used + 1);
     free(buf);
     return (int64_t)(uintptr_t)result;
@@ -16600,10 +16668,10 @@ int64_t nova_rt_udp_recv(int64_t sock_val) {
     socklen_t slen = (socklen_t)fromlen;
     int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&from, &slen);
 #endif
-    if (n <= 0) return (int64_t)(uintptr_t)"";
+    if (n <= 0) return NOVA_LIT("");
     buf[n] = 0;
     char* result = (char*)nova_heap_alloc(n + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, buf, n + 1);
     return (int64_t)(uintptr_t)result;
 }
@@ -16838,7 +16906,7 @@ int64_t nova_rt_http_read_request(int64_t client_val) {
     NOVA_SOCKET client = (NOVA_SOCKET)client_val;
     size_t cap = 65536;
     char* buf = (char*)malloc(cap);
-    if (!buf) return (int64_t)(uintptr_t)"";
+    if (!buf) return NOVA_LIT("");
     size_t total = 0;
     int header_done = 0;
     size_t content_length = 0;
@@ -17440,22 +17508,22 @@ int64_t nova_rt_str_count(int64_t s, int64_t sub) {
 
 int64_t nova_rt_lstrip(int64_t s) {
     const char* str = nova_str_safe(s);
-    if (!str) return (int64_t)(uintptr_t)"";
+    if (!str) return NOVA_LIT("");
     while (*str && isspace((unsigned char)*str)) str++;
     size_t len = strlen(str);
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, str, len + 1);
     return (int64_t)(uintptr_t)result;
 }
 
 int64_t nova_rt_rstrip(int64_t s) {
     const char* str = nova_str_safe(s);
-    if (!str) return (int64_t)(uintptr_t)"";
+    if (!str) return NOVA_LIT("");
     size_t len = strlen(str);
     while (len > 0 && isspace((unsigned char)str[len - 1])) len--;
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, str, len);
     result[len] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -17509,14 +17577,14 @@ int64_t nova_rt_cwd(void) {
 #ifdef _WIN32
     char buf[MAX_PATH];
     DWORD len = GetCurrentDirectoryA(sizeof(buf), buf);
-    if (len == 0 || len >= sizeof(buf)) return (int64_t)(uintptr_t)"";
+    if (len == 0 || len >= sizeof(buf)) return NOVA_LIT("");
 #else
     char buf[4096];
-    if (!getcwd(buf, sizeof(buf))) return (int64_t)(uintptr_t)"";
+    if (!getcwd(buf, sizeof(buf))) return NOVA_LIT("");
     size_t len = strlen(buf);
 #endif
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, buf, len);
     result[len] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -17528,11 +17596,11 @@ int64_t nova_rt_self_exe_path(void) {
 #ifdef _WIN32
     wchar_t wbuf[1024];
     DWORD wlen = GetModuleFileNameW(NULL, wbuf, 1024);
-    if (wlen == 0 || wlen >= 1024) return (int64_t)(uintptr_t)"";
+    if (wlen == 0 || wlen >= 1024) return NOVA_LIT("");
     int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, NULL, 0, NULL, NULL);
-    if (u8len <= 0) return (int64_t)(uintptr_t)"";
+    if (u8len <= 0) return NOVA_LIT("");
     char* result = (char*)nova_heap_alloc((size_t)u8len + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, result, u8len, NULL, NULL);
     result[u8len] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -17543,26 +17611,26 @@ int64_t nova_rt_self_exe_path(void) {
        toolchain) in a way nothing reports. _NSGetExecutablePath is the Darwin equivalent. */
     char raw[4096];
     uint32_t rawlen = (uint32_t)sizeof(raw);
-    if (_NSGetExecutablePath(raw, &rawlen) != 0) return (int64_t)(uintptr_t)"";
+    if (_NSGetExecutablePath(raw, &rawlen) != 0) return NOVA_LIT("");
     /* _NSGetExecutablePath may return a path containing symlinks or ".." components;
        realpath canonicalises it to match what /proc/self/exe already yields on Linux. */
     char buf[4096];
     if (!realpath(raw, buf)) {
         size_t rl = strlen(raw);                 /* realpath failing is not fatal -- the raw */
-        if (rl >= sizeof(buf)) return (int64_t)(uintptr_t)"";  /* path still locates the binary */
+        if (rl >= sizeof(buf)) return NOVA_LIT("");  /* path still locates the binary */
         memcpy(buf, raw, rl + 1);
     }
     size_t n = strlen(buf);
     char* result = (char*)nova_heap_alloc(n + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, buf, n + 1);
     return (int64_t)(uintptr_t)result;
 #else
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return (int64_t)(uintptr_t)"";
+    if (n <= 0) return NOVA_LIT("");
     char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, buf, (size_t)n);
     result[n] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -18442,9 +18510,9 @@ int64_t nova_rt_bytes_append_str(int64_t handle, int64_t str_ptr) {
 
 int64_t nova_rt_bytes_to_str(int64_t handle) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
-    if (!b || b->size == 0) return (int64_t)(uintptr_t)"";
+    if (!b || b->size == 0) return NOVA_LIT("");
     char* s = (char*)nova_heap_alloc((size_t)b->size + 1, NOVA_MEM_RAW);
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     memcpy(s, b->data, (size_t)b->size);
     s[b->size] = 0;
     return (int64_t)(uintptr_t)s;
@@ -18591,19 +18659,19 @@ int64_t nova_rt_symlink(int64_t target_val, int64_t link_val) {
 }
 int64_t nova_rt_readlink(int64_t path_val) {   /* returns the link target as an RC-identity NOVA string ("" on error) */
     const char* p = (const char*)(uintptr_t)path_val;
-    if (!p) { nova_set_error("readlink: null path"); return (int64_t)(uintptr_t)""; }
+    if (!p) { nova_set_error("readlink: null path"); return NOVA_LIT(""); }
 #ifdef _WIN32
     nova_set_error("readlink: not supported on Windows");
-    return (int64_t)(uintptr_t)"";
+    return NOVA_LIT("");
 #else
     char buf[4096];
     ssize_t n = readlink(p, buf, sizeof(buf) - 1);
     if (n < 0) {
         char e[512]; snprintf(e, sizeof(e), "readlink '%s': %s", p, strerror(errno));
-        nova_set_error(e); return (int64_t)(uintptr_t)"";
+        nova_set_error(e); return NOVA_LIT("");
     }
     char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     memcpy(result, buf, (size_t)n);
     result[n] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -19002,13 +19070,13 @@ int64_t nova_rt_file_read_bytes(int64_t h, int64_t n) {
 
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = nova_str_safe(str_val);
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     int64_t len = nova_str_len_fast(s);
     int64_t idx = index;
     if (idx < 0) idx += len;
-    if (idx < 0 || idx >= len) return (int64_t)(uintptr_t)"";
+    if (idx < 0 || idx >= len) return NOVA_LIT("");
     char* result = (char*)nova_heap_alloc(2, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
+    if (!result) return NOVA_LIT("");
     result[0] = s[idx];
     result[1] = '\0';
     return (int64_t)(uintptr_t)result;
@@ -20448,7 +20516,7 @@ int64_t nova_rt_test_reset(void) {
 int64_t nova_rt_datetime_now(void) {
     time_t t = time(NULL);
     struct tm* tm = localtime(&t);
-    if (!tm) return (int64_t)(uintptr_t)"1970-01-01T00:00:00";
+    if (!tm) return NOVA_LIT("1970-01-01T00:00:00");
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
@@ -20506,12 +20574,12 @@ int64_t nova_rt_datetime_weekday(int64_t ts) {
 int64_t nova_rt_datetime_format(int64_t ts, int64_t fmt_str) {
     time_t t = (time_t)ts;
     struct tm* tm = localtime(&t);
-    if (!tm) return (int64_t)(uintptr_t)"";
+    if (!tm) return NOVA_LIT("");
     const char* fmt = (const char*)(uintptr_t)fmt_str;
     if (!fmt || *fmt == '\0') fmt = "%Y-%m-%d %H:%M:%S";
     char buf[256];
     size_t len = strftime(buf, sizeof(buf), fmt, tm);
-    if (len == 0) return (int64_t)(uintptr_t)"";
+    if (len == 0) return NOVA_LIT("");
     char* r = nova_fat_str_create(buf, len);
     return r ? (int64_t)(uintptr_t)r : 0;
 }
@@ -20643,7 +20711,7 @@ int64_t nova_rt_sha256(int64_t input) {
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
     char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[hash[i] >> 4];
         out[i*2+1] = hex_chars[hash[i] & 0x0f];
@@ -20664,7 +20732,7 @@ int64_t nova_rt_sha256_of_bytes(int64_t handle) {
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
     char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[hash[i] >> 4];
         out[i*2+1] = hex_chars[hash[i] & 0x0f];
@@ -20684,7 +20752,7 @@ int64_t nova_rt_sha256_bytes(int64_t data, int64_t len_val) {
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
     char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[hash[i] >> 4];
         out[i*2+1] = hex_chars[hash[i] & 0x0f];
@@ -20733,7 +20801,7 @@ int64_t nova_rt_hmac_sha256(int64_t key_val, int64_t msg_val) {
     sha256_final(&outer, final_hash);
     static const char hex_chars[] = "0123456789abcdef";
     char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[final_hash[i] >> 4];
         out[i*2+1] = hex_chars[final_hash[i] & 0x0f];
@@ -20896,10 +20964,10 @@ int64_t nova_rt_ct_eq(int64_t a_handle, int64_t b_handle) {
 
 int64_t nova_rt_hex_encode(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     size_t len = strlen(s);
     char* out = (char*)nova_heap_alloc(len * 2 + 1, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     static const char hex_chars[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {
         out[i*2]   = hex_chars[(uint8_t)s[i] >> 4];
@@ -20911,15 +20979,15 @@ int64_t nova_rt_hex_encode(int64_t input) {
 
 int64_t nova_rt_hex_decode(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     size_t len = strlen(s);
     if (len % 2 != 0) {
         nova_set_error("hex_decode: odd-length input");
-        return (int64_t)(uintptr_t)"";
+        return NOVA_LIT("");
     }
     size_t out_len = len / 2;
     char* out = (char*)malloc(out_len + 1);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     for (size_t i = 0; i < out_len; i++) {
         int hi = s[i*2], lo = s[i*2+1];
         int hv = (hi >= '0' && hi <= '9') ? hi-'0' : (hi >= 'a' && hi <= 'f') ? hi-'a'+10 : (hi >= 'A' && hi <= 'F') ? hi-'A'+10 : -1;
@@ -20927,7 +20995,7 @@ int64_t nova_rt_hex_decode(int64_t input) {
         if (hv < 0 || lv < 0) {
             nova_set_error("hex_decode: invalid hex character");
             free(out);
-            return (int64_t)(uintptr_t)"";
+            return NOVA_LIT("");
         }
         out[i] = (char)((hv << 4) | lv);
     }
@@ -20941,11 +21009,11 @@ static const char b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 
 int64_t nova_rt_base64_encode(int64_t input) {
     const uint8_t* s = (const uint8_t*)(uintptr_t)input;
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     size_t len = strlen((const char*)s);
     size_t out_len = 4 * ((len + 2) / 3);
     char* out = (char*)nova_heap_alloc(out_len + 1, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     size_t j = 0;
     for (size_t i = 0; i < len; i += 3) {
         uint32_t a = s[i];
@@ -20972,12 +21040,12 @@ static int b64_decode_char(char c) {
 
 int64_t nova_rt_base64_decode(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
-    if (!s) return (int64_t)(uintptr_t)"";
+    if (!s) return NOVA_LIT("");
     size_t len = strlen(s);
     while (len > 0 && s[len-1] == '=') len--;
     size_t out_len = (len * 3) / 4;
     char* out = (char*)malloc(out_len + 1);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     size_t j = 0;
     for (size_t i = 0; i < len; i += 4) {
         int a = b64_decode_char(s[i]);
@@ -20987,7 +21055,7 @@ int64_t nova_rt_base64_decode(int64_t input) {
         if (a < 0 || b < 0 || c < 0 || d < 0) {
             nova_set_error("base64_decode: invalid character");
             free(out);
-            return (int64_t)(uintptr_t)"";
+            return NOVA_LIT("");
         }
         uint32_t triple = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | (uint32_t)d;
         if (j < out_len) out[j++] = (char)((triple >> 16) & 0xff);
@@ -21032,7 +21100,7 @@ int64_t nova_rt_uuid4(void) {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     char* out = (char*)nova_heap_alloc(37, NOVA_MEM_RAW);
-    if (!out) return (int64_t)(uintptr_t)"";
+    if (!out) return NOVA_LIT("");
     static const char hx[] = "0123456789abcdef";
     int pos = 0;
     for (int i = 0; i < 16; i++) {
@@ -21045,9 +21113,9 @@ int64_t nova_rt_uuid4(void) {
 }
 
 int64_t nova_rt_random_bytes(int64_t n) {
-    if (n <= 0 || n > 1048576) return (int64_t)(uintptr_t)"";
+    if (n <= 0 || n > 1048576) return NOVA_LIT("");
     char* buf = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
-    if (!buf) return (int64_t)(uintptr_t)"";
+    if (!buf) return NOVA_LIT("");
     nova_secure_random_bytes((uint8_t*)buf, (size_t)n);
     buf[n] = '\0';
     return (int64_t)(uintptr_t)buf;
@@ -21274,7 +21342,7 @@ int64_t nova_rt_atomic_cas(int64_t handle, int64_t expect, int64_t newv) {
 static int64_t nova_platform_str(const char* s) {
     size_t len = strlen(s);
     char* copy = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-    if (!copy) return (int64_t)(uintptr_t)"";
+    if (!copy) return NOVA_LIT("");
     memcpy(copy, s, len + 1);
     return (int64_t)(uintptr_t)copy;
 }
@@ -28346,7 +28414,7 @@ int64_t nova_rt_str_reverse_words(int64_t val) {
     int64_t words = nova_rt_str_words(val);
     NovaList* wl = nova_as_list(words);
     if (!wl || wl->size == 0) return nova_rt_create_string((void*)"");
-    int64_t result = (int64_t)(uintptr_t)"";
+    int64_t result = NOVA_LIT("");
     for (int64_t i = wl->size - 1; i >= 0; i--) {
         if (i < wl->size - 1) {
             result = nova_rt_str_concat_safe(result, nova_rt_create_string((void*)" "));

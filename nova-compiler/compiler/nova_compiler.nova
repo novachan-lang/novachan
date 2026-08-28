@@ -6166,7 +6166,7 @@ fn codegen_expr(cg: CodeGen, expr: Expr) -> string
                 let idx = intern_string(cg, value)
                 let r = fresh_reg(cg)
                 let slen = len(value) + 1
-                emit_indent(cg, r + " = getelementptr inbounds [" + str(slen) + " x i8], ptr @.str." + str(idx) + ", i64 0, i64 0")
+                emit_indent(cg, r + " = " + strlit_gep(idx, slen))
                 let r2 = fresh_reg(cg)
                 emit_indent(cg, r2 + " = ptrtoint ptr " + r + " to i64")
                 r2
@@ -6181,7 +6181,7 @@ fn codegen_expr(cg: CodeGen, expr: Expr) -> string
                                 let sidx = intern_string(cg, pval)
                                 let sr = fresh_reg(cg)
                                 let sl = len(pval) + 1
-                                emit_indent(cg, sr + " = getelementptr inbounds [" + str(sl) + " x i8], ptr @.str." + str(sidx) + ", i64 0, i64 0")
+                                emit_indent(cg, sr + " = " + strlit_gep(sidx, sl))
                                 let sr2 = fresh_reg(cg)
                                 emit_indent(cg, sr2 + " = ptrtoint ptr " + sr + " to i64")
                                 if acc == ""
@@ -6204,7 +6204,7 @@ fn codegen_expr(cg: CodeGen, expr: Expr) -> string
                 if acc == ""
                     let eidx = intern_string(cg, "")
                     let er = fresh_reg(cg)
-                    emit_indent(cg, er + " = getelementptr inbounds [1 x i8], ptr @.str." + str(eidx) + ", i64 0, i64 0")
+                    emit_indent(cg, er + " = " + strlit_gep(eidx, 1))
                     let er2 = fresh_reg(cg)
                     emit_indent(cg, er2 + " = ptrtoint ptr " + er + " to i64")
                     er2
@@ -10180,6 +10180,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_shell(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_create_string(ptr) nounwind")
     emit(cg, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    emit(cg, "declare void @nova_rt_strlit_strict() nounwind")
     emit(cg, "declare void @nova_rt_ensure_init() nounwind")
     emit(cg, "declare void @nova_rt_wait_all() nounwind")
     emit(cg, "declare void @nova_rt_main_dispatch(i64) nounwind")
@@ -10806,6 +10807,45 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_semver_compatible(i64, i64) nounwind")
     emit(cg, "")
 
+// ---------------------------------------------------------------------------------------
+// STRING LITERALS CARRY AN IDENTITY PREFIX.
+//
+// The runtime has to answer "is this i64 a string or an integer?" for every untyped (`any`)
+// operand. It used to answer by asking whether the value fell inside the program image, which
+// is not a property of the value at all -- it is a property of where the loader happened to
+// put the executable. macOS maps the image at 4.295e9, right inside the range ordinary
+// programs compute in, so ~1,076 plain integers per run of int_ptr_soundness_repro were
+// classified as strings and concatenated instead of added. Windows (1.4e14) and Linux (9.4e13)
+// map far above anything the suite computes, so the same latent bug was simply unreachable
+// there and every test passed.
+//
+// So identity now lives in the DATA: each literal is a packed struct whose first field is an
+// 8-byte magic prefix, and the pointer handed to the program addresses the second field. A
+// stray integer must now match 64 specific bits to be misread, on every platform.
+//
+// `unnamed_addr` is deliberately GONE. It asserts the address is irrelevant, which licenses
+// the linker to tail-merge one literal into the end of another -- and a merged literal would
+// not have the magic in front of it. We now depend on the bytes before the pointer, so the
+// attribute would be a lie with teeth.
+//
+// Kept in helpers because BOTH backends (cg and ire) emit literals, and the emitted type must
+// match the GEP that reads it in every one of them. See nova_is_readable_str in nova_runtime.c.
+// NOTE: `\{` -- a bare `{` opens an interpolation in a NOVA string, so every literal brace in
+// the emitted LLVM type must be escaped, exactly as the `nounwind \{` emissions below do.
+fn strlit_type(byte_len: int) -> string
+    "<\{ [8 x i8], [" + str(byte_len) + " x i8] }>"
+
+fn strlit_decl(name: string, escaped: string, byte_len: int) -> string
+    name + " = private constant " + strlit_type(byte_len) + " <\{ [8 x i8] c\"\\ABNOVSTR\\CD\", [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\" }>, align 8"
+
+// Address of the STRING BYTES (field 1), skipping the magic prefix (field 0). Every read of a
+// literal goes through this, so the emitted type can never drift from strlit_decl above.
+fn strlit_gep_name(name: string, byte_len: int) -> string
+    "getelementptr inbounds " + strlit_type(byte_len) + ", ptr " + name + ", i64 0, i32 1, i64 0"
+
+fn strlit_gep(idx: int, byte_len: int) -> string
+    strlit_gep_name("@.str." + str(idx), byte_len)
+
 fn emit_string_constants(cg: CodeGen)
     if len(cg.strings) > 0
         emit(cg, "; String constants")
@@ -10813,7 +10853,7 @@ fn emit_string_constants(cg: CodeGen)
         for s in cg.strings
             let escaped = llvm_escape_string(s)
             let byte_len = len(s) + 1
-            emit(cg, "@.str." + str(i) + " = private unnamed_addr constant [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\"")
+            emit(cg, strlit_decl("@.str." + str(i), escaped, byte_len))
             i = i + 1
         emit(cg, "")
 
@@ -10954,6 +10994,13 @@ fn emit_main_entry(cg: CodeGen)
     emit_indent(cg, "%argc64 = sext i32 %argc to i64")
     emit_indent(cg, "%argv64 = ptrtoint ptr %argv to i64")
     emit_indent(cg, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    // Tell the runtime this module's string literals carry the 8-byte magic
+    // prefix, so it can identify them by CONTENT instead of by address. A
+    // binary built by an older seed compiler never emits this call and keeps
+    // the legacy address test -- which is what lets the bootstrap generation,
+    // whose literals come from the OLD emitter but which links THIS runtime,
+    // still run correctly. See nova_is_readable_str in nova_runtime.c.
+    emit_indent(cg, "call void @nova_rt_strlit_strict()")
     emit_indent(cg, "call void @nova_rt_main_dispatch(i64 ptrtoint (ptr @nova_main to i64))")
     emit_indent(cg, "call void @nova_rt_wait_all()")
     emit_indent(cg, "call void @nova_rt_cleanup()")
@@ -24017,7 +24064,7 @@ fn ire_intern_string(e: IrEmitter, s: string) -> string
     let name = "@.str." + str(e.ire_sc)
     e.ire_sc = e.ire_sc + 1
     let byte_len = len(s) + 1
-    push(e.ire_strs, name + " = private unnamed_addr constant [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\"")
+    push(e.ire_strs, strlit_decl(name, escaped, byte_len))
     e.ire_smap[s] = name
     name
 
@@ -24040,7 +24087,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let cov_pi_reg = "%cov.pi" + str(e.ire_tc)
                 let cov_call_reg = "%cov.r" + str(e.ire_tc)
                 e.ire_tc = e.ire_tc + 1
-                ire_indent(e, cov_p_reg + " = getelementptr inbounds [" + str(fn_byte_len) + " x i8], ptr " + fn_str_name + ", i64 0, i64 0")
+                ire_indent(e, cov_p_reg + " = " + strlit_gep_name(fn_str_name, fn_byte_len))
                 ire_indent(e, cov_pi_reg + " = ptrtoint ptr " + cov_p_reg + " to i64")
                 ire_indent(e, cov_call_reg + " = call i64 @nova_rt_cov_hit(i64 " + cov_pi_reg + ", i64 " + str(line) + ")")
                 e.ire_cov_last_line = line
@@ -24052,7 +24099,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let dbgi_pi_reg = "%dbgi.pi" + str(e.ire_tc)
                 let dbgi_call_reg = "%dbgi.r" + str(e.ire_tc)
                 e.ire_tc = e.ire_tc + 1
-                ire_indent(e, dbgi_p_reg + " = getelementptr inbounds [" + str(dbgi_byte_len) + " x i8], ptr " + dbgi_str_name + ", i64 0, i64 0")
+                ire_indent(e, dbgi_p_reg + " = " + strlit_gep_name(dbgi_str_name, dbgi_byte_len))
                 ire_indent(e, dbgi_pi_reg + " = ptrtoint ptr " + dbgi_p_reg + " to i64")
                 ire_indent(e, dbgi_call_reg + " = call i64 @nova_rt_dbg_hook(i64 " + dbgi_pi_reg + ", i64 " + str(line) + ", i64 0)")
                 e.ire_dbg_instr_last_line = line
@@ -24082,7 +24129,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let str_name = ire_intern_string(e, value)
                 let byte_len = len(value) + 1
                 let ptr_reg = dest + ".p"
-                ire_indent(e, ptr_reg + " = getelementptr inbounds [" + str(byte_len) + " x i8], ptr " + str_name + ", i64 0, i64 0")
+                ire_indent(e, ptr_reg + " = " + strlit_gep_name(str_name, byte_len))
                 ire_indent(e, dest + " = ptrtoint ptr " + ptr_reg + " to i64")
             else if op == "inline_asm"
                 // 7.1: `%r = call i64 asm sideeffect "<template>", "<constraints>"()`
@@ -25077,7 +25124,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         let _fsn_g = ire_intern_string(e, value)
                         let _fsn_len = len(value) + 1
                         let _fsn_p = ire_fresh_tmp(e, "_fs.n")
-                        ire_indent(e, _fsn_p + " = getelementptr inbounds [" + str(_fsn_len) + " x i8], ptr " + _fsn_g + ", i64 0, i64 0")
+                        ire_indent(e, _fsn_p + " = " + strlit_gep_name(_fsn_g, _fsn_len))
                         let _fsn_i = ire_fresh_tmp(e, "_fs.ni")
                         ire_indent(e, _fsn_i + " = ptrtoint ptr " + _fsn_p + " to i64")
                         ire_indent(e, _fs_r + " = call i64 @nova_rt_field_set_by_name(i64 " + args[0] + ", i64 " + _fsn_i + ", i64 " + args[1] + ", i64 " + _fs_do_inc + ")")
@@ -26021,9 +26068,9 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                 let dbgf_fpi = "%dbgf.fpi" + str(e.ire_tc)
                                 let dbgf_call = "%dbgf.r" + str(e.ire_tc)
                                 e.ire_tc = e.ire_tc + 1
-                                ire_indent(e, dbgf_np + " = getelementptr inbounds [" + str(dbgf_name_len) + " x i8], ptr " + dbgf_name_str + ", i64 0, i64 0")
+                                ire_indent(e, dbgf_np + " = " + strlit_gep_name(dbgf_name_str, dbgf_name_len))
                                 ire_indent(e, dbgf_npi + " = ptrtoint ptr " + dbgf_np + " to i64")
-                                ire_indent(e, dbgf_fp + " = getelementptr inbounds [" + str(dbgf_file_len) + " x i8], ptr " + dbgf_file_str + ", i64 0, i64 0")
+                                ire_indent(e, dbgf_fp + " = " + strlit_gep_name(dbgf_file_str, dbgf_file_len))
                                 ire_indent(e, dbgf_fpi + " = ptrtoint ptr " + dbgf_fp + " to i64")
                                 let dbgf_line = 0
                                 if contains(e.ire_fn_lines, name)
@@ -26721,6 +26768,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_field_get(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_create_string(ptr) nounwind")
     ire_line(e, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_strlit_strict() nounwind")
     ire_line(e, "declare void @nova_rt_ensure_init() nounwind")
     ire_line(e, "declare void @nova_rt_wait_all() nounwind")
     ire_line(e, "declare void @nova_rt_main_dispatch(i64) nounwind")
@@ -29044,6 +29092,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_indent(e, "%argc64 = sext i32 %argc to i64")
     ire_indent(e, "%argv64 = ptrtoint ptr %argv to i64")
     ire_indent(e, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    ire_indent(e, "call void @nova_rt_strlit_strict()")
     if do_auto_arena == 1
         ire_line(e, "  ; AUTO-ARENA: no spawn detected, RC overhead globally eliminated")
         ire_indent(e, "call void @nova_rt_set_arena_mode(i64 1)")
@@ -29061,7 +29110,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             let st_len = len(st_name) + 1
             let sp_reg = "%sreg.p" + str(sreg_i)
             let spi_reg = "%sreg.pi" + str(sreg_i)
-            ire_indent(e, sp_reg + " = getelementptr inbounds [" + str(st_len) + " x i8], ptr " + st_str + ", i64 0, i64 0")
+            ire_indent(e, sp_reg + " = " + strlit_gep_name(st_str, st_len))
             ire_indent(e, spi_reg + " = ptrtoint ptr " + sp_reg + " to i64")
             ire_indent(e, "call void @nova_rt_register_struct_name(i64 " + st_hash + ", i64 " + spi_reg + ")")
             // Field metadata, keyed on the same slot-0 hash so json/show/from_json recover
@@ -29104,9 +29153,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             let _npi = "%sfld.ni" + str(fld_i)
                             let _tp = "%sfld.t" + str(fld_i)
                             let _tpi = "%sfld.ti" + str(fld_i)
-                            ire_indent(e, _np + " = getelementptr inbounds [" + str(_fn_len) + " x i8], ptr " + _fn_str + ", i64 0, i64 0")
+                            ire_indent(e, _np + " = " + strlit_gep_name(_fn_str, _fn_len))
                             ire_indent(e, _npi + " = ptrtoint ptr " + _np + " to i64")
-                            ire_indent(e, _tp + " = getelementptr inbounds [" + str(_ft_len) + " x i8], ptr " + _ft_str + ", i64 0, i64 0")
+                            ire_indent(e, _tp + " = " + strlit_gep_name(_ft_str, _ft_len))
                             ire_indent(e, _tpi + " = ptrtoint ptr " + _tp + " to i64")
                             ire_indent(e, "call void @nova_rt_register_struct_field(i64 " + st_hash + ", i64 " + str(_fi) + ", i64 " + _npi + ", i64 " + _tpi + ")")
                             _fi = _fi + 1
@@ -29129,7 +29178,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         let rf_len = len(rfn) + 1
                         let frp_reg = "%freg.p" + str(freg_i)
                         let frpi_reg = "%freg.pi" + str(freg_i)
-                        ire_indent(e, frp_reg + " = getelementptr inbounds [" + str(rf_len) + " x i8], ptr " + rf_str + ", i64 0, i64 0")
+                        ire_indent(e, frp_reg + " = " + strlit_gep_name(rf_str, rf_len))
                         ire_indent(e, frpi_reg + " = ptrtoint ptr " + frp_reg + " to i64")
                         ire_indent(e, "call void @nova_rt_register_fn(i64 " + frpi_reg + ", i64 ptrtoint (ptr @" + rfn + " to i64), i64 " + str(len(rfp)) + ")")
                         freg_i = freg_i + 1
@@ -29138,7 +29187,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     if e.ire_cov_enabled == 1 and len(keys(e.ire_cov_lines)) > 0
         let cov_fn_str = ire_intern_string(e, e.ire_filename)
         let cov_fn_len = len(e.ire_filename) + 1
-        ire_indent(e, "%covr.p = getelementptr inbounds [" + str(cov_fn_len) + " x i8], ptr " + cov_fn_str + ", i64 0, i64 0")
+        ire_indent(e, "%covr.p = " + strlit_gep_name(cov_fn_str, cov_fn_len))
         ire_indent(e, "%covr.pi = ptrtoint ptr %covr.p to i64")
         let cri = 0
         for lk in keys(e.ire_cov_lines)
