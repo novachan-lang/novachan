@@ -187,7 +187,12 @@ trap 'kill $TICKER_PID 2>/dev/null' EXIT
 run_one() {
   local t="$1"
   local ll="$OUT/$t.ll" exe="$OUT/$t.bin" log="$OUT/$t.log"
-  if ! TMO 150 "$NOVA" compile -o "$ll" "$t.nova" >"$log" 2>&1; then echo "COMPILE" >"$OUT/$t.res"; return; fi
+  # PER-TEST WALL TIME. Linux burned 330 minutes on work macOS does in 49, and a bare
+  # completion count cannot distinguish "everything is uniformly slow" from "a handful of tests
+  # hang and eat their 60s/150s caps". Those need completely different fixes -- a faster linker
+  # versus finding the hang -- so the slowest-test list is the measurement that actually decides.
+  local t0=$SECONDS
+  if ! TMO 150 "$NOVA" compile -o "$ll" "$t.nova" >"$log" 2>&1; then echo "COMPILE" >"$OUT/$t.res"; echo "$((SECONDS-t0)) $t COMPILE" >>"$OUT/_times.txt"; return; fi
 
   # HONOUR THE FFI LINK DIRECTIVES the compiler emits into the .ll. The regression links
   # manually rather than shelling to nova_link, so it must obey the same markers -- exactly as
@@ -219,14 +224,16 @@ run_one() {
   if [ -n "$SQLITE_OBJ" ] && grep -q '@sqlite3_' "$ll" 2>/dev/null; then sq="$SQLITE_OBJ"; fi
 
   if ! TMO 300 clang -O2 $EXTRA_CFLAGS -o "$exe" "$ll" "$OUT/nova_runtime.o" $sq $xsrc $LINKF $xlib -w >>"$log" 2>&1; then
-    echo "LINK" >"$OUT/$t.res"; return
+    echo "LINK" >"$OUT/$t.res"; echo "$((SECONDS-t0)) $t LINK" >>"$OUT/_times.txt"; return
   fi
   if TMO 60 "./$exe" >>"$log" 2>&1; then
     if grep -q "FAIL assert" "$log" 2>/dev/null; then echo "ASSERT" >"$OUT/$t.res"; else echo "PASS" >"$OUT/$t.res"; fi
+    echo "$((SECONDS-t0)) $t ok" >>"$OUT/_times.txt"
   else
     local c=$?
     # 124 = GNU timeout, 142 = 128+SIGALRM from the perl fallback. Both mean "hung".
     if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then echo "TIMEOUT" >"$OUT/$t.res"; else echo "RUN($c)" >"$OUT/$t.res"; fi
+    echo "$((SECONDS-t0)) $t rc=$c" >>"$OUT/_times.txt"
   fi
   rm -f "$ll" "$exe"
 }
@@ -262,6 +269,11 @@ while read -r t; do
   if [ "$r" = "PASS" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILED="$FAILED $t($r)"; fi
 done < "$OUT/_tests.txt"
 
+if [ -s "$OUT/_times.txt" ]; then
+  SLOW=$(sort -rn "$OUT/_times.txt" | head -12 | awk '{printf "%ss %s(%s) ", $1, $2, $3}')
+  TOTSEC=$(awk '{s+=$1} END {print s+0}' "$OUT/_times.txt")
+  echo "::notice title=posix slowest tests::cumulative ${TOTSEC}s across $(wc -l < "$OUT/_times.txt" | tr -d ' ') tests | slowest: $SLOW"
+fi
 echo "=== POSIX FULL SUITE: $PASS PASS, $FAIL FAIL (of $TOTAL) ==="
 echo "::notice title=posix full suite::$PASS PASS, $FAIL FAIL of $TOTAL on $(uname -s)"
 if [ "$FAIL" -gt 0 ]; then
