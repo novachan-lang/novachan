@@ -263,8 +263,7 @@ run_one() {
     if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then
       # A bare "TIMEOUT" says nothing about WHERE it stopped -- whether the server never bound,
       # never accepted, or simply ran long. The last log line usually distinguishes those.
-      echo "TIMEOUT[$(tail -c 90 "$log" 2>/dev/null | tr '
-' ' ' | tr -d '')]" >"$OUT/$t.res"
+      echo "TIMEOUT[$(tail -c 90 "$log" 2>/dev/null | tr '\n\r' '  ')]" >"$OUT/$t.res"
     else echo "RUN($c)" >"$OUT/$t.res"; fi
     echo "$((SECONDS-t0)) $t rc=$c" >>"$OUT/_times.txt"
   fi
