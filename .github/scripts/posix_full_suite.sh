@@ -36,6 +36,33 @@ case "$(uname -s)" in
   *)      LINKF="-lpthread -ldl -lm"; EXTRA_CFLAGS="" ;;
 esac
 
+# ── TLS ────────────────────────────────────────────────────────────────────────────────────
+# nova_rt_tls_upgrade has THREE implementations: SChannel (Windows), OpenSSL (guarded by
+# -DNOVA_HAVE_OPENSSL), and -- if neither is compiled in -- a stub that returns 0. POSIX built
+# without OpenSSL, so macOS and Linux had NO TLS AT ALL: every https:// request and every
+# tls_upgrade() silently failed. forge_tls_upgrade_test reported `expected 1 but got -1`, which
+# reads like a broken handshake but is really "the feature was never compiled in".
+#
+# Both hosted runners already ship OpenSSL (ubuntu: libssl-dev; macOS: brew openssl@3), so this
+# is a build-flag gap, not a dependency we need to install. Detected rather than hard-coded so a
+# machine without it still builds -- just with the stub, exactly as before.
+SSL_PREFIX=""
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl 2>/dev/null; then
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -DNOVA_HAVE_OPENSSL $(pkg-config --cflags openssl)"
+  LINKF="$LINKF $(pkg-config --libs openssl)"
+  echo "TLS: OpenSSL via pkg-config ($(pkg-config --modversion openssl))"
+elif command -v brew >/dev/null 2>&1 && SSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null)" && [ -d "$SSL_PREFIX" ]; then
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -DNOVA_HAVE_OPENSSL -I$SSL_PREFIX/include"
+  LINKF="$LINKF -L$SSL_PREFIX/lib -lssl -lcrypto"
+  echo "TLS: OpenSSL via brew at $SSL_PREFIX"
+elif [ -f /usr/include/openssl/ssl.h ]; then
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -DNOVA_HAVE_OPENSSL"
+  LINKF="$LINKF -lssl -lcrypto"
+  echo "TLS: OpenSSL via system headers"
+else
+  echo "::warning title=tls::OpenSSL not found -- tls_upgrade/https stay STUBBED on this host"
+fi
+
 # ── portable kill-on-timeout (macOS has no GNU `timeout`) ──────────────────────────────────
 if   command -v timeout  >/dev/null 2>&1; then TMO() { timeout "$@"; }
 elif command -v gtimeout >/dev/null 2>&1; then TMO() { gtimeout "$@"; }
