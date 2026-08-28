@@ -16876,11 +16876,21 @@ int64_t nova_rt_http_listen(int64_t port_val) {
     return nova_rt_tcp_listen(port_val);
 }
 
+/* Defined below, next to the read loops that share it. */
+static int nova_http_recv_should_retry(NOVA_SOCKET client, int n);
+
 int64_t nova_rt_http_accept(int64_t server_val) {
     NOVA_SOCKET client = (NOVA_SOCKET)nova_rt_tcp_accept(server_val);
     if ((int64_t)client == -1) return 0;
     char buf[8192];
-    int n = recv(client, buf, sizeof(buf) - 1, 0);
+    int n;
+    /* Same non-blocking trap as the loops above: a bare recv() on the accepted socket returns
+       EWOULDBLOCK before the request arrives, and this path then closed the connection with the
+       request unread -- an RST that the client sees as an aborted connection. */
+    for (;;) {
+        n = recv(client, buf, sizeof(buf) - 1, 0);
+        if (n >= 0 || !nova_http_recv_should_retry(client, n)) break;
+    }
     if (n <= 0) { NOVA_CLOSE_SOCKET(client); return 0; }
     buf[n] = 0;
 
@@ -16924,6 +16934,38 @@ int64_t nova_rt_http_accept(int64_t server_val) {
     return list;
 }
 
+/* THE ACCEPTED SOCKET IS NON-BLOCKING, and the HTTP read loops below did not know it.
+   Green tasks put every fd in non-blocking mode so a parked task can yield its carrier, and an
+   accepted socket inherits that from the listener. Both loops treated EVERY `recv() <= 0` as
+   "request finished", so the first recv returned EWOULDBLOCK -- before the client's bytes had even
+   arrived -- and the request was read as EMPTY.
+
+   That silently broke every in-process HTTP server, and the symptom pointed nowhere near the real
+   cause: the handler still replied, then closed a socket whose RECEIVE buffer still held the unread
+   request -- and closing a socket with unread inbound data makes the OS send RST rather than FIN.
+   The RST discards the already-queued response, so the CLIENT reports ECONNABORTED / "read timeout"
+   while the SERVER has logged a successful send of every byte. Both ends looked innocent.
+
+   Verified end to end before fixing: the server printed `REQUEST len=0`, and a PowerShell client
+   (nothing to do with NOVA) hitting the same server saw the identical abort -- which is what proved
+   the server was at fault rather than the NOVA client.
+
+   Waiting for readability is simply what recv() would have done on a blocking socket. The bound
+   stops a client that connects and never speaks from pinning a handler forever.
+
+   Returns 1 = "retry the recv", 0 = "stop reading". */
+static int nova_http_recv_should_retry(NOVA_SOCKET client, int n) {
+    if (n >= 0) return 0;                   /* not an error: caller handles data / EOF */
+#ifdef _WIN32
+    if (WSAGetLastError() != WSAEWOULDBLOCK) return 0;
+#else
+    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+#endif
+    /* Handles BOTH modes already: parks the fiber on the netpoller inside a green task, and
+       select()s on the OS thread otherwise. */
+    return nova_rt_tcp_wait_readable((int64_t)client, 30000) > 0;
+}
+
 /* Read an HTTP request from an already-connected client socket. Returns the
    raw request bytes (headers + body, up to Content-Length). Empty string on
    connection error. Used by multi-threaded HTTP servers — accept first, then
@@ -16939,7 +16981,8 @@ int64_t nova_rt_http_read_request(int64_t client_val) {
     size_t body_start = 0;
     while (total < cap - 1) {
         int n = recv(client, buf + total, (int)(cap - 1 - total), 0);
-        if (n <= 0) break;
+        if (n < 0) { if (nova_http_recv_should_retry(client, n)) continue; break; }
+        if (n == 0) break;                  /* peer half-closed: the request is complete */
         total += (size_t)n;
         buf[total] = 0;
         if (!header_done) {
@@ -16981,7 +17024,8 @@ int64_t nova_rt_http_accept_raw(int64_t server_val) {
     size_t body_start = 0;
     while (total < cap - 1) {
         int n = recv(client, buf + total, (int)(cap - 1 - total), 0);
-        if (n <= 0) break;
+        if (n < 0) { if (nova_http_recv_should_retry(client, n)) continue; break; }
+        if (n == 0) break;                  /* peer half-closed: the request is complete */
         total += (size_t)n;
         buf[total] = 0;
         if (!header_done) {

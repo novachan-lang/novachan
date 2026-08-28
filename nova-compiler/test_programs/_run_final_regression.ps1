@@ -692,13 +692,33 @@ if ($suspects.Count -gt 0) {
     Write-Host "SUSPECT (exit 0 but NO stdout - possible false-pass, audit these):"
     foreach ($s in $suspects) { Write-Host "  $s" }
 }
-# Exit 0 while PRINTING a failure report. Non-fatal for now, on purpose -- see the note in
-# _test_worker.ps1. This count is the measurement needed to decide whether the check can be made
-# fatal; a zero here means it can.
+# Exit 0 while PRINTING a failure report -- a test that FAILS and PASSES the gate at the same time.
+# This was measured for exactly the reason the old note gave ("a zero here means it can be made
+# fatal"), and the measurement paid for itself: of the three standing entries, TWO were real hidden
+# failures. _kat_http_redirect and _kat_http_cookie had a genuinely broken in-process HTTP server
+# (the accepted socket is non-blocking, so the request was read as EMPTY and the reply was then
+# destroyed by an RST) and nobody could see it, because printing FAIL and returning 0 reads as PASS.
+#
+# So the count is now DOWN TO THE ONE DELIBERATE CASE and the check is FATAL. Leaving it advisory
+# would keep training everyone to scroll past the only signal that catches this class.
+#
+# _kat_null_absence is the sole legitimate entry: it is compiled with NOVA_FIRSTCLASS_NULL=1 by
+# _null_absence_gate.ps1, which asserts BOTH states -- so under the default (flag off) it is
+# SUPPOSED to report FAIL, and its own gate verifies exactly that. It is owned by that gate, not
+# by this one. Anything else appearing here is a real failure hiding behind exit 0.
+$outfail_expected = @('_kat_null_absence')
+$outfail_real = @($outfails | Where-Object { $outfail_expected -notcontains $_ })
 if ($outfails.Count -gt 0) {
     Write-Host ""
     Write-Host "SUSPECT-OUTFAIL ($($outfails.Count)) (exit 0 but stdout reports FAIL - these pass the gate while failing):"
-    foreach ($s in $outfails) { Write-Host "  $s" }
+    foreach ($s in $outfails) {
+        if ($outfail_expected -contains $s) { Write-Host "  $s  [expected: owned by _null_absence_gate.ps1]" }
+        else                                { Write-Host "  $s  <- UNEXPECTED" }
+    }
+}
+if ($outfail_real.Count -gt 0) {
+    Write-Host "FAIL: $($outfail_real.Count) test(s) printed a failure report but exited 0."
+    $fail += $outfail_real.Count
 }
 if ($fail -gt 0) { exit 1 }
 exit 0
