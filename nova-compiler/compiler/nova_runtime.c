@@ -25694,9 +25694,18 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_v
     }
     SSL* ssl = SSL_new(ctx);
     if (!ssl) { SSL_CTX_free(ctx); return 0; }
-    if (verify && host && host[0]) {
-        SSL_set1_host(ssl, host);                    /* hostname match (OpenSSL 1.1+) */
-        SSL_set_tlsext_host_name(ssl, host);         /* SNI */
+    /* SNI IS NOT CONDITIONAL ON VERIFICATION -- they answer different questions.
+       SNI tells the SERVER which host you are asking for, so it can select the right virtual
+       host and certificate; `verify` decides whether WE check the certificate it returns. Gating
+       SNI on verify meant tls_upgrade(verify=0) sent no SNI at all, so any CDN- or vhost-hosted
+       origin either refused the handshake or served a default certificate -- SSL_connect failed
+       and the call returned 0. forge_tls_upgrade_test failed on exactly its verify=0 check while
+       its verify-full checks passed, which is the signature of this and not of a broken chain.
+       The runtime's three other SNI call sites (http_request, tls_connect, tls_connect_alpn) all
+       set it unconditionally; this one was the outlier. */
+    if (host && host[0]) {
+        SSL_set_tlsext_host_name(ssl, host);         /* SNI: which vhost/cert to serve */
+        if (verify) SSL_set1_host(ssl, host);        /* hostname match (OpenSSL 1.1+), verify-full only */
     }
     SSL_set_fd(ssl, fd);                 /* wrap the EXISTING connected fd */
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); return 0; }
