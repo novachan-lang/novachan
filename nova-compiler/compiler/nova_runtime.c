@@ -15068,6 +15068,52 @@ int64_t nova_rt_http_post(int64_t url, int64_t body, int64_t content_type) {
    -DNOVA_HAVE_OPENSSL -lssl -lcrypto (cert verification on, SNI set); otherwise
    https:// returns an explicit error. Returns the response BODY as a tracked string
    (same contract as the Windows WinHTTP path). */
+/* GREEN-AWARE PLAINTEXT I/O FOR THE BUILTIN HTTP CLIENT.
+
+   http_get/http_post used raw blocking socket/connect/send/recv -- zero green-aware primitives.
+   That blocks the carrier inside libc and never yields, so an in-process server parked in
+   tcp_accept in the SAME process can never be resumed: the request sits unread in the kernel
+   (`ESTAB Recv-Q 114`), every thread lands in futex_do_wait, and the test times out. It is the
+   root cause of the demo_forge_* / real_http_api / _forge_router_test hangs on macOS AND Linux,
+   at every carrier count. Verified by swapping in forge_http_client (which goes through the
+   green primitives) against an identical server: that combination works, the builtin deadlocks.
+
+   These mirror the proven pattern already used by nova_rt_tcp_connect/_recv: park on the
+   netpoller when the syscall would block, so the carrier stays free to run the server task.
+   Outside a green task the socket is left blocking and the behaviour is byte-for-byte as before.
+
+   TLS IS DELIBERATELY UNTOUCHED. SSL_read/SSL_write over a non-blocking fd require
+   SSL_ERROR_WANT_READ/WANT_WRITE retry handling, which is a materially larger change; the
+   plaintext path is what every failing test uses, and destabilising the OpenSSL backend that was
+   only just enabled would be a poor trade. The https path therefore still blocks its carrier --
+   a known, narrower version of the same defect, recorded rather than silently left. */
+int64_t nova_rt_io_set_nonblocking(int64_t fd_val);   /* defined with the socket layer below */
+
+static int nova_http_would_block(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+static int nova_http_send_green(int fd, const void* b, size_t l) {
+    for (;;) {
+        int n = (int)send(fd, (const char*)b, l, 0);
+        if (n >= 0 || !nova_sched_in_task() || !nova_http_would_block()) return n;
+        nova_sched_park_io((int64_t)fd, NOVA_POLL_WRITE);
+    }
+}
+
+static int nova_http_recv_green(int fd, void* b, size_t l) {
+    for (;;) {
+        int n = (int)recv(fd, (char*)b, l, 0);
+        if (n >= 0 || !nova_sched_in_task() || !nova_http_would_block()) return n;
+        nova_sched_park_io((int64_t)fd, NOVA_POLL_READ);
+    }
+}
+
 static int64_t nova_http_empty(void) {
     char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (e) e[0] = '\0';
     return (int64_t)(uintptr_t)e;
@@ -15075,11 +15121,11 @@ static int64_t nova_http_empty(void) {
 
 /* Read/write that use TLS when an SSL* is present, else the raw socket fd. */
 #ifdef NOVA_HAVE_OPENSSL
-#define NOVA_TLS_WRITE(sp, b, l) ((sp) ? SSL_write((SSL*)(sp), (b), (int)(l)) : (int)send(fd, (b), (l), 0))
-#define NOVA_TLS_READ(sp, b, l)  ((sp) ? SSL_read((SSL*)(sp), (b), (int)(l)) : (int)recv(fd, (b), (l), 0))
+#define NOVA_TLS_WRITE(sp, b, l) ((sp) ? SSL_write((SSL*)(sp), (b), (int)(l)) : nova_http_send_green(fd, (b), (l)))
+#define NOVA_TLS_READ(sp, b, l)  ((sp) ? SSL_read((SSL*)(sp), (b), (int)(l))  : nova_http_recv_green(fd, (b), (l)))
 #else
-#define NOVA_TLS_WRITE(sp, b, l) ((int)send(fd, (b), (l), 0))
-#define NOVA_TLS_READ(sp, b, l)  ((int)recv(fd, (b), (l), 0))
+#define NOVA_TLS_WRITE(sp, b, l) nova_http_send_green(fd, (b), (l))
+#define NOVA_TLS_READ(sp, b, l)  nova_http_recv_green(fd, (b), (l))
 #endif
 
 static int64_t http_request(const char* url, const char* method,
@@ -15107,7 +15153,35 @@ static int64_t http_request(const char* url, const char* method,
     if (nova_offload_getaddrinfo(host, portstr, &hints, &res) != 0 || !res) { nova_set_error("http: DNS resolution failed"); return nova_http_empty(); }
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); nova_set_error("http: socket() failed"); return nova_http_empty(); }
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
+    /* Non-blocking connect that PARKS during the TCP handshake, mirroring nova_rt_tcp_connect.
+       Only for the plaintext path: leaving the fd blocking for https keeps the OpenSSL backend
+       exactly as it is (see the note on the green helpers above). */
+    int use_green = (!is_https && nova_sched_in_task());
+    if (use_green) {
+        nova_rt_io_set_nonblocking((int64_t)fd);
+        if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+            int inprog;
+#ifdef _WIN32
+            int werr = WSAGetLastError();
+            inprog = (werr == WSAEWOULDBLOCK || werr == WSAEINPROGRESS);
+#else
+            inprog = (errno == EINPROGRESS || errno == EWOULDBLOCK);
+#endif
+            if (!inprog) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
+            nova_sched_park_io((int64_t)fd, NOVA_POLL_WRITE);   /* park until writable */
+            int soerr = 0;
+#ifdef _WIN32
+            int slen = (int)sizeof(soerr);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&soerr, &slen);
+#else
+            socklen_t slen = (socklen_t)sizeof(soerr);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, (void*)&soerr, &slen);
+#endif
+            if (soerr != 0) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
+        }
+    } else if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty();
+    }
     freeaddrinfo(res);
 
     void* sslp = NULL;
@@ -16194,14 +16268,22 @@ int64_t nova_rt_tcp_accept(int64_t server_val) {
         for (;;) {
             struct sockaddr_in ca;
             int al = sizeof(ca);
+        /* THE ACCEPTED SOCKET MUST BE MADE NON-BLOCKING EXPLICITLY -- inheritance is not portable.
+           Linux's accept() returns a socket that does NOT inherit O_NONBLOCK from the listener,
+           while macOS/BSD DOES. Every reader downstream is written for a non-blocking fd (it parks
+           on the netpoller when the syscall would block), so on Linux that path was never reached:
+           recv() blocked the carrier thread inside libc instead, and an in-process HTTP server hung
+           on its very first request. Measured directly -- after accept(), `fcntl(F_GETFL)` reported
+           `O_NONBLOCK=clear` on Linux and the following recv never returned.
+           This is why the same server code passed on macOS and Windows and hung only on Linux. */
 #ifdef _WIN32
             NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &al);
-            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); return (int64_t)c; }
+            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); nova_rt_io_set_nonblocking((int64_t)c); return (int64_t)c; }
             if (WSAGetLastError() != WSAEWOULDBLOCK) break;
 #else
             socklen_t sl = (socklen_t)al;
             NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &sl);
-            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); return (int64_t)c; }
+            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); nova_rt_io_set_nonblocking((int64_t)c); return (int64_t)c; }
             if (errno != EAGAIN && errno != EWOULDBLOCK) break;
 #endif
             nova_sched_park_io_ex(server_val, NOVA_POLL_READ, 1, g_single_poller_mode ? 1 : 0);   /* N1-exit listener park; S-b: exclusive (wake-one) at N>1 */
