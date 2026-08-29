@@ -8,19 +8,41 @@
 > regression BOTH modes → ASAN on risk surface → commit. Kill-on-timeout always. No cracked foundations.
 
 
-## ▶ CURRENT FOCUS (2026-08-28) — NOVA SELF-HOSTS ON FOUR PLATFORM/ARCH COMBINATIONS
+## ▶ CURRENT FOCUS (2026-08-30) — ✅ **CI IS 17/17 GREEN. CROSS-PLATFORM CAMPAIGN COMPLETE.**
 
-**The compiler compiles ITSELF to a byte-identical fixpoint on all four**, gated in CI on every push:
+**`ffc3e88f` — run `completed / success`, 17 of 17 jobs.** The compiler compiles ITSELF to a
+byte-identical fixpoint AND passes its full test suite on four platform/arch combinations, gated in
+CI on every push:
 
-| target | object format / libc | reconverge |
-|---|---|---|
-| `x86_64-pc-windows-msvc` | PE / MSVCRT | ✅ (local arc) |
-| `x86_64-unknown-linux-gnu` | ELF / glibc | ✅ CI |
-| `aarch64-apple-darwin` | Mach-O / libSystem | ✅ CI (3-pass) |
-| `aarch64-unknown-linux-gnu` | ELF / glibc | ✅ CI (3-pass) |
+| target | object format / libc | reconverge | full suite |
+|---|---|---|---|
+| `x86_64-pc-windows-msvc` | PE / MSVCRT | ✅ (local arc) | ✅ 3592/0 **NORMAL + FULLRC** |
+| `x86_64-unknown-linux-gnu` | ELF / glibc | ✅ CI (3-pass) + **UBSan gate** | ✅ 4 shards |
+| `aarch64-apple-darwin` | Mach-O / libSystem | ✅ CI (3-pass) | ✅ 4 shards |
+| `aarch64-unknown-linux-gnu` | ELF / glibc | ✅ CI (3-pass) | ✅ 4 shards |
 
 That closes **5.1**, **5.2** and **5.7**. "Needs hardware" was wrong for all of them —
 `macos-latest` is Apple Silicon and `ubuntu-24.04-arm` is free for public repos.
+
+### ⛔ The finding that matters more than the green checkmarks
+
+The campaign closed **three bugs that were live on EVERY platform**, each of which only ONE platform
+could expose. Throughout, the same-platform gates — 3592 tests × 2 memory modes × a byte-identical
+fixpoint — were **green**:
+
+| bug | why it was invisible elsewhere |
+|---|---|
+| `+` on two ints could return a **string pointer** | the heap sits ~10^14 on Win/Linux, far from integer data; macOS loads its image at 4.3e9 |
+| **signed-overflow UB** in `nova_rt_add/sub/mul` — argon2id hashed the same input differently | UB: Apple clang and Ubuntu clang were each *entitled* to a different answer. **ASAN and MSan cannot see this class; only UBSan can** — now a blocking gate |
+| **borrowed `const char*`** in the coverage/profiler tables | Linux/Windows leave freed bytes intact; Darwin reuses them |
+
+**Cross-platform CI is a CORRECTNESS ORACLE, not a packaging chore.** And: `timeout` was never
+actually killing anything (the runtime catches SIGTERM), so Linux and aarch64 had *never once*
+completed a full suite — a suite that never finishes reports no failures, which looks exactly like
+passing.
+
+**Remaining known limitation (DEFERRED, needs a go-ahead):** `https` still blocks its carrier —
+needs `SSL_ERROR_WANT_READ/WANT_WRITE` retry handling. Plain `http` was fixed in `74eefdb3`.
 
 **Linux-ARM64 passed on its FIRST run with zero porting work.** A proactive sweep had already
 confirmed no x86 intrinsics, no `immintrin.h`, and correctly arch-guarded asm — the AAPCS64
@@ -31,7 +53,7 @@ four real bugs (`st_mtim`, `epoll`→kqueue, Mach-O asm, and the bitwise pointer
 FAIL on its first run). It had zero CI coverage on any platform before 2026-08-28. Still Windows
 only; POSIX runs NORMAL alone, and Windows CI still never reconverges.
 
-**TIER 2 IN PROGRESS — the full ~3,571-test suite on POSIX.** macOS: 205 → 59 → **45 fails**.
+**TIER 2 ✅ CLOSED — the full ~3,571-test suite on POSIX.** macOS: 205 → 59 → 45 → **0 fails**.
 Early failures were all HARNESS, not NOVA (a glob scoring negative tests as failures, a 25s cap on
 deliberately-slow crypto, ignored FFI link directives, server tests run concurrently that starved
 their own green schedulers). **The residue was NOT the harness — it was two real soundness bugs,
@@ -94,9 +116,23 @@ C probe that `#include`s `nova_runtime.c` and calls the suspect function directl
 the macOS bug **on Windows** in three minutes. The platform decides only whether a bug is
 REACHABLE, never whether it exists.
 
-Linux hit the 180m cap (now 330m); `linux-arm64-selfhosted` reconverged byte-identical but its
-unsharded full suite stalled at 3525/3570 on exactly the serial server tests — i.e. the SIGPIPE
-cluster, so (2) is the expected fix. Awaiting the CI run for `da9e1752` to confirm both.
+**RESOLVED.** Linux hit the 180m cap (now 330m); `linux-arm64-selfhosted` reconverged
+byte-identical but its unsharded full suite stalled at 3525/3570 on the serial server tests — the
+SIGPIPE cluster, and (2) was indeed the fix. Both confirmed green; POSIX is now sharded 4 ways so
+no single job carries the whole suite.
+
+**Two more real bugs surfaced after that and are also closed** (`ffc3e88f`):
+
+7. **Signed-overflow UB in `nova_rt_add`/`_sub`/`_mul`** — argon2id returned a *different hash for
+   identical input* on macOS. BLAKE2b is defined on unsigned wraparound and so overflows constantly
+   by design; signed overflow is UB, so the two clangs computed different answers and both were
+   correct C. Fixed with `(int64_t)((uint64_t)a + (uint64_t)b)`. **ASAN (Linux and macOS) and MSan
+   were all clean while the failure reproduced** — three clean sanitizers plus a failing test means
+   a class those tools do not cover. New BLOCKING `ubsan_gate.sh` on the Linux job (UB is a property
+   of the SOURCE, so one instrumented run protects all three platforms).
+8. **`NovaCovLine`/`NovaProf` stored borrowed `const char*`** into NOVA strings the runtime does not
+   keep alive. Tables now own their strings. `nova_cov_table` deliberately left alone — it compares
+   by pointer identity and is fed by compiler-emitted `@.str` literals.
 
 ---
 
