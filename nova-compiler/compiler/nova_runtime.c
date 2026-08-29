@@ -8891,6 +8891,15 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
     f->status = 1;
 
     nova_fiber_limit_stack();
+    /* NO SOFTWARE FLOOR ON WINDOWS, deliberately. Windows fibers are created with
+       CreateFiberEx(commit, 0, ...) and take the PE header's RESERVE, so there is no constant
+       here that reliably describes the usable size -- and TEB StackLimit is the committed
+       low-water mark, which moves as the stack grows, so it is not a floor either. Inventing a
+       size would be a guess dressed as a fix.
+       Windows keeps its existing __except(EXCEPTION_STACK_OVERFLOW) containment, which is the
+       platform's supported mechanism and does work; its intermittent 0xC0000005 in these tests
+       is tracked separately. POSIX gets the software floor because there the guard-page approach
+       is provably unsound (a stranded libc lock), not merely flaky. */
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
@@ -9274,6 +9283,58 @@ static void nova_ensure_stack_guard(void) {
 #endif
 }
 
+/* ── SOFTWARE STACK-LIMIT CHECK: overflow detected at a SAFE POINT ─────────────────────────
+   THE PROBLEM WITH THE GUARD PAGE. Containment via guard page + siglongjmp is unsound, because
+   a hardware fault lands wherever the recursion happened to be -- frequently INSIDE libc's
+   malloc, holding its arena mutex. Jumping out strands that lock and the next allocation
+   deadlocks forever (POSIX), or the unwind resumes somewhere it cannot (Windows: an
+   intermittent 0xC0000005 in exactly these tests). Both symptoms, one cause: you cannot safely
+   unwind out of arbitrary code. Measured: the same recursion with SCALARS instead of a heap
+   list -- so malloc is never on the stack -- contains perfectly at NOVA_CARRIERS=2.
+
+   THE FIX, which is what production runtimes actually do. Go compares SP against a per-goroutine
+   limit in the prologue; HotSpot bangs the stack in the prologue so the fault is deterministic
+   and at a known point. Both make the detection happen at a place the runtime CHOSE, where no
+   library lock is held. We do the same: compare the current stack pointer against a per-fiber
+   floor at function entry and raise an ORDINARY NOVA panic, which the existing per-task fault
+   boundary already unwinds correctly. No signal is involved, so Windows, Linux and macOS behave
+   identically instead of each failing in their own way.
+
+   WHY IT IS NOT EMITTED EVERYWHERE. The compiler instruments only functions reachable from a
+   `spawn` -- the same reachability set (ir_green_reachable) and the same reasoning already used
+   for the 4.3 preemption check: code that can never run on a small fiber stack cannot overflow
+   one, and instrumenting it would be a permanent tax on the benchmarks carrying the "match C"
+   promise. That is also the reason nova_rt_stack_enter was historically kept out of native
+   prologues; this keeps that property while closing the soundness hole.
+
+   The floor is a plain __thread read, so the check is a load, a compare and a
+   predicted-not-taken branch. The guard page stays as a backstop for a single frame large
+   enough to leap the margin, but with this in front it is no longer the primary mechanism. */
+static __thread uintptr_t g_stack_floor = 0;   /* lowest SP this fiber may reach; 0 = unchecked */
+
+/* Margin between the floor and the guard page: enough for the panic path (which formats a
+   message and longjmps) to run without touching the guard. */
+#define NOVA_STACK_MARGIN (48 * 1024)
+
+static void nova_stack_floor_set(const void* stack_low, size_t usable) {
+    /* stack_low = lowest usable address (just above the guard). Keep a margin above it. */
+    g_stack_floor = (uintptr_t)stack_low + NOVA_STACK_MARGIN;
+    (void)usable;
+}
+static void nova_stack_floor_clear(void) { g_stack_floor = 0; }
+
+void nova_rt_stack_check(void) {
+    if (!g_stack_floor) return;                 /* not on a managed fiber stack */
+    char probe;
+    if ((uintptr_t)&probe < g_stack_floor) {
+        /* SAFE POINT: we are at function entry, so no libc or runtime lock is held and the
+           ordinary panic path can unwind. Clear the floor first so the panic path itself -- and
+           anything the fault boundary runs on the way out -- cannot re-trip this check. */
+        g_stack_floor = 0;
+        nova_panic("stack overflow");
+    }
+}
+
 static void nova_posix_fiber_trampoline(void) {
     NovaFiber* f = nova_current_fiber;
     nova_current_task = &f->task;
@@ -9281,6 +9342,9 @@ static void nova_posix_fiber_trampoline(void) {
 
     nova_fiber_limit_stack();
     nova_ensure_stack_guard();
+    /* The usable stack begins immediately above the PROT_NONE guard; the floor sits a margin
+       above that so the panic path has room to run without touching the guard. */
+    nova_stack_floor_set(f->stack_mem + NOVA_POSIX_GUARD_SIZE, (size_t)NOVA_POSIX_STACK_SIZE);
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
@@ -26252,6 +26316,22 @@ int64_t nova_rt_hot_load(int64_t path_val) {
     handle = (void*)LoadLibraryA(path);
 #else
     handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    /* A NAME WITH NO SLASH IS NOT A PATH TO dlopen. POSIX says such a name is looked up in the
+       implementation's search paths, and glibc does NOT include the current directory -- while
+       macOS's dyld does. So hot_load("plugin.so") loaded on macOS and failed on Linux: the same
+       NOVA program behaving differently per platform, which is a portability wart in NOVA's own
+       API rather than a fault of the caller. Verified directly:
+           dlopen("_probe_plugin.so")   -> cannot open shared object file
+           dlopen("./_probe_plugin.so") -> LOADED
+       Retry against the working directory so the behaviour is uniform. Only after the plain
+       lookup fails, so a genuine system library on the search path still wins -- this adds a
+       fallback, it does not change precedence. Windows' LoadLibraryA already searches the
+       working directory, so it needs nothing. */
+    if (!handle && !strchr(path, '/')) {
+        char rel[1088];
+        int n = snprintf(rel, sizeof(rel), "./%s", path);
+        if (n > 0 && n < (int)sizeof(rel)) handle = dlopen(rel, RTLD_NOW | RTLD_LOCAL);
+    }
 #endif
     if (!handle) return -1;
     int idx = g_hot_module_count++;
