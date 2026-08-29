@@ -543,6 +543,38 @@ jobs:
       # a known-open bug must never be able to turn the board red, or it stops being information
       # and starts being noise. The findings come out as ::error annotations because Actions logs
       # are 403 without a token, so anything that only reaches the log is invisible.
+      # Report WHERE the arena actually landed. The Darwin high-placement goes through
+      # mach_vm_allocate behind a __has_include(<mach/mach_vm.h>) guard; if that header is absent
+      # the code silently falls back to the advisory mmap hint -- which is precisely the failure
+      # that made an earlier "move the arena high" fix inert on macOS while looking applied.
+      # Measuring it is the whole point: I already made the mistake of assuming once.
+      - name: Verify arena placement (diagnostic, never fails the job)
+        run: |
+          cd nova-compiler/compiler
+          set +e
+          cat > /tmp/arena_probe.c <<'PROBE'
+          #include "nova_runtime.c"
+          int main(void) {
+              nova_oa_reserve();
+              unsigned long long b = (unsigned long long)g_oa_region_base;
+              const unsigned long long SAFE = 0x0000100000000000ULL;
+              printf("%llu %s\n", b, b >= SAFE ? "HIGH" : "LOW");
+              return 0;
+          }
+          PROBE
+          clang -O1 -I. -o /tmp/arena_probe /tmp/arena_probe.c -lm -D_DARWIN_C_SOURCE -w >/tmp/ap.log 2>&1
+          if [ ! -x /tmp/arena_probe ]; then
+            echo "::warning title=arena::probe did not build :: $(head -3 /tmp/ap.log | tr '\n' ' ' | cut -c1-300)"; exit 0
+          fi
+          OUT=$(/tmp/arena_probe 2>&1)
+          case "$OUT" in
+            *HIGH*) echo "::notice title=arena::macOS arena base $OUT -- above the range programs compute in" ;;
+            *LOW*)  echo "::error title=arena::macOS arena base $OUT -- the high placement did NOT take effect (mach_vm.h likely absent), so integer/pointer collisions remain possible" ;;
+            *)      echo "::warning title=arena::unexpected probe output: $OUT" ;;
+          esac
+          exit 0
+        timeout-minutes: 15
+
       - name: ASAN probe -- _argon2id_kat (diagnostic, never fails the job)
         run: |
           cd nova-compiler
@@ -562,17 +594,27 @@ jobs:
           if [ ! -x /tmp/argon_asan ]; then
             echo "::notice title=asan-argon2id::ASAN link failed; skipping probe"; exit 0
           fi
+          # NO `timeout` HERE. macOS ships neither GNU timeout nor gtimeout -- the suite already
+          # carries a perl-alarm fallback for exactly this, and the "timeout mechanism" notice in
+          # this same job says so. My first version of this probe used `timeout` anyway and every
+          # run died with rc=127 (command not found), so it never executed the test at all and
+          # reported a non-finding that meant nothing. The step's own timeout-minutes is the
+          # backstop; the test takes ~40s, so no inner timeout is needed.
+          #
           # Run it several times: the bug is INTERMITTENT, so a single clean run proves nothing.
           for i in 1 2 3 4 5; do
-            ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 timeout 600 /tmp/argon_asan >/tmp/argon_r.log 2>&1
+            ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 /tmp/argon_asan >/tmp/argon_r.log 2>&1
             rc=$?
             if grep -q "AddressSanitizer" /tmp/argon_r.log; then
-              echo "::error title=asan-argon2id::FINDING on run $i :: $(grep -E 'ERROR: AddressSanitizer|READ of|WRITE of' /tmp/argon_r.log | head -2 | tr '\n' ' ' | cut -c1-400)"
-              echo "::error title=asan-argon2id frames::$(grep -E '^ *#[0-9]' /tmp/argon_r.log | head -6 | tr '\n' ' ' | cut -c1-500)"
+              echo "::error title=asan-argon2id::FINDING on run $i :: $(grep -E 'ERROR: AddressSanitizer|READ of|WRITE of|SUMMARY' /tmp/argon_r.log | head -3 | tr '\n' ' ' | cut -c1-400)"
+              echo "::error title=asan-argon2id frames::$(grep -E '^ *#[0-9]' /tmp/argon_r.log | head -8 | tr '\n' ' ' | cut -c1-600)"
               exit 0
             fi
             if [ $rc -ne 0 ] || grep -q "^FAIL" /tmp/argon_r.log; then
-              echo "::error title=asan-argon2id::run $i FAILED under ASAN without a sanitizer finding (rc=$rc) :: $(grep -E '^(FAIL|ok )' /tmp/argon_r.log | tail -3 | tr '\n' ' ' | cut -c1-300)"
+              # Report the ACTUAL output, head and tail. The previous version grepped only for
+              # ^FAIL/^ok, so when the binary failed to launch it printed an empty reason -- a
+              # diagnostic that hid the one fact that mattered.
+              echo "::error title=asan-argon2id::run $i FAILED under ASAN, no sanitizer finding (rc=$rc) :: HEAD $(head -3 /tmp/argon_r.log | tr '\n' ' ' | cut -c1-250) :: TAIL $(tail -3 /tmp/argon_r.log | tr '\n' ' ' | cut -c1-250)"
               exit 0
             fi
           done
