@@ -143,27 +143,44 @@ jobs:
             || { echo "FAIL: native build did not target Linux"; grep '^target ' /tmp/hostprobe.ll; exit 1; }
           echo "OK: native host targeting resolves to Linux"
 
-      - name: Reconverge check (gen5 == gen6)
+      - name: Reconverge check (3-pass, gen5 == gen6)
         run: |
           cd nova-compiler/compiler
           export NOVA_NO_CACHE=1
           # NOTE: bare `-o` is NOT a top-level flag -- `nova <in.nova> <out.ll>` is positional.
           # (`nova compile -o <out> <in>` is the flag form, used in the probe step above.)
-          echo "=== gen5: compile compiler with itself ==="
-          ./nova nova_compiler.nova gen5.ll
-          echo "=== Build gen5 binary ==="
+          #
+          # THREE PASSES, not two. This job compared the SEED's output against the seed-built
+          # compiler's output, which are one generation apart -- so it diverged for ANY change to
+          # codegen, reporting "the compiler is broken" when the compiler was fine and the
+          # comparison was wrong. It only ever passed because emission happened not to change.
+          # macos-selfhosted and linux-arm64-selfhosted were already fixed to 3 passes; this one
+          # was missed, and linux-arm64 passing the same commit that failed here is the proof.
+          #
+          # The fixpoint claim needs gen5 and gen6 to be emitted by compilers that BOTH implement
+          # the current source: seed -> gen4 (emitted by the seed) -> gen5 (emitted by gen4) ->
+          # gen6 (emitted by gen5). gen4 is the throwaway that absorbs the emitter change.
+          echo "=== gen4: seed compiles the compiler ==="
+          ./nova nova_compiler.nova gen4.ll
+          clang -O2 -o nova_gen4 gen4.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          echo "=== gen5: gen4 compiles the compiler ==="
+          ./nova_gen4 nova_compiler.nova gen5.ll
           clang -O2 -o nova_gen5 gen5.ll nova_runtime.c -lpthread -ldl -lm -Wno-everything
-          echo "=== gen6: compile compiler with gen5 ==="
+          echo "=== gen6: gen5 compiles the compiler ==="
           ./nova_gen5 nova_compiler.nova gen6.ll
           echo "=== Compare gen5 vs gen6 ==="
           if diff -q gen5.ll gen6.ll; then
-            echo "RECONVERGED: gen5 == gen6 (byte-identical)"
+            echo "RECONVERGED: gen5 == gen6 (byte-identical, 3-pass)"
+            echo "::notice title=linux reconverge::RECONVERGED gen5 == gen6 (byte-identical, 3-pass)"
           else
-            echo "DIVERGED: gen5 != gen6"
+            D45=$(diff gen4.ll gen5.ll | grep -c '^<' || true); D56=$(diff gen5.ll gen6.ll | grep -c '^<' || true)
+            # Report the SHAPE: drift that shrinks to zero means one more pass was needed;
+            # drift that stays constant means non-determinism. That distinction is the diagnosis.
+            echo "::error title=linux reconverge::DIVERGED. drift gen4->gen5=$D45 gen5->gen6=$D56. First: $(diff gen5.ll gen6.ll | head -4 | paste -sd ' ' -)"
             diff gen5.ll gen6.ll | head -40
             exit 1
           fi
-          rm -f nova_gen5 gen5.ll gen6.ll
+          rm -f nova_gen4 nova_gen5 gen4.ll gen5.ll gen6.ll
         timeout-minutes: 30
 
       - name: Run core test suite
