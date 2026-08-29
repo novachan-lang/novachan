@@ -52,6 +52,42 @@ both now fixed** (`da9e1752`, 2026-08-28):
    it presented as a client TIMEOUT. Windows has no SIGPIPE, which is why the whole class was
    invisible locally. Proof it was a kill and not slowness: raising the cap 60s→150s changed nothing.
 
+**TIER 2 CONTINUED (2026-08-29) — the residue was FOUR more real bugs, all now closed.** Once the
+suite could actually report (see the harness note below), every remaining failure resolved to a
+genuine defect, not flakiness:
+
+3. **`74eefdb3` — an in-process HTTP server could not serve one request on POSIX.** Two bugs:
+   Linux `accept()` returns a socket that does NOT inherit `O_NONBLOCK` (macOS/BSD does), so the
+   green retry path was unreachable and `recv` blocked the carrier inside libc; and the builtin
+   `http_get`/`http_post` used raw blocking syscalls, so a task parked in `tcp_accept` in the same
+   process could never resume. Proof was the kernel socket table: `LISTEN Recv-Q 1`,
+   `ESTAB Recv-Q 114`, every thread in `futex_do_wait`.
+4. **`bfd9ab95` — stack-overflow containment was unsound on ALL THREE platforms.** Guard page +
+   `siglongjmp` cannot work: the fault lands wherever the recursion was, frequently inside libc
+   `malloc` holding its arena mutex. POSIX deadlocked; Windows threw an intermittent `0xC0000005`.
+   Replaced by an SP-vs-floor check at function entry — what Go and HotSpot do — raising an
+   ordinary panic at a point the runtime CHOSE. **Emitted only into `spawn`-reachable functions**
+   (reusing `ir_green_reachable`), so the perf gate still reports 0 dynamic ops: 5 checks across
+   10 functions in the test. `_stackovf_test` went from PASS-at-1-carrier/HANG-at-2-and-4 to PASS
+   at 1, 2 and 4. Windows deliberately keeps `__except` — `CreateFiberEx` takes the PE reserve, so
+   no reliable floor exists there and inventing one would be a guess.
+5. `hot_load("x.so")` loaded on macOS and failed on Linux (`dlopen` won't search `.` for a
+   slash-less name). Fixed in the runtime, not the test — it was a portability wart in NOVA's API.
+6. `benchx` asserted on the host's clock speed (integer `ns_per_op` truncates to 0 on fast
+   hardware); now driven with synthetic inputs.
+
+**THE HARNESS WAS HIDING ALL OF IT.** `timeout N` sends SIGTERM, which the runtime CATCHES and
+drains without exiting — so a hung test ignored its cap and consumed the whole 330-minute job.
+Linux and aarch64 had therefore NEVER reported a full-suite result; their 879 passing tests were
+always there, invisible behind one unkillable process. `timeout -k` fixed it (`5fa58317`), and the
+platforms began reporting immediately. **Kill-on-timeout is a project rule that POSIX silently was
+not honouring, because the mechanism had never been tested against a process that ignores SIGTERM.**
+
+**A CHECK CAN BE WRONG WHEN THE CODE IS RIGHT.** `linux-selfhosted` reconverge was still 2-pass,
+comparing the SEED's output against the seed-built compiler's — two different emitters — so it
+diverged on ANY codegen change. `linux-arm64-selfhosted` and `macos-selfhosted` (both 3-pass)
+passed the identical commit, which is what proved it. Fixed in `fee583c3`.
+
 **Method note, learned expensively:** two prior theories died from reasoning instead of measuring
 (one relocated the *arena* when the collision was with the *executable*). What worked was a 20-line
 C probe that `#include`s `nova_runtime.c` and calls the suspect function directly — it reproduced
