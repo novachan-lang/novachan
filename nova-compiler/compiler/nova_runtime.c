@@ -59,6 +59,18 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath -- Darwin has no /proc/self/exe */
 #include <stdlib.h>        /* realpath */
+#include <mach/mach.h>     /* mach_task_self, KERN_SUCCESS, VM_PROT_NONE */
+/* mach_vm_allocate/protect give FIXED placement that FAILS rather than clobbering, which mmap's
+   MAP_FIXED cannot promise -- see nova_oa_reserve for why the arena must be placed high on
+   Darwin. Guarded by __has_include because mach_vm.h is not present in every SDK layout, and a
+   missing header on the one platform I cannot compile-test here would be a build break rather
+   than a degraded fallback. Without it we simply keep the advisory-hint behaviour. */
+#if defined(__has_include)
+#  if __has_include(<mach/mach_vm.h>)
+#    include <mach/mach_vm.h>
+#    define NOVA_HAVE_MACH_VM 1
+#  endif
+#endif
 #endif
 /* mmap flag spellings differ. Darwin's historical name is MAP_ANON (MAP_ANONYMOUS is a
    later alias), and MAP_NORESERVE is a Linux extension that not every platform defines.
@@ -601,13 +613,72 @@ static int nova_oa_reserve(void) {
        can still collide. The only complete fixes are value tagging or never sniffing at all
        (which is what the bitwise type-propagation fix achieved for statically-typed code); both
        are recorded in the design notes. This shrinks the exposed window by ~1700x today. */
-    void* p = mmap((void*)(uintptr_t)0x0000400000000000ULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    /* THE PREVIOUS VERSION ASKED, BUT NEVER CHECKED. A plain mmap hint is advisory: Darwin
+       ignores it and returns a low address anyway, and the old code then used that address
+       without noticing -- so the "move the arena high" fix (9d573f66) changed nothing on the one
+       platform it was written for, and the failure list came back byte-identical.
+
+       Why it matters: nova_is_readable_str asks nova_mem_find_tag FIRST, and find_tag reports
+       RAW/FAT_STR for any address that IS a live heap string. An integer whose VALUE equals such
+       an address is therefore read as a string no matter what magic prefix we add -- the content
+       at that address really is a string. Content checks cannot fix that; only keeping heap
+       addresses out of the range programs compute in can. int_ptr_soundness_repro sweeps to
+       1.68e13, so a low arena sits directly in its path, and whether a given run corrupts depends
+       on heap layout -- which is exactly the intermittency macOS shows (non-deterministic
+       argon2id output, and SIGBUS in a different test each run).
+
+       So: ask, then VERIFY, then force -- and force with an API that cannot clobber. On Darwin
+       that is mach_vm_allocate with VM_FLAGS_FIXED, which FAILS with KERN_NO_SPACE if the range
+       is occupied rather than overwriting it (unlike mmap's MAP_FIXED, which is why MAP_FIXED was
+       correctly avoided before). On Linux MAP_FIXED_NOREPLACE has the same fail-don't-clobber
+       contract. If every candidate is unavailable we fall back to the kernel's choice and are no
+       worse off than before. */
+    static const uintptr_t kCandidates[] = {
+        0x0000400000000000ULL,   /* 7.04e13 -- above anything the suite computes */
+        0x0000500000000000ULL,
+        0x0000300000000000ULL,
+        0x0000200000000000ULL,
+    };
+    /* Anything at or above this is far enough from realistic integer data to be worth keeping. */
+    const uintptr_t kMinSafeBase = 0x0000100000000000ULL;   /* 1.76e13 */
+
+    void* p = MAP_FAILED;
+    for (size_t ci = 0; ci < sizeof(kCandidates)/sizeof(kCandidates[0]); ci++) {
+        uintptr_t want = kCandidates[ci];
+#if defined(NOVA_HAVE_MACH_VM)
+        mach_vm_address_t addr = (mach_vm_address_t)want;
+        if (mach_vm_allocate(mach_task_self(), &addr, (mach_vm_size_t)NOVA_OA_RESERVE_BYTES,
+                             VM_FLAGS_FIXED) == KERN_SUCCESS) {
+            /* Match the mmap path's contract: reserved but inaccessible until nova_oa_commit
+               mprotects each arena in. */
+            mach_vm_protect(mach_task_self(), addr, (mach_vm_size_t)NOVA_OA_RESERVE_BYTES,
+                            0, VM_PROT_NONE);
+            p = (void*)(uintptr_t)addr;
+            break;
+        }
+#elif defined(MAP_FIXED_NOREPLACE)
+        p = mmap((void*)want, NOVA_OA_RESERVE_BYTES, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED && (uintptr_t)p == want) break;
+        if (p != MAP_FAILED) { munmap(p, NOVA_OA_RESERVE_BYTES); p = MAP_FAILED; }
+#else
+        p = mmap((void*)want, NOVA_OA_RESERVE_BYTES, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED && (uintptr_t)p >= kMinSafeBase) break;
+        if (p != MAP_FAILED) { munmap(p, NOVA_OA_RESERVE_BYTES); p = MAP_FAILED; }
+#endif
+    }
     if (p == MAP_FAILED) {
+        /* Every high candidate refused -- take the kernel's choice rather than fail to start. */
         p = mmap(NULL, NOVA_OA_RESERVE_BYTES, PROT_NONE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     }
     if (p == MAP_FAILED) return 0;
+    /* Say so when the arena could NOT be placed safely, so a silent fallback is never mistaken
+       for a fix -- the failure mode this whole change exists to prevent. */
+    if ((uintptr_t)p < kMinSafeBase && getenv("NOVA_DEBUG_ARENA"))
+        fprintf(stderr, "level=WARN event=arena detail=\"arena at %p is BELOW the safe base; "
+                        "integer/pointer collisions are possible\"\n", p);
 #endif
     /* Align the usable base up to an arena boundary so arena ids stay exact. */
     uintptr_t b = ((uintptr_t)p + NOVA_OA_ARENA_SIZE - 1) & ~(uintptr_t)(NOVA_OA_ARENA_SIZE - 1);
