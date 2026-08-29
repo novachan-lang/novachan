@@ -9310,29 +9310,35 @@ static void nova_ensure_stack_guard(void) {
    The floor is a plain __thread read, so the check is a load, a compare and a
    predicted-not-taken branch. The guard page stays as a backstop for a single frame large
    enough to leap the margin, but with this in front it is no longer the primary mechanism. */
-static __thread uintptr_t g_stack_floor = 0;   /* lowest SP this fiber may reach; 0 = unchecked */
-
 /* Margin between the floor and the guard page: enough for the panic path (which formats a
    message and longjmps) to run without touching the guard. */
 #define NOVA_STACK_MARGIN (48 * 1024)
 
-static void nova_stack_floor_set(const void* stack_low, size_t usable) {
-    /* stack_low = lowest usable address (just above the guard). Keep a margin above it. */
-    g_stack_floor = (uintptr_t)stack_low + NOVA_STACK_MARGIN;
-    (void)usable;
-}
-static void nova_stack_floor_clear(void) { g_stack_floor = 0; }
+/* THE FLOOR IS DERIVED FROM THE FIBER, NOT CACHED IN THREAD-LOCAL STATE.
+   My first version kept it in a __thread variable set at fiber entry. That is wrong under M:N:
+   the floor describes a FIBER's stack, but __thread storage belongs to the CARRIER THREAD, so
+   once a fiber migrates to another carrier the floor there describes a different fiber's stack --
+   and the comparison trips against the wrong bounds. It cost false "stack overflow" panics in
+   _kat_zookeeper_audit and forge_metrics_mw_test on macOS, in tests with no deep recursion at all.
 
+   nova_current_fiber is already updated on every switch, so reading the bounds from it is correct
+   by construction and there is no second piece of state to keep in sync. The carrier fiber itself
+   has no managed stack (stack_mem is NULL), so it is simply unchecked -- the same guard the
+   SIGSEGV handler uses. */
 void nova_rt_stack_check(void) {
-    if (!g_stack_floor) return;                 /* not on a managed fiber stack */
+#ifndef _WIN32
+    NovaFiber* f = nova_current_fiber;
+    if (!f || f == &nova_carrier_fiber || !f->stack_mem) return;   /* not on a managed fiber stack */
+    uintptr_t floor = (uintptr_t)f->stack_mem + (uintptr_t)NOVA_POSIX_GUARD_SIZE + NOVA_STACK_MARGIN;
     char probe;
-    if ((uintptr_t)&probe < g_stack_floor) {
-        /* SAFE POINT: we are at function entry, so no libc or runtime lock is held and the
-           ordinary panic path can unwind. Clear the floor first so the panic path itself -- and
-           anything the fault boundary runs on the way out -- cannot re-trip this check. */
-        g_stack_floor = 0;
+    if ((uintptr_t)&probe < floor) {
+        /* SAFE POINT: at function entry, so no libc or runtime lock is held and the ordinary
+           panic path can unwind. ovf_active is cleared so the guard-page handler cannot also
+           claim a fault while this panic is unwinding. */
+        f->ovf_active = 0;
         nova_panic("stack overflow");
     }
+#endif
 }
 
 static void nova_posix_fiber_trampoline(void) {
@@ -9342,9 +9348,6 @@ static void nova_posix_fiber_trampoline(void) {
 
     nova_fiber_limit_stack();
     nova_ensure_stack_guard();
-    /* The usable stack begins immediately above the PROT_NONE guard; the floor sits a margin
-       above that so the panic path has room to run without touching the guard. */
-    nova_stack_floor_set(f->stack_mem + NOVA_POSIX_GUARD_SIZE, (size_t)NOVA_POSIX_STACK_SIZE);
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
