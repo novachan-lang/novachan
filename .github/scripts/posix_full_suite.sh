@@ -64,9 +64,39 @@ else
 fi
 
 # ── portable kill-on-timeout (macOS has no GNU `timeout`) ──────────────────────────────────
-if   command -v timeout  >/dev/null 2>&1; then TMO() { timeout "$@"; }
-elif command -v gtimeout >/dev/null 2>&1; then TMO() { gtimeout "$@"; }
-else TMO() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+# IT MUST ACTUALLY KILL. Plain `timeout N` sends SIGTERM, and the NOVA runtime CATCHES SIGTERM --
+# it logs `event=shutdown detail="signal received; draining (signal again to force quit)"` and
+# keeps running. So a hung test ignored its cap entirely: one deadlocked server test consumed the
+# whole 330-minute job budget instead of 150 seconds, and the shard was killed by the job cap
+# having emitted nothing but a repeating `879/893 done` progress line. Every Linux and aarch64
+# full-suite run this session died that way, which is why the platform had never once reported a
+# result -- the underlying hang was only ever costing us the ability to SEE the other 879 results.
+#
+# -k sends SIGKILL a grace period after SIGTERM, which the runtime cannot catch. The project rule
+# is "kill-on-timeout is mandatory for EVERY binary run"; on POSIX it silently was not.
+NOVA_TMO_GRACE=10
+if   command -v timeout  >/dev/null 2>&1; then TMO() { timeout -k "$NOVA_TMO_GRACE" "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then TMO() { gtimeout -k "$NOVA_TMO_GRACE" "$@"; }
+else
+  # perl fallback (macOS without coreutils): SIGALRM's default action terminates, but the runtime
+  # may install a handler for it too, so escalate to an uncatchable SIGKILL rather than trusting it.
+  TMO() {
+    local _s=$1; shift
+    perl -e '
+      my $secs = shift; my $grace = shift;
+      my $pid = fork(); die "fork: $!" unless defined $pid;
+      if ($pid == 0) { exec @ARGV or die "exec: $!"; }
+      my $done = 0;
+      $SIG{ALRM} = sub {
+        kill "TERM", $pid; sleep $grace; kill "KILL", $pid;
+      };
+      alarm $secs;
+      waitpid($pid, 0);
+      my $st = $?;
+      alarm 0;
+      exit($st >> 8 ? $st >> 8 : ($st & 127 ? 128 + ($st & 127) : 0));
+    ' "$_s" "$NOVA_TMO_GRACE" "$@"
+  }
 fi
 
 # ── install the framework into the toolchain stdlib ────────────────────────────────────────
@@ -292,8 +322,12 @@ run_one() {
     echo "$((SECONDS-t0)) $t ok" >>"$OUT/_times.txt"
   else
     local c=$?
-    # 124 = GNU timeout, 142 = 128+SIGALRM from the perl fallback. Both mean "hung".
-    if [ "$c" -eq 124 ] || [ "$c" -eq 142 ]; then
+    # 124 = GNU timeout, 142 = 128+SIGALRM, 137 = 128+SIGKILL. All three mean "hung".
+    # 137 is new and NOT optional: now that TMO escalates to SIGKILL, a process that ignores
+    # SIGTERM exits 137 rather than 124, and without this it would be misfiled as an ordinary
+    # RUN failure -- the timeout fix would have quietly corrupted the failure taxonomy it exists
+    # to make readable.
+    if [ "$c" -eq 124 ] || [ "$c" -eq 142 ] || [ "$c" -eq 137 ]; then
       # A bare "TIMEOUT" says nothing about WHERE it stopped -- whether the server never bound,
       # never accepted, or simply ran long. The last log line usually distinguishes those.
       echo "TIMEOUT[$(grep -viE 'alarm clock|perl -e|exec @ARGV|_suite\.sh' "$log" 2>/dev/null | tail -c 90 | tr '\n\r' '  ')]" >"$OUT/$t.res"
