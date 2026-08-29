@@ -8554,6 +8554,11 @@ typedef struct NovaFiber {
     int64_t           entry_fn;     /* NOVA closure */
     struct NovaFiber* resumer;
     int64_t           yield_value;  /* lazy generator: most recently yielded value */
+    /* Lowest stack address this fiber may reach before nova_rt_stack_check() panics. Lives on the
+       FIBER, not in __thread storage: under M:N a fiber migrates between carriers, and a
+       thread-local copy would then describe a different fiber's stack -- which is exactly the bug
+       that produced false "stack overflow" panics in tests with no deep recursion. 0 = unchecked. */
+    uintptr_t         stack_floor;
 #ifdef _WIN32
     LPVOID            handle;
 #else
@@ -8621,6 +8626,63 @@ static __thread int        nova_carrier_ready = 0;
    fiber activity it is NULL. This tests fiber IDENTITY directly, so it is immune to
    nova_rt_stack_set_max() (which can set an arbitrary stack_max on any thread and would
    defeat a stack_max-based heuristic). Used by nova_deep_copy_rec to pick its limit. */
+
+/* Margin between the floor and the guard page: enough for the panic path (which formats a
+   message and longjmps) to run without touching the guard. */
+#define NOVA_STACK_MARGIN (48 * 1024)
+
+/* THE FLOOR IS DERIVED FROM THE FIBER, NOT CACHED IN THREAD-LOCAL STATE.
+   My first version kept it in a __thread variable set at fiber entry. That is wrong under M:N:
+   the floor describes a FIBER's stack, but __thread storage belongs to the CARRIER THREAD, so
+   once a fiber migrates to another carrier the floor there describes a different fiber's stack --
+   and the comparison trips against the wrong bounds. It cost false "stack overflow" panics in
+   _kat_zookeeper_audit and forge_metrics_mw_test on macOS, in tests with no deep recursion at all.
+
+   nova_current_fiber is already updated on every switch, so reading the bounds from it is correct
+   by construction and there is no second piece of state to keep in sync. The carrier fiber itself
+   has no managed stack (stack_mem is NULL), so it is simply unchecked -- the same guard the
+   SIGSEGV handler uses. */
+void nova_rt_stack_check(void) {
+    NovaFiber* f = nova_current_fiber;
+    if (!f || f == &nova_carrier_fiber || !f->stack_floor) return;  /* not on a managed fiber stack */
+    char probe;
+    if ((uintptr_t)&probe < f->stack_floor) {
+        /* SAFE POINT: at function entry, so no libc or runtime lock is held and the ordinary
+           panic path can unwind. */
+#ifndef _WIN32
+        /* Stop the guard-page handler from also claiming a fault while this panic unwinds. */
+        f->ovf_active = 0;
+#endif
+        nova_panic("stack overflow");
+    }
+}
+
+/* Establish the floor for the fiber currently running. Called once per fiber entry, from the
+   trampoline, where the frame sits at the top of that fiber's own stack.
+
+   WINDOWS: I previously claimed no reliable floor existed here, because CreateFiberEx takes the
+   PE header's reserve and TEB StackLimit is a moving commit watermark. That was wrong.
+   VirtualQuery on any address in the stack returns AllocationBase -- the base of the WHOLE
+   reservation -- which is documented, stable as the stack grows, and per-fiber. Measured: a
+   fiber reports its own AllocationBase, distinct from the main thread's, with a sane reserve.
+   So Windows gets the same software containment as POSIX rather than relying solely on
+   __except(EXCEPTION_STACK_OVERFLOW). */
+static void nova_stack_floor_init(NovaFiber* f) {
+    if (!f) return;
+#ifdef _WIN32
+    char probe;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(&probe, &mbi, sizeof(mbi)) && mbi.AllocationBase)
+        f->stack_floor = (uintptr_t)mbi.AllocationBase + NOVA_STACK_MARGIN;
+    else
+        f->stack_floor = 0;                       /* unavailable -> unchecked, __except still guards */
+#else
+    f->stack_floor = f->stack_mem
+        ? (uintptr_t)f->stack_mem + (uintptr_t)NOVA_POSIX_GUARD_SIZE + NOVA_STACK_MARGIN
+        : 0;
+#endif
+}
+
 static int nova_on_fiber_stack(void) {
     return nova_current_fiber != NULL && nova_current_fiber != &nova_carrier_fiber;
 }
@@ -8891,15 +8953,17 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
     f->status = 1;
 
     nova_fiber_limit_stack();
-    /* NO SOFTWARE FLOOR ON WINDOWS, deliberately. Windows fibers are created with
-       CreateFiberEx(commit, 0, ...) and take the PE header's RESERVE, so there is no constant
-       here that reliably describes the usable size -- and TEB StackLimit is the committed
-       low-water mark, which moves as the stack grows, so it is not a floor either. Inventing a
-       size would be a guess dressed as a fix.
-       Windows keeps its existing __except(EXCEPTION_STACK_OVERFLOW) containment, which is the
-       platform's supported mechanism and does work; its intermittent 0xC0000005 in these tests
-       is tracked separately. POSIX gets the software floor because there the guard-page approach
-       is provably unsound (a stranded libc lock), not merely flaky. */
+    nova_stack_floor_init(f);
+    /* Windows DOES get a software floor, contrary to what an earlier version of this comment
+       claimed. The reasoning that ruled it out was: CreateFiberEx takes the PE header's RESERVE
+       so no constant describes the usable size, and TEB StackLimit is a moving commit watermark
+       rather than a floor. Both are true -- and both are irrelevant, because VirtualQuery returns
+       AllocationBase, the base of the whole reservation, which is documented, stable as the stack
+       grows, and per-fiber. Measured before relying on it: a fiber reports its own AllocationBase,
+       distinct from the main thread's.
+       __except(EXCEPTION_STACK_OVERFLOW) stays as the backstop, but it is no longer the primary
+       mechanism -- which matters, because unwinding out of an arbitrary fault is what made
+       containment unsound in the first place. */
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
@@ -9310,36 +9374,6 @@ static void nova_ensure_stack_guard(void) {
    The floor is a plain __thread read, so the check is a load, a compare and a
    predicted-not-taken branch. The guard page stays as a backstop for a single frame large
    enough to leap the margin, but with this in front it is no longer the primary mechanism. */
-/* Margin between the floor and the guard page: enough for the panic path (which formats a
-   message and longjmps) to run without touching the guard. */
-#define NOVA_STACK_MARGIN (48 * 1024)
-
-/* THE FLOOR IS DERIVED FROM THE FIBER, NOT CACHED IN THREAD-LOCAL STATE.
-   My first version kept it in a __thread variable set at fiber entry. That is wrong under M:N:
-   the floor describes a FIBER's stack, but __thread storage belongs to the CARRIER THREAD, so
-   once a fiber migrates to another carrier the floor there describes a different fiber's stack --
-   and the comparison trips against the wrong bounds. It cost false "stack overflow" panics in
-   _kat_zookeeper_audit and forge_metrics_mw_test on macOS, in tests with no deep recursion at all.
-
-   nova_current_fiber is already updated on every switch, so reading the bounds from it is correct
-   by construction and there is no second piece of state to keep in sync. The carrier fiber itself
-   has no managed stack (stack_mem is NULL), so it is simply unchecked -- the same guard the
-   SIGSEGV handler uses. */
-void nova_rt_stack_check(void) {
-#ifndef _WIN32
-    NovaFiber* f = nova_current_fiber;
-    if (!f || f == &nova_carrier_fiber || !f->stack_mem) return;   /* not on a managed fiber stack */
-    uintptr_t floor = (uintptr_t)f->stack_mem + (uintptr_t)NOVA_POSIX_GUARD_SIZE + NOVA_STACK_MARGIN;
-    char probe;
-    if ((uintptr_t)&probe < floor) {
-        /* SAFE POINT: at function entry, so no libc or runtime lock is held and the ordinary
-           panic path can unwind. ovf_active is cleared so the guard-page handler cannot also
-           claim a fault while this panic is unwinding. */
-        f->ovf_active = 0;
-        nova_panic("stack overflow");
-    }
-#endif
-}
 
 static void nova_posix_fiber_trampoline(void) {
     NovaFiber* f = nova_current_fiber;
@@ -9348,6 +9382,7 @@ static void nova_posix_fiber_trampoline(void) {
 
     nova_fiber_limit_stack();
     nova_ensure_stack_guard();
+    nova_stack_floor_init(f);
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
