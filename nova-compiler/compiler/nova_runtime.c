@@ -24454,7 +24454,16 @@ int64_t nova_rt_bench_reset(void) { g_bench_count = 0; return 0; }
 
 /* ── Coverage tracking ─────────────────────────────────────────────────── */
 
-typedef struct { const char* file; int line; int64_t count; } NovaCovLine;
+/* THESE TABLES OWN THEIR STRINGS. They previously stored the caller's `const char*` directly and
+   strcmp'd it on every later lookup -- a BORROWED pointer into a NOVA string the runtime does not
+   keep alive. Once that string is released the entry dangles, and what strcmp then reads is
+   whatever the allocator did with the memory: Linux and Windows happened to leave the bytes
+   intact, Darwin reused them. phase9_devx_test failed on macOS ONLY, reporting cov_get(...,10)==0
+   for a line that had just been marked, while the line marked twice still matched -- the exact
+   signature of one entry's backing string surviving and another's not.
+   Copying is the fix: these are diagnostic tables, not a hot path, and a fixed buffer removes the
+   lifetime question entirely rather than making it someone else's problem to get right. */
+typedef struct { char file[192]; int line; int64_t count; } NovaCovLine;
 static NovaCovLine g_cov[4096];
 static int g_cov_count = 0;
 
@@ -24470,7 +24479,10 @@ int64_t nova_rt_cov_mark(int64_t file_val, int64_t line_val) {
         }
     }
     if (g_cov_count < 4096) {
-        g_cov[g_cov_count++] = (NovaCovLine){file, line, 1};
+        NovaCovLine* e = &g_cov[g_cov_count++];
+        snprintf(e->file, sizeof(e->file), "%s", file);   /* COPY: see the note above */
+        e->line = line;
+        e->count = 1;
     }
     return 1;
 }
@@ -24504,7 +24516,7 @@ int64_t nova_rt_cov_reset(void) { g_cov_count = 0; return 0; }
 
 /* ── Profiling ─────────────────────────────────────────────────────────── */
 
-typedef struct { const char* name; int64_t start_ns; int64_t total_ns; int64_t calls; } NovaProf;
+typedef struct { char name[96]; int64_t start_ns; int64_t total_ns; int64_t calls; } NovaProf;
 static NovaProf g_prof[256];
 static int g_prof_count = 0;
 
@@ -24520,7 +24532,11 @@ int64_t nova_rt_prof_start(int64_t name_val) {
     }
     if (g_prof_count < 256) {
         int idx = g_prof_count++;
-        g_prof[idx] = (NovaProf){name, nova_rt_clock_ns(), 0, 1};
+        NovaProf* e = &g_prof[idx];
+        snprintf(e->name, sizeof(e->name), "%s", name);   /* COPY: same borrowed-pointer bug */
+        e->start_ns = nova_rt_clock_ns();
+        e->total_ns = 0;
+        e->calls = 1;
         return idx;
     }
     return -1;
