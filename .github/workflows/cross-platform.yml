@@ -528,6 +528,58 @@ jobs:
           fi
           if [ $FAIL -gt 0 ]; then exit 1; fi
 
+      # ─── ASAN probe for the LAST macOS failure ─────────────────────────────────────────────
+      # _argon2id_kat produces DIFFERENT OUTPUT FROM IDENTICAL INPUT on macOS -- single-threaded,
+      # single lane, pure computation -- and does it intermittently. That is memory corruption or
+      # an uninitialised read, and the failure gives us nothing to work with: `RUN(1)` and a one
+      # line message.
+      #
+      # It is not reproducible anywhere I can debug: 10/10 clean on Linux, and a full
+      # AddressSanitizer build on Linux reports NOTHING. So the only instrument that can see it is
+      # ASAN on Darwin itself, which is what this step is. It turns "wrong answer, somewhere" into
+      # a precise bad-read/bad-write with a backtrace.
+      #
+      # DIAGNOSTIC ONLY -- it always exits 0. This job is BLOCKING and currently green; a probe for
+      # a known-open bug must never be able to turn the board red, or it stops being information
+      # and starts being noise. The findings come out as ::error annotations because Actions logs
+      # are 403 without a token, so anything that only reaches the log is invisible.
+      - name: ASAN probe -- _argon2id_kat (diagnostic, never fails the job)
+        run: |
+          cd nova-compiler
+          export NOVA_HOME="$(pwd)"
+          export NOVA_NO_CACHE=1
+          cd test_programs
+          set +e
+          # Positional form, matching the core-suite step above -- that invocation is proven to
+          # work in this job, and a probe that silently skips because of an argument-form quirk
+          # would be worse than no probe.
+          ../compiler/nova _argon2id_kat.nova /tmp/argon.ll >/tmp/argon_c.log 2>&1
+          if [ ! -f /tmp/argon.ll ]; then
+            echo "::notice title=asan-argon2id::compile failed; skipping probe"; exit 0
+          fi
+          clang -O1 -g -fsanitize=address -o /tmp/argon_asan /tmp/argon.ll \
+                ../compiler/nova_runtime.c -lm -D_DARWIN_C_SOURCE -w >/tmp/argon_l.log 2>&1
+          if [ ! -x /tmp/argon_asan ]; then
+            echo "::notice title=asan-argon2id::ASAN link failed; skipping probe"; exit 0
+          fi
+          # Run it several times: the bug is INTERMITTENT, so a single clean run proves nothing.
+          for i in 1 2 3 4 5; do
+            ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 timeout 600 /tmp/argon_asan >/tmp/argon_r.log 2>&1
+            rc=$?
+            if grep -q "AddressSanitizer" /tmp/argon_r.log; then
+              echo "::error title=asan-argon2id::FINDING on run $i :: $(grep -E 'ERROR: AddressSanitizer|READ of|WRITE of' /tmp/argon_r.log | head -2 | tr '\n' ' ' | cut -c1-400)"
+              echo "::error title=asan-argon2id frames::$(grep -E '^ *#[0-9]' /tmp/argon_r.log | head -6 | tr '\n' ' ' | cut -c1-500)"
+              exit 0
+            fi
+            if [ $rc -ne 0 ] || grep -q "^FAIL" /tmp/argon_r.log; then
+              echo "::error title=asan-argon2id::run $i FAILED under ASAN without a sanitizer finding (rc=$rc) :: $(grep -E '^(FAIL|ok )' /tmp/argon_r.log | tail -3 | tr '\n' ' ' | cut -c1-300)"
+              exit 0
+            fi
+          done
+          echo "::notice title=asan-argon2id::5/5 clean under ASAN -- the fault does not reproduce with the sanitizer's allocator, so try -fsanitize=memory or undefined next"
+          exit 0
+        timeout-minutes: 45
+
   # ─── macOS (Kotlin bootstrap, legacy reference) ───────
 
   # ─── TIER 2: the FULL suite on POSIX. NON-BLOCKING until it is green. ───────────────
