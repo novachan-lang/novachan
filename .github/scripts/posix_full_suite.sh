@@ -74,9 +74,13 @@ fi
 #
 # -k sends SIGKILL a grace period after SIGTERM, which the runtime cannot catch. The project rule
 # is "kill-on-timeout is mandatory for EVERY binary run"; on POSIX it silently was not.
-NOVA_TMO_GRACE=10
-if   command -v timeout  >/dev/null 2>&1; then TMO() { timeout -k "$NOVA_TMO_GRACE" "$@"; }
-elif command -v gtimeout >/dev/null 2>&1; then TMO() { gtimeout -k "$NOVA_TMO_GRACE" "$@"; }
+# The grace period is written INLINE, not read from a variable. TMO is `export -f`d into the
+# `xargs -P` subshells, but a plain variable is NOT exported alongside it -- so a `$GRACE` here
+# expanded to the empty string in every parallel worker, producing `timeout -k "" 150 ...` ->
+# "invalid time interval" -> exit 125 -> 887 of 893 tests failed at COMPILE. An exported FUNCTION
+# that closes over an un-exported VARIABLE is a trap; keep this self-contained.
+if   command -v timeout  >/dev/null 2>&1; then TMO() { timeout -k 10 "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then TMO() { gtimeout -k 10 "$@"; }
 else
   # perl fallback (macOS without coreutils): SIGALRM's default action terminates, but the runtime
   # may install a handler for it too, so escalate to an uncatchable SIGKILL rather than trusting it.
@@ -95,7 +99,7 @@ else
       my $st = $?;
       alarm 0;
       exit($st >> 8 ? $st >> 8 : ($st & 127 ? 128 + ($st & 127) : 0));
-    ' "$_s" "$NOVA_TMO_GRACE" "$@"
+    ' "$_s" 10 "$@"
   }
 fi
 
