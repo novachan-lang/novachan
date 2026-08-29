@@ -957,7 +957,7 @@ static const unsigned char nova_strlit_magic[8] = { 0xAB,'N','O','V','S','T','R'
 static char     nova_strpool_data[NOVA_STRPOOL_COUNT][NOVA_STRPOOL_STRIDE] NOVA_ALIGN8;
 #define NOVA_STRPOOL_SLOT(i) (nova_strpool_data[i] + NOVA_STRPOOL_PREFIX)
 #define NOVA_STRPOOL_BASE    (nova_strpool_data[0] + NOVA_STRPOOL_PREFIX)
-#define NOVA_STRPOOL_END     ((const char*)nova_strpool_data[0] + sizeof(nova_strpool_data))
+#define NOVA_STRPOOL_END     ((const char*)&nova_strpool_data[NOVA_STRPOOL_COUNT])
 static int32_t  nova_strpool_rc[NOVA_STRPOOL_COUNT];
 static int      nova_strpool_stack[NOVA_STRPOOL_COUNT];
 static int      nova_strpool_top = -1;
@@ -1376,7 +1376,11 @@ void nova_rc_dec(int64_t val);
 static char     nova_int_str_cache[10000][NOVA_INTSTR_STRIDE] NOVA_ALIGN8;
 #define NOVA_INTSTR_SLOT(i) (nova_int_str_cache[i] + NOVA_INTSTR_PREFIX)
 #define NOVA_INTSTR_BASE    (nova_int_str_cache[0] + NOVA_INTSTR_PREFIX)
-#define NOVA_INTSTR_END     ((const char*)nova_int_str_cache[0] + sizeof(nova_int_str_cache))
+/* One past the last ROW, not row 0 plus the whole array size: `cache[0] + sizeof(cache)`
+   walks past the bounds of a single char[16] row, which is UB and which UBSan reports as
+   "index 160000 out of bounds for type char[16]". &cache[COUNT] is the well-defined form. */
+#define NOVA_INTSTR_COUNT   10000
+#define NOVA_INTSTR_END     ((const char*)&nova_int_str_cache[NOVA_INTSTR_COUNT])
 static uint64_t nova_int_str_cache_hash[10000];
 static int      nova_int_str_cache_inited;
 
@@ -1385,8 +1389,8 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
     uintptr_t addr = (uintptr_t)ptr;
     if (addr < 0x10000ULL) return (NovaMemTag)-1;
     if (nova_int_str_cache_inited &&
-        (char*)ptr >= nova_int_str_cache[0] &&
-        (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
+        (const char*)ptr >= (const char*)&nova_int_str_cache[0] &&
+        (const char*)ptr < NOVA_INTSTR_END)
         return (NovaMemTag)-1;
     if (nova_strpool_contains(ptr)) return NOVA_MEM_RAW;
     /* Cheap envelope pre-reject: outside the tracked extent nothing can be ours, and
@@ -7413,6 +7417,23 @@ static inline int64_t nova_from_double(double d) {
     int64_t v; memcpy(&v, &d, 8); return v;
 }
 
+/* WRAPPING, NOT UNDEFINED. NOVA's semantics are that integer arithmetic WRAPS on overflow -- the
+   codegen rules say so explicitly ("never use `nsw` on user arithmetic ... incorrectly turns
+   overflow from wrong-answer into UB, which is WORSE"). The IR side honoured that; this C side
+   did not, and computed `a + b` on int64_t, where signed overflow is UNDEFINED BEHAVIOUR.
+
+   That is not theoretical. BLAKE2b -- which argon2id is built on -- is DEFINED on unsigned 64-bit
+   wraparound, so it overflows constantly by design. UBSan caught it on the first run:
+
+     runtime error: signed integer overflow:
+       7640891576939301192 + 5840696475078001361 cannot be represented in type 'int64_t'
+       #0 nova_rt_add  #1 _blake2b_g  #2 blake2b  #3 argon2id_raw
+
+   (those two constants are BLAKE2b IV[0] and IV[3].) Because it is UB, the compiler may assume it
+   cannot happen -- so Apple clang 21 and Ubuntu clang 18 are both entitled to produce DIFFERENT
+   results from the same input. That is precisely the macOS-only symptom: argon2id returning a
+   different hash for identical input, intermittently, while Linux stayed correct. Casting through
+   uint64_t makes the wrap well-defined and identical on every compiler and platform. */
 int64_t nova_rt_add(int64_t a, int64_t b) {
     /* 1.6: absence coerces to the number zero (see the NULL VALUE MODEL note).
        Without this, `d["missing"] + 1` computes on a heap POINTER. */
@@ -7431,7 +7452,7 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
         return nova_rt_str_concat_safe(a, b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) + nova_to_double(b)));
-    return a + b;
+    return (int64_t)((uint64_t)a + (uint64_t)b);   /* wraps; see the note above nova_rt_add */
 }
 
 int64_t nova_rt_sub(int64_t a, int64_t b) {
@@ -7440,7 +7461,7 @@ int64_t nova_rt_sub(int64_t a, int64_t b) {
     a = nova_null0(a); b = nova_null0(b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) - nova_to_double(b)));
-    return a - b;
+    return (int64_t)((uint64_t)a - (uint64_t)b);   /* wraps; see the note above nova_rt_add */
 }
 
 int64_t nova_rt_mul(int64_t a, int64_t b) {
@@ -7467,7 +7488,7 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
         return nova_rt_list_repeat(b, a);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) * nova_to_double(b)));
-    return a * b;
+    return (int64_t)((uint64_t)a * (uint64_t)b);   /* wraps; see the note above nova_rt_add */
 }
 
 int64_t nova_rt_div(int64_t a, int64_t b) {
