@@ -1066,6 +1066,8 @@ fn syntax_error(tokens: list, pos: int, msg: string, pe: list) -> int
         help = "list and argument items must be separated by commas"
     else if contains(msg, "expected ':'")
         help = "type annotations and dict literals use ':' between name and value"
+    else if contains(msg, " arm ")
+        help = "arms are `PATTERN => body`; a comparison belongs in a GUARD -- `_ if x < 3 => ...` -- or use an if-chain"
     else if contains(msg, "unexpected")
         help = "check that the surrounding syntax (parens, braces, indentation) is balanced"
     else if contains(msg, "reserved keyword")
@@ -3711,6 +3713,7 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let p2 = skip_nl(tokens, subject_r.pos)
     let arms = []
     let arm_ref_col = tok_col(tokens, p2)
+    let _arm_err = false
     while tk(tokens, p2) != "EOF"
         if tok_col(tokens, p2) < arm_ref_col
             break
@@ -3737,6 +3740,35 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             p2 = guard_r.pos
         if tk(tokens, p2) == "FAT_ARROW"
             p2 = p2 + 1
+        else if tk(tokens, p2) != "NEWLINE"
+            // A MISSING `=>` IS ONLY AN ERROR ON THE SAME LINE. When a NEWLINE follows the pattern
+            // the arrow is legitimately omitted and the body is an indented BLOCK:
+            //     match x
+            //         Foo
+            //             stmt1
+            //             stmt2
+            // That form is load-bearing (prism/ uses it), and an earlier version of this fix
+            // errored on it -- resyncing to the next top-level statement, silently TRUNCATING the
+            // enclosing function and emitting a branch to a basic block that was never defined.
+            // It surfaced as `use of undefined value '%while_body3281'` from clang, with NO
+            // compiler error at all, because a parse error inside an IMPORTED module lands in a
+            // discarded error list. Reconverge stayed byte-identical throughout: the compiler
+            // still compiled ITSELF fine, it just miscompiled other programs.
+            //
+            // What IS an error is a token sitting on the same line where `=>` belongs. Without
+            // this the arm fell through and the rest of the file was parsed as its BODY, so one
+            // mistake produced a cascade pointing at innocent code far below (~85% of a 700-line
+            // file). `b` in `b < 128 => 1` parses cleanly as a bare-var binding pattern, so
+            // nothing complained until the token stream had already desynchronised.
+            // parse_match_expr was always right (it used expect()); only the statement forms
+            // were missing it. syntax_error resyncs to the next top-level statement.
+            let _bad = tv(tokens, p2)
+            let _mm = "expected '=>' in match arm but found '" + _bad + "'"
+            if _bad == "<" or _bad == ">" or _bad == "<=" or _bad == ">=" or _bad == "==" or _bad == "!="
+                _mm = "a comparison is not a pattern in a match arm (found '" + _bad + "')"
+            p2 = syntax_error(tokens, p2, _mm, pe)
+            _arm_err = true
+            break
         p2 = skip_nl(tokens, p2)
         let arm_body = []
         while tk(tokens, p2) != "EOF"
@@ -3746,7 +3778,10 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             push(arm_body, sr.stmt)
             p2 = skip_nl(tokens, sr.pos)
         push(arms, Stmt("arm", "", pat_r.expr, arm_body, [], [], [arm_guard], ln))
-    if len(arms) == 0
+    // Only complain about an EMPTY match when the arms were genuinely absent. If the first arm
+    // was malformed we have already reported that, and adding "match has no arms" on top of it
+    // is a second error for one mistake -- the exact noise this fix exists to remove.
+    if len(arms) == 0 and not _arm_err
         syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm", pe)
     // TUPLE PATTERNS desugar HERE, in ONE place, instead of in each of the ~10 match
     // lowering sites. A tuple arm becomes a WILDCARD arm whose GUARD compares the literal
@@ -3868,6 +3903,15 @@ fn parse_receive_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             p2 = gr.pos
         if tk(tokens, p2) == "FAT_ARROW"
             p2 = p2 + 1
+        else if tk(tokens, p2) != "NEWLINE"
+            // Same shape as parse_match_stmt above, including the NEWLINE carve-out: an omitted
+            // `=>` before an indented block body is legal and must keep falling through.
+            let _rbad = tv(tokens, p2)
+            let _rmm = "expected '=>' in receive arm but found '" + _rbad + "'"
+            if _rbad == "<" or _rbad == ">" or _rbad == "<=" or _rbad == ">=" or _rbad == "==" or _rbad == "!="
+                _rmm = "a comparison is not a pattern in a receive arm (found '" + _rbad + "')"
+            p2 = syntax_error(tokens, p2, _rmm, pe)
+            break
         p2 = skip_nl(tokens, p2)
         let arm_body = []
         while tk(tokens, p2) != "EOF"
@@ -20862,7 +20906,7 @@ fn ir_escape_analysis(func: IrFunction) -> list
 // tag-reading runtime fn (nova_rt_eq/hash/deep_copy/type_name/print/...) on the heap
 // (the MemTag guard), since those are non-summary calls. This is SEPARATE from
 // ir_escape_analysis's local_set (which drives RC-elision) so it cannot perturb that.
-fn ir_escaping_set(func: IrFunction, summaries: dict) -> dict
+fn ir_escaping_set(func: IrFunction, summaries: dict, addr_taken: dict) -> dict
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             let escaping = {}
@@ -20873,7 +20917,29 @@ fn ir_escaping_set(func: IrFunction, summaries: dict) -> dict
                             match inst
                                 IrInst(op, dest, _, args, value, _, _, _) =>
                                     if op == "call"
-                                        if contains(summaries, value)
+                                        // 3.1 POLYFIELD. An ADDRESS-TAKEN callee is reachable from a
+                                        // __fnref_ trampoline, so its call sites are NOT all visible and
+                                        // it cannot be specialized to the argument type seen here. It is
+                                        // compiled generically and reads fields BY NAME through
+                                        // nova_field_get_or -- which is already correct (it reads slot 0
+                                        // as the type hash and BOXES floats and bools), but whose guard is
+                                        // nova_mem_find_tag(...) == NOVA_MEM_STRUCT. A SROA'd STACK struct
+                                        // has no such tag and is rejected, which is exactly why the third
+                                        // attempt at this bug returned null. Keeping these args on the
+                                        // heap is what lets the correct path see them.
+                                        //
+                                        // Deliberately NARROW: a struct passed to an ordinary unannotated
+                                        // function still stacks, because those call sites ARE all visible
+                                        // and specialization stays sound. In NOVA unannotated is the NORM,
+                                        // so escaping on "callee has any params" would strip SROA almost
+                                        // everywhere and put GATE 4/5 at risk. Address-taken functions are
+                                        // rare, so this costs approximately nothing.
+                                        if contains(addr_taken, value)
+                                            let ti = 0
+                                            while ti < len(args)
+                                                escaping[args[ti]] = 1
+                                                ti = ti + 1
+                                        else if contains(summaries, value)
                                             let pm = summaries[value]
                                             let ai = 0
                                             while ai < len(args)
@@ -20955,7 +21021,7 @@ fn ir_escaping_set(func: IrFunction, summaries: dict) -> dict
 // ir_escape_summaries: fixpoint over all functions computing, per function, the SET of
 // parameter indices that escape. Monotonic (escapes only grow), so it converges; capped
 // at 8 iterations defensively. summaries[fname] = dict of "<paramIndex>" -> 1.
-fn ir_escape_summaries(all_fns: list) -> dict
+fn ir_escape_summaries(all_fns: list, addr_taken: dict) -> dict
     let summ = {}
     for fnx in all_fns
         match fnx
@@ -20971,7 +21037,7 @@ fn ir_escape_summaries(all_fns: list) -> dict
             match fnx
                 IrFunction(fnname, fparams, _, fblocks, _, fex) =>
                     if fex == 0 and len(fblocks) > 0
-                        let esc = ir_escaping_set(fnx, summ)
+                        let esc = ir_escaping_set(fnx, summ, addr_taken)
                         let newpm = {}
                         let pi = 0
                         for p in fparams
@@ -20992,8 +21058,8 @@ fn ir_escape_summaries(all_fns: list) -> dict
 // interprocedural escaping set) AND all-scalar-field type (no heap fields => zero RC concern
 // in any mode). The all-scalar restriction + the escaping set (which keeps any struct reaching
 // a runtime polymorphic/tag-reading path on the heap) make this sound for stack allocation.
-fn ir_stackable_structs(func: IrFunction, summaries: dict, allscalar_types: dict) -> dict
-    let esc = ir_escaping_set(func, summaries)
+fn ir_stackable_structs(func: IrFunction, summaries: dict, allscalar_types: dict, addr_taken: dict) -> dict
+    let esc = ir_escaping_set(func, summaries, addr_taken)
     let stackable = {}
     match func
         IrFunction(_, _, _, blocks, _, _) =>
@@ -23083,7 +23149,7 @@ fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
                     converged = false
             IrFunction(name, new_params, ret_type, new_blocks, type_params, is_extern)
 
-fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
+fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict, addr_taken: dict) -> string
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             let rt = {}
@@ -23096,7 +23162,16 @@ fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
                             IrType(tk, tn, tp, tid) =>
                                 if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
                                     st[pname] = tk
-                                else if contains(fpt, name) and contains(fpt[name], str(pidx))
+                                // 3.1 POLYFIELD: fpt is derived from the VISIBLE call sites. For an
+                                // ADDRESS-TAKEN function they are not all visible -- a __fnref_ trampoline
+                                // can invoke it with anything -- so seeding a param from fpt publishes a
+                                // return type that only holds for the calls we happened to see. That is the
+                                // bug: `poly` was specialized to CPt on its one direct call, frt["poly"]
+                                // became "float", and the closure call then read QPt's INT field back
+                                // through that float label (printing 7 as 3.45845952088873e-323, the
+                                // integer's bit pattern as a double). "any" is the honest answer; the field
+                                // read then goes by name through nova_field_get_or, which boxes correctly.
+                                else if contains(fpt, name) and contains(fpt[name], str(pidx)) and not contains(addr_taken, name)
                                     st[pname] = fpt[name][str(pidx)]
                                 else
                                     st[pname] = "any"
@@ -23190,7 +23265,7 @@ fn ir_reg_is_raw_double(rv: string, rt: dict, defop: dict, defval: dict, frt: di
 // gave the 2.6e-311 bug). We re-run the same type inference ir_analyze_return_type uses
 // (so add->float etc. are resolved), then require every return value to pass
 // ir_reg_is_raw_double. Used to gate extending unbox-removal to user-fn call results.
-fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
+fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict, addr_taken: dict) -> int
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             if is_extern == 1
@@ -23205,7 +23280,16 @@ fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
                             IrType(tk, tn, tp, tid) =>
                                 if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
                                     st[pname] = tk
-                                else if contains(fpt, name) and contains(fpt[name], str(pidx))
+                                // 3.1 POLYFIELD: fpt is derived from the VISIBLE call sites. For an
+                                // ADDRESS-TAKEN function they are not all visible -- a __fnref_ trampoline
+                                // can invoke it with anything -- so seeding a param from fpt publishes a
+                                // return type that only holds for the calls we happened to see. That is the
+                                // bug: `poly` was specialized to CPt on its one direct call, frt["poly"]
+                                // became "float", and the closure call then read QPt's INT field back
+                                // through that float label (printing 7 as 3.45845952088873e-323, the
+                                // integer's bit pattern as a double). "any" is the honest answer; the field
+                                // read then goes by name through nova_field_get_or, which boxes correctly.
+                                else if contains(fpt, name) and contains(fpt[name], str(pidx)) and not contains(addr_taken, name)
                                     st[pname] = fpt[name][str(pidx)]
                                 else
                                     st[pname] = "any"
@@ -23843,6 +23927,7 @@ type IrEmitter
     ire_slot_escaped: dict
     ire_dropped: dict
     ire_cur_fn_lambda: int
+    ire_cur_fn_name: string     // 3.1 POLYFIELD: name of the function being emitted, so a field read can ask whether it is ADDRESS-TAKEN (ire_addr_taken) and therefore cannot trust a compile-time field type.
     ire_struct_types: dict
     ire_stackable: dict
     ire_proven_float: dict
@@ -23867,7 +23952,7 @@ type IrEmitter
                                 // the only operand whose float-ness cannot be invalidated later.
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0, {}, {}, {}, {}, {})
+    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, "", {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0, {}, {}, {}, {}, {})
     // #33: enable DWARF variable emission when requested (NOVA_DWARF_VARS or `nova debug`).
     if env("NOVA_DWARF_VARS") != ""
         e.ire_dwarf_vars = 1
@@ -25081,6 +25166,40 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     ire_indent(e, dest + " = call i64 @" + ir_absent_sym("nova_rt_index_get") + "(i64 " + args[0] + ", i64 " + args[1] + ")")
             else if op == "field_get"
                 e.ire_borrow_src[dest] = 1        // total-RC S1: a field read is BORROWED (still owned by the struct). Inert metadata.
+                // 3.1 POLYFIELD. Inside an ADDRESS-TAKEN function with an UNTYPED field read, the
+                // compile-time field type is a guess: the receiver's struct is whatever some
+                // invisible __fnref_ caller passed. The SLOT is usually right (same field name,
+                // same index), but the TYPE is not -- reading CPt.cx (raw double) and QPt.cx (int)
+                // through one inline load hands `str()` raw bits, printing 1.5 as
+                // 4609434218613702656 or 7 as 3.45845952088873e-323 depending on which way it guessed.
+                //
+                // nova_field_get_or resolves against the object's OWN slot-0 type hash and BOXES
+                // floats and bools, which is exactly the invariant needed -- it was always correct;
+                // it simply could not be reached. Its guard is nova_mem_find_tag == NOVA_MEM_STRUCT,
+                // so a SROA'd STACK struct was rejected (that is what defeated the third attempt at
+                // this bug, returning null). The escape-analysis change above keeps arguments to
+                // address-taken functions on the HEAP, so this path now resolves.
+                //
+                // Cost is paid ONLY here: an address-taken function reading an un-inferrable field.
+                // Every statically-typed read keeps the inline GEP + load and full SROA.
+                let _pf_dyn = 0
+                // MEASURED, not assumed: the read of `poly.cx` arrives here with typ=FLOAT, because
+                // the lowering-time inference had already specialized `poly` to CPt. So gating on
+                // typ == "any" never fires. Inside an address-taken function EVERY compile-time
+                // field type is a guess -- float-for-int and int-for-float are both reachable, and
+                // by-name resolution repairs both. Internal `__`-prefixed slots (__fn_ptr,
+                // __type_hash) are NOT real fields and must keep the inline load.
+                if contains(e.ire_addr_taken, e.ire_cur_fn_name) and value != "" and not starts_with(value, "__")
+                    _pf_dyn = 1
+                if _pf_dyn == 1
+                    let _pf_g = ire_intern_string(e, value)
+                    let _pf_len = len(value) + 1
+                    let _pf_p = ire_fresh_tmp(e, "_pf.n")
+                    ire_indent(e, _pf_p + " = " + strlit_gep_name(_pf_g, _pf_len))
+                    let _pf_i = ire_fresh_tmp(e, "_pf.ni")
+                    ire_indent(e, _pf_i + " = ptrtoint ptr " + _pf_p + " to i64")
+                    ire_indent(e, dest + " = call i64 @nova_rt_field_get(i64 " + args[0] + ", i64 " + _pf_i + ")")
+                    return
                 let ptr_name = dest + ".ptr"
                 ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
                 let gep = dest + ".gep"
@@ -25569,6 +25688,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
             // float results boxed (consumers unbox), which the heuristic-free collection
             // reads rely on. (Bool returns stay raw so filter predicates work.)
             e.ire_cur_fn_lambda = 0
+            e.ire_cur_fn_name = name
             if starts_with(name, "__lambda_")
                 e.ire_cur_fn_lambda = 1
             if is_extern == 1
@@ -28523,6 +28643,13 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // call site in main reaches a callee two hops down. This loop already existed for RETURN types;
     // _pfpt_chg is what keeps it running while PARAM types are still moving, because return types
     // can settle first and used to stop the loop mid-propagation.
+    // 3.1 POLYFIELD: the address-taken set, needed by the fixpoint and escape analysis below,
+    // not only at emission time. Built from b.ir_tramps for the same reason e.ire_addr_taken is:
+    // trampolines are materialised from ir_tramps and never appear in all_fns, so scanning all_fns
+    // misses them -- precisely how an earlier attempt read a heap pointer as a double.
+    let _at_esc = {}
+    for _at_e in b.ir_tramps
+        _at_esc[_at_e[1]] = 1
     let _pfpt_chg = {}
     while changed and pass_count < 6
         changed = false
@@ -28537,7 +28664,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     let old_type = "any"
                     if contains(frt, fname)
                         old_type = frt[fname]
-                    let new_type = ir_analyze_return_type(ir_fn, frt, fpt)
+                    let new_type = ir_analyze_return_type(ir_fn, frt, fpt, _at_esc)
                     // TIER 1: a GENUINELY heterogeneous fn (ti_ widened its return to `any` on a real
                     // conflict) must STAY `any` — do not refine it to a first-return concrete type, or
                     // callers mis-dispatch print/box on the non-primary-type returns. (Incomplete-`any`
@@ -28569,7 +28696,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             match ir_fn
                 IrFunction(rfname, rfp, rfret, rfblocks, rftp, rfex) =>
                     if contains(frt, rfname) and frt[rfname] == "float" and not contains(frt, "@raw@" + rfname)
-                        if ir_returns_raw_double(ir_fn, frt, fpt) == 1
+                        if ir_returns_raw_double(ir_fn, frt, fpt, _at_esc) == 1
                             frt["@raw@" + rfname] = 1
                             raw_changed = true
 
@@ -28592,7 +28719,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             _allsc = 0
             if _allsc == 1
                 _allscalar[_sdt] = 1
-    let _esumm = ir_escape_summaries(all_fns)
+    let _esumm = ir_escape_summaries(all_fns, _at_esc)
 
     // ── #15 S5 ABI: compute by-value-eligible callee set (NOVA_S5_ABI=1) ──────
     // A param i of f is by-value-eligible iff:
@@ -28820,7 +28947,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             match typed_fn
                 IrFunction(fname, _, _, _, _, _) =>
                     ire_line(e, "; ESCAPE " + fname + ": allocs=" + str(ea[0]) + " escape=" + str(ea[1]) + " local=" + str(ea[0] - ea[1]))
-                    let _stk = ir_stackable_structs(typed_fn, _esumm, _allscalar)
+                    let _stk = ir_stackable_structs(typed_fn, _esumm, _allscalar, _at_esc)
                     if len(keys(_stk)) > 0
                         let _sl = "; STACKABLE " + fname + ":"
                         for _sk in keys(_stk)
@@ -28828,7 +28955,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         ire_line(e, _sl)
         e.ire_stackable = {}
         if do_sroa and want_escape
-            e.ire_stackable = ir_stackable_structs(typed_fn, _esumm, _allscalar)
+            e.ire_stackable = ir_stackable_structs(typed_fn, _esumm, _allscalar, _at_esc)
         ire_emit_function(e, typed_fn)
 
     // Emit nova_main
@@ -28843,7 +28970,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             for k in keys(local_set_m)
                 e.ire_local_lists[k] = 1
         ire_line(e, "; ESCAPE nova_main: allocs=" + str(ea_main[0]) + " escape=" + str(ea_main[1]) + " local=" + str(ea_main[0] - ea_main[1]))
-        let _stkm = ir_stackable_structs(typed_main, _esumm, _allscalar)
+        let _stkm = ir_stackable_structs(typed_main, _esumm, _allscalar, _at_esc)
         if len(keys(_stkm)) > 0
             let _slm = "; STACKABLE nova_main:"
             for _skm in keys(_stkm)
@@ -28851,7 +28978,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             ire_line(e, _slm)
     e.ire_stackable = {}
     if do_sroa and want_escape
-        e.ire_stackable = ir_stackable_structs(typed_main, _esumm, _allscalar)
+        e.ire_stackable = ir_stackable_structs(typed_main, _esumm, _allscalar, _at_esc)
     ire_emit_function(e, typed_main)
 
     // Emit any lambdas generated during nova_main lowering

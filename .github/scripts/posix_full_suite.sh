@@ -144,8 +144,16 @@ export MYSQLPASSWORD="" PGPASSWORD=""
 # Same reason the PowerShell harness does it: recompiling nova_runtime.c (and the ~250k-line
 # sqlite3 amalgamation) per test would dominate wall time entirely.
 echo "pre-compiling runtime + sqlite3 ..."
+# The clang error MUST reach an ANNOTATION, not just stdout. This step failed on all 20 POSIX jobs
+# with the bare message "runtime pre-compile FAILED" and nothing else -- and because the Actions
+# LOGS endpoint is 403 without a token, the actual cause was unreadable. Diagnosing it took a full
+# CI cycle plus a documentation lookup, for what turned out to be one undefined symbol
+# (SSL_set1_ip_asc, which does not exist in OpenSSL). A gate that says only "it broke" is barely
+# better than no gate; the first `error:` lines are what make it actionable.
 clang -c -O2 $EXTRA_CFLAGS "$RUNTIME_SRC" -o "$OUT/nova_runtime.o" -w 2>"$OUT/_rt.log" \
-  || { echo "::error title=posix-full::runtime pre-compile FAILED"; tail -5 "$OUT/_rt.log"; exit 1; }
+  || { RTERR="$(grep -m3 -E 'error:' "$OUT/_rt.log" | tr '\n' '|' | cut -c1-500)"
+       echo "::error title=posix-full runtime pre-compile::${RTERR:-no 'error:' line found; see the step log}"
+       echo "----- nova_runtime.c compile log (last 25) -----"; tail -25 "$OUT/_rt.log"; exit 1; }
 SQLITE_SRC="$NOVA_HOME/compiler/sqlite3.c"
 SQLITE_OBJ=""
 if [ -f "$SQLITE_SRC" ]; then

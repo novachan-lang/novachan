@@ -100,6 +100,7 @@
 #ifdef NOVA_HAVE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>   /* X509_VERIFY_PARAM_set1_host / _set1_ip_asc (hostname + IP pinning) */
 #endif
 #endif
 #endif  /* NOVA_NO_SYSHEADERS: platform I/O headers gated out for wasm */
@@ -15515,15 +15516,22 @@ static int64_t http_request(const char* url, const char* method,
            that is perfectly valid for ANY other domain satisfied the check -- i.e. http_get was
            MITM-able by anyone holding any CA-issued cert. Bind the name we actually asked for.
 
-           An IPv4 LITERAL must go through SSL_set1_ip_asc instead: a bare address is matched
-           against the certificate's IP SAN, and handing it to SSL_set1_host would compare it to
-           the DNS names and reject every certificate -- swapping a too-weak check for a too-strong
-           one. (IPv6 literals cannot arrive here at all: the URL parser above ends the host at the
+           An IPv4 LITERAL must be pinned as an IP instead: a bare address is matched against the
+           certificate's IP SAN, and handing it to the hostname setter would compare it to the DNS
+           names and reject every certificate -- swapping a too-weak check for a too-strong one. (IPv6 literals cannot arrive here at all: the URL parser above ends the host at the
            first ':', so a bracketed authority was never supported. Pre-existing, not introduced
-           here.) */
+           here.)
+
+           ⛔ GO THROUGH X509_VERIFY_PARAM, NOT SSL_set1_*. `SSL_set1_host` exists, but there is NO
+           `SSL_set1_ip_asc` in OpenSSL -- only the X509_VERIFY_PARAM form. Calling the former was
+           an IMPLICIT FUNCTION DECLARATION, which modern clang treats as a hard ERROR, so the
+           runtime failed to compile on every POSIX platform while Windows stayed green because it
+           builds SChannel with NOVA_HAVE_OPENSSL undefined and never sees this block at all.
+           Both calls use the param API so the pair is uniform and provably present since 1.0.2. */
         struct in_addr ip4_probe;
-        if (inet_pton(AF_INET, host, &ip4_probe) == 1) SSL_set1_ip_asc(ssl, host);
-        else                                           SSL_set1_host(ssl, host);
+        X509_VERIFY_PARAM* vp = SSL_get0_param(ssl);
+        if (inet_pton(AF_INET, host, &ip4_probe) == 1) X509_VERIFY_PARAM_set1_ip_asc(vp, host);
+        else                                           X509_VERIFY_PARAM_set1_host(vp, host, 0);
         if (nova_tls_handshake(ssl, fd, 0) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); nova_set_error("http: TLS handshake/verification failed"); return nova_http_empty(); }
         sslp = ssl;
     }

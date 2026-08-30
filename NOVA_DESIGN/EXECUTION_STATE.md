@@ -41,6 +41,52 @@ actually killing anything (the runtime catches SIGTERM), so Linux and aarch64 ha
 completed a full suite — a suite that never finishes reports no failures, which looks exactly like
 passing.
 
+### ✅ 2026-08-30 — WEAPON PARITY IS COMPLETE: the last three open items are closed
+
+The plan's feature tables were already green; three items remained in its **prose**, invisible to a
+table-level summary. All three are now closed and gated, arc green (reconverge byte-identical,
+3592/0 both modes).
+
+**1. `match true` parser defect — and it was not what the note claimed.** `match true` with
+comparison arms is not valid NOVA at all: a comparison is not a pattern, and the guard form
+`_ if n < 0 => ...` already works. The REAL defect was `parse_match_stmt` testing
+`if tk == FAT_ARROW` with **no else** — a missing `=>` fell through silently and the remainder of
+the file was parsed as that arm's body, so one bad arm cascaded across ~85% of a 700-line file.
+Fixed with a NEWLINE carve-out: an omitted `=>` before an indented **block body** is legal and must
+keep falling through. ⛔ My first version errored on that legal form and **silently truncated
+functions** — clang rejected the IR (`use of undefined value '%while_body3281'`) while the compiler
+exited 0, emitted no error (the parse error landed in an imported module's discarded error list),
+**and reconverge stayed byte-identical**. The compiler still compiled ITSELF fine; it only
+miscompiled other programs. `parse_receive_stmt` shared the bug; `parse_match_expr` was always
+correct (it used `expect()`). Gated on the ERROR COUNT (exactly 1), not on rejection — the broken
+compiler "rejected" too.
+
+**2. wasm carve resynced — 40 build errors → 0.** All POSIX declarations the freestanding shim
+never gated, plus a `nova_task_arena_cleanup` redefinition that appeared once the runtime began
+defining it on the POSIX path. Live wasm execution is unblocked; the canvas gate self-upgrades.
+
+**3. 3.1 polyfield — closed after FIVE attempts.** Three parts, all keyed off the address-taken set:
+the escape analysis keeps a struct passed to an address-taken function on the **heap**; the return
+type stops being seeded from `fpt`; and the field read resolves **by name**. The unlock: 
+`nova_field_get_or` was ALWAYS correct (reads slot 0 as the type hash, boxes floats/bools) — its
+guard is `nova_mem_find_tag == NOVA_MEM_STRUCT`, so a SROA'd **stack** struct was rejected. That
+alone defeated the third attempt; part 1 is what makes it reachable. Trigger is deliberately narrow
+(address-taken only, not "callee has `any` params" — in NOVA unannotated is the norm and that would
+have stripped SROA almost everywhere). Gated on BOTH call paths: parts 1+2 alone made the closure
+call right while the direct call printed `4609434218613702656`.
+
+⛔ **The process failure worth keeping.** That fix was written, judged ineffective, and REVERTED —
+on evidence from a build that never happened. `nova_compile_file` skips the compile when the output
+`.ll` exists and is newer than the unchanged source, so every re-test relinked a stale artifact and
+a debug `print` inserted into the compiler never fired. **Delete outputs and set `NOVA_NO_CACHE=1`
+before testing a compiler change.** Third stale-artifact incident in this codebase.
+
+**New gate — `_posix_typecheck.ps1` (arc stage 1b).** Compiles `nova_runtime.c` in a Linux
+container in three configurations (POSIX+OpenSSL, POSIX no-OpenSSL, wasm32 carve). It exists
+because large regions sit behind BOTH `#else of #ifdef _WIN32` AND `#ifdef NOVA_HAVE_OPENSSL` and
+were therefore never compiled on this box — which let a call to `SSL_set1_ip_asc` (a function that
+does not exist in OpenSSL) reach master and fail 20 of 25 CI jobs. Skips cleanly without Docker.
+
 ### ✅ 2026-08-30 — the last deferred limitation is CLOSED, and CI is now a real gate
 
 **`https` no longer blocks its carrier.** All nine OpenSSL call sites now park on the netpoller

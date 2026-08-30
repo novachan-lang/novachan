@@ -38,6 +38,69 @@ function Test-ShouldReject {
     }
 }
 
+# PARSER ERROR RECOVERY. Rejection alone is NOT the property under test here -- the broken version
+# also "rejected". What regressed was the error COUNT: one malformed match arm used to desynchronise
+# the token stream and get the remainder of the file parsed as that arm's body, so a single mistake
+# on line 3 produced a cascade of errors pointing at innocent code (~85% of a 700-line file). This
+# asserts the exact count, because "it errors" would pass even with the cascade fully restored.
+function Test-ErrorCount {
+    param([string]$file, [string]$expected_err_frag, [int]$want_errors)
+    $r = Invoke-Timed -FilePath (Resolve-Path $compiler).Path -Arguments $file -TimeoutMs 30000
+    if ($r.TimedOut) { Write-Host "  TIMEOUT $file  => BUG"; $script:fail++; return }
+    $all = "$($r.Stdout)$($r.Stderr)"
+    $n = ([regex]::Matches($all, 'error\[')).Count
+    if ($r.ExitCode -eq 0) { Write-Host "  FAIL $file  accepted when it should have been rejected"; $script:fail++; return }
+    if ($all -notmatch [regex]::Escape($expected_err_frag)) {
+        Write-Host "  FAIL $file  rejected but expected '$expected_err_frag' not in output"; $script:fail++; return
+    }
+    if ($n -ne $want_errors) {
+        Write-Host "  FAIL $file  emitted $n error(s), want exactly $want_errors -- the parse-state CASCADE is back"
+        $script:fail++; return
+    }
+    Write-Host "  PASS $file  exactly $n error, no cascade"
+    $script:pass++
+}
+
+# The positive half. It must LINK AND RUN, not merely compile.
+#
+# ⛔ A COMPILE-ONLY CHECK WOULD NOT HAVE CAUGHT THE REGRESSION THIS GUARDS. An earlier version of
+# the missing-`=>` diagnostic errored on the legal block-body arm form, resynced to the next
+# top-level statement and silently truncated the enclosing function. The compiler still exited 0
+# and still wrote a .ll -- the damage only appeared when clang rejected the IR with
+# `use of undefined value '%while_body3281'`. Worse, reconverge stayed byte-identical, because the
+# compiler still compiled ITSELF correctly; it only miscompiled OTHER programs. Exit code and
+# fixpoint were both green while codegen was broken, so the only assertion with teeth is to build
+# the program the whole way and run it.
+function Test-ShouldAccept {
+    param([string]$file)
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($file)
+    Remove-Item "$stem.ll", "_pos_$stem.exe" -Force -ErrorAction SilentlyContinue
+    $r = Invoke-Timed -FilePath (Resolve-Path $compiler).Path -Arguments $file -TimeoutMs 60000
+    if ($r.TimedOut) { Write-Host "  TIMEOUT $file"; $script:fail++; return }
+    if ($r.ExitCode -ne 0) {
+        Write-Host "  FAIL $file  REJECTED a valid program (exit=$($r.ExitCode))"
+        Write-Host "    $((($r.Stdout + $r.Stderr) -split "`n" | Where-Object { $_ -match '^error' } | Select-Object -First 2) -join ' | ')"
+        $script:fail++; return
+    }
+    if (-not (Test-Path "$stem.ll")) { Write-Host "  FAIL $file  compiled but produced no IR"; $script:fail++; return }
+    $lk = & clang -O1 -o "_pos_$stem.exe" "$stem.ll" "..\compiler\nova_runtime.c" -lws2_32 -ladvapi32 -w 2>&1
+    if (-not (Test-Path "_pos_$stem.exe")) {
+        $le = ($lk | Where-Object { $_ -match 'error:' } | Select-Object -First 1)
+        Write-Host "  FAIL $file  compiled (exit 0) but emitted INVALID IR -- $le"
+        $script:fail++
+        Remove-Item "$stem.ll" -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $run = Invoke-Timed -FilePath (Resolve-Path "_pos_$stem.exe").Path -Arguments "" -TimeoutMs 30000
+    Remove-Item "$stem.ll", "_pos_$stem.exe" -Force -ErrorAction SilentlyContinue
+    if ($run.TimedOut -or $run.ExitCode -ne 0) {
+        Write-Host "  FAIL $file  built but did not run clean (exit=$($run.ExitCode) timedout=$($run.TimedOut))"
+        $script:fail++; return
+    }
+    Write-Host "  PASS $file  compiles, links and runs"
+    $script:pass++
+}
+
 Write-Host "=== Negative type-error tests ==="
 
 Test-ShouldReject "_negty_arity.nova"      "expects 2 arguments"
@@ -102,6 +165,29 @@ Test-ShouldReject "_negty_default_order.nova"       "must come last"
 # variants so it passed, while a Wrap(StrVal(...)) value matched no arm and fell through to "".
 # Adding a feature had added a soundness hole; this is the check that closes it.
 Test-ShouldReject "_negty_nested_exhaustive.nova"  "non-exhaustive nested match"
+
+# PARSE-STATE CASCADE (WEAPON_PARITY 5.6 follow-up). `match true` with comparison arms is NOT valid
+# NOVA -- a comparison is not a pattern -- and rejecting it is correct. The DEFECT was that the
+# statement form checked `if tk == FAT_ARROW` with NO else, so a missing `=>` fell through silently
+# and the rest of the file became the arm's body. parse_match_expr was always right (it used
+# expect()); only parse_match_stmt and parse_receive_stmt were missing it.
+Write-Host ""
+Write-Host "=== Parser error recovery (no parse-state cascade) ==="
+Test-ErrorCount "_mtrue_repro.nova" "a comparison is not a pattern in a match arm" 1
+# Both legal forms the diagnostic must NOT touch: the documented guard, and the block-body arm
+# whose pattern line carries no `=>` at all. The second one is the form the first attempt broke.
+Test-ShouldAccept "_mt_guard_probe.nova"
+Test-ShouldAccept "_mt_block_probe.nova"
+
+# 3.1 POLYFIELD (WEAPON_PARITY 3.1) — was a KNOWN GAP that printed a wrong number for five
+# attempts. An address-taken function reached through a __fnref_ trampoline was specialized to the
+# ONE argument type its visible direct call passed, so the other caller's field was read through
+# the wrong type label. Asserts BOTH call paths, because every partial fix so far got exactly one
+# of them right: parts 1+2 alone made the closure call correct and the DIRECT call print
+# 4609434218613702656 (the bits of 1.5 as an integer). One assertion would have looked like success.
+Write-Host ""
+Write-Host "=== 3.1 polyfield (address-taken fn + raw float field) ==="
+Test-ShouldAccept "_f31_polyfield_known_gap.nova"
 
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"

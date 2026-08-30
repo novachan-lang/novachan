@@ -690,7 +690,11 @@ from assumption rather than measurement. Every future item gets grepped before i
 
 ---
 
-### 🔧 3.1 PARTIAL (2026-08-23) — scalar float 2.21x → 1.69x C, and the real numbers measured
+### ✅ 3.1 CLOSED — scalar float parity + float ARRAY 1.09x C (2026-08-27), polyfield gap closed 2026-08-30
+
+*(The section below is the 2026-08-23 snapshot at 2.21x -> 1.69x C, kept for the measurements and
+the reasoning. Superseded: the float ARRAY half reached **1.09x C** and the last open item, the
+address-taken polyfield gap, is closed and gated — see further down.)*
 
 **The plan's "1.7x" was one stale number covering two very different paths.** Measured against C
 (-O2), best-of-3:
@@ -904,7 +908,7 @@ example.com and badssl.com and passes 4/4 in isolation on both this compiler and
 compiler it reports exactly 3 failures — one per fix (`poisoned_f` boxes, `bits 4886396799603965952`,
 `anyp 2.5 3.45845952088873e-323`). A gate that has never been observed to fail is not evidence.
 
-#### ⚠ OPEN DEFECT found by the new gate — an inferred param type does not chain through a second function
+#### ✅ CLOSED — an inferred param type did not chain through a second function (fix documented below)
 
 Discovered while writing Rule 4; **pre-existing**, verified by running the previously committed
 compiler, which produces the identical wrong answer. Not caused by 3.1 and not fixed by it.
@@ -1198,11 +1202,41 @@ The experiment is preserved at `/tmp/_nc_31exp.nova` (all behind `NOVA_EXP_NORM`
 `NOVA_EXP_LINK`) and is NOT committed: the remaining layer fix and a quiet-machine measurement both
 have to land before it is worth an arc.
 
-**STILL OPEN — the float ARRAY half.** ~1.7x, a different mechanism (element representation, not the
+**✅ CLOSED — the float ARRAY half** (1.60x -> **1.09x C**, 2026-08-27; the note below is historical). ~1.7x, a different mechanism (element representation, not the
 call boundary), untouched by any of this. The reading was taken with an arc running (167/247/176 ms
 spread) so it needs a quiet machine before being trusted.
 
-#### ⚠ OPEN GAP — address-taken function + raw float field (`_f31_polyfield_known_gap.nova`)
+#### ✅ CLOSED 2026-08-30 — address-taken function + raw float field
+
+**FIXED after five attempts.** Three parts, all keyed off the ADDRESS-TAKEN set (`b.ir_tramps`):
+
+1. **Escape analysis** — a struct passed to an address-taken function stays on the **HEAP**. This is
+   what unblocked everything: `nova_field_get_or` was ALREADY correct (it reads slot 0 as the type
+   hash and BOXES floats and bools), but its guard is `nova_mem_find_tag == NOVA_MEM_STRUCT`, so a
+   SROA'd STACK struct was rejected. That, and only that, defeated attempt (c) below. The trigger is
+   deliberately NARROW — not "callee has `any` params", which in NOVA describes most functions and
+   would have stripped SROA almost everywhere and put GATE 4/5 at risk.
+2. **Return type** — `ir_analyze_return_type` / `ir_returns_raw_double` no longer seed params from
+   `fpt` for an address-taken function, so `frt` stops publishing a float return derived from call
+   sites that cannot be seen.
+3. **Field read** — inside an address-taken function the field read resolves BY NAME. **Measured,
+   not assumed:** the read arrives with `typ=FLOAT` (lowering had already specialized), so gating on
+   `typ == "any"` never fired. Inside such a function EVERY compile-time field type is a guess,
+   because float-for-int and int-for-float are both reachable.
+
+Cost is confined to address-taken functions reading un-inferrable fields; statically typed code
+keeps the inline GEP+load and full SROA, and **reconverge stayed byte-identical**. Now GATED — the
+repro asserts BOTH call paths, because parts 1+2 alone made the closure call correct while the
+direct call printed `4609434218613702656` (the bits of 1.5 as an integer); a one-sided assertion
+would have reported success.
+
+⛔ **Process note.** This fix was once written, judged ineffective and REVERTED — on evidence from
+a build that never happened. `nova_compile_file` skips the compile when the output `.ll` exists and
+is newer than the unchanged source, so every re-test relinked a stale artifact and a debug `print`
+inserted into the compiler never fired. Delete outputs and set `NOVA_NO_CACHE=1` before testing a
+compiler change; `_polyfield_check.ps1` does both.
+
+The historical analysis of the failed attempts follows.
 
 Found by the adversarial half of the same probe. Pre-existing, verified against the previously
 committed compiler. Prints `poly 1.5 3.45845952088873e-323` where `poly 1.5 7` is correct.
@@ -1622,7 +1656,7 @@ The dev bundle exists solely to make the gate runnable without a release archive
 
 ---
 
-### 🔧 5.6 PARTIAL (2026-08-26) — the renderer, the decoder, and the gate all work; the wasm carve does not
+### ✅ 5.6 CLOSED — renderer, decoder and gate (2026-08-26); **wasm carve RESYNCED 2026-08-30** (40 build errors -> 0)
 
 **What this is, precisely, restated because the title above is a correction.** This is a **Canvas2D** backend, not WebGL — nothing here emits a shader, a vertex buffer, or a GPU handle. It walks the same `PrismNode` tree `prism/render/prism_render_html.nova` (Milestone MA.5) and `prism/backend/ansi/prism_render_ansi.nova` (MA.6) already render, making it Prism's **third** backend and the first real falsifier of "backend-agnostic node tree" against a medium with no built-in layout engine (HTML gets CSS, a terminal gets its own grid; a `<canvas>` gets neither). It is also the first backend that needs a browser-side companion — a `<canvas>` element has no DOM to receive markup, so the NOVA side cannot hand off a string the way `prism_html_render` does; it has to hand off *something else* across the wasm boundary, which is most of what makes this item different from 5.3's existing WASM plumbing.
 
@@ -1676,7 +1710,7 @@ The gate is written to **self-upgrade**: the best-effort block runs every time, 
 | `flexible` gap expansion | Not implemented — visible-but-not-expanding; needs a second constraint pass (the layout engine, a different milestone) |
 | Baseline alignment, bidi, RTL, subpixel text | Not implemented — v1 scope, stated in the renderer's own header |
 | Scrolling | Not implemented — a `pane` clips only |
-| **Live wasm execution in a real browser/Node** | ❌ **blocked upstream** by the runtime-carve gap above — everything feeding into it is done and verified |
+| **Live wasm execution in a real browser/Node** | ✅ **UNBLOCKED 2026-08-30** — the carve compiles again (40 errors -> 0: POSIX declarations the freestanding shim never gated, plus a `nova_task_arena_cleanup` redefinition that appeared once the runtime defined it on the POSIX path too). The gate self-upgrades from here. |
 
 **Rejected, and why:**
 1. **Reading `NovaList`'s raw `{data,size,cap,elem_kind}` struct directly out of wasm linear memory**, which would make word-pulling "zero crossings" instead of one call per word — rejected because it means depending on the RC-header offset and the S4 typed-array `elem_kind` tagging state, both runtime internals and neither part of `prism_render_canvas.nova`'s public contract; either can change shape with no compile error here to catch it. `pullWordsFromWasmExports()` instead calls the program's own exported `canvas_len()`/`canvas_word(i)` — for a UI-sized command stream (a screen, not a video frame) the call overhead is not the risk that matters; silently decoding a stale struct layout is.
@@ -1684,7 +1718,7 @@ The gate is written to **self-upgrade**: the best-effort block runs every time, 
 3. **Hand-retyping the expected word array into JavaScript** for the Node decode test — would test a human's transcription, not the decoder. `_canvas_words_dump.nova` instead hands the Node test a real, natively-produced stream.
 4. **Claiming WebGL** because "canvas" is in the title — this is Canvas2D, stated plainly in the renderer's own header and repeated here per the task's instruction not to overclaim.
 
-**Compiler-side change needed: none from this task's hard-constrained scope.** What a *future* session needs, precisely: (a) resync `nova-compiler/compiler/nova_runtime_wasm.c` against the current `nova_runtime.c` (the missing-symbol list above is the starting point; expect more once those clear), verified with the carve's own native-token-identical methodology; (b) separately, `nova_compiler.nova`'s parser has a real defect where `match true` with comparison-expression arms corrupts parse state for the remainder of the file — worth a minimal repro and a fix, independent of Prism.
+**✅ BOTH FOLLOW-UPS ARE NOW DONE (2026-08-30).** This paragraph used to list what a future session needed: (a) resync `nova_runtime_wasm.c` against the current `nova_runtime.c` -- done, 40 build errors -> 0, all of them POSIX declarations the freestanding shim never gated (plus a `nova_task_arena_cleanup` redefinition that appeared once the runtime started defining it on the POSIX path too); and (b) the `match true` parser defect -- done, and it was NOT what the note claimed. `match true` with comparison-expression arms is not valid NOVA at all (a comparison is not a pattern; the documented grammar is `PAT (| PAT)* (if GUARD)? => body`, and the guard form `_ if n < 0 => ...` works today). The REAL defect was that `parse_match_stmt` tested `if tk == FAT_ARROW` with **no else**, so a missing `=>` fell through silently and the rest of the file was parsed as that arm's body -- one bad arm produced a file-wide cascade. Fixed with a NEWLINE carve-out (an omitted `=>` before an indented block body is legal and must keep falling through -- an earlier version of the fix errored on that legal form and silently truncated functions, emitting a branch to an undefined basic block while reconverge stayed byte-identical). `parse_receive_stmt` shared the bug and was fixed too; `parse_match_expr` was always correct because it used `expect()`. Now gated on the ERROR COUNT (exactly 1), not merely on rejection.
 
 ---
 

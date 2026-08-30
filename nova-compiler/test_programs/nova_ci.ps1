@@ -40,6 +40,21 @@ if (-not $SkipReconverge) {
     Write-Host ""
 }
 
+# Runs EARLY and cheaply (seconds, once its image is cached) because it guards the one region of
+# nova_runtime.c this Windows box can never compile: the code behind BOTH `#else` of `#ifdef _WIN32`
+# AND `#ifdef NOVA_HAVE_OPENSSL`. That blind spot let a call to a nonexistent OpenSSL function reach
+# master and fail 20 of 25 CI jobs. Skips cleanly when Docker is not running, so it never blocks.
+Write-Host "`n[CI 1b/3] POSIX + OpenSSL + wasm32 type-check (the branches Windows never compiles)..."
+# MUST be a child process (the script ends in `exit`, which with `&` would tear down THIS script),
+# but `pwsh` is NOT present on every machine -- this dev box has only Windows PowerShell, so the
+# first version of this line threw CommandNotFoundException, left $LASTEXITCODE at its previous 0,
+# and the stage was SILENTLY SKIPPED. A gate that cannot run is a decoration; resolve the
+# interpreter instead of assuming one, and make a missing interpreter fail loudly.
+$psExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+$global:LASTEXITCODE = 0
+& $psExe -NoProfile -ExecutionPolicy Bypass -File .\_posix_typecheck.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 1b (POSIX/OpenSSL/wasm type-check) ==="; exit 1 }
+
 Write-Host "`n[CI 2/3] Perf-regression gate..."
 & .\_perf_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2 (perf regression) ==="; exit 1 }

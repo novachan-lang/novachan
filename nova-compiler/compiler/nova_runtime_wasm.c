@@ -65,6 +65,10 @@ typedef long ssize_t;
 typedef int  pid_t;
 typedef unsigned long _nova_jb[64];
 typedef _nova_jb jmp_buf;
+typedef _nova_jb sigjmp_buf;          /* stack-overflow containment; siglongjmp is dead in wasm */
+typedef unsigned int mode_t;          /* chmod/umask take it on the POSIX branch */
+typedef int pthread_once_t;
+#define PTHREAD_ONCE_INIT 0
 typedef unsigned long pthread_t;
 typedef struct { long _o[8]; } pthread_mutex_t;
 typedef struct { long _o[8]; } pthread_cond_t;
@@ -230,6 +234,7 @@ typedef int sig_atomic_t;
 #define SIGABRT 6
 #define SIGFPE 8
 #define SIGILL 4
+#define SIGPIPE 13    /* nova_rt_init ignores it on POSIX; wasm has no signals, so the value is inert */
 #define SIG_DFL ((void(*)(int))0)
 #define SIG_IGN ((void(*)(int))1)
 void (*signal(int sig, void(*h)(int)))(int) { (void)sig;(void)h; return SIG_DFL; }
@@ -296,8 +301,10 @@ struct tm { int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_y
 #define S_ISDIR(m) (((m)&S_IFMT)==S_IFDIR)
 #define PROT_READ 1
 #define PROT_WRITE 2
+#define PROT_NONE 0
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
+#define MAP_NORESERVE 0x4000
 #define MAP_FAILED ((void*)-1)
 #define AF_INET 2
 #define AF_UNSPEC 0
@@ -306,6 +313,10 @@ struct tm { int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_y
 #define SOL_SOCKET 1
 #define SO_ERROR 4
 #define SO_REUSEADDR 2
+#define SO_KEEPALIVE 9
+#define SO_BROADCAST 6
+#define SO_RCVBUF 8
+#define SO_SNDBUF 7
 #define IPPROTO_TCP 6
 #define TCP_NODELAY 1
 #define INADDR_ANY 0
@@ -341,6 +352,7 @@ ssize_t recvfrom(int s,void* b,size_t n,int f,struct sockaddr* a,socklen_t* l){(
 int    setsockopt(int s,int lv,int o,const void* v,socklen_t l){(void)s;(void)lv;(void)o;(void)v;(void)l;return -1;}
 int    getsockopt(int s,int lv,int o,void* v,socklen_t* l){(void)s;(void)lv;(void)o;(void)v;(void)l;return -1;}
 int    shutdown(int s,int how){(void)s;(void)how;return -1;}
+int    getpeername(int s,struct sockaddr* a,socklen_t* l){(void)s;(void)a;(void)l;return -1;}
 unsigned short htons(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
 unsigned short ntohs(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
 unsigned int   htonl(unsigned int x){return ((x<<24)&0xff000000u)|((x<<8)&0xff0000u)|((x>>8)&0xff00u)|((x>>24)&0xffu);}
@@ -397,10 +409,30 @@ long   strtol(const char* s,char** end,int base){
 }
 char*  strrchr(const char* s,int c){const char* last=(const char*)0; for(;*s;s++) if(*s==(char)c) last=s; return (char*)(c?last:s);}
 
-/* nova_task_arena_cleanup is defined only inside `#ifdef _WIN32` in nova_runtime.c -> absent on the POSIX path
-   wasm takes. No task pool exists in wasm, so a no-op is the correct freestanding behavior. */
+/* nova_task_arena_cleanup USED to be `#ifdef _WIN32`-only in nova_runtime.c, so the carve supplied a
+   no-op. It is now defined on the POSIX path too, and re-declaring it here is a hard redefinition
+   error -- the single non-mechanical item in this resync. The runtime's own definition is the right
+   one to keep; deleting the stub is the fix, not renaming or #ifdef-ing around it. */
 struct NovaTaskState; /* fwd (real type defined later in the include) */
-static void nova_task_arena_cleanup(void) { }
+
+/* --- ctype / math / fs / thread-once: POSIX declarations nova_runtime.c reaches on the wasm path.
+   Implicit declarations are HARD ERRORS in modern clang, which is what made these 40 build failures
+   rather than warnings. ctype and strdup get REAL implementations because the value model actually
+   calls them (string casing, identifier scanning); the rest are dead in a value-model program and
+   get honest failing stubs that wasm-ld --gc-sections drops. */
+int  toupper(int c){ return (c>='a'&&c<='z') ? c-32 : c; }
+int  tolower(int c){ return (c>='A'&&c<='Z') ? c+32 : c; }
+int  isalpha(int c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z'); }
+int  isalnum(int c){ return isalpha(c) || (c>='0'&&c<='9'); }
+char* strdup(const char* s){ if(!s) return (char*)0; size_t n=strlen(s)+1; char* p=(char*)malloc(n); if(p) memcpy(p,s,n); return p; }
+double lgamma(double x){ (void)x; return 0.0; }   /* stats builtins: unreachable in a value-model program */
+double erf(double x){ (void)x; return 0.0; }
+int    mprotect(void* a,size_t l,int p){ (void)a;(void)l;(void)p; return -1; }   /* no guard pages in wasm */
+char*  realpath(const char* p,char* out){ (void)p;(void)out; return (char*)0; }
+int    chmod(const char* p,mode_t m){ (void)p;(void)m; return -1; }
+mode_t umask(mode_t m){ (void)m; return 0; }
+int    symlink(const char* a,const char* b){ (void)a;(void)b; return -1; }
+int    pthread_once(pthread_once_t* o,void(*f)(void)){ if(o&&!*o){ *o=1; if(f) f(); } return 0; }
 
 /* compiler-rt i128 builtins. LLVM emits these for widened/closed-formed i64 arithmetic (e.g. a loop summing
    i*i that -O2 turns into the polynomial formula with i128 intermediates). They live in libgcc/compiler-rt on
