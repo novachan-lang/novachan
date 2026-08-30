@@ -87,6 +87,7 @@
 #include <signal.h>   /* hoisted: the fiber stack-overflow guard below needs sigaction/sigaltstack,
                          and the pre-existing include sat ~2500 lines AFTER the fiber code */
 #include <fcntl.h>
+#include <poll.h>        /* green-TLS non-task readiness wait; poll() has no FD_SETSIZE ceiling */
 #include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -15276,11 +15277,8 @@ int64_t nova_rt_http_post(int64_t url, int64_t body, int64_t content_type) {
    netpoller when the syscall would block, so the carrier stays free to run the server task.
    Outside a green task the socket is left blocking and the behaviour is byte-for-byte as before.
 
-   TLS IS DELIBERATELY UNTOUCHED. SSL_read/SSL_write over a non-blocking fd require
-   SSL_ERROR_WANT_READ/WANT_WRITE retry handling, which is a materially larger change; the
-   plaintext path is what every failing test uses, and destabilising the OpenSSL backend that was
-   only just enabled would be a poor trade. The https path therefore still blocks its carrier --
-   a known, narrower version of the same defect, recorded rather than silently left. */
+   TLS IS NOW COVERED TOO -- see the green-TLS helpers below. https previously still blocked its
+   carrier (the narrower half of this same defect); it no longer does. */
 int64_t nova_rt_io_set_nonblocking(int64_t fd_val);   /* defined with the socket layer below */
 
 static int nova_http_would_block(void) {
@@ -15292,12 +15290,19 @@ static int nova_http_would_block(void) {
 #endif
 }
 
+/* Sends the WHOLE buffer. send() is permitted to accept only part of it, and every caller here
+   tests only for a negative return -- so a short write silently TRUNCATED the request rather
+   than failing. Rare in practice (a fresh socket's send buffer swallows a 2.5 KB header whole),
+   but it is a wrong answer rather than an error when it does happen, so it loops. */
 static int nova_http_send_green(int fd, const void* b, size_t l) {
-    for (;;) {
-        int n = (int)send(fd, (const char*)b, l, 0);
-        if (n >= 0 || !nova_sched_in_task() || !nova_http_would_block()) return n;
+    size_t off = 0;
+    while (off < l) {
+        int n = (int)send(fd, (const char*)b + off, l - off, 0);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (!nova_sched_in_task() || !nova_http_would_block()) return (off > 0) ? (int)off : n;
         nova_sched_park_io((int64_t)fd, NOVA_POLL_WRITE);
     }
+    return (int)off;
 }
 
 static int nova_http_recv_green(int fd, void* b, size_t l) {
@@ -15313,10 +15318,122 @@ static int64_t nova_http_empty(void) {
     return (int64_t)(uintptr_t)e;
 }
 
+#ifdef NOVA_HAVE_OPENSSL
+/* ---- GREEN TLS I/O -------------------------------------------------------------------------
+   SSL_read/SSL_write on a BLOCKING fd hold the carrier thread inside OpenSSL. That is the TLS
+   half of the deadlock fixed for plaintext above: a green task doing https could not yield, so
+   an in-process server sharing that carrier never ran and both ends timed out.
+
+   Over a NON-BLOCKING fd OpenSSL never blocks. It returns <=0 and names the ONE readiness it is
+   waiting for via SSL_get_error; we park on the netpoller for exactly that and retry.
+
+   ⛔ THE PARK DIRECTION COMES FROM THE ERROR CODE, NEVER FROM THE CALL. The TLS record layer can
+   renegotiate mid-stream, so SSL_read can return SSL_ERROR_WANT_WRITE and SSL_write can return
+   SSL_ERROR_WANT_READ. Parking on the operation's "natural" direction instead of the reported one
+   deadlocks until the peer gives up -- load-dependent, rare, and near-impossible to reproduce.
+   This is THE classic mistake in non-blocking OpenSSL; it is why the switch below keys off `err`.
+
+   ⛔ A RETRY MUST REPEAT THE CALL WITH IDENTICAL ARGUMENTS. Absent
+   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, OpenSSL requires the same pointer and length on a retried
+   SSL_write. The loops below never alter their arguments between attempts -- note the write loop
+   advances `off` only after a SUCCESSFUL write, never mid-retry.
+
+   ERR_clear_error() precedes every call: SSL_get_error consults the thread's error queue, and a
+   stale entry from an earlier unrelated call misreports the reason.
+
+   Outside a green task these still work -- nova_tls_wait_io blocks in poll() instead of parking --
+   so a handle created in a task and used outside one behaves synchronously rather than spinning. */
+
+/* Wait for one readiness on fd. Inside a green task: PARK (the carrier stays free to run other
+   tasks). Outside one: block. poll() rather than select() on POSIX -- select() is undefined for
+   fd >= FD_SETSIZE, and a server with >1024 open sockets reaches that legitimately. */
+static int nova_tls_wait_io(int fd, int events) {
+    if (nova_sched_in_task()) { nova_sched_park_io((int64_t)fd, events); return 1; }
+#ifdef _WIN32
+    fd_set s; FD_ZERO(&s); FD_SET((NOVA_SOCKET)fd, &s);
+    return select(0, (events & NOVA_POLL_READ) ? &s : NULL,
+                     (events & NOVA_POLL_WRITE) ? &s : NULL, NULL, NULL) > 0;
+#else
+    struct pollfd p;
+    p.fd = fd;
+    p.events = (short)(((events & NOVA_POLL_READ) ? POLLIN : 0) |
+                       ((events & NOVA_POLL_WRITE) ? POLLOUT : 0));
+    p.revents = 0;
+    int r;
+    do { r = poll(&p, 1, -1); } while (r < 0 && errno == EINTR);
+    return r > 0;
+#endif
+}
+
+static int nova_tls_eintr(void) {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
+/* Classify a failed SSL_* return. 1 => we waited (or should retry at once), caller loops.
+   0 => terminal, caller returns. *eof is set for a CLEAN TLS shutdown, which is EOF, not error. */
+static int nova_tls_retry_after(SSL* ssl, int fd, int rc, int* eof) {
+    int err = SSL_get_error(ssl, rc);
+    if (eof) *eof = 0;
+    switch (err) {
+        case SSL_ERROR_WANT_READ:   return nova_tls_wait_io(fd, NOVA_POLL_READ);
+        case SSL_ERROR_WANT_WRITE:  return nova_tls_wait_io(fd, NOVA_POLL_WRITE);
+        case SSL_ERROR_ZERO_RETURN: if (eof) *eof = 1; return 0;   /* peer sent close_notify */
+        case SSL_ERROR_SYSCALL:
+            /* Some stacks surface a would-block/interrupt here rather than as WANT_*. */
+            if (nova_tls_eintr()) return 1;                        /* retry immediately */
+            if (nova_http_would_block()) return nova_tls_wait_io(fd, NOVA_POLL_READ);
+            return 0;
+        default: return 0;
+    }
+}
+
+/* SSL_write is capped at int; chunk large buffers with the same 1 MiB bound the bytes path uses. */
+#define NOVA_TLS_CHUNK 1048576
+
+static int nova_tls_write_all(SSL* ssl, int fd, const void* b, size_t l) {
+    size_t off = 0;
+    while (off < l) {
+        size_t remain = l - off;
+        int chunk = (remain > (size_t)NOVA_TLS_CHUNK) ? NOVA_TLS_CHUNK : (int)remain;
+        ERR_clear_error();
+        int n = SSL_write(ssl, (const char*)b + off, chunk);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (!nova_tls_retry_after(ssl, fd, n, NULL)) return (off > 0) ? (int)off : n;
+    }
+    return (int)off;
+}
+
+static int nova_tls_read_green(SSL* ssl, int fd, void* b, size_t l) {
+    int cap = (l > (size_t)NOVA_TLS_CHUNK) ? NOVA_TLS_CHUNK : (int)l;
+    for (;;) {
+        ERR_clear_error();
+        int n = SSL_read(ssl, b, cap);
+        if (n > 0) return n;
+        int eof = 0;
+        if (!nova_tls_retry_after(ssl, fd, n, &eof)) return eof ? 0 : n;
+    }
+}
+
+/* The handshake blocks just as hard as the data path -- SSL_connect on a blocking fd is several
+   round trips with the carrier pinned. Returns 1 on success, matching SSL_connect/SSL_accept. */
+static int nova_tls_handshake(SSL* ssl, int fd, int server) {
+    for (;;) {
+        ERR_clear_error();
+        int rc = server ? SSL_accept(ssl) : SSL_connect(ssl);
+        if (rc == 1) return 1;
+        if (!nova_tls_retry_after(ssl, fd, rc, NULL)) return rc;
+    }
+}
+#endif /* NOVA_HAVE_OPENSSL */
+
 /* Read/write that use TLS when an SSL* is present, else the raw socket fd. */
 #ifdef NOVA_HAVE_OPENSSL
-#define NOVA_TLS_WRITE(sp, b, l) ((sp) ? SSL_write((SSL*)(sp), (b), (int)(l)) : nova_http_send_green(fd, (b), (l)))
-#define NOVA_TLS_READ(sp, b, l)  ((sp) ? SSL_read((SSL*)(sp), (b), (int)(l))  : nova_http_recv_green(fd, (b), (l)))
+#define NOVA_TLS_WRITE(sp, b, l) ((sp) ? nova_tls_write_all((SSL*)(sp), fd, (b), (size_t)(l)) : nova_http_send_green(fd, (b), (l)))
+#define NOVA_TLS_READ(sp, b, l)  ((sp) ? nova_tls_read_green((SSL*)(sp), fd, (b), (size_t)(l))  : nova_http_recv_green(fd, (b), (l)))
 #else
 #define NOVA_TLS_WRITE(sp, b, l) nova_http_send_green(fd, (b), (l))
 #define NOVA_TLS_READ(sp, b, l)  nova_http_recv_green(fd, (b), (l))
@@ -15348,9 +15465,9 @@ static int64_t http_request(const char* url, const char* method,
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); nova_set_error("http: socket() failed"); return nova_http_empty(); }
     /* Non-blocking connect that PARKS during the TCP handshake, mirroring nova_rt_tcp_connect.
-       Only for the plaintext path: leaving the fd blocking for https keeps the OpenSSL backend
-       exactly as it is (see the note on the green helpers above). */
-    int use_green = (!is_https && nova_sched_in_task());
+       Now applied to https TOO: the TLS handshake and data path both run through the green
+       helpers above, so the fd stays non-blocking end to end and the carrier is never pinned. */
+    int use_green = nova_sched_in_task();
     if (use_green) {
         nova_rt_io_set_nonblocking((int64_t)fd);
         if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
@@ -15393,8 +15510,21 @@ static int64_t http_request(const char* url, const char* method,
         SSL* ssl = SSL_new(ctx);
         if (!ssl) { SSL_CTX_free(ctx); close(fd); nova_set_error("http: SSL_new failed"); return nova_http_empty(); }
         SSL_set_fd(ssl, fd);
-        SSL_set_tlsext_host_name(ssl, host);   /* SNI */
-        if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); nova_set_error("http: TLS handshake/verification failed"); return nova_http_empty(); }
+        SSL_set_tlsext_host_name(ssl, host);   /* SNI: which vhost/cert the server should present */
+        /* SSL_VERIFY_PEER validates the CHAIN but NOT the hostname. Without this, a certificate
+           that is perfectly valid for ANY other domain satisfied the check -- i.e. http_get was
+           MITM-able by anyone holding any CA-issued cert. Bind the name we actually asked for.
+
+           An IPv4 LITERAL must go through SSL_set1_ip_asc instead: a bare address is matched
+           against the certificate's IP SAN, and handing it to SSL_set1_host would compare it to
+           the DNS names and reject every certificate -- swapping a too-weak check for a too-strong
+           one. (IPv6 literals cannot arrive here at all: the URL parser above ends the host at the
+           first ':', so a bracketed authority was never supported. Pre-existing, not introduced
+           here.) */
+        struct in_addr ip4_probe;
+        if (inet_pton(AF_INET, host, &ip4_probe) == 1) SSL_set1_ip_asc(ssl, host);
+        else                                           SSL_set1_host(ssl, host);
+        if (nova_tls_handshake(ssl, fd, 0) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); nova_set_error("http: TLS handshake/verification failed"); return nova_http_empty(); }
         sslp = ssl;
     }
 #endif
@@ -25688,7 +25818,8 @@ int64_t nova_rt_tls_accept(int64_t listen_handle) {
     SSL* ssl = SSL_new(L->ctx);
     if (!ssl) { NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); nova_set_error("tls_accept: SSL_new failed"); return 0; }
     SSL_set_fd(ssl, (int)cfd);
-    if (SSL_accept(ssl) != 1) { SSL_free(ssl); NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); nova_set_error("tls_accept: handshake failed"); return 0; }
+    nova_rt_io_set_nonblocking((int64_t)cfd);   /* green handshake: park on WANT_*, never pin the carrier */
+    if (nova_tls_handshake(ssl, (int)cfd, 1) != 1) { SSL_free(ssl); NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); nova_set_error("tls_accept: handshake failed"); return 0; }
     NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
     if (!C) { SSL_free(ssl); NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); return 0; }
     C->fd = (int)cfd; C->ssl = ssl; C->ctx = L->ctx; C->own_ctx = 0;  /* shares listener CTX */
@@ -25708,7 +25839,8 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
     SSL_set_fd(ssl, (int)fd);
     const char* host = (const char*)(uintptr_t)host_val;
     if (host) SSL_set_tlsext_host_name(ssl, host);
-    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect: handshake failed"); return 0; }
+    nova_rt_io_set_nonblocking(fd);             /* green handshake: park on WANT_*, never pin the carrier */
+    if (nova_tls_handshake(ssl, (int)fd, 0) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect: handshake failed"); return 0; }
     NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
     if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
     C->fd = (int)fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
@@ -25747,7 +25879,8 @@ int64_t nova_rt_tls_connect_alpn(int64_t host_val, int64_t port_val, int64_t pro
         }
         if (ok && wl > 0) SSL_set_alpn_protos(ssl, wire, (unsigned int)wl); /* returns 0 on success (OpenSSL quirk) */
     }
-    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect_alpn: handshake failed"); return 0; }
+    nova_rt_io_set_nonblocking(fd);             /* green handshake: park on WANT_*, never pin the carrier */
+    if (nova_tls_handshake(ssl, (int)fd, 0) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect_alpn: handshake failed"); return 0; }
     NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
     if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
     C->fd = (int)fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
@@ -25768,7 +25901,7 @@ int64_t nova_rt_tls_send(int64_t handle, int64_t data_val) {
     NovaTls* C = (NovaTls*)(uintptr_t)handle;
     const char* d = (const char*)(uintptr_t)data_val;
     if (!C || !C->ssl || !d) return -1;
-    int n = SSL_write(C->ssl, d, (int)strlen(d));
+    int n = nova_tls_write_all(C->ssl, C->fd, d, strlen(d));
     return (n > 0) ? (int64_t)n : -1;
 }
 
@@ -25778,7 +25911,7 @@ int64_t nova_rt_tls_recv(int64_t handle, int64_t max_bytes) {
     int cap = (int)max_bytes; if (cap <= 0 || cap > 1048576) cap = 65536;
     char* buf = (char*)malloc((size_t)cap + 1);
     if (!buf) return nova_rt_create_string((void*)"");
-    int n = SSL_read(C->ssl, buf, cap);
+    int n = nova_tls_read_green(C->ssl, C->fd, buf, (size_t)cap);
     if (n <= 0) { free(buf); return nova_rt_create_string((void*)""); }
     buf[n] = '\0';
     char* tracked = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
@@ -25805,7 +25938,7 @@ int64_t nova_rt_tls_send_bytes(int64_t handle, int64_t bytes_handle) {
     int64_t off = 0;
     while (off < b->size) {
         int chunk = (b->size - off > 1048576) ? 1048576 : (int)(b->size - off);
-        int n = SSL_write(C->ssl, b->data + off, chunk);
+        int n = nova_tls_write_all(C->ssl, C->fd, b->data + off, (size_t)chunk);
         if (n <= 0) return off;
         off += n;
     }
@@ -25818,7 +25951,7 @@ int64_t nova_rt_tls_recv_bytes(int64_t handle) {
     int64_t out = nova_rt_bytes_create(cap);
     NovaBytes* ob = (NovaBytes*)(uintptr_t)out;
     if (!ob || !ob->data) return nova_rt_bytes_create(0);
-    int n = SSL_read(C->ssl, ob->data, cap);
+    int n = nova_tls_read_green(C->ssl, C->fd, ob->data, (size_t)cap);
     if (n <= 0) { ob->size = 0; return out; }
     ob->size = n;
     return out;
@@ -25827,7 +25960,7 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_v
     const char* host = host_val ? (const char*)(uintptr_t)host_val : "";
     int verify = (int)verify_val;
     int fd = (int)sock_val;
-    int fl = fcntl(fd, F_GETFL, 0); if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);  /* blocking handshake */
+    nova_rt_io_set_nonblocking((int64_t)fd);   /* green handshake: park on WANT_*, never pin the carrier */
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return 0;
     if (verify) {
@@ -25851,7 +25984,7 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_v
         if (verify) SSL_set1_host(ssl, host);        /* hostname match (OpenSSL 1.1+), verify-full only */
     }
     SSL_set_fd(ssl, fd);                 /* wrap the EXISTING connected fd */
-    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); return 0; }
+    if (nova_tls_handshake(ssl, fd, 0) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); return 0; }
     if (verify && SSL_get_verify_result(ssl) != X509_V_OK) {
         nova_set_error("tls_upgrade: certificate verification failed (verify-full)");
         SSL_free(ssl); SSL_CTX_free(ctx); return 0;

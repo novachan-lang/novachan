@@ -41,8 +41,50 @@ actually killing anything (the runtime catches SIGTERM), so Linux and aarch64 ha
 completed a full suite — a suite that never finishes reports no failures, which looks exactly like
 passing.
 
-**Remaining known limitation (DEFERRED, needs a go-ahead):** `https` still blocks its carrier —
-needs `SSL_ERROR_WANT_READ/WANT_WRITE` retry handling. Plain `http` was fixed in `74eefdb3`.
+### ✅ 2026-08-30 — the last deferred limitation is CLOSED, and CI is now a real gate
+
+**`https` no longer blocks its carrier.** All nine OpenSSL call sites now park on the netpoller
+instead of pinning the carrier thread: the builtin `http_get`/`http_post` path *and* the forge
+`tls_*` builtins (`tls_accept`, `tls_connect`, `tls_connect_alpn`, `tls_upgrade`, `tls_send`,
+`tls_recv`, `tls_send_bytes`, `tls_recv_bytes`), handshake included — `SSL_connect` on a blocking
+fd is several round trips with the carrier held.
+
+⛔ **The park direction comes from `SSL_get_error`, never from which call was made.** The TLS record
+layer renegotiates mid-stream, so `SSL_read` can return `WANT_WRITE` and `SSL_write` can return
+`WANT_READ`. Parking on the operation's "natural" direction deadlocks until the peer gives up —
+load-dependent and near-unreproducible. That is *the* classic non-blocking-OpenSSL mistake, and it
+is why the retry classifier keys off the error code.
+
+**Two pre-existing bugs found while in there:**
+1. **`http_get` had NO hostname verification.** `SSL_VERIFY_PEER` validates the chain but not the
+   name, so any attacker holding any CA-issued certificate could MITM it. Added `SSL_set1_host`,
+   with `SSL_set1_ip_asc` for IPv4 literals — using `set1_host` on an IP compares it against the
+   DNS names and rejects every certificate, i.e. swaps a too-weak check for a too-strong one.
+2. **Short writes silently truncated requests.** Callers tested only `< 0`, so a partial `send()`
+   lost data instead of erroring. Both write paths now loop to completion.
+
+**Verified:** a 21-assertion probe drives the REAL helper code (sed-extracted from the runtime, so
+there is no copy to drift) against a scripted fake OpenSSL — including the direction bug, retry
+argument stability, `ZERO_RETURN`-is-EOF, and that a terminal error is not retried forever. Full arc
+green: reconverge byte-identical, 3592/0 in BOTH modes. **Caveat stated plainly: this machine has no
+OpenSSL toolchain (WSL has no compilers, sudo needs a password), so the `#ifdef NOVA_HAVE_OPENSSL`
+code COMPILES only in CI.** Windows builds SChannel and never sees it.
+
+**CI: 17 → 25 jobs, and 13 of the old 17 were not actually gating.**
+- `posix-full-suite` (12 jobs) and `linux-arm64-selfhosted` carried `continue-on-error: true`. They
+  passed honestly, but could not turn the board red. **Both are now blocking.** A board that cannot
+  go red is a dashboard, not a gate.
+- **Intel macOS added** (`macos-15-intel`, 4 shards, non-blocking until it passes once) with a new
+  `nova_compiler_macos_x64.ll` seed. ⛔ `macos-13` — the label most docs and priors still name — was
+  **RETIRED 2025-12-04**; `macos-15-intel` is itself available only until **August 2027**.
+- **`posix-fullrc` added** (ubuntu-latest, 4 shards): FULLRC had Windows-only coverage, so a leak
+  that manifests solely on POSIX went unseen. `NOVA_T8_FULLRC` is read by the COMPILER at compile
+  time, which is what makes this cheap.
+
+**Known flaky test inside a blocking gate:** `forge_tls_upgrade_test` makes three live internet
+calls (example.com, self-signed.badssl.com). It guards against a connect failure but not a
+mid-handshake stall; it failed one arc and passed the next on identical code. Loosening it means
+weakening a MITM assertion, so it is recorded rather than silently relaxed.
 
 **Linux-ARM64 passed on its FIRST run with zero porting work.** A proactive sweep had already
 confirmed no x86 intrinsics, no `immintrin.h`, and correctly arch-guarded asm — the AAPCS64

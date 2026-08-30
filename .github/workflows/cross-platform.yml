@@ -638,10 +638,11 @@ jobs:
   # Windows runs all ~3,590. This job closes that gap and turns "the COMPILER works on three
   # platforms" into "NOVA works on three platforms".
   #
-  # continue-on-error: TRUE ON PURPOSE. Linux and macOS are green today; this suite has never run
-  # on POSIX, so its first pass will surface real unknowns (macOS took four genuine bugs to go
-  # from "never built" to green). Reporting them WITHOUT turning the board red is the point --
-  # flip this to blocking once it passes.
+  # NOW BLOCKING (2026-08-30) for every platform that has passed. It went green 12/12 on ffc3e88f,
+  # and the run reported "17/17" while THIRTEEN of those jobs were advisory -- a board that cannot
+  # turn red is a dashboard, not a gate. Same principle already written on windows-fullrc below.
+  # macos-15-intel is the sole exception: brand new, never built, so it reports without blocking
+  # until it passes once -- exactly the discipline the other platforms just graduated from.
   posix-full-suite:
     strategy:
       fail-fast: false
@@ -650,10 +651,15 @@ jobs:
         # ~3,570-test suite on ONE runner and hit the 330-minute cap at 3525/3570 -- roughly 200
         # minutes in the parallel phase before it even reached the serial server tests. Sharded
         # four ways it gets the same wall-clock budget as every other platform.
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        #
+        # macos-15-intel is the x86_64 Darwin runner. NOTE: `macos-13` -- the label most docs and
+        # model priors still name -- was RETIRED on 2025-12-04; macos-15-intel replaces it and is
+        # itself available only until AUGUST 2027, after which GitHub drops x86_64 macOS entirely.
+        # When it goes, delete this entry and nova_compiler_macos_x64.ll with it.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
         shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    continue-on-error: ${{ matrix.os == 'macos-15-intel' }}
     env:
       NOVA_SHARD_INDEX: ${{ matrix.shard }}
       NOVA_SHARD_TOTAL: 4
@@ -670,7 +676,10 @@ jobs:
           # Branch on ARCH as well as OS. This used to test only `uname -s`, so an aarch64 Linux
           # runner would have been handed the x86_64 seed -- a triple mismatch that fails at the
           # first instruction selection, with an error naming clang rather than the seed.
+          # Darwin/x86_64 MUST be tested before Darwin/* -- the Intel runner would otherwise be
+          # handed the aarch64 seed and die at instruction selection.
           case "$(uname -s)/$(uname -m)" in
+            Darwin/x86_64)     SEED=nova_compiler_macos_x64.ll;   LINK="-lm -D_DARWIN_C_SOURCE" ;;
             Darwin/*)          SEED=nova_compiler_macos.ll;       LINK="-lm -D_DARWIN_C_SOURCE" ;;
             Linux/aarch64|Linux/arm64) SEED=nova_compiler_linux_arm64.ll; LINK="-lpthread -ldl -lm" ;;
             *)                 SEED=nova_compiler_linux.ll;       LINK="-lpthread -ldl -lm" ;;
@@ -679,6 +688,7 @@ jobs:
           # Guard the triple, exactly as the per-platform selfhosted jobs do: a seed emitted for the
           # wrong target is the one failure mode this whole step exists to avoid.
           case "$(uname -s)/$(uname -m)" in
+            Darwin/x86_64)             WANT=x86_64-apple-darwin ;;
             Darwin/*)                  WANT=aarch64-apple-darwin ;;
             Linux/aarch64|Linux/arm64) WANT=aarch64-unknown-linux-gnu ;;
             *)                         WANT=x86_64-unknown-linux-gnu ;;
@@ -695,10 +705,10 @@ jobs:
   # GitHub's ubuntu-24.04-arm runners are free for public repos. macOS already proves the
   # aarch64 CODEGEN path (macos-latest is arm64); this proves aarch64 + ELF + glibc, which is a
   # genuinely different combination: different object format, different libc, different syscall
-  # ABI. Non-blocking until green, same discipline as the Tier 2 job.
+  # ABI. NOW BLOCKING (2026-08-30): it passed on its FIRST run and has stayed green since, so the
+  # "non-blocking until green" clause has been satisfied and is hereby collected.
   linux-arm64-selfhosted:
     runs-on: ubuntu-24.04-arm
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -778,3 +788,50 @@ jobs:
           if ($fails.Count -gt 0) { Write-Host "::error title=Windows FULLRC FAILS::$(($fails -join ' | '))" }
           exit $code
         timeout-minutes: 120
+
+  # ─── TIER 3b: NOVA_T8_FULLRC on POSIX — the other half of the leak-checking gap ───────
+  # FULLRC had CI coverage on Windows only, so a leak or use-after-free that manifests solely on
+  # POSIX went unseen. That is not hypothetical for this codebase: the last three bugs this
+  # campaign closed were each latent on every platform and visible on exactly one, and one of
+  # them (borrowed const char* in the devx tables) was a lifetime bug of precisely the class
+  # FULLRC exists to catch — found only because Darwin reuses freed memory that Linux and
+  # Windows leave intact.
+  #
+  # NOVA_T8_FULLRC is read by the COMPILER at compile time (it changes codegen to emit rc_dec on
+  # slot overwrite), not by the runtime — so exporting it for the whole job is what puts every
+  # test under the leak-checking path.
+  #
+  # ubuntu-latest only, not the full 3-platform matrix: this closes "POSIX has zero FULLRC
+  # coverage" for a quarter of the cost, and the platform-specific risk is already carried by the
+  # NORMAL suite running on all four. Widen it if it ever catches something arch-specific.
+  #
+  # continue-on-error until it passes once — it has never run anywhere on POSIX, same discipline
+  # every other new job in this file started under.
+  posix-fullrc:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      NOVA_SHARD_INDEX: ${{ matrix.shard }}
+      NOVA_SHARD_TOTAL: 4
+      NOVA_T8_FULLRC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: sudo apt-get update -qq && sudo apt-get install -y clang lld
+
+      - name: Build self-hosted compiler from the checked-in seed
+        run: |
+          cd nova-compiler/compiler
+          SEED=nova_compiler_linux.ll
+          grep -q "x86_64-unknown-linux-gnu" "$SEED" || { echo "::error title=seed::$SEED is not x86_64-linux-targeted"; exit 1; }
+          clang -O2 -o nova "$SEED" nova_runtime.c -lpthread -ldl -lm -Wno-everything
+          ./nova --version || true
+
+      - name: Run FULL suite under NOVA_T8_FULLRC
+        run: bash .github/scripts/posix_full_suite.sh
+        timeout-minutes: 330
