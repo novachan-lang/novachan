@@ -60,11 +60,26 @@ if ($rt -match "int64_t nova_rt_remote_send\(int64_t sock_val, int64_t value\) \
 # These were all present and all unrun. Each is a real end-to-end exercise of a different
 # part of the transport, so leaving them out of the manifest meant the whole feature was
 # unverified in CI despite looking well-tested in the tree.
-# distributed_serialize_test: hangs (serialize round-trip has no network peer to talk to)
-# distributed_spawn_test: assumes a spawn-dispatch protocol (dict with "fn"/"args") that node_recv does not provide
-# Both are pre-existing broken tests that were never gated -- excluded here, tracked for fix.
+# BOTH PREVIOUSLY-EXCLUDED TESTS ARE NOW GATED (2026-08-31). The old notes were wrong about both:
+#
+# distributed_serialize_test -- was noted as "hangs (no network peer to talk to)". It has NO network
+#   in it at all: six serialize/deserialize round-trips. It CRASHED (0x80000003), because
+#   `serialize`/`deserialize` were registered in ti_build_stdlib (the TYPE table) but never given a
+#   lowering, so the names resolved as undefined locals -- `alloca i64; store i64 0; load; call` --
+#   an indirect call through NULL. Wired to nova_rt_term_encode/decode, which is exactly their
+#   semantics and the codec this transport already uses.
+#
+# distributed_spawn_test -- was noted as "assumes a protocol node_recv does not provide". The
+#   protocol was fine and both families share one frame (see the comment on nova_rt_node_send). The
+#   READ gave up: nova_recv_exact treated recv()'s -1/EAGAIN as a hard failure, but tcp_accept and
+#   tcp_connect hand out NON-BLOCKING sockets so the green scheduler can park on them. So node_recv
+#   returned 0 whenever it was called before the peer's bytes landed. Same bug already fixed on the
+#   HTTP path; nova_recv_exact now parks and retries (this also backs the WebSocket frame reader).
+#
+# LESSON: both exclusion notes described a symptom as though it were a cause, and being excluded is
+# what let them stay wrong. A test removed from the gate stops being evidence about anything.
 $progs = @("remote_test", "remote_multi_test", "remote_spawn_test",
-           "distributed_channel_test")
+           "distributed_channel_test", "distributed_serialize_test", "distributed_spawn_test")
 foreach ($pr in $progs) {
     if (-not (Test-Path "$pr.nova")) { Write-Host "  FAIL $pr.nova missing"; $fail++; continue }
     Remove-Item -Force "$pr.exe" -ErrorAction SilentlyContinue

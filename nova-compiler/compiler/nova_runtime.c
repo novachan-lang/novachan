@@ -26087,9 +26087,53 @@ static int nova_send_all(NOVA_SOCKET fd, const char* p, size_t n) {
     while (s < n) { int k = send(fd, p + s, (int)(n - s), 0); if (k <= 0) return 0; s += (size_t)k; }
     return 1;
 }
+/* Read exactly n bytes. MUST tolerate a NON-BLOCKING socket.
+ *
+ * nova_rt_tcp_accept and nova_rt_tcp_connect call nova_rt_io_set_nonblocking on every socket they
+ * hand out, so the green scheduler can park on them instead of pinning a carrier. This helper used
+ * to be `if (k <= 0) return 0;`, which treats recv()'s -1/EAGAIN -- "no data has arrived YET" --
+ * as a hard failure. So node_recv returned 0 the instant it was called before the peer's bytes
+ * landed, and distributed_spawn_test saw `req` as the integer 0, printed "fn=0, args=0", and was
+ * excluded from the gate with the note "assumes a spawn-dispatch protocol node_recv does not
+ * provide". The protocol was fine and the framing was identical; the READ gave up early.
+ *
+ * EXACTLY the bug already fixed on the HTTP path (see nova_http_recv_should_retry): a would-block
+ * is not an error, it is an instruction to wait. Same shape, second location -- this helper also
+ * backs the WebSocket frame reader, so that path was equally affected.
+ *
+ * k == 0 is still a genuine EOF (peer closed) and stays terminal. */
 static int nova_recv_exact(NOVA_SOCKET fd, char* p, size_t n) {
     size_t g = 0;
-    while (g < n) { int k = recv(fd, p + g, (int)(n - g), 0); if (k <= 0) return 0; g += (size_t)k; }
+    while (g < n) {
+        int k = recv(fd, p + g, (int)(n - g), 0);
+        if (k > 0) { g += (size_t)k; continue; }
+        if (k == 0) return 0;                       /* peer closed -- real EOF */
+        /* Would-block is checked INLINE rather than via nova_http_would_block(): that helper sits
+           inside the POSIX branch of `#ifdef _WIN32`, so it is not visible from this shared region
+           and calling it broke the Windows build. */
+        {
+#ifdef _WIN32
+            int _e = WSAGetLastError();
+            if (_e != WSAEWOULDBLOCK && _e != WSAEINTR) return 0;   /* a real socket error */
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+#endif
+        }
+        if (nova_sched_in_task()) {
+            nova_sched_park_io((int64_t)fd, NOVA_POLL_READ);   /* carrier stays free */
+            continue;
+        }
+        /* Outside a green task the fd may still be non-blocking, so a bare retry would spin.
+           Block until it is readable, then retry -- the synchronous behaviour a caller expects. */
+#ifdef _WIN32
+        { fd_set rs; FD_ZERO(&rs); FD_SET(fd, &rs);
+          if (select(0, &rs, NULL, NULL, NULL) <= 0) return 0; }
+#else
+        { struct pollfd pf; pf.fd = (int)fd; pf.events = POLLIN; pf.revents = 0;
+          int pr; do { pr = poll(&pf, 1, -1); } while (pr < 0 && errno == EINTR);
+          if (pr <= 0) return 0; }
+#endif
+    }
     return 1;
 }
 
