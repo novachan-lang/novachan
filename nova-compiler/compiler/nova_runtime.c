@@ -12902,15 +12902,21 @@ int64_t nova_rt_pfor(int64_t start, int64_t end, int64_t closure) {
 
 /* ── Integer power (fast exponentiation by squaring) ─────────────────────── */
 
+/* Exponentiation by squaring. BOTH multiplies go through uint64_t: signed overflow is UNDEFINED
+   BEHAVIOUR in C, and `base *= base` overflows almost immediately (any base past ~3e9, or a small
+   base with a large exponent). Same class as the bug in nova_rt_add that made argon2id return a
+   different hash for identical input on Apple clang vs Ubuntu clang -- and the same fix: unsigned
+   arithmetic wraps in a defined, identical way on every compiler. NOVA's semantics are wrapping,
+   so this is a faithful lowering, not a workaround. */
 int64_t nova_rt_int_pow(int64_t base, int64_t exp) {
     if (exp < 0) return 0;
-    int64_t result = 1;
+    uint64_t result = 1, b = (uint64_t)base;
     while (exp > 0) {
-        if (exp & 1) result *= base;
-        base *= base;
+        if (exp & 1) result *= b;
+        b *= b;
         exp >>= 1;
     }
-    return result;
+    return (int64_t)result;
 }
 
 /* ── Math stdlib ──────────────────────────────────────────────────────────── */
