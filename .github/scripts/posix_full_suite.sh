@@ -323,6 +323,19 @@ run_one() {
   # 60s cap is marginal rather than generous -- a slower runner turns "slow but correct" into
   # TIMEOUT. They get 150s; everything else keeps the Windows-matching 60s.
   local rtmo="${2:-60}"
+  # KNOWN-SLOW TESTS. A run cap is a HANG DETECTOR, not a performance budget -- its job is to stop
+  # a deadlocked process eating the whole 330-minute shard, not to fail honest work that is simply
+  # slow on slower hardware.
+  #
+  # forge_chain_test passes on Apple Silicon and every other platform, and TIMEOUTs on
+  # macos-15-intel -- twice, same job, same shard, so not a flake. Measured there: 81s and killed
+  # (rc=137, i.e. the SIGKILL escalation did its job), while the NEXT-slowest test in the entire
+  # 893-test shard is 30s. That is Intel-Mac slowness against a 60s default, not a NOVA defect.
+  # Raising only this test's cap keeps the 60s default doing its real job for the other 892.
+  # Never lower a cap that was passed in explicitly (the serial path passes 150).
+  case "$t" in
+    forge_chain_test) [ "$rtmo" -lt 180 ] && rtmo=180 ;;
+  esac
   # RUN(1) failures print their own diagnosis to stdout/stderr; keep the first meaningful line.
   if TMO "$rtmo" "./$exe" >>"$log" 2>&1; then
     if grep -q "FAIL assert" "$log" 2>/dev/null; then
