@@ -647,6 +647,61 @@ jobs:
       # DIAGNOSTIC, never fails the job: Apple clang's UBSan may flag pre-existing sites in system
       # headers that have nothing to do with us. Promote it to blocking once it has run clean once,
       # exactly as every other gate in this file was promoted.
+      # THE INTERMITTENT macOS FAILURES. macos-latest fails ~1 test out of 892 per run, a DIFFERENT
+      # test each time, clustered in crypto: _argon2id_test, forge_jwt_test, forge_pg_scram_test.
+      # Already eliminated WITH EVIDENCE, so do not re-run these theories:
+      #   * undefined behaviour  -- UBSan under APPLE clang is clean (step below)
+      #   * memory corruption    -- ASAN finds nothing while the failure still reproduces
+      #   * the fiber switch     -- AAPCS64 set is complete (x19-x28, x29/x30, d8-d15, 160B aligned)
+      #   * 16KB Apple pages     -- fiber stack is 1MB + 64KB guard, both multiples of 16384
+      #   * __thread vs fiber    -- audited; the stack-floor lesson is applied everywhere
+      #   * a Linux-reproducible bug -- both tests pass 5/5 clean AND 5/5 under MALLOC_PERTURB_
+      #
+      # THE ONE HARD FACT, and what this step chases: forge_jwt_test printed a 43-character string
+      # LITERAL as 24 characters ("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c" -> truncated at
+      # "...QT4fwpMeJ"). That is STRING CORRUPTION, not a wrong HMAC -- and every sanitizer run so
+      # far has been pointed at _argon2id_kat, never at the tests that actually fail.
+      #
+      # Two things measured here: the RATE (10 runs each, so "intermittent" becomes a number), and
+      # whether ASAN sees anything when pointed at the RIGHT test.
+      - name: Intermittent-failure probe -- jwt/scram, rate + ASAN (diagnostic, never fails)
+        continue-on-error: true
+        run: |
+          cd nova-compiler
+          export NOVA_HOME="$(pwd)" NOVA_NO_CACHE=1
+          cd test_programs
+          set +e
+          for t in forge_jwt_test forge_pg_scram_test; do
+            [ -f "$t.nova" ] || { echo "::notice title=flaky-probe::$t absent"; continue; }
+            rm -f "/tmp/$t.ll"
+            ../compiler/nova "$t.nova" "/tmp/$t.ll" >/dev/null 2>&1
+            [ -f "/tmp/$t.ll" ] || { echo "::notice title=flaky-probe::$t did not compile"; continue; }
+            clang -O1 -o "/tmp/$t.bin" "/tmp/$t.ll" ../compiler/nova_runtime.c -lm -w 2>/dev/null
+            if [ -x "/tmp/$t.bin" ]; then
+              f=0; first=""
+              for i in $(seq 1 10); do
+                out=$("/tmp/$t.bin" 2>&1); rc=$?
+                if [ $rc -ne 0 ]; then f=$((f+1)); [ -z "$first" ] && first=$(printf '%s' "$out" | grep -m1 -iE 'mismatch|assert|error' | tr '\n' ' ' | cut -c1-240); fi
+              done
+              echo "::notice title=flaky-rate::$t plain: $f/10 FAILED ${first:+:: $first}"
+            fi
+            # ASAN, pointed at the test that actually fails rather than at argon2id.
+            clang -O1 -g -fsanitize=address -o "/tmp/$t.asan" "/tmp/$t.ll" ../compiler/nova_runtime.c -lm -w 2>/dev/null
+            if [ -x "/tmp/$t.asan" ]; then
+              af=0; asan_find=""
+              for i in 1 2 3 4 5; do
+                out=$(ASAN_OPTIONS=detect_leaks=0 "/tmp/$t.asan" 2>&1); rc=$?
+                if [ $rc -ne 0 ]; then
+                  af=$((af+1))
+                  [ -z "$asan_find" ] && asan_find=$(printf '%s' "$out" | grep -m1 -E 'ERROR: AddressSanitizer|SUMMARY: AddressSanitizer' | cut -c1-220)
+                fi
+              done
+              echo "::notice title=flaky-asan::$t ASAN: $af/5 FAILED ${asan_find:+:: $asan_find}${asan_find:+ (SANITIZER FINDING)}"
+            fi
+          done
+          exit 0
+        timeout-minutes: 45
+
       - name: UBSan probe on Darwin (Apple clang) -- diagnostic, never fails the job
         continue-on-error: true
         run: |
