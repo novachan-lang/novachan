@@ -5420,7 +5420,17 @@ int64_t nova_rt_dict_get_concat2(int64_t handle, int64_t a, int64_t b) {
         int64_t ei = d->idx[slot];
         if (d->hashes[ei] == h) {
             const char* stored = (const char*)(uintptr_t)d->keys[ei];
-            if (memcmp(stored, sa, la) == 0 && strcmp(stored + la, sb) == 0)
+            /* strncmp, NOT memcmp. `la` is strlen of the LOOKUP key; nothing here proves the
+               STORED key is that long, and `stored` is a raw d->keys[ei] cast to char* -- so a
+               shorter key, or an entry whose key is not a string at all, made memcmp read straight
+               off the end. ASAN caught exactly that: a global-buffer-overflow landing in a
+               `.str.NNN` literal in this file. It is macOS-shaped -- Darwin loads the image at
+               ~4.3e9, right where such a value points, while Linux/Windows sit at ~1e14 so the
+               same read misses the module and returns non-zero by luck, which is why 0/120 Linux
+               runs were clean while macOS failed 53%. strncmp stops at a NUL in EITHER operand:
+               identical result when the stored key is long enough, bounded when it is not, and
+               the && short-circuits so `stored + la` is only formed after a real prefix match. */
+            if (strncmp(stored, sa, la) == 0 && strcmp(stored + la, sb) == 0)
                 return d->vals[ei];
         }
         slot = (slot + 1) & (d->idx_cap - 1);
@@ -5446,7 +5456,8 @@ int64_t nova_rt_dict_set_concat2(int64_t handle, int64_t a, int64_t b, int64_t v
         int64_t ei = d->idx[slot];
         if (d->hashes[ei] == h) {
             const char* stored = (const char*)(uintptr_t)d->keys[ei];
-            if (memcmp(stored, sa, la) == 0 && strcmp(stored + la, sb) == 0) {
+            /* Same unbounded read as the GET path -- see the note there. */
+            if (strncmp(stored, sa, la) == 0 && strcmp(stored + la, sb) == 0) {
                 nova_rc_dec(d->vals[ei]);
                 d->vals[ei] = val;
                 nova_rc_inc(val);
