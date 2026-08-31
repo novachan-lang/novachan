@@ -353,6 +353,17 @@ int    setsockopt(int s,int lv,int o,const void* v,socklen_t l){(void)s;(void)lv
 int    getsockopt(int s,int lv,int o,void* v,socklen_t* l){(void)s;(void)lv;(void)o;(void)v;(void)l;return -1;}
 int    shutdown(int s,int how){(void)s;(void)how;return -1;}
 int    getpeername(int s,struct sockaddr* a,socklen_t* l){(void)s;(void)a;(void)l;return -1;}
+/* poll(): nova_recv_exact waits on a non-blocking socket with it when it is called OUTSIDE a green
+   task (inside one it parks on the netpoller instead). Sockets are dead in a value-model wasm
+   program, so a stub that reports "ready" is correct here -- the recv that follows returns -1 and
+   the caller gives up, which is the same outcome as before. Declared because the freestanding shim
+   gates <poll.h> out, and an implicit declaration is a hard error in modern clang. */
+struct pollfd { int fd; short events; short revents; };
+#define POLLIN  0x001
+#define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
+int poll(struct pollfd* p, unsigned long n, int timeout){ (void)p;(void)n;(void)timeout; return 1; }
 unsigned short htons(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
 unsigned short ntohs(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
 unsigned int   htonl(unsigned int x){return ((x<<24)&0xff000000u)|((x<<8)&0xff0000u)|((x>>8)&0xff00u)|((x>>24)&0xffu);}

@@ -1866,12 +1866,34 @@ static int nova_mod_cb(struct dl_phdr_info* info, size_t sz, void* data) {
     }
     return 0;
 }
+/* ⛔ THIS WAS A DATA RACE, and the comment it carried ("idempotent; re-running is harmless") was
+   FALSE on both counts. nova_mod_cb APPENDS through a shared g_mod_n and never resets it, so:
+     * check-then-act -- two carriers both observe ready==0 and both capture concurrently;
+     * g_mod_n++ is not atomic, so entries are READ while being WRITTEN. A half-written row has
+       hi == 0, which makes a GENUINE STRING LITERAL fail the range test and be treated as an
+       INTEGER -- the exact int/string confusion this function exists to prevent, and a wrong
+       answer rather than a crash;
+     * both threads can pass `g_mod_n < NOVA_MOD_MAX` at 63 and both increment, so the reader
+       loop indexes g_mod_lo[64] -- PAST THE END OF A GLOBAL ARRAY.
+   Measured consequence on macOS ARM64: forge_pg_scram_test (pure deterministic crypto, fixed
+   inputs and fixed expected outputs) failed 29/60 = 48% of runs, _argon2id_test 9/60, and ASAN
+   reported global-buffer-overflow 5/5. Non-deterministic because it is a race, and invisible to
+   UBSan because it is not undefined arithmetic.
+   pthread_once gives exactly-once execution AND the barriers, so no reader can observe a partial
+   table; the count is published separately with a release store after every row is written. */
+static pthread_once_t g_mod_once = PTHREAD_ONCE_INIT;
+static int g_mod_count_pub = 0;      /* published AFTER all rows; read with acquire */
+static void nova_mod_capture_once(void) {
+    g_mod_n = 0;
+    dl_iterate_phdr(nova_mod_cb, NULL);
+    __atomic_store_n(&g_mod_count_pub, g_mod_n, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
+}
 static int nova_addr_in_module(uintptr_t a) {
-    if (!__atomic_load_n(&g_mod_ready, __ATOMIC_ACQUIRE)) {
-        dl_iterate_phdr(nova_mod_cb, NULL);            /* idempotent; re-running is harmless */
-        __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
-    }
-    for (int i = 0; i < g_mod_n; i++)
+    pthread_once(&g_mod_once, nova_mod_capture_once);
+    int n = __atomic_load_n(&g_mod_count_pub, __ATOMIC_ACQUIRE);
+    if (n > NOVA_MOD_MAX) n = NOVA_MOD_MAX;            /* belt and braces: never index past the array */
+    for (int i = 0; i < n; i++)
         if (a >= g_mod_lo[i] && a < g_mod_hi[i]) return 1;
     return 0;
 }
@@ -1921,12 +1943,25 @@ static void nova_mod_capture_darwin(void) {
         }
     }
 }
+/* Same data race as the Linux branch above, and this is the one that actually FIRED. See the full
+   note there: check-then-act lazy init, a non-atomic g_mod_n++ that APPENDS without resetting, and
+   a reader walking the table while it is written. On macOS ARM64 that made a genuine string
+   literal fail its range test and be read as an INTEGER -- so forge_pg_scram_test, which is pure
+   deterministic crypto asserting the RFC 7677 worked example byte for byte, produced a DIFFERENT
+   ANSWER on 48% of runs, and ASAN caught the reader indexing past g_mod_lo[]. */
+static pthread_once_t g_mod_once = PTHREAD_ONCE_INIT;
+static int g_mod_count_pub = 0;      /* published AFTER all rows; read with acquire */
+static void nova_mod_capture_once(void) {
+    g_mod_n = 0;
+    nova_mod_capture_darwin();
+    __atomic_store_n(&g_mod_count_pub, g_mod_n, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
+}
 static int nova_addr_in_module(uintptr_t a) {
-    if (!__atomic_load_n(&g_mod_ready, __ATOMIC_ACQUIRE)) {
-        nova_mod_capture_darwin();                     /* idempotent; re-running is harmless */
-        __atomic_store_n(&g_mod_ready, 1, __ATOMIC_RELEASE);
-    }
-    for (int i = 0; i < g_mod_n; i++)
+    pthread_once(&g_mod_once, nova_mod_capture_once);
+    int n = __atomic_load_n(&g_mod_count_pub, __ATOMIC_ACQUIRE);
+    if (n > NOVA_MOD_MAX) n = NOVA_MOD_MAX;            /* belt and braces: never index past the array */
+    for (int i = 0; i < n; i++)
         if (a >= g_mod_lo[i] && a < g_mod_hi[i]) return 1;
     return 0;
 }
