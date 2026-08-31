@@ -1860,8 +1860,14 @@ static int nova_mod_cb(struct dl_phdr_info* info, size_t sz, void* data) {
         if (ph->p_type != PT_LOAD) continue;
         if (ph->p_flags & PF_W) continue;              /* read-only only: .rodata/.text */
         if (g_mod_n >= NOVA_MOD_MAX) return 1;
+        /* p_filesz, NOT p_memsz -- same over-claim as the Darwin branch below: p_memsz includes
+           the zero-fill tail that is not file-backed, and this table is used to decide whether an
+           address is SAFE TO READ. Latent here (read-only PT_LOAD usually has p_filesz == p_memsz)
+           but fixed for the same reason: the table must never claim unbacked memory. */
+        uint64_t _seg_readable = (uint64_t)ph->p_filesz;
+        if (_seg_readable > (uint64_t)ph->p_memsz) _seg_readable = (uint64_t)ph->p_memsz;
         g_mod_lo[g_mod_n] = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
-        g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)ph->p_memsz;
+        g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)_seg_readable;
         g_mod_n++;
     }
     return 0;
@@ -1934,8 +1940,24 @@ static void nova_mod_capture_darwin(void) {
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64* sg = (const struct segment_command_64*)lc;
                 if ((sg->initprot & VM_PROT_WRITE) == 0 && (sg->initprot & VM_PROT_READ) != 0) {
+                    /* ⛔ filesize, NOT vmsize. This function's entire job is "is this address SAFE
+                       TO READ", and vmsize over-claims: it includes the page-rounded, zero-fill
+                       tail that is NOT file-backed. nova_is_readable_str then reads the 8 bytes in
+                       front of a candidate pointer inside that tail and takes SIGBUS -- which is
+                       why forge_pg_scram_test and _argon2id_test DIED (exit 138 = 128+SIGBUS) with
+                       NO output rather than printing a wrong value. They were crashing, not
+                       miscomputing; every theory that assumed a wrong ANSWER was looking in the
+                       wrong place.
+                       Mach-O makes this reachable: __TEXT and __DATA_CONST routinely have
+                       vmsize > filesize. ELF read-only PT_LOAD segments normally have
+                       p_filesz == p_memsz, which is why the identical bug stayed latent on Linux
+                       (0/120) while macOS failed ~50%. ASLR moves the tail each run, so which
+                       candidate values land in it -- and therefore whether the run crashes --
+                       varies, giving a deterministic-input test a non-deterministic outcome. */
+                    uint64_t _seg_readable = sg->filesize;
+                    if (_seg_readable > sg->vmsize) _seg_readable = sg->vmsize;   /* never exceed the mapping */
                     g_mod_lo[g_mod_n] = (uintptr_t)sg->vmaddr + (uintptr_t)slide;
-                    g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)sg->vmsize;
+                    g_mod_hi[g_mod_n] = g_mod_lo[g_mod_n] + (uintptr_t)_seg_readable;
                     g_mod_n++;
                 }
             }
