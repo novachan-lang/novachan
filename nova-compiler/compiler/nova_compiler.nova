@@ -10238,6 +10238,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_create_string(ptr) nounwind")
     emit(cg, "declare void @nova_rt_init_args(i64, i64) nounwind")
     emit(cg, "declare void @nova_rt_strlit_strict() nounwind")
+    emit(cg, "declare void @nova_rt_lit_reloc_all(ptr) nounwind")
     emit(cg, "declare void @nova_rt_ensure_init() nounwind")
     emit(cg, "declare void @nova_rt_wait_all() nounwind")
     emit(cg, "declare void @nova_rt_main_dispatch(i64) nounwind")
@@ -10893,19 +10894,33 @@ fn emit_runtime_declarations(cg: CodeGen)
 fn strlit_type(byte_len: int) -> string
     "<\{ [8 x i8], [" + str(byte_len) + " x i8] }>"
 
-fn strlit_decl(name: string, escaped: string, byte_len: int) -> string
-    name + " = private constant " + strlit_type(byte_len) + " <\{ [8 x i8] c\"\\ABNOVSTR\\CD\", [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\" }>, align 8"
+// The mutable SLOT that holds a literal's live address: `@.str.7` -> `@.strp.7`. Derived by one
+// helper so the decl, the table and every read agree by construction.
+fn strlit_slot(name: string) -> string
+    replace(name, "@.str.", "@.strp.")
 
-// Address of the STRING BYTES (field 1), skipping the magic prefix (field 0). Every read of a
-// literal goes through this, so the emitted type can never drift from strlit_decl above.
+// A literal emits TWO globals: the constant bytes, and a pointer slot initialised to those bytes.
+// nova_rt_lit_reloc_all overwrites the slot at startup with an ARENA copy -- see the long note on
+// that function. Until it runs (and if it fails), the slot still holds the image address, so the
+// program is correct either way; relocation only moves literals out of the range where an INTEGER
+// can share their address.
+fn strlit_decl(name: string, escaped: string, byte_len: int) -> string
+    let _c = name + " = private constant " + strlit_type(byte_len) + " <\{ [8 x i8] c\"\\ABNOVSTR\\CD\", [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\" }>, align 8"
+    let _p = strlit_slot(name) + " = internal global ptr getelementptr inbounds (" + strlit_type(byte_len) + ", ptr " + name + ", i64 0, i32 1, i64 0), align 8"
+    _c + "\n" + _p
+
+// Address of the STRING BYTES. Reads the SLOT rather than GEP-ing the constant directly, so a
+// relocated literal is picked up automatically. Every read of a literal goes through here, so the
+// emitted form can never drift from strlit_decl above.
 fn strlit_gep_name(name: string, byte_len: int) -> string
-    "getelementptr inbounds " + strlit_type(byte_len) + ", ptr " + name + ", i64 0, i32 1, i64 0"
+    "load ptr, ptr " + strlit_slot(name) + ", align 8"
 
 fn strlit_gep(idx: int, byte_len: int) -> string
     strlit_gep_name("@.str." + str(idx), byte_len)
 
 fn emit_string_constants(cg: CodeGen)
-    if len(cg.strings) > 0
+    let _nstr = len(cg.strings)
+    if _nstr > 0
         emit(cg, "; String constants")
         let i = 0
         for s in cg.strings
@@ -10914,6 +10929,17 @@ fn emit_string_constants(cg: CodeGen)
             emit(cg, strlit_decl("@.str." + str(i), escaped, byte_len))
             i = i + 1
         emit(cg, "")
+    // The relocation table, ALWAYS emitted (the prologue references it even with zero literals).
+    // NULL-TERMINATED rather than length-prefixed: main's prologue is emitted BEFORE the literals
+    // it will use have been interned, so the count is not knowable at the call site. A forward
+    // reference to a global defined later in the module is fine in LLVM IR.
+    let _tbl = ""
+    let _ti = 0
+    while _ti < _nstr
+        _tbl = _tbl + "ptr " + strlit_slot("@.str." + str(_ti)) + ", "
+        _ti = _ti + 1
+    emit(cg, "@.strtab = internal constant [" + str(_nstr + 1) + " x ptr] [" + _tbl + "ptr null], align 8")
+    emit(cg, "")
 
 fn codegen_last_as_return(cg: CodeGen, stmt: Stmt)
     match stmt
@@ -11059,6 +11085,9 @@ fn emit_main_entry(cg: CodeGen)
     // whose literals come from the OLD emitter but which links THIS runtime,
     // still run correctly. See nova_is_readable_str in nova_runtime.c.
     emit_indent(cg, "call void @nova_rt_strlit_strict()")
+    // Relocate literals into the arena BEFORE any of them is read. Must follow the strict
+    // announcement (which enables magic checking) and precede all user code.
+    emit_indent(cg, "call void @nova_rt_lit_reloc_all(ptr @.strtab)")
     emit_indent(cg, "call void @nova_rt_main_dispatch(i64 ptrtoint (ptr @nova_main to i64))")
     emit_indent(cg, "call void @nova_rt_wait_all()")
     emit_indent(cg, "call void @nova_rt_cleanup()")
@@ -26925,6 +26954,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_create_string(ptr) nounwind")
     ire_line(e, "declare void @nova_rt_init_args(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_strlit_strict() nounwind")
+    ire_line(e, "declare void @nova_rt_lit_reloc_all(ptr) nounwind")
     ire_line(e, "declare void @nova_rt_ensure_init() nounwind")
     ire_line(e, "declare void @nova_rt_wait_all() nounwind")
     ire_line(e, "declare void @nova_rt_main_dispatch(i64) nounwind")
@@ -29257,6 +29287,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_indent(e, "%argv64 = ptrtoint ptr %argv to i64")
     ire_indent(e, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
     ire_indent(e, "call void @nova_rt_strlit_strict()")
+    // See the cg backend: relocate before any literal is read. Both backends must agree.
+    ire_indent(e, "call void @nova_rt_lit_reloc_all(ptr @.strtab)")
     if do_auto_arena == 1
         ire_line(e, "  ; AUTO-ARENA: no spawn detected, RC overhead globally eliminated")
         ire_indent(e, "call void @nova_rt_set_arena_mode(i64 1)")
@@ -29373,6 +29405,17 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         for sc in e.ire_strs
             ire_line(e, sc)
         ire_line(e, "")
+    // Relocation table -- same contract as the cg backend's (see emit_string_constants). ALWAYS
+    // emitted, NULL-terminated: the prologue that calls nova_rt_lit_reloc_all is written before
+    // the literals are interned, so the count is unknown there. Slot names come from e.ire_sc,
+    // which is exactly how many @.str.N were minted, so the table and the decls cannot disagree.
+    let _ntbl = ""
+    let _nti = 0
+    while _nti < e.ire_sc
+        _ntbl = _ntbl + "ptr " + strlit_slot("@.str." + str(_nti)) + ", "
+        _nti = _nti + 1
+    ire_line(e, "@.strtab = internal constant [" + str(e.ire_sc + 1) + " x ptr] [" + _ntbl + "ptr null], align 8")
+    ire_line(e, "")
 
     // Emit debug metadata
     let lb = chr(123)
