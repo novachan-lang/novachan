@@ -787,25 +787,48 @@ jobs:
               # exactly when nova_rt_sched_run returns) and the process then goes silent until the
               # external alarm kills it. Watchdog output that instead shows a carrier parked with
               # live > 0 forever means a real scheduler stall -- a different bug.
-              f1=0; wd1=""
+              # ⛔ THIS LOOP USED TO COUNT ANY NON-ZERO EXIT AS ONE UNDIFFERENTIATED "FAILURE",
+              # which made its own annotation unreadable. A HANG and a WRONG ANSWER have nothing
+              # in common but a non-zero exit, and the distinction is the whole question here.
+              # The reading it produced was actively misleading: run #92 reported "1/6 failed with
+              # NO watchdog output", which I nearly took as evidence of a stall -- but the watchdog
+              # prints every 4 SECONDS, so a 60s hang would emit ~14 lines. Zero lines means the
+              # process almost certainly DIED FAST, i.e. a wrong answer, not a stall. Record the
+              # exit code and the test's own verdict so the next run cannot be misread:
+              #   142 = 128+SIGALRM (our alarm fired)  -> genuinely hung
+              #   137 = 128+SIGKILL (killed by the OS) -> OOM or external kill
+              #   1   = the test's own assertion failed -> WRONG VALUE
+              f1=0; h1=0; d1=""
               for i in $(seq 1 6); do
-                o1=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=1 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1) || {
-                  f1=$((f1+1))
-                  [ -z "$wd1" ] && wd1=$(printf "%s" "$o1" | grep -E "^\[watchdog|carrier_fibers" | tail -3 | paste -sd";" - | cut -c1-500)
-                }
+                o1=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=1 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1); rc1=$?
+                if [ $rc1 -ne 0 ]; then
+                  f1=$((f1+1)); [ $rc1 -eq 142 ] && h1=$((h1+1))
+                  [ -z "$d1" ] && d1="rc=$rc1 :: $(printf '%s' "$o1" | grep -m2 -iE 'FAIL|mismatch|expected|watchdog' | paste -sd';' - | cut -c1-300)"
+                  [ -z "$d1" ] && d1="rc=$rc1 :: $(printf '%s' "$o1" | tail -2 | paste -sd';' - | cut -c1-300)"
+                fi
               done
-              f4=0; wd4=""
+              f4=0; h4=0; d4=""
               for i in $(seq 1 6); do
-                o4=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=4 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1) || {
-                  f4=$((f4+1))
-                  [ -z "$wd4" ] && wd4=$(printf "%s" "$o4" | grep -E "^\[watchdog|carrier_fibers" | tail -3 | paste -sd";" - | cut -c1-500)
-                }
+                o4=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=4 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1); rc4=$?
+                if [ $rc4 -ne 0 ]; then
+                  f4=$((f4+1)); [ $rc4 -eq 142 ] && h4=$((h4+1))
+                  [ -z "$d4" ] && d4="rc=$rc4 :: $(printf '%s' "$o4" | grep -m2 -iE 'FAIL|mismatch|expected|watchdog' | paste -sd';' - | cut -c1-300)"
+                  [ -z "$d4" ] && d4="rc=$rc4 :: $(printf '%s' "$o4" | tail -2 | paste -sd';' - | cut -c1-300)"
+                fi
               done
+              [ -n "$d1" ] && echo "::error title=flaky-bisect-detail::$t CARRIERS=1 first failure :: $d1"
+              [ -n "$d4" ] && echo "::error title=flaky-bisect-detail::$t CARRIERS=4 first failure :: $d4"
+              if [ $((f1 + f4)) -gt 0 ]; then
+                echo "::error title=flaky-bisect-mode::$t hangs: $h1/6 at CARRIERS=1, $h4/6 at CARRIERS=4 (of $f1 and $f4 total failures) -- a failure that is NOT a hang is a WRONG ANSWER, a different bug"
+              fi
               echo "::error title=flaky-bisect::$t CARRIERS=1 $f1/6 FAILED vs CARRIERS=4 $f4/6 FAILED"
-              [ -n "$wd4" ] && echo "::error title=flaky-bisect-watchdog::$t CARRIERS=4 :: $wd4"
-              [ -n "$wd1" ] && echo "::error title=flaky-bisect-watchdog::$t CARRIERS=1 :: $wd1"
-              if [ "$f4" -gt 0 ] && [ -z "$wd4" ]; then
-                echo "::error title=flaky-bisect-watchdog::$t failed $f4/6 at CARRIERS=4 with NO watchdog output -- consistent with a stall AFTER nova_rt_sched_run returned (i.e. in the join/shutdown path), since the watchdog thread exits at that point"
+              # ⛔ The line that used to live here read "NO watchdog output -- consistent with a
+              # stall in the join/shutdown path". That inference was BACKWARDS and is deleted
+              # rather than reworded: the watchdog prints every 4 SECONDS, so a 60-second hang
+              # would produce ~14 lines. ABSENCE of watchdog output is evidence AGAINST a hang,
+              # not for one. The exit code, captured above, is what actually settles it.
+              if [ "$((f1 + f4))" -gt 0 ] && [ "$((h1 + h4))" -eq 0 ]; then
+                echo "::error title=flaky-bisect-mode::$t failed $((f1 + f4))/12 with ZERO hangs -- these are FAST failures (wrong values or crashes), NOT stalls. See flaky-bisect-detail for the exit code and the test's own verdict"
               fi
             fi
             # ASAN, pointed at the test that actually fails rather than at argon2id.
