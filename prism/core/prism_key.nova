@@ -1,0 +1,356 @@
+// prism_key -- keyboard/input keys as a CLOSED, TYPED vocabulary, not a stringly-typed OS key
+// name. PRISM_SPEC.md §13's "keyboard contract" row is the reason this module exists: `press`
+// responds to Enter/Space, `pick` to arrows/type-ahead, `range` to arrows/Home/End, `tabs` to
+// arrows, and focus order is a Tab ring -- every one of those is a DECISION a compositor makes by
+// asking "which key was this", and a raw OS string (`"ArrowUp"` vs `"Up"`, `" "` vs `"Space"`, a
+// or "a" ambiguity, `"Enter"` vs `"Return"`) is exactly the kind of stringly-typed surface A2/A7
+// exist to close everywhere else in Prism. This module is the ONE place that OS string is parsed,
+// so nothing downstream (prism_event's `*_from_input` constructors, prism_a11y's derived keyboard
+// contract, text/ editing) ever matches on a raw string again.
+//
+// ⚠ README DISCREPANCY, RECORDED RATHER THAN SILENTLY PICKED: `prism/core/README.md` describes
+// the planned `prism_key.nova` as "Runtime keyed identity map for collection rows (spec §12.6)" --
+// a DIFFERENT concept (the `by`-selector runtime identity map §12.6's reactivity analysis needs for
+// `each`/`grid` rows, Defense 2 of the two-defense reactivity design). This file instead builds
+// what the task brief for this session explicitly specified: keyboard keys as typed values, tied
+// to §13's keyboard contract table. Both are real, both are needed, and they are NOT the same
+// module. Since `prism_node_keyed()` (`core/prism_node.nova`, already BUILT in MA.2/MA.3) already
+// carries the per-node `key: string` identity tag §12.6 describes at the NODE level, the runtime
+// keyed-identity MAP (a `by`-value -> row-index/dependency-cell lookup used by the reactivity
+// engine itself, per §12.6's "runtime keyed identity map -- it cannot be purely static") remains
+// UNBUILT and is not this file. Flagging this explicitly rather than quietly reusing the filename
+// for two different contracts -- the owner should decide whether the identity-map module gets a
+// different name (e.g. `prism_reactive_key.nova`) when M1.7/M3.4 (§12.8's falsifier, reactivity
+// engine) are scheduled.
+//
+// ── THE VOCABULARY IS CLOSED (axiom A7), AND DELIBERATELY SMALL FOR v1 ──────────────────────────
+// Exactly the keys §13's contract table and text-editing (Backspace/Delete, needed by text/
+// selection/richedit) name, plus Tab/ShiftTab for the derived focus ring, plus ONE parameterized
+// variant (`KeyChar`) for printable-character type-ahead (`pick`'s "arrows/type-ahead"). No
+// function keys, no modifier-only keys (Ctrl/Alt/Meta/Shift are not independently representable --
+// §13 never asks for a chord, only for Shift+Tab, handled as its own named key rather than a
+// separate modifier channel), no IME composition events. Extending this is additive: the exhaustive
+// `prism_key_name` match below lives beside the enum in this SAME file, so a missed arm is a
+// same-file compile error (E1009) -- PRISM_STATUS.md MA.5x measured that this exhaustiveness
+// guarantee does NOT hold for a match written in a DIFFERENT file, so no caller elsewhere should
+// assume the same protection.
+//
+// ── WHY KeyChar CARRIES A PAYLOAD WHILE EVERYTHING ELSE IS A BARE VARIANT ───────────────────────
+// Named keys are a fixed, finite set -- Enter is Enter. A printable character for type-ahead
+// (`pick` jumping to the item starting with the typed letter) is not: there are as many as there
+// are Unicode code points a keyboard can produce. One parameterized variant closes the vocabulary
+// exactly the way `prism_event`'s per-kind constructors do for its payload fields -- ONE variant
+// carries a character, every other variant carries nothing, and `prism_key_char` is a `Result`
+// accessor gated on kind (err on any other variant), the same shape as `prism_ev_text`/`_index`.
+//
+// ── prism_key_from_name: THE BOUNDARY THAT CLOSES THE STRINGLY-TYPED HOLE ───────────────────────
+// A real backend receives a key as a string (JS's `KeyboardEvent.key`, an ANSI escape sequence
+// decoded to a name, a native platform key name) -- this function is the ONE place that string is
+// interpreted, converting it into the closed `PrismKey` vocabulary or REJECTING it as `err`, never
+// silently guessing. It accepts one well-known alias per arrow key (`"Up"` alongside the modern
+// `"ArrowUp"`, etc. -- both appear in real-world `KeyboardEvent.key` histories) and BOTH `" "` and
+// `"Space"` for the space bar (browsers report `" "`; some native/terminal backends report the
+// literal word). `shift` is a required second parameter, not a default -- NOVA's default parameter
+// values are documented to die at the module boundary (`fn f(a, b = 5)` called cross-module drops
+// the default and demands both arguments), so a default here would silently behave differently for
+// a same-file caller than for every real one. It affects ONLY the Tab/ShiftTab distinction; no
+// other key in this vocabulary depends on a modifier, because §13 does not ask for one.
+//
+// A single Unicode CODE POINT (not byte) is what makes something a candidate `KeyChar`: `len()` on
+// a NOVA string is BYTE length, so a non-ASCII character like "é" or "日" is 2-3 BYTES and `len==1`
+// would silently reject or corrupt it -- `char_count()` is the correct one-character test (see
+// prism_textmodel.nova's `_tm_sub` for the same idiom, and the project's own recorded trap: "an
+// ASCII-only test proves NOTHING about a position/string API"). Control characters (byte codes
+// < 0x20 and 0x7F) are rejected even at length 1 -- an unlabelled Ctrl+key chord or a stray
+// control byte must not silently become a bogus type-ahead character, mirroring the same
+// before-parsing control-character check `prism_event`'s route validator uses for the same reason.
+//
+// PUBLIC API
+//   prism_key_from_name(name: string, shift: bool)  -> Result<PrismKey>   the string->key boundary
+//   prism_key_all_fixed()                           -> list<PrismKey>     the 13 non-payload keys
+//   prism_key_name(k)                               -> string
+//   prism_key_char(k)                               -> Result<string>     err unless KeyChar
+//   prism_key_eq(a, b)                               -> bool
+//   prism_key_is_activation(k)   -- Enter or Space (press: §13 "press -> Enter/Space")
+//   prism_key_is_dismiss(k)      -- Escape (sheet dismissal, §13's derived "dismissal" row)
+//   prism_key_is_next(k) / prism_key_is_prev(k)      -- ArrowDown|ArrowRight / ArrowUp|ArrowLeft
+//   prism_key_is_step_home(k) / prism_key_is_step_end(k)   -- Home / End (range: Home/End)
+//   prism_key_is_focus_next(k) / prism_key_is_focus_prev(k) -- Tab / ShiftTab (the tab ring)
+
+// No field prefix needed -- every variant except KeyChar is zero-arg, and KeyChar's single field
+// has no name to collide (NOVA enum-variant payload fields are positional, matched by pattern, not
+// referenced by a struct-style field name -- unlike PrismEvent/PrismSecret/PrismCap's plain structs).
+enum PrismKey
+    KeyEnter()
+    KeySpace()
+    KeyEscape()
+    KeyTab()
+    KeyShiftTab()
+    KeyArrowUp()
+    KeyArrowDown()
+    KeyArrowLeft()
+    KeyArrowRight()
+    KeyHome()
+    KeyEnd()
+    KeyBackspace()
+    KeyDelete()
+    // Payload field is `key_ch`-PREFIXED, not `ch`: NOVA's field->slot map is GLOBAL, so a bare
+    // `ch` shares a slot with any other module's field of that name. Every access here is
+    // POSITIONAL (`KeyChar(c) =>`), so nothing collides today -- but the first person to write
+    // `k.ch` would inherit a corruption that reconverge cannot detect. Prefixing costs nothing.
+    KeyChar(key_ch: string)
+
+fn prism_key_name(k: PrismKey) -> string
+    match k
+        KeyEnter() => "Enter"
+        KeySpace() => "Space"
+        KeyEscape() => "Escape"
+        KeyTab() => "Tab"
+        KeyShiftTab() => "ShiftTab"
+        KeyArrowUp() => "ArrowUp"
+        KeyArrowDown() => "ArrowDown"
+        KeyArrowLeft() => "ArrowLeft"
+        KeyArrowRight() => "ArrowRight"
+        KeyHome() => "Home"
+        KeyEnd() => "End"
+        KeyBackspace() => "Backspace"
+        KeyDelete() => "Delete"
+        KeyChar(c) => "Char:{c}"
+
+// Used by prism_key_eq -- returns the carried character for KeyChar, "" for every other variant.
+// A private helper (this file's own linkage discipline: prefixed `_prism_key_` like every other
+// module's helpers, since NOVA has no real module-private linkage for functions either way).
+fn _prism_key_char_or_empty(k: PrismKey) -> string
+    match k
+        KeyChar(c) => c
+        KeyEnter() => ""
+        KeySpace() => ""
+        KeyEscape() => ""
+        KeyTab() => ""
+        KeyShiftTab() => ""
+        KeyArrowUp() => ""
+        KeyArrowDown() => ""
+        KeyArrowLeft() => ""
+        KeyArrowRight() => ""
+        KeyHome() => ""
+        KeyEnd() => ""
+        KeyBackspace() => ""
+        KeyDelete() => ""
+
+// Structural equality by NAME (+ payload for KeyChar), not NOVA's built-in `==` on the enum value
+// directly -- prism_event.nova's own equality (`prism_ev_same`) uses the identical pattern for the
+// identical reason: comparing derived name strings is the proven-safe path in this codebase.
+fn prism_key_eq(a: PrismKey, b: PrismKey) -> bool
+    prism_key_name(a) == prism_key_name(b) and _prism_key_char_or_empty(a) == _prism_key_char_or_empty(b)
+
+fn prism_key_char(k: PrismKey) -> Result<string>
+    match k
+        KeyChar(c) => ok(c)
+        KeyEnter() => err("prism_key: no character carried by Enter")
+        KeySpace() => err("prism_key: no character carried by Space")
+        KeyEscape() => err("prism_key: no character carried by Escape")
+        KeyTab() => err("prism_key: no character carried by Tab")
+        KeyShiftTab() => err("prism_key: no character carried by ShiftTab")
+        KeyArrowUp() => err("prism_key: no character carried by ArrowUp")
+        KeyArrowDown() => err("prism_key: no character carried by ArrowDown")
+        KeyArrowLeft() => err("prism_key: no character carried by ArrowLeft")
+        KeyArrowRight() => err("prism_key: no character carried by ArrowRight")
+        KeyHome() => err("prism_key: no character carried by Home")
+        KeyEnd() => err("prism_key: no character carried by End")
+        KeyBackspace() => err("prism_key: no character carried by Backspace")
+        KeyDelete() => err("prism_key: no character carried by Delete")
+
+fn prism_key_all_fixed() -> list
+    [KeyEnter(), KeySpace(), KeyEscape(), KeyTab(), KeyShiftTab(), KeyArrowUp(), KeyArrowDown(), KeyArrowLeft(), KeyArrowRight(), KeyHome(), KeyEnd(), KeyBackspace(), KeyDelete()]
+
+// ── the string -> key boundary ──────────────────────────────────────────────────────────────
+fn prism_key_from_name(name, shift: bool) -> Result<PrismKey>
+    if type_of(name) != "string"
+        return err("prism_key: name must be a string, got {type_of(name)}")
+    if len(name) == 0
+        return err("prism_key: empty key name")
+    if name == "Enter"
+        return ok(KeyEnter())
+    if name == " " or name == "Space"
+        return ok(KeySpace())
+    if name == "Escape"
+        return ok(KeyEscape())
+    if name == "Tab"
+        if shift
+            return ok(KeyShiftTab())
+        return ok(KeyTab())
+    // "ShiftTab" is accepted DIRECTLY, not only as ("Tab", shift=true). prism_key_name EMITS
+    // "ShiftTab", so without this the module could produce a name it could not parse back --
+    // caught by the KAT's round-trip property, and it would have lost Shift+Tab across any
+    // serialise/restore boundary (a journal replay, a saved keymap, a wire message).
+    // The `shift` flag is ignored here on purpose: the name already carries the modifier, and
+    // honouring shift as well would make ("ShiftTab", shift=true) ambiguous.
+    if name == "ShiftTab"
+        return ok(KeyShiftTab())
+    if name == "ArrowUp" or name == "Up"
+        return ok(KeyArrowUp())
+    if name == "ArrowDown" or name == "Down"
+        return ok(KeyArrowDown())
+    if name == "ArrowLeft" or name == "Left"
+        return ok(KeyArrowLeft())
+    if name == "ArrowRight" or name == "Right"
+        return ok(KeyArrowRight())
+    if name == "Home"
+        return ok(KeyHome())
+    if name == "End"
+        return ok(KeyEnd())
+    if name == "Backspace"
+        return ok(KeyBackspace())
+    if name == "Delete"
+        return ok(KeyDelete())
+    // Not a named key: accept exactly one Unicode CODE POINT (char_count, not byte len -- see file
+    // header) that is not a control character, as a type-ahead candidate. Everything else (an
+    // unrecognized multi-character name like "F1"/"PageUp", or a lone control byte) is rejected --
+    // this module never guesses.
+    if char_count(name) == 1
+        let cps = code_points(name)
+        let cp = cps[0]
+        if cp >= 32 and cp != 127
+            return ok(KeyChar(name))
+        return err("prism_key: '{name}' is a control character, not a printable key")
+    err("prism_key: unrecognized key name '{name}'")
+
+// ── semantic classification (§13's keyboard contract) ───────────────────────────────────────
+fn prism_key_is_activation(k: PrismKey) -> bool
+    match k
+        KeyEnter() => true
+        KeySpace() => true
+        KeyEscape() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_dismiss(k: PrismKey) -> bool
+    match k
+        KeyEscape() => true
+        KeyEnter() => false
+        KeySpace() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+// "next"/"prev" cover BOTH axes (Down/Right advance, Up/Left retreat) because a single widget only
+// ever uses one axis at a time (§13: `tabs` uses arrows on one axis, `range`/`pick` likewise) --
+// the caller already knows which axis its widget is laid out on.
+fn prism_key_is_next(k: PrismKey) -> bool
+    match k
+        KeyArrowDown() => true
+        KeyArrowRight() => true
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowUp() => false
+        KeyArrowLeft() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_prev(k: PrismKey) -> bool
+    match k
+        KeyArrowUp() => true
+        KeyArrowLeft() => true
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowDown() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_step_home(k: PrismKey) -> bool
+    match k
+        KeyHome() => true
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_step_end(k: PrismKey) -> bool
+    match k
+        KeyEnd() => true
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyTab() => false
+        KeyShiftTab() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_focus_next(k: PrismKey) -> bool
+    match k
+        KeyTab() => true
+        KeyShiftTab() => false
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false
+
+fn prism_key_is_focus_prev(k: PrismKey) -> bool
+    match k
+        KeyShiftTab() => true
+        KeyTab() => false
+        KeyEnter() => false
+        KeySpace() => false
+        KeyEscape() => false
+        KeyArrowUp() => false
+        KeyArrowDown() => false
+        KeyArrowLeft() => false
+        KeyArrowRight() => false
+        KeyHome() => false
+        KeyEnd() => false
+        KeyBackspace() => false
+        KeyDelete() => false
+        KeyChar(c) => false

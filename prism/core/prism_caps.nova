@@ -1,0 +1,278 @@
+// prism_caps -- capability values: PRISM_SPEC.md §15.2's "Every host power is a value that must
+// be threaded from `main`... unforgeable (no constructor exposed), attenuable (`files.read_only()`),
+// and revocable (dropping the value revokes it)." Axiom A5. features #112, #124.
+//
+// WHY THIS IS core/ AND NOT dev/ OR obs/: §15.2's `needs`/`grant` keywords are RESERVED (§3) but
+// the compiler-checked "a face that was not granted `camera` cannot open the camera -- the call
+// does not type-check" mechanism is UNBUILT (PRISM_STATUS.md: "T11/M0.3, the runtime split" is
+// still awaiting owner GO/NO-GO). This module is the VALUE half of §15.2 -- something an
+// application can construct, thread through function parameters, attenuate and revoke TODAY -- so
+// that application-level capability discipline (explicit `prism_cap_check()` gates before a
+// privileged action) is possible before the compiler-enforced half exists. Read the whole of the
+// next section before trusting what this module can and cannot promise; the gap between the two
+// halves is exactly the gap between "checked by the type system" and "checked at runtime by code
+// that chose to call the check."
+//
+// ── ⛔ WHAT "UNFORGEABLE" CAN ACTUALLY MEAN IN NOVA -- READ THIS BEFORE TRUSTING THIS MODULE ─────
+// PRISM_SPEC promises "no constructor exposed." NOVA gives partial, uneven support for that claim,
+// and this session measured exactly how far it goes -- both halves are load-bearing for anyone
+// building on this module, so both are recorded precisely rather than rounded to "mostly safe."
+//
+// HALF THAT IS STRUCTURALLY TRUE: a plain struct's POSITIONAL constructor is FILE-LOCAL in NOVA
+// (PRISM_STATUS.md MA.3d, independently re-verified with its own 2-file probe: `mod.Struct(...)`
+// is a link error E1000, a bare `Struct(...)` in another file is E1002 unknown identifier). So
+// `PrismCap(kind, scope, ro, live)` -- the raw constructor -- genuinely CANNOT be called from any
+// file but this one. Nobody outside prism_caps.nova can hand-assemble a `PrismCap` from arbitrary
+// field values via that route. This is a REAL, compiler-enforced boundary, stronger than anything
+// available for a plain function (see prism_event.nova's own honest-limitation note on that).
+//
+// HALF THAT IS NOT TRUE, AND IS WORSE THAN THE CONVENTIONAL LIMIT PRISM_EVENT DOCUMENTS: NOVA
+// auto-generates a `<Type>__from_json(d: dict) -> Type` for EVERY struct (the DB/HTTP serialize
+// keystone, zero annotation, `nova_compiler.nova` `_make_from_json_method`) -- and that function is
+// an ORDINARY top-level `fn`, not a positional constructor, so it has NORMAL cross-module linkage.
+// Measured directly (`_prz_probe6*.nova`, this session, deleted after use): a second file that
+// NEVER calls any `prism_cap_grant_*` function can still do
+//     let forged = PrismCap__from_json({"cap_kind": "files", "cap_scope": "/", "cap_ro_i": 0, "cap_live": [1]})
+// and `prism_cap_is_live(forged)` returns TRUE. The `cap_scope` and `cap_live` fields round-trip
+// exactly as the attacker wrote them (plain string/list fields, no validation). The `cap_kind`
+// field does NOT round-trip cleanly -- `_make_from_json_method` does not special-case enum-typed
+// fields, so the raw JSON string is stuffed into a slot typed `PrismCapKind` without going through
+// any of this file's constructors, and reading it back (`prism_cap_kind_name`) produced `""`,
+// matching neither arm of an exhaustive match. That is NOT a mitigation -- it means a forged cap's
+// *kind* is unpredictable garbage rather than attacker-chosen, which is arguably worse: code that
+// pattern-matches `cap_kind` cross-module inherits the OTHER measured NOVA gap (exhaustiveness does
+// not check across a module boundary, PRISM_STATUS.md MA.5x) and could silently take a wrong branch
+// instead of erroring. Either way, a forged, live, attacker-scoped capability is achievable with NO
+// call to any function this file exports, which is a strictly worse hole than "app code can call
+// the legitimate grant function without authorization" (prism_event's class of limitation). This is
+// a COMPILER gap -- there is no attribute to opt a struct out of `__from_json` generation, and no
+// module-private linkage for the function even if there were reason to hide it -- and it is
+// out of scope to fix here; `prism/` is the only area this session owns.
+//
+// WHAT THIS LEAVES THIS MODULE ABLE TO HONESTLY PROMISE: capability values constructed and threaded
+// through `prism_cap_grant_*`/`prism_cap_read_only`/`prism_cap_revoke` behave exactly as documented
+// below (attenuation cannot widen, revocation propagates to every copy and every attenuated
+// derivative). What it CANNOT promise is that every `PrismCap` value a callee receives was
+// legitimately granted -- a caller with any code-execution in the process can synthesize one via
+// `PrismCap__from_json`. Real unforgeability requires either the compiler-checked `needs`/`grant`
+// mechanism §15.2 describes (unbuilt) or a host-boundary check outside NOVA entirely (e.g. the
+// actual OS camera permission prompt, which this module does not and cannot replace). Treat
+// `prism_cap_check()` below as a DISCIPLINE AID for well-behaved callers, not a security boundary
+// against an adversarial one -- exactly PRISM_SPEC's own §15.2 language ("must be threaded from
+// main") describes a discipline, and this module makes that discipline possible, not adversarial.
+//
+// ── ATTENUATION AND REVOCATION -- WHAT ACTUALLY WORKS, AND WHY ──────────────────────────────────
+// `cap_live` is a ONE-ELEMENT LIST (`[1]` live / `[0]` revoked), not a plain int field, for a
+// specific reason: NOVA has no linear/affine types, so an ordinary struct VALUE can be freely
+// copied (assigned, passed, returned) -- "dropping the value revokes it" cannot mean what it says
+// literally, because there is no way to stop a copy from continuing to exist. A LIST, however, is a
+// reference type: copying the STRUCT copies the list HANDLE, not the list's contents, so every copy
+// of a `PrismCap` -- and critically, every value `prism_cap_read_only()` DERIVES from it, which
+// deliberately shares the SAME `cap_live` list rather than allocating a fresh one -- observes the
+// SAME liveness cell. `prism_cap_revoke(cap)` mutates that cell in place (`cap.cap_live[0] = 0`),
+// which is therefore visible through every copy and every attenuation, without needing module-level
+// mutable state (itself a fragile pattern in this codebase -- see prism_node.nova, prism_theme.nova
+// and others' own notes on module-level `let` collections). This is the standard mechanism real
+// capability-security systems use for revocation without linear types: a capability is a HANDLE
+// checked against shared live state at USE time, not a value whose mere non-existence enforces
+// anything (seL4's revocation via capability-derivation trees and the object-capability
+// literature's "Revoker" idiom both work this way). Attenuation sharing the parent's cell rather
+// than minting a fresh one is deliberate: it means revoking a root grant also kills everything
+// derived from it, and there is no "re-widen" function that could hand attenuation back its
+// original power -- the only way to get a full-power cap is `prism_cap_grant_*` itself, which is
+// exactly as available (or as forgeable) as it always was.
+//
+// PUBLIC API
+//   prism_cap_kind_all()                          -> list<PrismCapKind>   the closed vocabulary
+//   prism_cap_kind_name(k)                        -> string
+//   prism_cap_grant(kind, scope)                  -> Result<PrismCap>     generic grant
+//   prism_cap_grant_camera/_embed/_clipboard/_geo/_mic/_notify()  -> Result<PrismCap>  (unscoped)
+//   prism_cap_grant_files/_network/_storage(scope) -> Result<PrismCap>    (scope required)
+//   prism_cap_read_only(cap)                      -> Result<PrismCap>     attenuate; err if not live
+//   prism_cap_revoke(cap)                         -> PrismCap             mutates the shared cell
+//   prism_cap_is_live(cap) / prism_cap_is_read_only(cap)  -> bool
+//   prism_cap_kind(cap) / prism_cap_scope(cap)
+//   prism_cap_check(cap)                          -> Result<PrismCap>     the §15.2 gate
+//   prism_cap_describe(cap)                       -> string               hand-written, safe
+
+// The starter vocabulary: `camera`, `files` and `embed` are the three PRISM_SPEC.md names this
+// vocabulary is anchored to (§15.2's example, §17's escape hatch). The remaining six are the
+// obviously-necessary host powers any real UI framework needs and are NOT yet spec-ratified --
+// PRISM_SPEC.md line 922 tracks "minimum viable capability set for v1" as an OPEN QUESTION for
+// Phase 3. Extending this enum later is additive and, because the exhaustive `prism_cap_kind_name`
+// match below lives in THIS file beside the enum, a missed arm is a same-file compile error
+// (E1009) -- the one place in this module exhaustiveness checking is real (PRISM_STATUS.md MA.5x:
+// it does NOT hold across a module boundary, so no caller elsewhere should assume the same).
+enum PrismCapKind
+    CapCamera()
+    CapFiles()
+    CapEmbed()
+    CapNetwork()
+    CapStorage()
+    CapClipboard()
+    CapGeo()
+    CapMic()
+    CapNotify()
+
+// `cap_` prefix on every field -- NOVA's struct field->slot map is GLOBAL (see prism_secret.nova
+// and prism_event.nova for the same note); an unprefixed `kind`/`scope`/`live` would collide.
+type PrismCap
+    cap_kind: PrismCapKind
+    cap_scope: string
+    cap_ro_i: int
+    cap_live: list
+
+fn prism_cap_kind_camera() -> PrismCapKind
+    CapCamera()
+
+fn prism_cap_kind_files() -> PrismCapKind
+    CapFiles()
+
+fn prism_cap_kind_embed() -> PrismCapKind
+    CapEmbed()
+
+fn prism_cap_kind_network() -> PrismCapKind
+    CapNetwork()
+
+fn prism_cap_kind_storage() -> PrismCapKind
+    CapStorage()
+
+fn prism_cap_kind_clipboard() -> PrismCapKind
+    CapClipboard()
+
+fn prism_cap_kind_geo() -> PrismCapKind
+    CapGeo()
+
+fn prism_cap_kind_mic() -> PrismCapKind
+    CapMic()
+
+fn prism_cap_kind_notify() -> PrismCapKind
+    CapNotify()
+
+fn prism_cap_kind_all() -> list
+    [CapCamera(), CapFiles(), CapEmbed(), CapNetwork(), CapStorage(), CapClipboard(), CapGeo(), CapMic(), CapNotify()]
+
+fn prism_cap_kind_name(k: PrismCapKind) -> string
+    match k
+        CapCamera() => "camera"
+        CapFiles() => "files"
+        CapEmbed() => "embed"
+        CapNetwork() => "network"
+        CapStorage() => "storage"
+        CapClipboard() => "clipboard"
+        CapGeo() => "geo"
+        CapMic() => "mic"
+        CapNotify() => "notify"
+
+// Which kinds carry a meaningful scope (a path/host/key prefix that NARROWS the grant) vs which
+// are all-or-nothing host powers with no sub-scoping concept.
+fn _prism_cap_kind_scoped(k: PrismCapKind) -> bool
+    match k
+        CapFiles() => true
+        CapNetwork() => true
+        CapStorage() => true
+        CapCamera() => false
+        CapEmbed() => false
+        CapClipboard() => false
+        CapGeo() => false
+        CapMic() => false
+        CapNotify() => false
+
+// A scoped kind REQUIRES a non-empty scope (an unscoped "files" grant is unbounded filesystem
+// access by omission, not by a deliberate empty-string choice -- reject rather than guess). An
+// unscoped kind REJECTS a non-empty scope rather than silently discarding it, so a caller who
+// passes a path to `camera` gets told, not ignored.
+fn _prism_cap_check_scope(k: PrismCapKind, scope) -> Result<string>
+    if type_of(scope) != "string"
+        return err("prism_caps: scope must be a string, got {type_of(scope)}")
+    let scoped = _prism_cap_kind_scoped(k)
+    if scoped and len(scope) == 0
+        return err("prism_caps: {prism_cap_kind_name(k)} requires a non-empty scope (a path/host/key prefix) -- an unscoped grant of this kind is unbounded access by omission")
+    if scoped == false and len(scope) > 0
+        return err("prism_caps: {prism_cap_kind_name(k)} does not take a scope, got '{scope}'")
+    ok(scope)
+
+// prism_cap_grant: the one place a fresh, full-power, LIVE capability comes from. See the file
+// header for exactly what "the one place" can and cannot mean in NOVA.
+fn prism_cap_grant(k: PrismCapKind, scope: string) -> Result<PrismCap>
+    let s = _prism_cap_check_scope(k, scope)?
+    ok(PrismCap(k, s, 0, [1]))
+
+fn prism_cap_grant_camera() -> Result<PrismCap>
+    prism_cap_grant(CapCamera(), "")
+
+fn prism_cap_grant_files(path_prefix: string) -> Result<PrismCap>
+    prism_cap_grant(CapFiles(), path_prefix)
+
+fn prism_cap_grant_embed() -> Result<PrismCap>
+    prism_cap_grant(CapEmbed(), "")
+
+fn prism_cap_grant_network(host_prefix: string) -> Result<PrismCap>
+    prism_cap_grant(CapNetwork(), host_prefix)
+
+fn prism_cap_grant_storage(key_prefix: string) -> Result<PrismCap>
+    prism_cap_grant(CapStorage(), key_prefix)
+
+fn prism_cap_grant_clipboard() -> Result<PrismCap>
+    prism_cap_grant(CapClipboard(), "")
+
+fn prism_cap_grant_geo() -> Result<PrismCap>
+    prism_cap_grant(CapGeo(), "")
+
+fn prism_cap_grant_mic() -> Result<PrismCap>
+    prism_cap_grant(CapMic(), "")
+
+fn prism_cap_grant_notify() -> Result<PrismCap>
+    prism_cap_grant(CapNotify(), "")
+
+// prism_cap_read_only: attenuate. Cannot be undone -- there is no "widen" function, and the
+// returned value shares the PARENT's cap_live cell (see file header), so revoking the parent also
+// revokes every attenuation derived from it. Attenuating an already-revoked cap is rejected: a
+// revoked capability has no power left to narrow.
+fn prism_cap_read_only(cap: PrismCap) -> Result<PrismCap>
+    if prism_cap_is_live(cap) == false
+        return err("prism_caps: cannot attenuate a revoked {prism_cap_kind_name(cap.cap_kind)} capability")
+    ok(PrismCap(cap.cap_kind, cap.cap_scope, 1, cap.cap_live))
+
+// prism_cap_revoke: mutate the shared liveness cell. Visible through every copy of `cap` and every
+// value `prism_cap_read_only` derived from it, per the file header. Returns `cap` back (now dead)
+// for chaining convenience; it is the SAME cell, not a new one, so there is nothing further to do.
+fn prism_cap_revoke(cap: PrismCap) -> PrismCap
+    cap.cap_live[0] = 0
+    cap
+
+fn prism_cap_is_live(cap: PrismCap) -> bool
+    cap.cap_live[0] == 1
+
+fn prism_cap_is_read_only(cap: PrismCap) -> bool
+    cap.cap_ro_i == 1
+
+fn prism_cap_kind(cap: PrismCap) -> PrismCapKind
+    cap.cap_kind
+
+fn prism_cap_scope(cap: PrismCap) -> string
+    cap.cap_scope
+
+// prism_cap_check: the §15.2 gate a privileged action calls before proceeding. A Result forces the
+// caller to handle a dead capability, where a bool getter invites being ignored -- same reasoning
+// as prism_event's `prism_ev_require_user`.
+fn prism_cap_check(cap: PrismCap) -> Result<PrismCap>
+    if prism_cap_is_live(cap)
+        ok(cap)
+    else
+        err("prism_caps: {prism_cap_kind_name(cap.cap_kind)} capability (scope='{cap.cap_scope}') is revoked")
+
+// prism_cap_describe: hand-written, deliberately not relying on the generic str()/to_json()
+// builtins -- prism_secret.nova's header documents a measured NOVA defect where those mis-dispatch
+// for an imported struct once the caller's file declares any struct of its own. Nothing here is
+// secret-valued, so there is no redaction concern, only the same dispatch-safety reason to hand-roll it.
+fn prism_cap_describe(cap: PrismCap) -> string
+    let live_s = if prism_cap_is_live(cap)
+        "live"
+    else
+        "revoked"
+    let ro_s = if prism_cap_is_read_only(cap)
+        " read_only"
+    else
+        ""
+    "{prism_cap_kind_name(cap.cap_kind)} scope='{cap.cap_scope}' {live_s}{ro_s}"

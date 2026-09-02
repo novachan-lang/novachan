@@ -1,0 +1,143 @@
+// KAT for prism/core/prism_caps.nova -- PrismCap, PRISM_SPEC.md §15.2.
+//
+// Proves, against concrete values:
+//   1. The closed vocabulary: 9 kinds, each name round-trips, matching prism_cap_kind_all().
+//   2. Scope validation: a scoped kind (files/network/storage) rejects an empty scope; an unscoped
+//      kind (camera/embed/clipboard/geo/mic/notify) rejects a NON-empty scope. Both directions.
+//   3. A fresh grant is live and NOT read-only.
+//   4. Revocation: prism_cap_check fails after revoke, with a message naming the kind.
+//   5. Revocation propagates through a COPY of the value (passed into another function) --
+//      proves the shared-list-cell mechanism the file header documents, not just "the same
+//      variable stops being live."
+//   6. Attenuation: prism_cap_read_only produces a NEW value (same kind/scope, ro=true, still
+//      live) that does NOT affect the original's read_only flag; revoking the ORIGINAL propagates
+//      to the ATTENUATED derivative (shared cell), proving "derived caps die with their parent."
+//   7. Attenuating an already-revoked capability is rejected.
+//   8. prism_cap_describe's format, for both a live and a revoked capability.
+//   9. ⛔ DOCUMENTED, NOT SCORED: PrismCap__from_json forges a live, attacker-scoped capability
+//      with NO call to any prism_cap_grant_* function -- the measured NOVA gap the file header
+//      documents under "WHAT 'UNFORGEABLE' CAN ACTUALLY MEAN". Printed for visibility of a live
+//      compiler gap, not asserted pass/fail -- it is not a defect IN this module's own API.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set, NOVA_NO_CACHE=1; prism/**/*.nova already
+// synced into $NOVA_HOME/lib):
+//   ./gen3_test.exe _kat_prism_caps.nova
+//   clang -O2 -o _kat_prism_caps.exe _kat_prism_caps.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_caps.exe
+
+import prism_caps
+
+let PASSED = [0]
+let FAILED = [0]
+
+fn _ok(label: string)
+    print("  ok  " + label)
+    PASSED[0] = PASSED[0] + 1
+
+fn _fail(label: string, detail: string)
+    print("FAIL " + label + ": " + detail)
+    FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool, detail: string)
+    if cond
+        _ok(label)
+    else
+        _fail(label, detail)
+
+// Used by test (5): revoke through a value received by a DIFFERENT function, to prove the
+// liveness cell is shared by reference, not copied along with the struct.
+fn revoke_via_copy(cap: PrismCap)
+    prism_cap_revoke(cap)
+
+fn main()
+    // (1) closed vocabulary
+    let kinds = prism_cap_kind_all()
+    _check_true("vocabulary has exactly 9 kinds", len(kinds) == 9, "got " + str(len(kinds)))
+    let names = [prism_cap_kind_name(k) for k in kinds]
+    let want_names = ["camera", "files", "embed", "network", "storage", "clipboard", "geo", "mic", "notify"]
+    let i = 0
+    while i < len(want_names)
+        _check_true("kind name[" + str(i) + "] = " + want_names[i], names[i] == want_names[i], "got " + names[i])
+        i = i + 1
+
+    // (2) scope validation -- both directions
+    match prism_cap_grant_files("")
+        Err(m) => _ok("files rejects empty scope")
+        Ok(c) => _fail("files rejects empty scope", "constructed with empty scope")
+    match prism_cap_grant_network("")
+        Err(m) => _ok("network rejects empty scope")
+        Ok(c) => _fail("network rejects empty scope", "constructed with empty scope")
+    match prism_cap_grant_storage("")
+        Err(m) => _ok("storage rejects empty scope")
+        Ok(c) => _fail("storage rejects empty scope", "constructed with empty scope")
+    match prism_cap_grant(prism_cap_kind_camera(), "/dev/video0")
+        Err(m) => _ok("camera rejects a non-empty scope")
+        Ok(c) => _fail("camera rejects a non-empty scope", "constructed with a scope")
+    match prism_cap_grant(prism_cap_kind_clipboard(), "x")
+        Err(m) => _ok("clipboard rejects a non-empty scope")
+        Ok(c) => _fail("clipboard rejects a non-empty scope", "constructed with a scope")
+
+    // (3) a fresh grant is live and not read-only
+    match prism_cap_grant_files("/home/alice/")
+        Err(m) => _fail("files grant with valid scope", "unexpected err: " + m)
+        Ok(c) =>
+            _check_true("fresh grant is live", prism_cap_is_live(c), "not live")
+            _check_true("fresh grant is not read-only", prism_cap_is_read_only(c) == false, "was read-only")
+            _check_true("fresh grant kind round-trips", prism_cap_kind_name(prism_cap_kind(c)) == "files", "wrong kind")
+            _check_true("fresh grant scope round-trips", prism_cap_scope(c) == "/home/alice/", "wrong scope")
+
+            // (8) describe, live case
+            let d1 = prism_cap_describe(c)
+            print("describe (live) = " + d1)
+            _check_true("describe names the kind", contains(d1, "files"), "kind missing: " + d1)
+            _check_true("describe names the scope", contains(d1, "/home/alice/"), "scope missing: " + d1)
+            _check_true("describe says live", contains(d1, "live"), "liveness missing: " + d1)
+
+            // (6) attenuation: does not affect the original
+            match prism_cap_read_only(c)
+                Err(m) => _fail("attenuate a live cap", "unexpected err: " + m)
+                Ok(ro) =>
+                    _check_true("attenuated copy is read-only", prism_cap_is_read_only(ro), "not read-only")
+                    _check_true("original is still NOT read-only after attenuating", prism_cap_is_read_only(c) == false, "original mutated")
+                    _check_true("attenuated copy keeps the same scope", prism_cap_scope(ro) == "/home/alice/", "scope changed")
+                    _check_true("attenuated copy is live", prism_cap_is_live(ro), "not live")
+
+                    // revoking the ORIGINAL propagates to the ATTENUATED DERIVATIVE (shared cell)
+                    prism_cap_revoke(c)
+                    _check_true("revoking the root also revokes its attenuated derivative", prism_cap_is_live(ro) == false, "derivative still live")
+
+                    // (7) attenuating an already-revoked cap is rejected
+                    match prism_cap_read_only(c)
+                        Err(m) => _ok("attenuating a revoked cap is rejected")
+                        Ok(x) => _fail("attenuating a revoked cap is rejected", "constructed anyway")
+
+                    // (4) prism_cap_check fails after revoke, message names the kind
+                    match prism_cap_check(c)
+                        Err(m) =>
+                            _ok("prism_cap_check rejects a revoked cap")
+                            _check_true("error names the kind", contains(m, "files"), "kind missing: " + m)
+                        Ok(x) => _fail("prism_cap_check rejects a revoked cap", "returned ok")
+
+                    // (8) describe, revoked case
+                    let d2 = prism_cap_describe(c)
+                    print("describe (revoked) = " + d2)
+                    _check_true("describe says revoked", contains(d2, "revoked"), "wrong state: " + d2)
+
+    // (5) revocation propagates through a COPY passed into another function
+    match prism_cap_grant_camera()
+        Err(m) => _fail("camera grant", "unexpected err: " + m)
+        Ok(cam) =>
+            _check_true("camera cap starts live", prism_cap_is_live(cam), "not live")
+            revoke_via_copy(cam)
+            _check_true("revoke through a copy propagates back to the original", prism_cap_is_live(cam) == false, "still live")
+
+    // (9) DOCUMENTED, NOT SCORED: the from_json forgery vector.
+    let forged_dict = {"cap_kind": "files", "cap_scope": "/etc/", "cap_ro_i": 0, "cap_live": [1]}
+    let forged = PrismCap__from_json(forged_dict)
+    print("[known compiler gap, not scored] forged scope=" + prism_cap_scope(forged) + " live=" + str(prism_cap_is_live(forged)) + " kind_name='" + prism_cap_kind_name(prism_cap_kind(forged)) + "'")
+
+    print("passed=" + str(PASSED[0]) + " failed=" + str(FAILED[0]))
+    if FAILED[0] == 0
+        print("KAT prism_caps PASS")
+    else
+        print("KAT prism_caps FAIL")
