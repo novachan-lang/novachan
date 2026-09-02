@@ -21394,10 +21394,13 @@ static void sha256_final(Sha256Ctx* ctx, uint8_t hash[32]) {
 
 int64_t nova_rt_sha256(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
-    if (!s) s = "";
+    /* Length-aware, NOT strlen: hashing binary is the normal case (sha256(random_bytes(32))),
+       and strlen stopped at the first 0x00 -- hashing FEWER bytes than the caller supplied. */
+    size_t slen = (size_t)nova_rt_len(input);
+    if (!s) { s = ""; slen = 0; }
     Sha256Ctx ctx;
     sha256_init(&ctx);
-    sha256_update(&ctx, (const uint8_t*)s, strlen(s));
+    sha256_update(&ctx, (const uint8_t*)s, slen);
     uint8_t hash[32];
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
@@ -21457,10 +21460,13 @@ int64_t nova_rt_sha256_bytes(int64_t data, int64_t len_val) {
 int64_t nova_rt_hmac_sha256(int64_t key_val, int64_t msg_val) {
     const char* key = (const char*)(uintptr_t)key_val;
     const char* msg = (const char*)(uintptr_t)msg_val;
-    if (!key) key = "";
-    if (!msg) msg = "";
-    size_t key_len = strlen(key);
-    size_t msg_len = strlen(msg);
+    /* Length-aware, NOT strlen. A binary KEY (the usual case -- hmac_sha256(random_bytes(32), m))
+       was truncated at its first 0x00, producing a MAC under a shorter key than the caller asked
+       for: a silent cryptographic weakening, not just a wrong length. */
+    size_t key_len = (size_t)nova_rt_len(key_val);
+    size_t msg_len = (size_t)nova_rt_len(msg_val);
+    if (!key) { key = ""; key_len = 0; }
+    if (!msg) { msg = ""; msg_len = 0; }
     uint8_t k_pad[64];
     memset(k_pad, 0, 64);
     if (key_len > 64) {
@@ -21705,7 +21711,9 @@ static const char b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 int64_t nova_rt_base64_encode(int64_t input) {
     const uint8_t* s = (const uint8_t*)(uintptr_t)input;
     if (!s) return NOVA_LIT("");
-    size_t len = strlen((const char*)s);
+    /* Length-aware, NOT strlen: base64 exists to carry BINARY, so a 0x00 in the input must not
+       end it. Same defect class as nova_rt_random_bytes / nova_rt_hex_encode. */
+    size_t len = (size_t)nova_rt_len(input);
     size_t out_len = 4 * ((len + 2) / 3);
     char* out = (char*)nova_heap_alloc(out_len + 1, NOVA_MEM_RAW);
     if (!out) return NOVA_LIT("");
@@ -23699,7 +23707,8 @@ int64_t nova_rt_crc32(int64_t data_ptr) {
     const uint8_t* data = (const uint8_t*)(uintptr_t)data_ptr;
     if (!data) return 0;
     if (!nova_crc32_table_ready) nova_crc32_init();
-    size_t len = strlen((const char*)data);
+    /* Length-aware, NOT strlen: a checksum over binary must cover every byte, 0x00 included. */
+    size_t len = (size_t)nova_rt_len(data_ptr);
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; i++)
         crc = (crc >> 8) ^ nova_crc32_table[(crc ^ data[i]) & 0xFFu];
