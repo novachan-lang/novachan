@@ -1,0 +1,252 @@
+// prism_face -- Prism's component/view abstraction (PRISM_SPEC.md §5 face_decl, §12 reactivity's
+// vocabulary, worked examples §19-21). core/, because widget/ builds NODES and prism_event.nova
+// builds EVENTS, but nothing yet ties a name + state + a render function + an event-dispatch table
+// together into one addressable unit -- which is what every worked example (§19 counter, §20
+// task_list, §21 employee_form) actually IS.
+//
+// ── SCOPE, STATED HONESTLY ────────────────────────────────────────────────────────────────────
+// PRISM_SPEC.md's `face` is a LANGUAGE construct (§5 EBNF: `face_decl`) the compiler would parse,
+// whose local `let` cells the compiler's §12 dependency-inference pass would track, and whose
+// `->`/`when` actions the compiler would lower into typed dispatch. NONE of that parsing or
+// inference exists yet -- `face`, `look`, `palette` are not NOVA keywords, and adding them is
+// compiler-grammar work (RED blast radius; nova_compiler.nova is explicitly off-limits for this
+// session, and is being actively edited elsewhere).
+//
+// What THIS file provides instead: the RUNTIME VALUE a compiled face_decl would eventually target.
+// A face is representable, TODAY, in ordinary NOVA, as a named bundle of (a) a pure render function
+// from state to a PrismNode tree, (b) a table of per-target event handlers, and (c) the four
+// lifecycle hooks §5's closed `life_event` set names (show/hide/fail/load). An app can build one of
+// these by hand -- see the KAT's `_counter_face`, a literal transcription of spec §19 -- and get
+// real dispatch, real validation, and the same input-origin guarantee prism_event.nova already
+// proved, without waiting for face syntax to exist.
+//
+// §12's REACTIVITY (automatic fine-grained invalidation: TEXT/PROP/ROW/SUBTREE/FACE granularity)
+// is explicitly NOT implemented here. `prism_face_dispatch` returns the new state; the caller
+// re-renders by calling `prism_face_render` again from scratch. That is always correct and always
+// FACE-granularity -- §12.2's coarsest case, never wrong, never optimized. Building the dependency
+// inference pass that picks a finer granularity is real compiler work (PRISM_STATUS.md M1.7), not
+// silently pretended away here.
+//
+// ── WHY STATE IS A dict, NOT A COMPILER-GENERATED STRUCT ─────────────────────────────────────
+// §12.1 defines a "cell" as a mutable `let` binding in the face body (`let n = 0`). Without a
+// compiler that parses face bodies there is no per-face struct type to generate, so cells are
+// represented as named entries in a `dict` -- the same escape valve prism_node.nova's `attrs` uses
+// for "one generic value shape serves arbitrarily many call sites," and the exact shape
+// forge_saga.nova already ships for a materially identical problem ("thread a mutable context
+// through a sequence of named steps, each `fn(ctx: dict) -> Result<dict>`"). A real face's
+// `let n = 0` becomes `state["n"] = 0` here. This is a library-level stand-in, not the final
+// representation: the day face_decl compiles, cells become real typed locals and THIS dict layer
+// is what its codegen would target, not what an app author writes directly forever.
+//
+// ── WHY A HANDLER RETURNS THE NEW STATE, NOT MUTATES IN PLACE ────────────────────────────────
+// NOVA dicts mutate through a shared reference (`seen[key] = true` in prism_ui_pager.nova relies on
+// exactly this), so an in-place-mutating handler signature (`fn(PrismEvent, dict) -> Result<()>`)
+// would work today. Rejected anyway: "did the handler forget to touch state" is then
+// indistinguishable from "the handler legitimately left state unchanged," and a KAT cannot tell the
+// two apart by inspecting a return value that doesn't exist. `fn(PrismEvent, dict) -> Result<dict>`
+// makes every handler's effect an explicit, assertable value -- the same reason
+// prism_look.nova's `merge` returns a new look instead of mutating either input, and the same
+// return shape forge_saga.nova's own step actions already use.
+//
+// ── FACE VALUES ARE BUILT FUNCTIONALLY: prism_face_on RETURNS A NEW PrismFace ────────────────
+// Registering a handler or a hook copies the existing table into a fresh dict and adds one entry,
+// rather than mutating `face.face_handlers` in place -- the identical discipline
+// prism_look.prism_look_merge documents ("a base look is shared by every widget that uses it, so a
+// mutating merge would let one caller's `.tight` silently restyle every other user of `card`").
+// Here a `face` value returned by `prism_face_new` could in principle be handed to two different
+// call sites that each want to attach their own handlers; a mutating `prism_face_on` would let the
+// second caller's registration silently appear on the first caller's copy too.
+//
+// ── DISPATCH KEYS ON TARGET ALONE, NOT (TARGET, KIND) ────────────────────────────────────────
+// prism_event.nova's six kinds are already 1:1 with the six interactive widgets (§9) -- a given
+// target string names one control, which has exactly one kind. Keying the handler table on
+// (target, kind) would let two DIFFERENT kinds silently share a target's handler slot, which cannot
+// happen for a real widget tree; keying on target alone matches the real invariant instead of
+// defending against a case the vocabulary already rules out.
+//
+// ── §15.7 INTEGRATION: `needs_user` IS DECLARATIVE, NOT INVENTED ─────────────────────────────
+// §15.7: "security-relevant actions MAY require genuine user origin." prism_event.nova built the
+// enforcement primitive (`prism_ev_require_user`) but left "which actions need it" to the caller.
+// `prism_face_on(face, target, handler_fn, needs_user)` lets a registration DECLARE that
+// requirement once, instead of every handler body remembering to call
+// `prism_ev_require_user(ev)?` as its own first line -- dispatch enforces it centrally, so a
+// forgotten call can no longer silently accept a synthetic/replayed event for that target. This is
+// §15.7 applied, not a new rule: the spec already names the property; this is where a face-level
+// API for it lives.
+//
+// ── HOOKS: show/hide/load SHARE A SIGNATURE, fail DOES NOT ───────────────────────────────────
+// §5's `life_event` is the closed set {show, hide, fail, load}. show/hide/load hooks are
+// `fn(dict) -> Result<dict>` (state in, state out) -- a face becoming visible, hidden, or finishing
+// an async load is a pure state transition. `fail` additionally carries the failure message (worked
+// example §21: `on fail -> label "Could not save: {it.message}"`), so its hook is
+// `fn(dict, string) -> Result<dict>`. Both live in the same `face_hooks: dict` (keyed by fixed
+// internal name), which is safe only because callers never invoke a hook generically -- each of
+// `prism_face_show/_hide/_load/_fail` calls its OWN named slot with its OWN fixed arity, so a
+// show hook can never be accidentally invoked with a fail hook's two-argument shape.
+//
+// ⚠ NOT MODELLED, DELIBERATELY: §5's node_body-scoped inline form (`on fail -> label "..."` written
+// INSIDE a node body, as a per-subtree rendering fallback rather than a face-level state hook) is a
+// DIFFERENT feature -- an error-boundary that swaps in fallback UI for one subtree -- and needs
+// integration with widget/ tree construction that does not exist yet. Only the face-body-level
+// lifecycle hook (a state transition, run via `prism_face_fail`) is implemented here. Recorded so
+// this is not mistaken for full §21 fidelity.
+//
+// ⚠ NOT ENFORCED: nothing stops app code from calling a handler or hook closure directly, bypassing
+// `prism_face_dispatch` and its §15.7 gate -- the identical CONVENTIONAL-not-structural limitation
+// prism_event.nova already states for `*_from_input`. The guarantee holds as long as dispatch is
+// the only call path exercised, and becomes structural once the compositor (§15.8) is the sole
+// producer of events and the sole caller of dispatch.
+//
+// PUBLIC API
+//   PrismFace                                                     the value type
+//   prism_face_new(name, render_fn)                    -> Result<PrismFace>
+//     render_fn: fn(dict) -> Result<PrismNode>. No handlers/hooks yet.
+//   prism_face_on(face, target, handler_fn, needs_user: bool) -> Result<PrismFace>
+//     handler_fn: fn(PrismEvent, dict) -> Result<dict>. Rejects an empty/duplicate target.
+//   prism_face_on_show/_hide/_load(face, hook_fn)     -> Result<PrismFace>  fn(dict) -> Result<dict>
+//   prism_face_on_fail(face, hook_fn)                 -> Result<PrismFace>  fn(dict, string) -> Result<dict>
+//     (each rejects re-registering the same hook)
+//   prism_face_name(face)                              -> string
+//   prism_face_has_handler(face, target)               -> bool
+//   prism_face_handler_count(face)                      -> int
+//   prism_face_handler_needs_user(face, target)         -> Result<bool>
+//   prism_face_has_hook(face, name)                     -> bool   name in {"show","hide","load","fail"}
+//   prism_face_render(face, state)                      -> Result<PrismNode>
+//   prism_face_dispatch(face, event, state)             -> Result<dict>
+//     Looks up event's target, enforces §15.7 if that handler needs_user, runs it.
+//   prism_face_show/_hide/_load(face, state)            -> Result<dict>  runs that hook if present,
+//     else `ok(state)` unchanged -- a no-op, not an error (not every face cares about a life event).
+//   prism_face_fail(face, state, message)               -> Result<dict>  same no-op-if-absent rule.
+
+import prism_node
+import prism_event
+
+// The runtime value a compiled face_decl would target. `face_render` and the closures stored
+// inside `face_handlers`/`face_hooks` are typed `any` -- NOVA closures are stored on struct fields
+// this way elsewhere in the codebase (forge.nova's `WsConn.recv_fn: any` / `send_fn: any`,
+// prism_render_canvas.nova's `pcv_measure: any`), and every call site here extracts the closure
+// into a local before calling it (`let h = ...; h(...)`), matching forge_saga.nova's own
+// `let act = step[1]` discipline -- the verified-safe shape for calling a closure that came out of
+// a dynamically-typed slot.
+type PrismFace
+    face_name: string
+    face_render: any
+    face_handlers: dict   // target(string) -> [handler_fn(any), needs_user_flag(int 0/1)]
+    face_hooks: dict      // "show"|"hide"|"load"|"fail" -> hook_fn(any)
+
+// ── Construction ───────────────────────────────────────────────────────────────────────────
+
+fn prism_face_new(name: string, render_fn) -> Result<PrismFace>
+    if len(name) == 0
+        return err("prism_face: name must not be empty")
+    ok(PrismFace(name, render_fn, {}, {}))
+
+// Register one target's handler. Returns a NEW face (see header) with a duplicate check: two
+// handlers silently sharing a target is the same mistake `each`/`grid`'s mandatory-unique `by` and
+// prism_pg_size_select's duplicate-size check exist to catch one layer over.
+fn prism_face_on(face: PrismFace, target: string, handler_fn, needs_user: bool) -> Result<PrismFace>
+    if len(target) == 0
+        return err("prism_face: target must not be empty")
+    if target in face.face_handlers
+        return err("prism_face: a handler is already registered for target '{target}' on face '{face.face_name}'")
+    let next = {}
+    for k in face.face_handlers
+        next[k] = face.face_handlers[k]
+    let flag = 1 if needs_user else 0
+    next[target] = [handler_fn, flag]
+    ok(PrismFace(face.face_name, face.face_render, next, face.face_hooks))
+
+fn _prism_face_set_hook(face: PrismFace, name: string, hook_fn) -> Result<PrismFace>
+    if name in face.face_hooks
+        return err("prism_face: a '{name}' hook is already registered on face '{face.face_name}'")
+    let next = {}
+    for k in face.face_hooks
+        next[k] = face.face_hooks[k]
+    next[name] = hook_fn
+    ok(PrismFace(face.face_name, face.face_render, face.face_handlers, next))
+
+// show/hide/load: fn(dict) -> Result<dict>
+fn prism_face_on_show(face: PrismFace, hook_fn) -> Result<PrismFace>
+    _prism_face_set_hook(face, "show", hook_fn)
+
+fn prism_face_on_hide(face: PrismFace, hook_fn) -> Result<PrismFace>
+    _prism_face_set_hook(face, "hide", hook_fn)
+
+fn prism_face_on_load(face: PrismFace, hook_fn) -> Result<PrismFace>
+    _prism_face_set_hook(face, "load", hook_fn)
+
+// fail: fn(dict, string) -> Result<dict> -- see header for why this one's arity differs.
+fn prism_face_on_fail(face: PrismFace, hook_fn) -> Result<PrismFace>
+    _prism_face_set_hook(face, "fail", hook_fn)
+
+// ── Inspection ─────────────────────────────────────────────────────────────────────────────
+
+fn prism_face_name(face: PrismFace) -> string
+    face.face_name
+
+fn prism_face_has_handler(face: PrismFace, target: string) -> bool
+    target in face.face_handlers
+
+fn prism_face_handler_count(face: PrismFace) -> int
+    len(face.face_handlers)
+
+fn prism_face_handler_needs_user(face: PrismFace, target: string) -> Result<bool>
+    if target not in face.face_handlers
+        return err("prism_face: no handler registered for target '{target}' on face '{face.face_name}'")
+    let entry = face.face_handlers[target]
+    ok(entry[1] == 1)
+
+fn prism_face_has_hook(face: PrismFace, name: string) -> bool
+    name in face.face_hooks
+
+// ── Render ─────────────────────────────────────────────────────────────────────────────────
+
+fn prism_face_render(face: PrismFace, state: dict) -> Result<PrismNode>
+    let render = face.face_render
+    render(state)
+
+// ── Dispatch (the §15.7 gate lives here) ──────────────────────────────────────────────────
+
+// NOTE: `prism_ev_require_user` returns `Result<PrismEvent>`, a DIFFERENT Ok-type parameter than
+// this function's `Result<dict>` -- using `?` across that mismatch is the exact E1001 type-mismatch
+// class prism_ui_kit.prism_ui_collect's own header documents ("returning the element's Result
+// straight out unifies the two type parameters"). So this checks `is_err` explicitly and re-wraps
+// the message, the same one-line fix prism_ui_collect already uses for the identical shape.
+fn prism_face_dispatch(face: PrismFace, event: PrismEvent, state: dict) -> Result<dict>
+    let target = prism_event.prism_ev_target(event)
+    if target not in face.face_handlers
+        return err("prism_face: no handler registered for target '{target}' on face '{face.face_name}'")
+    let entry = face.face_handlers[target]
+    let needs_user = entry[1]
+    if needs_user == 1
+        let gate = prism_event.prism_ev_require_user(event)
+        if is_err(gate)
+            return err(unwrap_err(gate))
+    let handler = entry[0]
+    handler(event, state)
+
+// ── Lifecycle runners: no-op (state unchanged) if the hook was never registered ──────────────
+
+fn prism_face_show(face: PrismFace, state: dict) -> Result<dict>
+    if "show" not in face.face_hooks
+        return ok(state)
+    let hook = face.face_hooks["show"]
+    hook(state)
+
+fn prism_face_hide(face: PrismFace, state: dict) -> Result<dict>
+    if "hide" not in face.face_hooks
+        return ok(state)
+    let hook = face.face_hooks["hide"]
+    hook(state)
+
+fn prism_face_load(face: PrismFace, state: dict) -> Result<dict>
+    if "load" not in face.face_hooks
+        return ok(state)
+    let hook = face.face_hooks["load"]
+    hook(state)
+
+fn prism_face_fail(face: PrismFace, state: dict, message: string) -> Result<dict>
+    if "fail" not in face.face_hooks
+        return ok(state)
+    let hook = face.face_hooks["fail"]
+    hook(state, message)

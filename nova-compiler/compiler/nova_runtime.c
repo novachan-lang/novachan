@@ -3822,7 +3822,9 @@ int64_t nova_rt_str_zfill(int64_t s, int64_t width) {
 
 int64_t nova_rt_url_encode(int64_t s) {
     const char* str = nova_str_safe(s);
-    size_t slen = strlen(str);
+    /* Length-aware: percent-encoding binary is legitimate (that is largely what it is FOR), and
+       strlen dropped everything past the first 0x00. */
+    size_t slen = (size_t)nova_rt_len(s);
     char* out = (char*)nova_heap_alloc(slen * 3 + 1, NOVA_MEM_RAW);
     if (!out) return s;
     size_t pos = 0;
@@ -19183,7 +19185,7 @@ int64_t nova_rt_bytes_append_str(int64_t handle, int64_t str_ptr) {
     if (!b) return handle;
     const char* s = nova_str_safe(str_ptr);
     if (!s) return handle;
-    size_t sl = strlen(s);
+    size_t sl = (size_t)nova_rt_len(str_ptr);   /* length-aware: appended data may be binary */
     if (sl == 0) return handle;
     int64_t need = b->size + (int64_t)sl;
     if (need > b->cap) {
@@ -19212,7 +19214,9 @@ int64_t nova_rt_bytes_to_str(int64_t handle) {
 int64_t nova_rt_str_to_bytes(int64_t str_ptr) {
     const char* s = (const char*)(uintptr_t)str_ptr;
     if (!s) return nova_rt_bytes_create(0);
-    size_t len = strlen(s);
+    /* Length-aware: str_to_bytes exists to hand binary to the bytes API, so stopping at the
+       first 0x00 silently dropped the tail. Same class as random_bytes/hex_encode/sha256. */
+    size_t len = (size_t)nova_rt_len(str_ptr);
     int64_t result = nova_rt_bytes_create((int64_t)len);
     NovaBytes* b = (NovaBytes*)(uintptr_t)result;
     if (b && b->data) memcpy(b->data, s, len);
@@ -19680,7 +19684,9 @@ int64_t nova_rt_file_write(int64_t h, int64_t s_val) {
     if (!f) { nova_set_error("file_write: invalid handle"); return -1; }
     const char* s = (const char*)(uintptr_t)s_val;
     if (!s) return 0;
-    size_t len = strlen(s);
+    /* Length-aware: writing BINARY to a file is a normal use, and strlen stopped at the first
+       0x00 -- silently writing a truncated file and reporting success for the short count. */
+    size_t len = (size_t)nova_rt_len(s_val);
     if (len == 0) return 0;
     size_t nw = fwrite(s, 1, len, f);
     if (nw != len) { nova_set_error("file_write: short write"); return -1; }
@@ -29610,8 +29616,11 @@ int64_t nova_rt_dict_filter_keys(int64_t handle, int64_t closure) {
 /* nova_rt_str_encode_uri: percent-encode a URI component (RFC 3986 unreserved set) */
 int64_t nova_rt_str_encode_uri(int64_t val) {
     const char* s = nova_str_safe(val);
-    if (!s || !s[0]) return nova_rt_create_string((void*)"");
-    size_t slen = strlen(s);
+    if (!s) return nova_rt_create_string((void*)"");
+    /* Length-aware, and the `!s[0]` early-out goes with it: a value whose FIRST byte is 0x00 is
+       not an empty value, and returning "" for it was the same truncation in another guise. */
+    size_t slen = (size_t)nova_rt_len(val);
+    if (slen == 0) return nova_rt_create_string((void*)"");
     char* buf = (char*)malloc(slen * 3 + 1);
     if (!buf) return val;
     size_t j = 0;
@@ -30471,7 +30480,7 @@ int64_t nova_rt_bytes_size(int64_t handle) {
 
 int64_t nova_rt_str_hex_encode(int64_t val) {
     const char* s = nova_str_safe(val);
-    size_t len = strlen(s);
+    size_t len = (size_t)nova_rt_len(val);   /* length-aware: hex-encoding is for BINARY */
     char* buf = (char*)malloc(len * 2 + 1);
     if (!buf) return nova_rt_create_string("");
     for (size_t i = 0; i < len; i++) {
@@ -33557,7 +33566,7 @@ int64_t nova_rt_dict_keys_with_value(int64_t handle, int64_t target) {
 int64_t nova_rt_str_encode_hex(int64_t str_handle) {
     const char* s = nova_str_safe(str_handle);
     if (!s) return str_handle;
-    size_t len = strlen(s);
+    size_t len = (size_t)nova_rt_len(str_handle);   /* length-aware: hex-encoding is for BINARY */
     char* buf = (char*)malloc(len * 2 + 1);
     if (!buf) return str_handle;
     for (size_t i = 0; i < len; i++)

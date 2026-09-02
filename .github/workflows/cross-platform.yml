@@ -723,11 +723,24 @@ jobs:
             [ -f "/tmp/$t.ll" ] || { echo "::notice title=flaky-probe::$t did not compile"; continue; }
             clang -O1 $PCF -o "/tmp/$t.bin" "/tmp/$t.ll" ../compiler/nova_runtime.c $PLF -w 2>/dev/null
             if [ -x "/tmp/$t.bin" ]; then
-              f=0; first=""
+              f=0; first=""; hangs=0; wdog=""
               for i in $(seq 1 8); do
-                out=$("/tmp/$t.bin" 2>&1); rc=$?
+                # A HANG must be distinguishable from a wrong answer, and it must not hang the
+                # job. GNU `timeout` DOES NOT EXIST on macOS -- relying on it has already faked
+                # macOS results twice here (every run exited 127 and read as a failure). perl's
+                # alarm is portable and, because perl exec's the child, the signal lands on the
+                # test itself: rc 142 = 128+SIGALRM = hung.
+                # NOVA_SCHED_WATCHDOG makes the runtime print per-carrier task/fiber state every
+                # 4s, which is what separates a scheduler deadlock from a spin or a blocked
+                # syscall. argon2id here is m=32KiB/t=2..3 -- MILLISECONDS of work -- so 60s
+                # elapsing is a hang, never slowness.
+                out=$(NOVA_SCHED_WATCHDOG=1 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1); rc=$?
                 if [ $rc -ne 0 ]; then
                   f=$((f+1))
+                  if [ $rc -eq 142 ] || [ $rc -eq 124 ]; then
+                    hangs=$((hangs+1))
+                    [ -z "$wdog" ] && wdog=$(printf "%s" "$out" | grep -E "^\[watchdog|carrier_fibers" | tail -4 | paste -sd";" - | cut -c1-600)
+                  fi
                   # CAPTURE THE TEST'S OWN VERDICT. forge_pg_scram_test prints
                   #   FAIL: client-final -> <value>   /   FAIL: server-signature -> <value>
                   # naming WHICH computation is wrong and WITH WHAT VALUE. The old pattern grepped
@@ -742,6 +755,13 @@ jobs:
                 fi
               done
               echo "::notice title=flaky-rate::$t plain: $f/8 FAILED ${first:+:: $first}"
+              # Separate the two failure MODES. A wrong answer and a hang have nothing in common
+              # except a non-zero exit, and conflating them is what made "_argon2id_test 3/10"
+              # look like a memory bug when the work is milliseconds long.
+              if [ "$hangs" -gt 0 ]; then
+                echo "::error title=flaky-HANG::$t HUNG $hangs/8 (60s alarm on a ms-scale workload -- this is a DEADLOCK, not slowness) ${wdog:+:: watchdog $wdog}"
+                [ -z "$wdog" ] && echo "::error title=flaky-HANG::$t hung with NO watchdog output -- the stall is before the scheduler starts, or stderr was lost; treat as instrument failure, not a clean result"
+              fi
               # BISECT THE CAUSE, not just the rate. forge_pg_scram_test is PURE DETERMINISTIC
               # crypto -- fixed inputs, fixed expected outputs, no network, no randomness -- so a
               # 48% failure means the SAME INPUT PRODUCES DIFFERENT OUTPUT. It is also PBKDF2 with

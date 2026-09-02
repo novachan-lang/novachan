@@ -1,0 +1,373 @@
+// prism_event -- Prism's event model: what a user (or a program) DID, as a typed value.
+// PRISM_SPEC.md §15.7 (input-origin integrity) is the reason this module exists at all, and §9
+// (the six interaction primitives) fixes its vocabulary.
+//
+// WHY THIS IS core/ AND NOT ui/: 67 ui/ components exist and NONE of them can respond to
+// anything -- `press`/`entry`/`pick`/`flag`/`range`/`link` construct and render, but there is no
+// value that represents "this was activated". text/ selection, a11y/ focus and dev/ interaction
+// tooling all sit on top of this, so it comes first.
+//
+// ── THE VOCABULARY IS CLOSED (axiom A7) ──────────────────────────────────────────────────────
+// Exactly six event kinds, one per interaction primitive in §9. There is deliberately no
+// "custom"/"generic" event: a 7th event kind would require a 7th primitive, and A7 forbids that.
+// prism_ev_kind_all() enumerates the vocabulary so adding a kind without covering it turns the
+// KAT red BY NAME rather than silently leaving a hole (same mechanism as prism_node_kind_all).
+//
+// ── ORIGIN IS AN ENUM, NOT A BOOL (§15.7) ────────────────────────────────────────────────────
+// Two independent reasons, both load-bearing:
+//   1. A NOVA `bool` CANNOT BE TYPE-VALIDATED -- `type_name()` never returns "bool" and
+//      `is_bool()` is self-inconsistent. A security tag that cannot be validated is a hole, and
+//      this tag's entire job is to be trusted. An enum is checkable by exhaustive match.
+//   2. Three states are genuinely needed. REPLAY (the journal -> undo/redo/audit) is neither
+//      genuine user input nor an attack; collapsing it into "synthetic" would make replayed
+//      history indistinguishable from a self-attack flow, and collapsing it into "user" would
+//      let a replay authorise a security-relevant action. It needs its own state.
+//
+// ── INVALID KIND/PAYLOAD COMBINATIONS ARE UNREPRESENTABLE ────────────────────────────────────
+// A press has no text; an entry has no index. Rather than one struct of optional fields (which
+// makes `press` carrying text expressible, then a matter of discipline), there is ONE constructor
+// PER KIND that fills exactly its own payload, and every payload accessor is a `Result` that
+// ERRORS when read against the wrong kind. So a nonsensical event cannot be built through the
+// public API and cannot be read by accident -- the same shape as prism_ui_form's 7 typed field
+// constructors, where an invalid field kind is unrepresentable.
+//
+// ── THE §15.7 GATE IS EXECUTABLE, NOT DOCUMENTARY ────────────────────────────────────────────
+// prism_ev_require_user(ev) returns `err` for BOTH synthetic and replay origin. §15.7 says
+// security-relevant actions "may require genuine user origin"; a `Result` forces the caller to
+// handle it, where a bool getter invites being ignored.
+//
+// ⚠ HONEST LIMITATION, stated rather than implied: NOVA has no module-private linkage (a
+// leading `_` does not make a function private -- `_render_gap` collided across two Prism
+// backends and broke the link). So nothing can stop app code calling a user-origin constructor
+// directly. The guarantee is therefore CONVENTIONAL at this layer: the backend/compositor is the
+// only intended caller of `*_from_input`, everything else uses `*_synth`. When the compositor
+// lands (§15.8) it becomes the sole producer of user-origin events and the guarantee becomes
+// structural. Recorded here so the boundary is not mistaken for enforcement it does not have.
+//
+// ── ROUTE VALIDATION MIRRORS §15.1 ───────────────────────────────────────────────────────────
+// A link event's route must start with "/". That single rule excludes every dangerous scheme
+// structurally -- `javascript:`, `data:` and `vbscript:` cannot start with "/" -- so there is no
+// scheme blocklist to keep up to date, which is the same argument prism_link makes for hrefs.
+//
+// PUBLIC API (constructors are Result; accessors are Result where the kind gates them)
+//   prism_ev_press_from_input(target)              -> Result<PrismEvent>   (user origin)
+//   prism_ev_entry_from_input(target, text)        -> Result<PrismEvent>
+//   prism_ev_pick_from_input(target, index)        -> Result<PrismEvent>
+//   prism_ev_flag_from_input(target, state)        -> Result<PrismEvent>
+//   prism_ev_range_from_input(target, value)       -> Result<PrismEvent>
+//   prism_ev_link_from_input(target, route)        -> Result<PrismEvent>
+//   prism_ev_press_synth / _entry_synth / _pick_synth / _flag_synth / _range_synth / _link_synth
+//                                                  -> same shapes, synthetic origin
+//   prism_ev_replay(ev)                            -> Result<PrismEvent>   re-tag as replay
+//   prism_ev_require_user(ev)                      -> Result<PrismEvent>   ok iff user origin
+//   prism_ev_text / prism_ev_index / prism_ev_flag_state / prism_ev_value / prism_ev_route
+//                                                  -> Result<payload>, err on wrong kind
+//   prism_ev_kind(ev) prism_ev_origin(ev) prism_ev_target(ev) prism_ev_is_user(ev)
+//   prism_ev_kind_name(k) prism_ev_origin_name(o) prism_ev_describe(ev) prism_ev_kind_all()
+
+// Distinct variant names are MANDATORY, not stylistic: PrismNodeKind already declares Press(),
+// Entry(), Pick(), Flag(), Range() and Link(), NOVA has one flat symbol space, and enum variant
+// constructors resolve across module boundaries -- so bare `Press()` here would collide with the
+// node kind. Every variant is `Ev*`/`Or*` prefixed for exactly that reason.
+enum PrismEventKind
+    EvPress()
+    EvEntry()
+    EvPick()
+    EvFlag()
+    EvRange()
+    EvLink()
+
+enum PrismOrigin
+    OrUser()
+    OrSynthetic()
+    OrReplay()
+
+// Fields are `ev_`-prefixed because NOVA's struct field->slot map is GLOBAL: an unprefixed
+// `text`/`index`/`value` would share a slot with any other module's field of that name, and
+// reconverge cannot detect that class of corruption.
+// `ev_flag_i` is an int 0/1 and never a `bool`: a bool cannot be type-validated in NOVA, and its
+// representation changes across a call boundary (inline int vs fn-arg bool), which has broken
+// real writes before. It is normalised once, in the constructor.
+type PrismEvent
+    ev_kind: PrismEventKind
+    ev_origin: PrismOrigin
+    ev_target: string
+    ev_text: string
+    ev_index: int
+    ev_flag_i: int
+    ev_value: int
+    ev_route: string
+
+// ── variant wrappers ────────────────────────────────────────────────────────────────────────
+// Zero-arg wrapper per variant: a bare `EvPress()` written in ANOTHER file used to resolve as an
+// unknown identifier, so the declaring file exports these instead. They are also what makes
+// prism_ev_kind_all() constructible.
+fn prism_ev_kind_press() -> PrismEventKind
+    EvPress()
+
+fn prism_ev_kind_entry() -> PrismEventKind
+    EvEntry()
+
+fn prism_ev_kind_pick() -> PrismEventKind
+    EvPick()
+
+fn prism_ev_kind_flag() -> PrismEventKind
+    EvFlag()
+
+fn prism_ev_kind_range() -> PrismEventKind
+    EvRange()
+
+fn prism_ev_kind_link() -> PrismEventKind
+    EvLink()
+
+fn prism_origin_user() -> PrismOrigin
+    OrUser()
+
+fn prism_origin_synthetic() -> PrismOrigin
+    OrSynthetic()
+
+fn prism_origin_replay() -> PrismOrigin
+    OrReplay()
+
+// The whole closed vocabulary, in §9 order. A 7th kind that is not added here makes the KAT's
+// coverage assertion fail by name instead of leaving an untested hole.
+fn prism_ev_kind_all() -> list
+    [EvPress(), EvEntry(), EvPick(), EvFlag(), EvRange(), EvLink()]
+
+fn prism_ev_origin_all() -> list
+    [OrUser(), OrSynthetic(), OrReplay()]
+
+fn prism_ev_kind_name(k: PrismEventKind) -> string
+    match k
+        EvPress() => "press"
+        EvEntry() => "entry"
+        EvPick() => "pick"
+        EvFlag() => "flag"
+        EvRange() => "range"
+        EvLink() => "link"
+
+fn prism_ev_origin_name(o: PrismOrigin) -> string
+    match o
+        OrUser() => "user"
+        OrSynthetic() => "synthetic"
+        OrReplay() => "replay"
+
+// ── validation ──────────────────────────────────────────────────────────────────────────────
+// A target is REQUIRED. §10 already makes the identity selector `by` mandatory on `each`/`grid`
+// because anonymous items are a bug source; an event with no target is the same mistake one
+// layer down -- "something was pressed" is not actionable.
+fn prism_ev_check_target(target) -> Result<string>
+    if type_of(target) != "string"
+        return err("prism_event: target must be a string, got {type_of(target)}")
+    if len(target) == 0
+        return err("prism_event: target is required (an event with no target is not actionable)")
+    ok(target)
+
+fn prism_ev_check_route(route) -> Result<string>
+    if type_of(route) != "string"
+        return err("prism_event: route must be a string, got {type_of(route)}")
+    if len(route) == 0
+        return err("prism_event: link route is required")
+    if not starts_with(route, "/")
+        return err("prism_event: route must start with '/' (got '{route}') -- this single rule excludes javascript:/data:/vbscript: structurally, so there is no scheme blocklist to maintain")
+    // ⛔ "starts with /" is NOT sufficient on its own, which the KAT caught while being written.
+    // `//evil.example` satisfies it and is a PROTOCOL-RELATIVE URL: a browser reads it as
+    // `https://evil.example` and navigates OFF-SITE. That is an open-redirect primitive hiding
+    // inside a rule that looks like it only admits local paths, and §15.1 claims injection is
+    // UNREPRESENTABLE -- accepting this would make that claim false.
+    if starts_with(route, "//")
+        return err("prism_event: route '{route}' is protocol-relative -- '//host' navigates OFF-SITE (an open redirect), even though it starts with '/'. Use a single-slash path.")
+    ok(route)
+
+// ── constructors, one per kind ──────────────────────────────────────────────────────────────
+// Each fills EXACTLY its own payload and leaves every other field at its zero value, which is
+// why a press cannot carry text.
+fn prism_ev_press_at(target, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    ok(PrismEvent(EvPress(), origin, t, "", 0, 0, 0, ""))
+
+fn prism_ev_entry_at(target, text, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    if type_of(text) != "string"
+        return err("prism_event: entry text must be a string, got {type_of(text)}")
+    ok(PrismEvent(EvEntry(), origin, t, text, 0, 0, 0, ""))
+
+fn prism_ev_pick_at(target, index, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    if type_of(index) != "int"
+        return err("prism_event: pick index must be an int, got {type_of(index)}")
+    if index < 0
+        return err("prism_event: pick index must be >= 0, got {index}")
+    ok(PrismEvent(EvPick(), origin, t, "", index, 0, 0, ""))
+
+fn prism_ev_flag_at(target, state, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    // `state` is normalised to 0/1 HERE, at the one boundary, because a bool cannot be
+    // type-validated in NOVA -- so it is never stored or compared as a bool.
+    let s = if state
+        1
+    else
+        0
+    ok(PrismEvent(EvFlag(), origin, t, "", 0, s, 0, ""))
+
+fn prism_ev_range_at(target, value, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    if type_of(value) != "int"
+        return err("prism_event: range value must be an int, got {type_of(value)}")
+    ok(PrismEvent(EvRange(), origin, t, "", 0, 0, value, ""))
+
+fn prism_ev_link_at(target, route, origin: PrismOrigin) -> Result<PrismEvent>
+    let t = prism_ev_check_target(target)?
+    let r = prism_ev_check_route(route)?
+    ok(PrismEvent(EvLink(), origin, t, "", 0, 0, 0, r))
+
+// ── user-origin entry points (intended for the backend/compositor ONLY) ─────────────────────
+fn prism_ev_press_from_input(target) -> Result<PrismEvent>
+    prism_ev_press_at(target, OrUser())
+
+fn prism_ev_entry_from_input(target, text) -> Result<PrismEvent>
+    prism_ev_entry_at(target, text, OrUser())
+
+fn prism_ev_pick_from_input(target, index) -> Result<PrismEvent>
+    prism_ev_pick_at(target, index, OrUser())
+
+fn prism_ev_flag_from_input(target, state) -> Result<PrismEvent>
+    prism_ev_flag_at(target, state, OrUser())
+
+fn prism_ev_range_from_input(target, value) -> Result<PrismEvent>
+    prism_ev_range_at(target, value, OrUser())
+
+fn prism_ev_link_from_input(target, route) -> Result<PrismEvent>
+    prism_ev_link_at(target, route, OrUser())
+
+// ── synthetic constructors (what application code should use) ───────────────────────────────
+fn prism_ev_press_synth(target) -> Result<PrismEvent>
+    prism_ev_press_at(target, OrSynthetic())
+
+fn prism_ev_entry_synth(target, text) -> Result<PrismEvent>
+    prism_ev_entry_at(target, text, OrSynthetic())
+
+fn prism_ev_pick_synth(target, index) -> Result<PrismEvent>
+    prism_ev_pick_at(target, index, OrSynthetic())
+
+fn prism_ev_flag_synth(target, state) -> Result<PrismEvent>
+    prism_ev_flag_at(target, state, OrSynthetic())
+
+fn prism_ev_range_synth(target, value) -> Result<PrismEvent>
+    prism_ev_range_at(target, value, OrSynthetic())
+
+fn prism_ev_link_synth(target, route) -> Result<PrismEvent>
+    prism_ev_link_at(target, route, OrSynthetic())
+
+// ── accessors ───────────────────────────────────────────────────────────────────────────────
+fn prism_ev_kind(ev: PrismEvent) -> PrismEventKind
+    ev.ev_kind
+
+fn prism_ev_origin(ev: PrismEvent) -> PrismOrigin
+    ev.ev_origin
+
+fn prism_ev_target(ev: PrismEvent) -> string
+    ev.ev_target
+
+fn prism_ev_kind_str(ev: PrismEvent) -> string
+    prism_ev_kind_name(ev.ev_kind)
+
+fn prism_ev_origin_str(ev: PrismEvent) -> string
+    prism_ev_origin_name(ev.ev_origin)
+
+// Payload accessors are Results GATED ON KIND. Reading text off a press is a programming
+// mistake, and it is reported as one instead of returning a plausible "".
+fn prism_ev_text(ev: PrismEvent) -> Result<string>
+    match ev.ev_kind
+        EvEntry() => ok(ev.ev_text)
+        EvPress() => err("prism_event: text is only carried by an entry event, not press")
+        EvPick() => err("prism_event: text is only carried by an entry event, not pick")
+        EvFlag() => err("prism_event: text is only carried by an entry event, not flag")
+        EvRange() => err("prism_event: text is only carried by an entry event, not range")
+        EvLink() => err("prism_event: text is only carried by an entry event, not link")
+
+fn prism_ev_index(ev: PrismEvent) -> Result<int>
+    match ev.ev_kind
+        EvPick() => ok(ev.ev_index)
+        EvPress() => err("prism_event: index is only carried by a pick event, not press")
+        EvEntry() => err("prism_event: index is only carried by a pick event, not entry")
+        EvFlag() => err("prism_event: index is only carried by a pick event, not flag")
+        EvRange() => err("prism_event: index is only carried by a pick event, not range")
+        EvLink() => err("prism_event: index is only carried by a pick event, not link")
+
+fn prism_ev_flag_state(ev: PrismEvent) -> Result<bool>
+    match ev.ev_kind
+        EvFlag() => ok(ev.ev_flag_i == 1)
+        EvPress() => err("prism_event: state is only carried by a flag event, not press")
+        EvEntry() => err("prism_event: state is only carried by a flag event, not entry")
+        EvPick() => err("prism_event: state is only carried by a flag event, not pick")
+        EvRange() => err("prism_event: state is only carried by a flag event, not range")
+        EvLink() => err("prism_event: state is only carried by a flag event, not link")
+
+fn prism_ev_value(ev: PrismEvent) -> Result<int>
+    match ev.ev_kind
+        EvRange() => ok(ev.ev_value)
+        EvPress() => err("prism_event: value is only carried by a range event, not press")
+        EvEntry() => err("prism_event: value is only carried by a range event, not entry")
+        EvPick() => err("prism_event: value is only carried by a range event, not pick")
+        EvFlag() => err("prism_event: value is only carried by a range event, not flag")
+        EvLink() => err("prism_event: value is only carried by a range event, not link")
+
+fn prism_ev_route(ev: PrismEvent) -> Result<string>
+    match ev.ev_kind
+        EvLink() => ok(ev.ev_route)
+        EvPress() => err("prism_event: route is only carried by a link event, not press")
+        EvEntry() => err("prism_event: route is only carried by a link event, not entry")
+        EvPick() => err("prism_event: route is only carried by a link event, not pick")
+        EvFlag() => err("prism_event: route is only carried by a link event, not flag")
+        EvRange() => err("prism_event: route is only carried by a link event, not range")
+
+// ── origin: the §15.7 gate ──────────────────────────────────────────────────────────────────
+fn prism_ev_is_user(ev: PrismEvent) -> bool
+    match ev.ev_origin
+        OrUser() => true
+        OrSynthetic() => false
+        OrReplay() => false
+
+// A security-relevant action calls this and propagates. REPLAY is rejected as firmly as
+// SYNTHETIC: a replayed event is real history, but authorising a fresh privileged action from it
+// is exactly the confused-deputy step this gate exists to stop.
+fn prism_ev_require_user(ev: PrismEvent) -> Result<PrismEvent>
+    match ev.ev_origin
+        OrUser() => ok(ev)
+        OrSynthetic() => err("prism_event: this action requires genuine user input, but the event on '{ev.ev_target}' was programmatically synthesized (PRISM_SPEC.md §15.7)")
+        OrReplay() => err("prism_event: this action requires genuine user input, but the event on '{ev.ev_target}' came from replay (PRISM_SPEC.md §15.7)")
+
+// Re-tag an existing event as replayed, preserving kind, target and payload. Non-mutating: the
+// journal replays a COPY, and the original stays exactly as recorded.
+fn prism_ev_replay(ev: PrismEvent) -> Result<PrismEvent>
+    ok(PrismEvent(ev.ev_kind, OrReplay(), ev.ev_target, ev.ev_text, ev.ev_index, ev.ev_flag_i, ev.ev_value, ev.ev_route))
+
+// ── description (dev/ and obs/ both need a stable one-line form) ────────────────────────────
+fn prism_ev_describe(ev: PrismEvent) -> string
+    let head = "{prism_ev_origin_str(ev)} {prism_ev_kind_str(ev)} on '{ev.ev_target}'"
+    match ev.ev_kind
+        EvPress() => head
+        EvEntry() => "{head} text='{ev.ev_text}'"
+        EvPick() => "{head} index={ev.ev_index}"
+        EvFlag() => "{head} state={ev.ev_flag_i == 1}"
+        EvRange() => "{head} value={ev.ev_value}"
+        EvLink() => "{head} route='{ev.ev_route}'"
+
+// Structural equality: two events are the same event when kind, origin, target and the payload
+// THAT KIND CARRIES all agree. Deliberately not a field-by-field compare -- the unused payload
+// slots are zero for both, so comparing them would work by accident rather than by design.
+fn prism_ev_same(a: PrismEvent, b: PrismEvent) -> bool
+    if prism_ev_kind_name(a.ev_kind) != prism_ev_kind_name(b.ev_kind)
+        return false
+    if prism_ev_origin_name(a.ev_origin) != prism_ev_origin_name(b.ev_origin)
+        return false
+    if a.ev_target != b.ev_target
+        return false
+    match a.ev_kind
+        EvPress() => true
+        EvEntry() => a.ev_text == b.ev_text
+        EvPick() => a.ev_index == b.ev_index
+        EvFlag() => a.ev_flag_i == b.ev_flag_i
+        EvRange() => a.ev_value == b.ev_value
+        EvLink() => a.ev_route == b.ev_route

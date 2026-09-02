@@ -1,0 +1,186 @@
+// KAT for prism/core/prism_face.nova -- Prism's component/view abstraction.
+//
+// The three things this test exists to prove, in order of importance:
+//   1. PRISM_SPEC.md §19's counter, transcribed literally as a hand-built PrismFace, actually
+//      round-trips: render reflects state, dispatch mutates state via the registered handler, and
+//      re-rendering after dispatch reflects the NEW state.
+//   2. §15.7 integration is real, not decorative -- a handler registered `needs_user: true` REJECTS
+//      a synthetic/replayed event and only dispatch's central gate is what stops it (the handler
+//      body itself never calls prism_ev_require_user).
+//   3. Every rejection this module promises actually rejects: empty name, empty/duplicate target,
+//      duplicate hook, dispatch to an unregistered target -- and every hook's "not registered ->
+//      no-op, not an error" rule holds for all four hook kinds.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_face` resolves.
+//   ./gen3_test.exe _kat_prism_face.nova
+//   clang -O2 -o _kat_prism_face.exe _kat_prism_face.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_face.exe
+
+import prism_face
+import prism_event
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+
+let STATS = [0, 0]  // [passed, failed]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+// ── §19 counter, transcribed literally ────────────────────────────────────────────────────────
+//   face counter
+//       let n = 0
+//       stack.card
+//           label "Counted {n} times"
+//           band
+//               press "Add"   -> n += 1
+//               press "Clear" -> n = 0
+// `state["n"]` stands in for the cell `n` (see file header: no compiler-generated per-face struct
+// exists yet). Targets "counter.add" / "counter.clear" are an app-level naming convention -- see
+// prism_event.nova's own honest note that target<->widget linkage is conventional, not structural,
+// until the compositor exists.
+
+fn _counter_render(state: dict) -> Result<PrismNode>
+    let n = state["n"]
+    let lbl = prism_content.prism_label("Counted {n} times")?
+    let add_btn = prism_interact.prism_press("Add", [])?
+    let clear_btn = prism_interact.prism_press("Clear", [])?
+    let row = prism_arrange.prism_band([add_btn, clear_btn])?
+    prism_arrange.prism_stack([lbl, row])
+
+fn _counter_copy(state: dict) -> dict
+    let next = {}
+    for k in state
+        next[k] = state[k]
+    next
+
+fn _counter_add(ev: PrismEvent, state: dict) -> Result<dict>
+    let next = _counter_copy(state)
+    next["n"] = state["n"] + 1
+    ok(next)
+
+fn _counter_clear(ev: PrismEvent, state: dict) -> Result<dict>
+    let next = _counter_copy(state)
+    next["n"] = 0
+    ok(next)
+
+fn _build_counter_face() -> Result<PrismFace>
+    let render_fn = fn(s) _counter_render(s)
+    let f0 = prism_face.prism_face_new("counter", render_fn)?
+    let f1 = prism_face.prism_face_on(f0, "counter.add", fn(ev, s) _counter_add(ev, s), false)?
+    prism_face.prism_face_on(f1, "counter.clear", fn(ev, s) _counter_clear(ev, s), false)
+
+fn main()
+    print("== _kat_prism_face ==")
+    print("")
+
+    // ── 1. construction + registration ───────────────────────────────────────────────────────
+    print("1. construction")
+    let counter = unwrap(_build_counter_face())
+    check("name preserved", prism_face.prism_face_name(counter) == "counter")
+    check("2 handlers registered", prism_face.prism_face_handler_count(counter) == 2)
+    check("has handler for counter.add", prism_face.prism_face_has_handler(counter, "counter.add"))
+    check("has handler for counter.clear", prism_face.prism_face_has_handler(counter, "counter.clear"))
+    check("no handler for a target never registered", not prism_face.prism_face_has_handler(counter, "counter.nope"))
+    check("neither handler needs_user (both false)", not unwrap(prism_face.prism_face_handler_needs_user(counter, "counter.add")) and not unwrap(prism_face.prism_face_handler_needs_user(counter, "counter.clear")))
+    print("")
+
+    // ── 2. render reflects state ─────────────────────────────────────────────────────────────
+    print("2. render reflects state")
+    let s0 = {"n": 0}
+    let tree0 = unwrap(prism_face.prism_face_render(counter, s0))
+    check("root is a stack (2 children: label, band)", prism_node.prism_node_kind_str(tree0) == "stack" and prism_node.prism_node_child_count(tree0) == 2)
+    let label0 = prism_node.prism_node_children(tree0)[0]
+    check("label reflects n=0", prism_node.prism_node_attr_str(label0, "text", "") == "Counted 0 times")
+    print("")
+
+    // ── 3. dispatch mutates state via the registered handler ────────────────────────────────
+    print("3. dispatch (the full round trip)")
+    let ev_add = unwrap(prism_event.prism_ev_press_synth("counter.add"))
+    let s1 = unwrap(prism_face.prism_face_dispatch(counter, ev_add, s0))
+    check("n incremented by dispatch", s1["n"] == 1)
+    check("ORIGINAL state dict not mutated (handler returns a copy)", s0["n"] == 0)
+    let tree1 = unwrap(prism_face.prism_face_render(counter, s1))
+    let label1 = prism_node.prism_node_children(tree1)[0]
+    check("re-render after dispatch reflects NEW state", prism_node.prism_node_attr_str(label1, "text", "") == "Counted 1 times")
+    let s2 = unwrap(prism_face.prism_face_dispatch(counter, ev_add, s1))
+    let s3 = unwrap(prism_face.prism_face_dispatch(counter, ev_add, s2))
+    check("three adds -> n=3", s3["n"] == 3)
+    let ev_clear = unwrap(prism_event.prism_ev_press_synth("counter.clear"))
+    let s4 = unwrap(prism_face.prism_face_dispatch(counter, ev_clear, s3))
+    check("clear resets to 0", s4["n"] == 0)
+    print("")
+
+    // ── 4. dispatch to an unregistered target is rejected ────────────────────────────────────
+    print("4. dispatch rejects an unregistered target")
+    let ev_ghost = unwrap(prism_event.prism_ev_press_synth("counter.ghost"))
+    check("unregistered target rejected", is_err(prism_face.prism_face_dispatch(counter, ev_ghost, s0)))
+    print("")
+
+    // ── 5. §15.7 -- needs_user is enforced CENTRALLY by dispatch ─────────────────────────────
+    print("5. needs_user (§15.7) -- enforced by dispatch, not the handler body")
+    let danger_render = fn(s) _counter_render(s)
+    let g0 = unwrap(prism_face.prism_face_new("danger", danger_render))
+    // This handler does NOT call prism_ev_require_user itself -- proving the gate is dispatch's.
+    let danger_handler = fn(ev, s) ok(s)
+    let g1 = unwrap(prism_face.prism_face_on(g0, "danger.delete", danger_handler, true))
+    check("registered as needs_user", unwrap(prism_face.prism_face_handler_needs_user(g1, "danger.delete")))
+    let ev_synth = unwrap(prism_event.prism_ev_press_synth("danger.delete"))
+    let ev_user = unwrap(prism_event.prism_ev_press_from_input("danger.delete"))
+    let ev_replay = unwrap(prism_event.prism_ev_replay(ev_user))
+    check("synthetic event REJECTED for a needs_user target", is_err(prism_face.prism_face_dispatch(g1, ev_synth, {})))
+    check("replayed event REJECTED for a needs_user target", is_err(prism_face.prism_face_dispatch(g1, ev_replay, {})))
+    check("genuine user-origin event ACCEPTED", not is_err(prism_face.prism_face_dispatch(g1, ev_user, {})))
+    print("")
+
+    // ── 6. rejections at construction/registration time ──────────────────────────────────────
+    print("6. rejections")
+    check("empty face name rejected", is_err(prism_face.prism_face_new("", fn(s) ok(s))))
+    let base = unwrap(prism_face.prism_face_new("x", fn(s) ok(s)))
+    check("empty target rejected", is_err(prism_face.prism_face_on(base, "", fn(ev, s) ok(s), false)))
+    let with_one = unwrap(prism_face.prism_face_on(base, "t", fn(ev, s) ok(s), false))
+    check("duplicate target rejected", is_err(prism_face.prism_face_on(with_one, "t", fn(ev, s) ok(s), false)))
+    check("querying needs_user on an unregistered target is an error, not a default", is_err(prism_face.prism_face_handler_needs_user(base, "nope")))
+    print("")
+
+    // ── 7. lifecycle hooks -- absent is a no-op, present runs ────────────────────────────────
+    print("7. lifecycle hooks")
+    let h0 = unwrap(prism_face.prism_face_new("h", fn(s) ok(s)))
+    check("no hooks registered yet", not prism_face.prism_face_has_hook(h0, "show") and not prism_face.prism_face_has_hook(h0, "hide") and not prism_face.prism_face_has_hook(h0, "load") and not prism_face.prism_face_has_hook(h0, "fail"))
+    let state_in = {"loaded": 0}
+    let state_after_show = unwrap(prism_face.prism_face_show(h0, state_in))
+    check("show with NO hook registered is a no-op (state unchanged)", state_after_show["loaded"] == 0)
+    let state_after_fail = unwrap(prism_face.prism_face_fail(h0, state_in, "boom"))
+    check("fail with NO hook registered is a no-op (state unchanged)", state_after_fail["loaded"] == 0)
+
+    let show_hook = fn(s) ok({"loaded": 1})
+    let hide_hook = fn(s) ok({"loaded": 0})
+    let load_hook = fn(s) ok({"loaded": 2})
+    let fail_hook = fn(s, msg) ok({"loaded": 0 - 1, "error": msg})
+    let h1 = unwrap(prism_face.prism_face_on_show(h0, show_hook))
+    let h2 = unwrap(prism_face.prism_face_on_hide(h1, hide_hook))
+    let h3 = unwrap(prism_face.prism_face_on_load(h2, load_hook))
+    let h4 = unwrap(prism_face.prism_face_on_fail(h3, fail_hook))
+    check("all 4 hooks now present", prism_face.prism_face_has_hook(h4, "show") and prism_face.prism_face_has_hook(h4, "hide") and prism_face.prism_face_has_hook(h4, "load") and prism_face.prism_face_has_hook(h4, "fail"))
+    check("show hook runs", unwrap(prism_face.prism_face_show(h4, state_in))["loaded"] == 1)
+    check("hide hook runs", unwrap(prism_face.prism_face_hide(h4, state_in))["loaded"] == 0)
+    check("load hook runs", unwrap(prism_face.prism_face_load(h4, state_in))["loaded"] == 2)
+    let failed = unwrap(prism_face.prism_face_fail(h4, state_in, "network timeout"))
+    check("fail hook runs and carries the message", failed["loaded"] == 0 - 1 and failed["error"] == "network timeout")
+    check("re-registering an already-set hook is rejected", is_err(prism_face.prism_face_on_show(h4, show_hook)))
+    print("")
+
+    if STATS[1] == 0
+        print("_kat_prism_face: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_face: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

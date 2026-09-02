@@ -1,0 +1,195 @@
+// KAT for prism/core/prism_event.nova -- Prism's event model. Data-driven: the payload-gating
+// matrix (6 kinds x 5 payload accessors) is walked by one loop rather than 30 hand-written
+// blocks, which is also the only way the NEGATIVE half stays honest -- every wrong-kind read is
+// asserted, not just the two or three a hand-written test would remember.
+//
+// The three things this test exists to prove, in order of importance:
+//   1. §15.7 -- the origin gate REJECTS synthetic AND replay, and accepts only genuine input.
+//   2. Invalid kind/payload combinations are unreadable: reading `text` off a press is an `err`,
+//      not a plausible "". Proven for all 30 kind x accessor pairs, not a sample.
+//   3. The vocabulary is CLOSED and fully covered: a 7th kind added without updating this file
+//      fails by name here instead of leaving an untested hole.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to the nova-compiler/ root,
+// NOVA_NO_CACHE=1): _proc_util.ps1's Prism sync block installs prism/**/*.nova into
+// $NOVA_HOME/lib, so `import prism_event` resolves.
+//   ./gen3_test.exe _kat_prism_event.nova
+//   clang -O2 -o _kat_prism_event.exe _kat_prism_event.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_event.exe
+
+import prism_event
+
+let STATS = [0, 0]  // [passed, failed]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+// Build one event of each kind at a given origin, so every matrix walk below uses the same
+// construction path the public API offers rather than a test-only shortcut.
+fn _one_of_each(origin_name: string) -> list
+    if origin_name == "user"
+        return [
+            prism_event.prism_ev_press_from_input("t.press"),
+            prism_event.prism_ev_entry_from_input("t.entry", "hello"),
+            prism_event.prism_ev_pick_from_input("t.pick", 2),
+            prism_event.prism_ev_flag_from_input("t.flag", true),
+            prism_event.prism_ev_range_from_input("t.range", 42),
+            prism_event.prism_ev_link_from_input("t.link", "/docs")
+        ]
+    [
+        prism_event.prism_ev_press_synth("t.press"),
+        prism_event.prism_ev_entry_synth("t.entry", "hello"),
+        prism_event.prism_ev_pick_synth("t.pick", 2),
+        prism_event.prism_ev_flag_synth("t.flag", true),
+        prism_event.prism_ev_range_synth("t.range", 42),
+        prism_event.prism_ev_link_synth("t.link", "/docs")
+    ]
+
+fn main()
+    print("== _kat_prism_event ==")
+    print("")
+
+    // ── 1. the closed vocabulary ─────────────────────────────────────────────────────────────
+    print("1. closed vocabulary (axiom A7)")
+    let kinds = prism_event.prism_ev_kind_all()
+    let origins = prism_event.prism_ev_origin_all()
+    check("6 event kinds, one per §9 interaction primitive (got {len(kinds)})", len(kinds) == 6)
+    check("3 origins (got {len(origins)})", len(origins) == 3)
+    let kind_names = kinds.map(fn(k) prism_event.prism_ev_kind_name(k))
+    let expect_names = ["press", "entry", "pick", "flag", "range", "link"]
+    check("kind names are exactly {expect_names} (got {kind_names})", kind_names == expect_names)
+    let origin_names = origins.map(fn(o) prism_event.prism_ev_origin_name(o))
+    check("origin names are [user, synthetic, replay] (got {origin_names})", origin_names == ["user", "synthetic", "replay"])
+    // Coverage: every kind must be constructible. If a 7th kind is added to the enum without a
+    // constructor here, this count disagrees and names the gap.
+    let built = _one_of_each("user")
+    check("every kind is constructible ({len(built)} of {len(kinds)})", len(built) == len(kinds))
+    print("")
+
+    // ── 2. §15.7 -- the origin gate ──────────────────────────────────────────────────────────
+    print("2. §15.7 input-origin integrity -- THE security property")
+    let u = unwrap(prism_event.prism_ev_press_from_input("save.button"))
+    let s = unwrap(prism_event.prism_ev_press_synth("save.button"))
+    let r = unwrap(prism_event.prism_ev_replay(u))
+    check("user-origin event is_user", prism_event.prism_ev_is_user(u))
+    check("synthetic event is NOT is_user", not prism_event.prism_ev_is_user(s))
+    check("replayed event is NOT is_user", not prism_event.prism_ev_is_user(r))
+    check("require_user ACCEPTS genuine input", not is_err(prism_event.prism_ev_require_user(u)))
+    check("require_user REJECTS synthetic", is_err(prism_event.prism_ev_require_user(s)))
+    check("require_user REJECTS replay (a replayed event must not authorise a fresh action)", is_err(prism_event.prism_ev_require_user(r)))
+    check("origin names round-trip: user/synthetic/replay", prism_event.prism_ev_origin_str(u) == "user" and prism_event.prism_ev_origin_str(s) == "synthetic" and prism_event.prism_ev_origin_str(r) == "replay")
+    print("")
+
+    // ── 3. payload gating: all 30 kind x accessor pairs ──────────────────────────────────────
+    print("3. invalid kind/payload combinations are UNREADABLE (6 kinds x 5 accessors)")
+    let evs = _one_of_each("user").map(fn(x) unwrap(x))
+    // For each accessor, exactly ONE kind index may succeed; every other must err.
+    // order of evs: 0 press, 1 entry, 2 pick, 3 flag, 4 range, 5 link
+    let ok_count = [0, 0]   // [correct-ok, correct-err]
+    let wrong = [0]
+    // `for` over an explicit index list, never a `let mut` counter: the high-level standard bans
+    // hand-rolled index loops, and `enumerate()` is unusable here because it corrupts struct
+    // fields when the list holds structs -- which `evs` does.
+    for idx in [0, 1, 2, 3, 4, 5]
+        let ev = evs[idx]
+        let results = [
+            prism_event.prism_ev_text(ev),
+            prism_event.prism_ev_index(ev),
+            prism_event.prism_ev_flag_state(ev),
+            prism_event.prism_ev_value(ev),
+            prism_event.prism_ev_route(ev)
+        ]
+        // press(0) carries NOTHING, so no accessor may succeed for it; entry(1)->text(0),
+        // pick(2)->index(1), flag(3)->state(2), range(4)->value(3), link(5)->route(4).
+        let expect_ok_at = idx - 1
+        for j in [0, 1, 2, 3, 4]
+            let got_err = is_err(results[j])
+            let should_be_ok = j == expect_ok_at
+            if should_be_ok and got_err
+                wrong[0] = wrong[0] + 1
+                print("    unexpected err: kind {prism_event.prism_ev_kind_str(ev)} accessor {j}")
+            else if not should_be_ok and not got_err
+                wrong[0] = wrong[0] + 1
+                print("    LEAK: kind {prism_event.prism_ev_kind_str(ev)} returned a value for accessor {j} it does not carry")
+            else if should_be_ok
+                ok_count[0] = ok_count[0] + 1
+            else
+                ok_count[1] = ok_count[1] + 1
+    check("30 pairs walked: {ok_count[0]} correct reads + {ok_count[1]} correct rejections, {wrong[0]} wrong", wrong[0] == 0)
+    check("press carries NO payload -> all 5 accessors err", ok_count[1] >= 5)
+    check("the 5 payload-bearing kinds each read back exactly once (got {ok_count[0]})", ok_count[0] == 5)
+    print("")
+
+    // ── 4. payload values round-trip ─────────────────────────────────────────────────────────
+    print("4. payloads round-trip")
+    check("entry text", unwrap(prism_event.prism_ev_text(evs[1])) == "hello")
+    check("pick index", unwrap(prism_event.prism_ev_index(evs[2])) == 2)
+    check("flag state true", unwrap(prism_event.prism_ev_flag_state(evs[3])))
+    let flag_off = unwrap(prism_event.prism_ev_flag_from_input("t.flag", false))
+    check("flag state false", not unwrap(prism_event.prism_ev_flag_state(flag_off)))
+    check("range value", unwrap(prism_event.prism_ev_value(evs[4])) == 42)
+    check("link route", unwrap(prism_event.prism_ev_route(evs[5])) == "/docs")
+    check("targets preserved", prism_event.prism_ev_target(evs[0]) == "t.press" and prism_event.prism_ev_target(evs[5]) == "t.link")
+    print("")
+
+    // ── 5. validation / rejection ────────────────────────────────────────────────────────────
+    print("5. rejection -- a target is required, a route must be a path")
+    check("empty target rejected", is_err(prism_event.prism_ev_press_from_input("")))
+    check("non-string target rejected", is_err(prism_event.prism_ev_press_from_input(7)))
+    check("non-string entry text rejected", is_err(prism_event.prism_ev_entry_from_input("t", 9)))
+    check("non-int pick index rejected", is_err(prism_event.prism_ev_pick_from_input("t", "2")))
+    check("negative pick index rejected", is_err(prism_event.prism_ev_pick_from_input("t", -1)))
+    check("non-int range value rejected", is_err(prism_event.prism_ev_range_from_input("t", "x")))
+    check("empty route rejected", is_err(prism_event.prism_ev_link_from_input("t", "")))
+    // §15.1: the "must start with /" rule excludes every dangerous scheme STRUCTURALLY, so
+    // these are not blocklist entries -- they simply cannot begin with a slash.
+    check("javascript: route rejected structurally", is_err(prism_event.prism_ev_link_from_input("t", "javascript:alert(1)")))
+    check("data: route rejected structurally", is_err(prism_event.prism_ev_link_from_input("t", "data:text/html,<script>")))
+    check("vbscript: route rejected structurally", is_err(prism_event.prism_ev_link_from_input("t", "vbscript:msgbox")))
+    check("bare fragment rejected (no leading /)", is_err(prism_event.prism_ev_link_from_input("t", "#page-3")))
+    // Found while writing this KAT: "//host" satisfies "starts with /" but is PROTOCOL-RELATIVE,
+    // so a browser navigates off-site -- an open redirect wearing the shape of a local path.
+    check("protocol-relative //evil.example REJECTED (open-redirect primitive)", is_err(prism_event.prism_ev_link_from_input("t", "//evil.example")))
+    check("protocol-relative //host/path REJECTED", is_err(prism_event.prism_ev_link_from_input("t", "//attacker.test/login")))
+    check("ordinary single-slash path still ACCEPTED", not is_err(prism_event.prism_ev_link_from_input("t", "/settings/profile")))
+    check("a path whose SECOND segment is empty is still fine (/a//b)", not is_err(prism_event.prism_ev_link_from_input("t", "/a//b")))
+    print("")
+
+    // ── 6. replay is non-mutating ────────────────────────────────────────────────────────────
+    print("6. replay preserves payload and does NOT mutate the original")
+    let orig = unwrap(prism_event.prism_ev_entry_from_input("form.name", "ada"))
+    let rep = unwrap(prism_event.prism_ev_replay(orig))
+    check("replay keeps kind", prism_event.prism_ev_kind_str(rep) == "entry")
+    check("replay keeps target", prism_event.prism_ev_target(rep) == "form.name")
+    check("replay keeps payload", unwrap(prism_event.prism_ev_text(rep)) == "ada")
+    check("replay re-tags origin", prism_event.prism_ev_origin_str(rep) == "replay")
+    check("ORIGINAL still user-origin (non-mutating)", prism_event.prism_ev_origin_str(orig) == "user")
+    print("")
+
+    // ── 7. describe + equality ───────────────────────────────────────────────────────────────
+    print("7. describe and structural equality")
+    check("describe press", prism_event.prism_ev_describe(evs[0]) == "user press on 't.press'")
+    check("describe entry includes text", contains(prism_event.prism_ev_describe(evs[1]), "text='hello'"))
+    check("describe pick includes index", contains(prism_event.prism_ev_describe(evs[2]), "index=2"))
+    check("describe link includes route", contains(prism_event.prism_ev_describe(evs[5]), "route='/docs'"))
+    let a = unwrap(prism_event.prism_ev_pick_from_input("list", 3))
+    let b = unwrap(prism_event.prism_ev_pick_from_input("list", 3))
+    let c = unwrap(prism_event.prism_ev_pick_from_input("list", 4))
+    let d = unwrap(prism_event.prism_ev_pick_synth("list", 3))
+    check("same event is same", prism_event.prism_ev_same(a, b))
+    check("different payload is not same", not prism_event.prism_ev_same(a, c))
+    check("SAME payload but different ORIGIN is not same", not prism_event.prism_ev_same(a, d))
+    check("different kind is not same", not prism_event.prism_ev_same(a, evs[0]))
+    print("")
+
+    if STATS[1] == 0
+        print("_kat_prism_event: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_event: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

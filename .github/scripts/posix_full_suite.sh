@@ -335,6 +335,13 @@ run_one() {
   # Never lower a cap that was passed in explicitly (the serial path passes 150).
   case "$t" in
     forge_chain_test) [ "$rtmo" -lt 180 ] && rtmo=180 ;;
+    # ⛔ DELIBERATELY NOT RAISED for _argon2id_*. Raising it was my first instinct and it is
+    # WRONG: both argon2id tests use m=32 KiB with t=2..3, which is MILLISECONDS of work, so 60s
+    # is not a tight cap -- the test HANGS. A longer cap would only make the hang take 3x longer
+    # to report, which is "measuring the cap, not the platform" in reverse.
+    # Evidence it is a hang and not slowness: 60/60 clean on Windows at NOVA_CARRIERS=1/4/8, but
+    # macOS shows CARRIERS=1 0/6 vs CARRIERS=4 2/6 -- i.e. it needs multiple carriers. The
+    # watchdog is enabled for the macOS probe runs so the next occurrence names where it is stuck.
   esac
   # RUN(1) failures print their own diagnosis to stdout/stderr; keep the first meaningful line.
   if TMO "$rtmo" "./$exe" >>"$log" 2>&1; then
