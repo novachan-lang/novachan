@@ -1,0 +1,123 @@
+// KAT for prism/obs/prism_perf.nova -- per-face invalidation counts + render latency profiling.
+//
+// The five things this proves, in order of importance:
+//   1. Counts are PER-FACE -- two faces never interfere with each other's counters.
+//   2. begin/end MISUSE is rejected: end without a matching begin, and a double begin without an
+//      intervening end, both come back as a typed err naming the face -- never silently corrupt.
+//   3. Derived stats (avg/min/max) REJECT at zero samples rather than lying with a 0ms answer that
+//      would be indistinguishable from "genuinely renders in under a millisecond".
+//   4. `PrismPerf` is an immutable VALUE: every operation returns a NEW value, and a reference held
+//      to an older snapshot is provably unaffected by later recording -- the same guarantee
+//      prism_face.nova's header states for its own handler table.
+//   5. Real elapsed time (via `sleep`) actually accumulates into total/min/max/avg correctly.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to nova-compiler/, NOVA_NO_CACHE=1)
+
+import prism_perf
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_perf ==")
+    print("")
+
+    print("1. a fresh recorder knows nothing -- totals are 0, derived stats REJECT")
+    let p0 = prism_perf.prism_perf_new()
+    check("render_count on an unseen face is 0 (total function, not an error)", prism_perf.prism_perf_render_count(p0, "card") == 0)
+    check("invalidate_count on an unseen face is 0", prism_perf.prism_perf_invalidate_count(p0, "card") == 0)
+    check("total_ms on an unseen face is 0", prism_perf.prism_perf_total_ms(p0, "card") == 0)
+    check("avg_ms REJECTS at zero samples", is_err(prism_perf.prism_perf_avg_ms(p0, "card")))
+    check("min_ms REJECTS at zero samples", is_err(prism_perf.prism_perf_min_ms(p0, "card")))
+    check("max_ms REJECTS at zero samples", is_err(prism_perf.prism_perf_max_ms(p0, "card")))
+    check("no faces tracked yet", len(prism_perf.prism_perf_faces(p0)) == 0)
+    check("is_open is false before any begin", not prism_perf.prism_perf_is_open(p0, "card"))
+    print("")
+
+    print("2. invalidation counts are PER-FACE and additive")
+    let p1 = unwrap(prism_perf.prism_perf_mark_invalidate(p0, "card"))
+    let p2 = unwrap(prism_perf.prism_perf_mark_invalidate(p1, "card"))
+    let p3 = unwrap(prism_perf.prism_perf_mark_invalidate(p2, "toolbar"))
+    check("card invalidated twice", prism_perf.prism_perf_invalidate_count(p3, "card") == 2)
+    check("toolbar invalidated once -- independent of card's count", prism_perf.prism_perf_invalidate_count(p3, "toolbar") == 1)
+    check("a third face never touched stays at 0", prism_perf.prism_perf_invalidate_count(p3, "sidebar") == 0)
+    check("mark_invalidate rejects an empty face name", is_err(prism_perf.prism_perf_mark_invalidate(p0, "")))
+    check("mark_invalidate rejects a non-string face", is_err(prism_perf.prism_perf_mark_invalidate(p0, 7)))
+    print("")
+
+    print("3. begin/end -- a real timed span")
+    let b1 = unwrap(prism_perf.prism_perf_begin(p0, "card"))
+    check("is_open is true right after begin", prism_perf.prism_perf_is_open(b1, "card"))
+    sleep(30)
+    let e1 = unwrap(prism_perf.prism_perf_end(b1, "card"))
+    check("is_open is false right after end", not prism_perf.prism_perf_is_open(e1, "card"))
+    check("render_count is 1 after one begin/end pair", prism_perf.prism_perf_render_count(e1, "card") == 1)
+    let total1 = prism_perf.prism_perf_total_ms(e1, "card")
+    check("total_ms picked up the ~30ms sleep (elapsed > 0)", total1 > 0)
+    check("avg_ms now succeeds and equals total_ms for a single sample", unwrap(prism_perf.prism_perf_avg_ms(e1, "card")) == total1)
+    check("min_ms == max_ms == total_ms for a single sample", unwrap(prism_perf.prism_perf_min_ms(e1, "card")) == total1 and unwrap(prism_perf.prism_perf_max_ms(e1, "card")) == total1)
+    print("")
+
+    print("4. a second span updates min/max/avg/total correctly")
+    let b2 = unwrap(prism_perf.prism_perf_begin(e1, "card"))
+    sleep(5)
+    let e2 = unwrap(prism_perf.prism_perf_end(b2, "card"))
+    check("render_count is now 2", prism_perf.prism_perf_render_count(e2, "card") == 2)
+    let total2 = prism_perf.prism_perf_total_ms(e2, "card")
+    let mn = unwrap(prism_perf.prism_perf_min_ms(e2, "card"))
+    let mx = unwrap(prism_perf.prism_perf_max_ms(e2, "card"))
+    let avg = unwrap(prism_perf.prism_perf_avg_ms(e2, "card"))
+    check("total_ms grew (2nd span added positive time)", total2 >= total1)
+    check("min <= avg <= max holds", mn <= avg and avg <= mx)
+    check("avg is exactly total/count (integer division)", avg == total2 / 2)
+    check("max is at least as large as the FIRST span alone (the slower one)", mx >= total1)
+    print("")
+
+    print("5. begin/end misuse -- REJECTED, never silently corrupted")
+    check("end() with no matching begin is rejected", is_err(prism_perf.prism_perf_end(p0, "never_begun")))
+    let opened = unwrap(prism_perf.prism_perf_begin(p0, "dup"))
+    check("a SECOND begin on an already-open face is rejected", is_err(prism_perf.prism_perf_begin(opened, "dup")))
+    check("begin rejects an empty face name", is_err(prism_perf.prism_perf_begin(p0, "")))
+    check("end rejects a non-string face", is_err(prism_perf.prism_perf_end(p0, 7)))
+    print("")
+
+    print("6. PrismPerf is an IMMUTABLE VALUE -- old snapshots are frozen")
+    check("p0 (the original, never mutated) still shows 0 invalidations for card", prism_perf.prism_perf_invalidate_count(p0, "card") == 0)
+    check("p1 (before the 2nd mark) still shows exactly 1", prism_perf.prism_perf_invalidate_count(p1, "card") == 1)
+    check("p3 (after both marks) shows 2 -- p1 was NOT retroactively mutated", prism_perf.prism_perf_invalidate_count(p3, "card") == 2)
+    check("e1 (before the 2nd span) still has render_count 1", prism_perf.prism_perf_render_count(e1, "card") == 1)
+    check("e2 (after the 2nd span) has render_count 2 -- e1 was NOT retroactively mutated", prism_perf.prism_perf_render_count(e2, "card") == 2)
+    print("")
+
+    print("7. faces() / snapshot() reporting")
+    let names = prism_perf.prism_perf_faces(p3)
+    check("faces() lists exactly the 2 faces touched, in insertion order", join(names, ",") == "card,toolbar")
+    let snap = prism_perf.prism_perf_snapshot(p3)
+    check("snapshot() has one PrismPerfStat per tracked face", len(snap) == 2)
+    check("snapshot()'s first stat is card's, with the right invalidate_count", prism_perf.prism_perf_stat_face(snap[0]) == "card" and prism_perf.prism_perf_stat_invalidate_count(snap[0]) == 2)
+    check("snapshot() stat accessors agree with the direct query functions", prism_perf.prism_perf_stat_render_count(snap[0]) == prism_perf.prism_perf_render_count(p3, "card"))
+    print("")
+
+    print("8. reset")
+    let r1 = unwrap(prism_perf.prism_perf_reset_face(p3, "card"))
+    check("reset_face clears card's invalidate_count back to 0", prism_perf.prism_perf_invalidate_count(r1, "card") == 0)
+    check("reset_face leaves toolbar untouched", prism_perf.prism_perf_invalidate_count(r1, "toolbar") == 1)
+    check("reset_face rejects an empty face name", is_err(prism_perf.prism_perf_reset_face(p3, "")))
+    let r2 = prism_perf.prism_perf_reset_all(p3)
+    check("reset_all clears every face", len(prism_perf.prism_perf_faces(r2)) == 0)
+    check("reset_all leaves the ORIGINAL p3 untouched (still immutable)", prism_perf.prism_perf_invalidate_count(p3, "card") == 2)
+    print("")
+
+    if STATS[1] == 0
+        print("_kat_prism_perf: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_perf: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

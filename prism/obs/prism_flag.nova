@@ -1,0 +1,141 @@
+// prism_flag -- feature flags + A/B experiments for Prism apps (obs/prism_flag.nova).
+// prism/obs/README.md: "Feature flags + A/B, wrapping the existing forge_flags/forge_ab_test
+// modules (#94 #95)".
+//
+// ── WHY A WRAPPER, NOT A NEW IMPLEMENTATION ──────────────────────────────────────────────────
+// forge_flags already ships a correct, race-free actor-owned flag store (a single spawned green
+// task owns all state; callers park on a reply channel -- no locks, no atomics, correct under N>1
+// NOVA_CARRIERS by construction, per its own header), and forge_ab_test already ships a correct
+// A/B experiment tracker (Result-based, with its own key-scheme/existence-guard bugs already fixed
+// per its header). Re-implementing either here would be exactly the redundant-implementation class
+// CLAUDE.md's "does this already exist?" rule exists to catch. This module's job is narrower: give
+// Prism app code (face bodies, event handlers) ONE Result-based, validated, Prism-prefixed surface
+// over BOTH stores, instead of two different underlying conventions -- forge_flags returns bare
+// strings/bools with NO input validation (an empty flag name is silently accepted), forge_ab_test
+// returns Result but only validates at the experiment/variant level, not the name itself.
+//
+// ── PrismFlags IS A HANDLE, NOT AN IMMUTABLE VALUE -- UNLIKE prism_select / prism_perf ──────────
+// Every other text/ and obs/ module built this session (prism_select, prism_perf) returns a NEW
+// value from every operation, matching prism_face.nova's documented discipline. This module
+// deliberately does NOT: forge_flags's handle wraps a CHANNEL to a live actor, and forge_ab_test's
+// table is a `dict` mutated in place by the underlying module's own functions (`t["experiments"]
+// [...] = ...`, relying on the same shared-reference dict semantics `prism_ui_pager.nova`'s
+// `seen[key] = true` and prism_face.nova's own header both document). Wrapping either as if it were
+// a frozen snapshot would misrepresent what they actually are: two callers holding the same
+// `PrismFlags` handle always observe the same live, shared state -- that IS the point of an
+// actor-owned flag store (every reader sees the latest write, with no stale-copy risk). So every
+// wrapper function below returns the SAME handle it was given inside its `Result` (never a copy),
+// purely so call sites can still use `?`-chaining the way the rest of Prism does; the underlying
+// mutation already happened (or the actor's state already changed) before the function returns.
+//
+// ── VALIDATION ADDED AT THIS LAYER ────────────────────────────────────────────────────────────
+// Both underlying names accept an empty string as a flag/experiment name with no complaint
+// (forge_flags stores it as a valid dict key; forge_ab_test would key it as `"exp_"`, colliding
+// with every OTHER caller who also passes an empty name). Rejected here, at the Prism boundary,
+// the same way every other Prism constructor rejects an empty required string. `ab_create` also
+// gets one more check forge_ab_test does not make: `variant_a == variant_b` is accepted upstream
+// (the two labels are purely descriptive; the actual bucket keys are the fixed "a"/"b" from
+// `ab_variants()`) but produces a report where both rows carry the identical label -- indistinguish-
+// able to a human reading a dashboard. Rejected here as a caller mistake.
+//
+// PUBLIC API
+//   PrismFlags                                                    the value type (a HANDLE, see above)
+//   prism_flag_new()                                 -> PrismFlags
+//   prism_flag_set(pf, name, value)                  -> Result<PrismFlags>   fire-and-forget write
+//   prism_flag_enable/_disable(pf, name)             -> Result<PrismFlags>   set to "on"/"off"
+//   prism_flag_value(pf, name)                       -> Result<string>       "" if never set
+//   prism_flag_on(pf, name)                          -> Result<bool>         true iff value == "on"
+//   prism_flag_ab_create(pf, name, variant_a, variant_b) -> Result<PrismFlags>
+//   prism_flag_ab_assign(pf, name, user_hash)        -> Result<string>       buckets into "a"/"b"
+//   prism_flag_ab_convert(pf, name, variant)         -> Result<PrismFlags>   record a conversion
+//   prism_flag_ab_rate(pf, name, variant)            -> Result<int>          conversion rate, whole percent
+//   prism_flag_ab_winner(pf, name)                   -> Result<string>       "a" | "b" | "tie"
+//   prism_flag_ab_report(pf, name)                   -> Result<dict>         {variant: [imp,conv,rate]}
+
+import forge_flags
+import forge_ab_test
+
+// Fields are `flg_`-prefixed: NOVA's struct field->slot map is GLOBAL, so an unprefixed `handle`
+// would share a slot with any other module's field of that name and silently corrupt dot-access,
+// which reconverge cannot detect (the same rule every other Prism module in this campaign states).
+type PrismFlags
+    flg_handle: any    // forge_flags actor handle (a dict holding the request channel)
+    flg_ab: dict        // forge_ab_test experiment table -- mutated IN PLACE by forge_ab_test itself
+
+fn _pfg_check_name(v, label: string) -> Result<string>
+    if type_of(v) != "string"
+        return err("prism_flag: {label} must be a string, got {type_of(v)}")
+    if len(v) == 0
+        return err("prism_flag: {label} must not be empty")
+    ok(v)
+
+fn prism_flag_new() -> PrismFlags
+    PrismFlags(forge_flags.flags_new(), forge_ab_test.ab_new())
+
+// ── boolean / variant flags (wraps forge_flags) ─────────────────────────────────────────────
+fn prism_flag_set(pf: PrismFlags, name, value) -> Result<PrismFlags>
+    let n = _pfg_check_name(name, "flag name")?
+    let v = _pfg_check_name(value, "flag value")?
+    forge_flags.flag_set(pf.flg_handle, n, v)
+    ok(pf)
+
+fn prism_flag_enable(pf: PrismFlags, name) -> Result<PrismFlags>
+    let n = _pfg_check_name(name, "flag name")?
+    forge_flags.flag_enable(pf.flg_handle, n)
+    ok(pf)
+
+fn prism_flag_disable(pf: PrismFlags, name) -> Result<PrismFlags>
+    let n = _pfg_check_name(name, "flag name")?
+    forge_flags.flag_disable(pf.flg_handle, n)
+    ok(pf)
+
+fn prism_flag_value(pf: PrismFlags, name) -> Result<string>
+    let n = _pfg_check_name(name, "flag name")?
+    ok(forge_flags.flag_value(pf.flg_handle, n))
+
+fn prism_flag_on(pf: PrismFlags, name) -> Result<bool>
+    let n = _pfg_check_name(name, "flag name")?
+    ok(forge_flags.flag_on(pf.flg_handle, n))
+
+// ── A/B experiments (wraps forge_ab_test) ───────────────────────────────────────────────────
+// forge_ab_test's own functions return `Result` with a DIFFERENT Ok-type parameter than this
+// module's `Result<PrismFlags>` (dict vs PrismFlags) -- the same E1001 class prism_face.nova's
+// header documents for `prism_ev_require_user`. Those two check `is_err` explicitly and re-wrap;
+// the ones whose underlying Ok-type already matches (string, int) use `?` directly.
+fn prism_flag_ab_create(pf: PrismFlags, name, variant_a, variant_b) -> Result<PrismFlags>
+    let n = _pfg_check_name(name, "experiment name")?
+    let va = _pfg_check_name(variant_a, "variant_a")?
+    let vb = _pfg_check_name(variant_b, "variant_b")?
+    if va == vb
+        return err("prism_flag: variant_a and variant_b must be different labels, both were '{va}'")
+    let r = forge_ab_test.ab_create(pf.flg_ab, n, va, vb)
+    if is_err(r)
+        return err(unwrap_err(r))
+    ok(pf)
+
+fn prism_flag_ab_assign(pf: PrismFlags, name, user_hash) -> Result<string>
+    let n = _pfg_check_name(name, "experiment name")?
+    if type_of(user_hash) != "int"
+        return err("prism_flag: user_hash must be an int, got {type_of(user_hash)}")
+    forge_ab_test.ab_assign(pf.flg_ab, n, user_hash)
+
+fn prism_flag_ab_convert(pf: PrismFlags, name, variant) -> Result<PrismFlags>
+    let n = _pfg_check_name(name, "experiment name")?
+    let v = _pfg_check_name(variant, "variant")?
+    let r = forge_ab_test.ab_convert(pf.flg_ab, n, v)
+    if is_err(r)
+        return err(unwrap_err(r))
+    ok(pf)
+
+fn prism_flag_ab_rate(pf: PrismFlags, name, variant) -> Result<int>
+    let n = _pfg_check_name(name, "experiment name")?
+    let v = _pfg_check_name(variant, "variant")?
+    forge_ab_test.ab_conversion_rate(pf.flg_ab, n, v)
+
+fn prism_flag_ab_winner(pf: PrismFlags, name) -> Result<string>
+    let n = _pfg_check_name(name, "experiment name")?
+    forge_ab_test.ab_winner(pf.flg_ab, n)
+
+fn prism_flag_ab_report(pf: PrismFlags, name) -> Result<dict>
+    let n = _pfg_check_name(name, "experiment name")?
+    forge_ab_test.ab_report(pf.flg_ab, n)

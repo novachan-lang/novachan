@@ -1,0 +1,161 @@
+// prism_find -- in-app find over a prism_textmodel document (text/prism_find.nova).
+// PRISM_STATUS.md text/README: "In-app find (replaces Ctrl+F on the GPU backend, where there is
+// no browser find-in-page)". Does not re-implement positions: matches are located and reported in
+// the same CODE POINT space prism_textmodel and prism_select already use.
+//
+// ── WHY CODE POINTS, NOT A BYTE indexOf ────────────────────────────────────────────────────────
+// `text.contains(needle)`-style byte search cannot report a usable POSITION for anything past the
+// first multi-byte character -- a match after "héllo " would be off by however many extra bytes
+// the accented/CJK text before it contributed, the same corruption prism_textmodel's own header
+// documents for byte-indexed edits. So the haystack and needle are both decoded to CODE POINT
+// arrays (`code_points`, matching `_tm_sub`'s idiom) and compared element-by-element; every
+// reported `PrismMatch` is a `[from, to)` CODE POINT range, directly usable as a
+// `prism_sel_select_range` argument with no conversion.
+//
+// ── MATCHES DO NOT OVERLAP: THE SCAN ADVANCES PAST EACH HIT ─────────────────────────────────────
+// This is a deliberate, tested policy choice, not an accident of the algorithm. Given "aaaa" and
+// needle "aa", a naive scan that only ever advances by 1 code point would report THREE candidate
+// positions (0, 1, 2) -- but position 1's match ([1,3)) overlaps position 0's ([0,2)), which is not
+// what "find all" means in any real editor or browser Ctrl+F: those report each character of text
+// as part of AT MOST ONE match. So on a hit the scan cursor jumps to the END of that match (skips
+// `needle`'s own length) rather than advancing by 1; on a miss it advances by 1 as normal. The KAT
+// proves this on exactly the case that would fail a naive slide-by-1 scan ("ababa" containing
+// "aba" twice by naive overlap but once under this policy).
+//
+// ── AN EMPTY NEEDLE IS REJECTED, NOT AN INFINITE / ALL-POSITIONS MATCH ───────────────────────────
+// A zero-length needle technically "matches" at every position including the end, which is not a
+// useful find result and is the classic way a naive scanner hangs (advancing by the needle's own
+// length, which is 0, never makes progress). Rejected outright by `_fnd_check_needle` with a typed
+// err rather than returning a match at every position or looping forever.
+//
+// ── NEEDLE LONGER THAN THE HAYSTACK IS ZERO MATCHES, NOT AN ERROR ───────────────────────────────
+// Typing a search term longer than the whole document is completely ordinary while a user is still
+// typing into a find box (every character typed re-runs the search). `find_all` returns an empty
+// list; only an empty/non-string needle is rejected, because that is a caller mistake, but "no
+// matches exist" never is.
+//
+// ── CASE-INSENSITIVE SEARCH IS ASCII-ONLY, STATED RATHER THAN HIDDEN ────────────────────────────
+// `case_sensitive: false` lowers both haystack and needle with the builtin `str_to_lower`, which is
+// a byte-wise C-locale `tolower` (verified against `nova_rt_str_to_lower` in nova_runtime.c) -- it
+// is SAFE on UTF-8 (no ASCII byte 'A'-'Z' can occur inside a multi-byte sequence, so it can never
+// corrupt one) but it does not case-fold non-ASCII letters (accented Latin, Cyrillic, etc). A
+// case-insensitive search for "CAFE" will not match "café"'s accented form differently than a
+// case-sensitive one would; a case-insensitive search over plain ASCII text works exactly as
+// expected. Known limitation, not a silent one: full Unicode case-folding needs an ICU-class table
+// this runtime does not have. Because `str_to_lower` only ever rewrites ASCII bytes, code point
+// COUNT and POSITIONS are unaffected either way, so this limitation never corrupts a reported
+// range -- it only means an accented character will not participate in a case-insensitive fold.
+//
+// PUBLIC API (positions are code points; doc = a prism_textmodel PrismDoc)
+//   PrismMatch                                                     the value type
+//   prism_fnd_match_from/_to/_len(m)                 -> int
+//   prism_fnd_match_text(m, doc)                     -> Result<string>
+//   prism_fnd_find_all(doc, needle, case_sensitive)  -> Result<list>        list<PrismMatch>, non-overlapping
+//   prism_fnd_count(doc, needle, case_sensitive)     -> Result<int>
+//   prism_fnd_find_first(doc, needle, case_sensitive) -> Result<PrismMatch> err if no match
+//   prism_fnd_find_next(doc, needle, case_sensitive, from_pos) -> Result<PrismMatch>
+//     first match with fnd_from >= from_pos; WRAPS to the first match if none qualifies -- the
+//     "Find Next" behaviour of every real find box. err only if there is no match anywhere.
+
+import prism_textmodel
+
+// Fields are `fnd_`-prefixed: NOVA's struct field->slot map is GLOBAL, so an unprefixed `from`/`to`
+// would share a slot with any other module's field of that name and silently corrupt dot-access,
+// which reconverge cannot detect (the same rule prism_textmodel and prism_select both state).
+type PrismMatch
+    fnd_from: int
+    fnd_to: int
+
+fn _fnd_check_needle(needle) -> Result<string>
+    if type_of(needle) != "string"
+        return err("prism_find: needle must be a string, got {type_of(needle)}")
+    if len(needle) == 0
+        return err("prism_find: needle must not be empty (an empty needle would match everywhere or loop forever, so it is rejected outright)")
+    ok(needle)
+
+fn _fnd_check_int(v, label: string) -> Result<int>
+    if type_of(v) != "int"
+        return err("prism_find: {label} must be an int, got {type_of(v)}")
+    ok(v)
+
+// True iff `nn` consecutive code points of `hay_cp` starting at `start` equal `ndl_cp` exactly.
+// A plain comparison loop rather than a list-slice-then-compare: list bracket slicing is not
+// reliable in NOVA today (only string slicing is; see prism_textmodel.nova's header), so this
+// mirrors `_tm_sub`'s own workaround of walking code points explicitly instead of slicing a list.
+fn _fnd_matches_at(hay_cp: list, ndl_cp: list, start: int, nn: int) -> bool
+    let all_eq = [true]
+    for j in 0..nn
+        if hay_cp[start + j] != ndl_cp[j]
+            all_eq[0] = false
+    all_eq[0]
+
+// ── accessors ─────────────────────────────────────────────────────────────────────────────
+fn prism_fnd_match_from(m: PrismMatch) -> int
+    m.fnd_from
+
+fn prism_fnd_match_to(m: PrismMatch) -> int
+    m.fnd_to
+
+fn prism_fnd_match_len(m: PrismMatch) -> int
+    m.fnd_to - m.fnd_from
+
+fn prism_fnd_match_text(m: PrismMatch, doc: PrismDoc) -> Result<string>
+    let sl = prism_textmodel.prism_tm_slice(doc, m.fnd_from, m.fnd_to)?
+    ok(prism_textmodel.prism_tm_text(sl))
+
+// ── search ────────────────────────────────────────────────────────────────────────────────
+// A `while` scan with a variable step (1 on a miss, `nn` on a hit) is used deliberately -- the
+// step size depends on the outcome of each comparison, which a `for x in xs`/`.map()` cannot
+// express, the same reasoning prism_text.nova's own byte-scanning loops document (`i += blen`).
+fn prism_fnd_find_all(doc: PrismDoc, needle, case_sensitive) -> Result<list>
+    let nd = _fnd_check_needle(needle)?
+    let text = prism_textmodel.prism_tm_text(doc)
+    let hay_cmp = if case_sensitive
+        text
+    else
+        str_to_lower(text)
+    let ndl_cmp = if case_sensitive
+        nd
+    else
+        str_to_lower(nd)
+    let hay_cp = code_points(hay_cmp)
+    let ndl_cp = code_points(ndl_cmp)
+    let hn = len(hay_cp)
+    let nn = len(ndl_cp)
+    let out = []
+    if nn > hn
+        return ok(out)
+    let i = 0
+    while i <= hn - nn
+        if _fnd_matches_at(hay_cp, ndl_cp, i, nn)
+            push(out, PrismMatch(i, i + nn))
+            i += nn
+        else
+            i += 1
+    ok(out)
+
+fn prism_fnd_count(doc: PrismDoc, needle, case_sensitive) -> Result<int>
+    let all = prism_fnd_find_all(doc, needle, case_sensitive)?
+    ok(len(all))
+
+fn prism_fnd_find_first(doc: PrismDoc, needle, case_sensitive) -> Result<PrismMatch>
+    let all = prism_fnd_find_all(doc, needle, case_sensitive)?
+    if len(all) == 0
+        return err("prism_find: no match for the given needle")
+    ok(all[0])
+
+// "Find Next": the first match at or after `from_pos`, wrapping to the very first match if the
+// cursor is past the last one -- e.g. pressing Enter in a find box repeatedly cycles through every
+// match and then loops back to the top, which is what every real find box does.
+fn prism_fnd_find_next(doc: PrismDoc, needle, case_sensitive, from_pos) -> Result<PrismMatch>
+    let fp = _fnd_check_int(from_pos, "from_pos")?
+    let all = prism_fnd_find_all(doc, needle, case_sensitive)?
+    if len(all) == 0
+        return err("prism_find: no match for the given needle")
+    let hit = [[]]
+    for m in all
+        if len(hit[0]) == 0 and m.fnd_from >= fp
+            hit[0] = [m]
+    if len(hit[0]) > 0
+        return ok(hit[0][0])
+    ok(all[0])

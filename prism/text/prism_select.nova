@@ -1,0 +1,206 @@
+// prism_select -- selection + caret, built ON TOP of prism_textmodel (text/prism_select.nova).
+// PRISM_STATUS.md text/README: "Selection + caret". Does not re-implement positions: every bound
+// operation below calls prism_textmodel for length/slice/text and inherits its CODE POINT
+// contract (prism_textmodel.nova's header explains why bytes/cells are both wrong here).
+//
+// ── A SELECTION IS AN ANCHOR + A HEAD, NOT A (LO,HI) PAIR ────────────────────────────────────
+// anchor = where the selection STARTED (mouse-down, shift-click origin, the first arrow-key press
+// with shift held). head = the ACTIVE end -- the one that moves while shift is held, where the
+// caret renders. Collapsed (anchor == head) IS the caret; there is no separate Caret type, the
+// same move prism_textmodel made for a plain label being a one-run document instead of a second
+// type. A bare (lo,hi) pair cannot represent this: it cannot say "which end is anchored", so
+// shift+Right after a backwards drag would not know whether to grow or shrink the selection.
+//
+// ── BACKWARDS SELECTIONS ARE REAL: anchor MAY BE AFTER head ─────────────────────────────────
+// Drag or shift+Left from a point produces anchor > head. Every real text control supports this.
+// `lo`/`hi`/`normalize` exist for callers that only care about the covered RANGE (rendering the
+// highlight, extracting text, clipboard); `anchor`/`head` stay whatever direction the interaction
+// actually produced everywhere else, because collapsing that direction is exactly what would make
+// a subsequent shift+Right on a backwards selection do the wrong thing.
+//
+// ── TWO DIFFERENT KINDS OF OUT-OF-RANGE, TWO DIFFERENT ANSWERS ───────────────────────────────
+// prism_textmodel's rule is "never silently clamp" -- an out-of-range edit is always a bug and is
+// always rejected. That rule is right for a document edit. It is WRONG for caret movement:
+// pressing End, or Backspace at position 0, or Right at the last character are not bugs -- they
+// are the single most common thing a text control does every keystroke, and an editor that raised
+// an error on "you pressed Right at the end of the line" would be unusable. So the split is made
+// explicit instead of picking one rule for everything:
+//   * VALIDATED CONSTRUCTION (prism_sel_new, prism_sel_select_range) REJECTS an out-of-range
+//     position with a typed err, exactly like prism_textmodel -- building a selection from data
+//     that claims a position outside the document IS a bug (e.g. a stale index after an edit).
+//   * INTERACTIVE MOVEMENT (prism_sel_extend_to/_by, prism_sel_move_to/_by, prism_sel_clamp_to_doc)
+//     CLAMPS into [0, length] -- these model arrow keys and drags, where landing exactly on a
+//     boundary is the expected outcome of ordinary use, not an error state a caller must handle.
+// Both families still REJECT a wrong TYPE (e.g. a string where an int position is expected) --
+// clamping only ever applies to an int that is merely out of range, never to a malformed value.
+//
+// ── WHAT THIS MODULE DOES NOT DO ──────────────────────────────────────────────────────────────
+// Arrow-key POLICY (does Right on an active, non-collapsed selection move the caret, or just
+// collapse to the visual end without moving further?) is editor-widget policy, not position math,
+// and differs by platform convention. This module supplies the primitives a policy is built from
+// (`collapse_to_start`/`collapse_to_end`/`extend_by`/`move_by`) and takes no view on which one an
+// arrow-key handler should call in which state.
+//
+// PUBLIC API (bound = takes `doc: PrismDoc`; positions are code points throughout)
+//   PrismSelection                                          the value type
+//   prism_sel_at(pos)                        -> Result<PrismSelection>   unbound collapsed caret
+//   prism_sel_raw(anchor, head)              -> Result<PrismSelection>   unbound pair (>= 0 only)
+//   prism_sel_new(doc, anchor, head)         -> Result<PrismSelection>   bound, REJECTS out-of-range
+//   prism_sel_select_range(doc, from, to)    -> Result<PrismSelection>   bound, forward-only, REJECTS
+//   prism_sel_select_all(doc)                -> PrismSelection           anchor 0, head length(doc)
+//   prism_sel_anchor/_head/_lo/_hi(sel)      -> int
+//   prism_sel_is_collapsed(sel) / _is_backwards(sel) -> bool
+//   prism_sel_normalize(sel)                 -> PrismSelection           anchor<=head, same range
+//   prism_sel_collapse_to_anchor/_head/_start/_end(sel) -> PrismSelection
+//   prism_sel_extend_to(sel, doc, pos)       -> Result<PrismSelection>   CLAMPS, moves head only
+//   prism_sel_move_to(sel, doc, pos)         -> Result<PrismSelection>   CLAMPS, collapses to pos
+//   prism_sel_extend_by(sel, doc, delta)     -> Result<PrismSelection>   CLAMPS, moves head only
+//   prism_sel_move_by(sel, doc, delta)       -> Result<PrismSelection>   CLAMPS, collapses
+//   prism_sel_clamp_to_doc(sel, doc)         -> PrismSelection           re-bind after doc shrinks
+//   prism_sel_text(sel, doc)                 -> Result<string>          the covered text
+//   prism_sel_same(a, b) / _same_range(a, b) -> bool
+
+import prism_textmodel
+
+// Fields are `sel_`-prefixed: NOVA's struct field->slot map is GLOBAL, so an unprefixed `anchor`
+// or `head` would share a slot with any other module's field of that name and silently corrupt
+// dot-access, which reconverge cannot detect (prism_textmodel.nova's header states the same rule).
+type PrismSelection
+    sel_anchor: int
+    sel_head: int
+
+fn _sel_clamp(v: int, lo: int, hi: int) -> int
+    if v < lo
+        lo
+    else if v > hi
+        hi
+    else
+        v
+
+fn _sel_check_int(v, label: string) -> Result<int>
+    if type_of(v) != "int"
+        return err("prism_select: {label} must be an int, got {type_of(v)}")
+    ok(v)
+
+// ── unbound construction (no document, so only non-negativity is checkable) ─────────────────
+fn prism_sel_raw(anchor, head) -> Result<PrismSelection>
+    let a = _sel_check_int(anchor, "anchor")?
+    let h = _sel_check_int(head, "head")?
+    if a < 0
+        return err("prism_select: anchor must be >= 0, got {a}")
+    if h < 0
+        return err("prism_select: head must be >= 0, got {h}")
+    ok(PrismSelection(a, h))
+
+fn prism_sel_at(pos) -> Result<PrismSelection>
+    prism_sel_raw(pos, pos)
+
+// ── bound, VALIDATED construction -- REJECTS out-of-range (prism_textmodel's rule) ──────────
+fn _sel_check_bound(doc: PrismDoc, v, label: string) -> Result<int>
+    let iv = _sel_check_int(v, label)?
+    let n = prism_textmodel.prism_tm_length(doc)
+    if iv < 0 or iv > n
+        return err("prism_select: {label} {iv} is outside the document (length {n})")
+    ok(iv)
+
+fn prism_sel_new(doc: PrismDoc, anchor, head) -> Result<PrismSelection>
+    let a = _sel_check_bound(doc, anchor, "anchor")?
+    let h = _sel_check_bound(doc, head, "head")?
+    ok(PrismSelection(a, h))
+
+// Forward-only range, REUSING prism_textmodel's own range validation instead of re-deriving the
+// boundary math -- if the slice succeeds, the range is valid, full stop.
+fn prism_sel_select_range(doc: PrismDoc, from, to) -> Result<PrismSelection>
+    let _s = prism_textmodel.prism_tm_slice(doc, from, to)?
+    ok(PrismSelection(from, to))
+
+fn prism_sel_select_all(doc: PrismDoc) -> PrismSelection
+    PrismSelection(0, prism_textmodel.prism_tm_length(doc))
+
+// ── inspection ────────────────────────────────────────────────────────────────────────────
+fn prism_sel_anchor(sel: PrismSelection) -> int
+    sel.sel_anchor
+
+fn prism_sel_head(sel: PrismSelection) -> int
+    sel.sel_head
+
+fn prism_sel_lo(sel: PrismSelection) -> int
+    if sel.sel_anchor < sel.sel_head
+        sel.sel_anchor
+    else
+        sel.sel_head
+
+fn prism_sel_hi(sel: PrismSelection) -> int
+    if sel.sel_anchor > sel.sel_head
+        sel.sel_anchor
+    else
+        sel.sel_head
+
+fn prism_sel_is_collapsed(sel: PrismSelection) -> bool
+    sel.sel_anchor == sel.sel_head
+
+fn prism_sel_is_backwards(sel: PrismSelection) -> bool
+    sel.sel_anchor > sel.sel_head
+
+// Same covered range, forward-ordered. Idempotent on an already-forward selection (asserted in
+// the KAT) -- normalising is a pure re-ordering, never a range change.
+fn prism_sel_normalize(sel: PrismSelection) -> PrismSelection
+    PrismSelection(prism_sel_lo(sel), prism_sel_hi(sel))
+
+fn prism_sel_collapse_to_anchor(sel: PrismSelection) -> PrismSelection
+    PrismSelection(sel.sel_anchor, sel.sel_anchor)
+
+fn prism_sel_collapse_to_head(sel: PrismSelection) -> PrismSelection
+    PrismSelection(sel.sel_head, sel.sel_head)
+
+// Visual start/end regardless of drag direction -- what Left/Right typically collapse to.
+fn prism_sel_collapse_to_start(sel: PrismSelection) -> PrismSelection
+    let p = prism_sel_lo(sel)
+    PrismSelection(p, p)
+
+fn prism_sel_collapse_to_end(sel: PrismSelection) -> PrismSelection
+    let p = prism_sel_hi(sel)
+    PrismSelection(p, p)
+
+// ── interactive movement -- CLAMPS, never rejects an in-range-TYPE position that is out of BOUNDS
+fn prism_sel_extend_to(sel: PrismSelection, doc: PrismDoc, pos) -> Result<PrismSelection>
+    let p = _sel_check_int(pos, "pos")?
+    let n = prism_textmodel.prism_tm_length(doc)
+    ok(PrismSelection(sel.sel_anchor, _sel_clamp(p, 0, n)))
+
+fn prism_sel_move_to(sel: PrismSelection, doc: PrismDoc, pos) -> Result<PrismSelection>
+    let p = _sel_check_int(pos, "pos")?
+    let n = prism_textmodel.prism_tm_length(doc)
+    let c = _sel_clamp(p, 0, n)
+    ok(PrismSelection(c, c))
+
+fn prism_sel_extend_by(sel: PrismSelection, doc: PrismDoc, delta) -> Result<PrismSelection>
+    let d = _sel_check_int(delta, "delta")?
+    prism_sel_extend_to(sel, doc, sel.sel_head + d)
+
+fn prism_sel_move_by(sel: PrismSelection, doc: PrismDoc, delta) -> Result<PrismSelection>
+    let d = _sel_check_int(delta, "delta")?
+    prism_sel_move_to(sel, doc, sel.sel_head + d)
+
+// Re-bind a possibly-stale selection into a document's current bounds -- e.g. after an edit
+// deleted text out from under it. Total: never fails, because clamping always produces a valid
+// selection regardless of how far out of range the input was.
+fn prism_sel_clamp_to_doc(sel: PrismSelection, doc: PrismDoc) -> PrismSelection
+    let n = prism_textmodel.prism_tm_length(doc)
+    PrismSelection(_sel_clamp(sel.sel_anchor, 0, n), _sel_clamp(sel.sel_head, 0, n))
+
+// ── content ───────────────────────────────────────────────────────────────────────────────
+fn prism_sel_text(sel: PrismSelection, doc: PrismDoc) -> Result<string>
+    let sl = prism_textmodel.prism_tm_slice(doc, prism_sel_lo(sel), prism_sel_hi(sel))?
+    ok(prism_textmodel.prism_tm_text(sl))
+
+// ── equality ──────────────────────────────────────────────────────────────────────────────
+// Exact match -- direction-sensitive, because a backwards and a forward selection over the same
+// range behave differently under further extension and are NOT the same selection.
+fn prism_sel_same(a: PrismSelection, b: PrismSelection) -> bool
+    a.sel_anchor == b.sel_anchor and a.sel_head == b.sel_head
+
+// Same covered range regardless of direction -- for callers that only care WHAT is selected
+// (e.g. "did this edit change the selected content"), not which end is anchored.
+fn prism_sel_same_range(a: PrismSelection, b: PrismSelection) -> bool
+    prism_sel_lo(a) == prism_sel_lo(b) and prism_sel_hi(a) == prism_sel_hi(b)

@@ -1,0 +1,98 @@
+// KAT for prism/obs/prism_flag.nova -- feature flags + A/B experiments wrapping
+// forge_flags/forge_ab_test.
+//
+// The four things this proves, in order of importance:
+//   1. PrismFlags is a HANDLE, not an immutable value -- unlike prism_select/prism_perf, an OLDER
+//      reference to the same handle sees LATER writes (it is the same live actor / same shared
+//      dict), which is the opposite property those two modules prove and must be shown, not
+//      assumed, given how different this module's design is from the rest of the campaign.
+//   2. Validation added at the Prism boundary rejects what the underlying forge modules accept:
+//      empty flag/experiment names, and (Prism-only) variant_a == variant_b.
+//   3. The underlying forge_ab_test error paths (unknown experiment, invalid variant, duplicate
+//      experiment) still surface correctly THROUGH the wrapper's re-wrapped Result.
+//   4. Ordinary flag lifecycle (unset -> "" / false, set, enable/disable) and a full A/B lifecycle
+//      (create, assign buckets deterministically by hash, convert, rate, winner, report) work.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to nova-compiler/, NOVA_NO_CACHE=1)
+
+import prism_flag
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_flag ==")
+    print("")
+
+    let pf0 = prism_flag.prism_flag_new()
+
+    print("1. an unset flag reads as empty / off")
+    check("unset flag value is \"\"", unwrap(prism_flag.prism_flag_value(pf0, "dark_mode")) == "")
+    check("unset flag is NOT on", not unwrap(prism_flag.prism_flag_on(pf0, "dark_mode")))
+    print("")
+
+    print("2. set / enable / disable")
+    let pf1 = unwrap(prism_flag.prism_flag_set(pf0, "theme", "midnight"))
+    check("set() stores the exact value", unwrap(prism_flag.prism_flag_value(pf1, "theme")) == "midnight")
+    let pf2 = unwrap(prism_flag.prism_flag_enable(pf1, "dark_mode"))
+    check("enable() sets value to \"on\"", unwrap(prism_flag.prism_flag_value(pf2, "dark_mode")) == "on")
+    check("on() is true after enable()", unwrap(prism_flag.prism_flag_on(pf2, "dark_mode")))
+    let pf3 = unwrap(prism_flag.prism_flag_disable(pf2, "dark_mode"))
+    check("disable() sets value to \"off\"", unwrap(prism_flag.prism_flag_value(pf3, "dark_mode")) == "off")
+    check("on() is false after disable()", not unwrap(prism_flag.prism_flag_on(pf3, "dark_mode")))
+    print("")
+
+    print("3. PrismFlags is a HANDLE -- an OLDER reference sees LATER writes")
+    check("pf0 (captured BEFORE any write) now sees theme=midnight too -- same live store", unwrap(prism_flag.prism_flag_value(pf0, "theme")) == "midnight")
+    check("pf0 also sees the enable/disable sequence's final state (off)", unwrap(prism_flag.prism_flag_value(pf0, "dark_mode")) == "off")
+    print("")
+
+    print("4. flag validation -- rejects what forge_flags itself would silently accept")
+    check("set() rejects an empty flag name", is_err(prism_flag.prism_flag_set(pf0, "", "x")))
+    check("set() rejects a non-string name", is_err(prism_flag.prism_flag_set(pf0, 7, "x")))
+    check("set() rejects a non-string value", is_err(prism_flag.prism_flag_set(pf0, "theme", 7)))
+    check("enable() rejects an empty name", is_err(prism_flag.prism_flag_enable(pf0, "")))
+    check("value() rejects an empty name", is_err(prism_flag.prism_flag_value(pf0, "")))
+    check("on() rejects an empty name", is_err(prism_flag.prism_flag_on(pf0, "")))
+    print("")
+
+    print("5. A/B experiment lifecycle")
+    let ab0 = unwrap(prism_flag.prism_flag_ab_create(pf0, "checkout_button", "blue", "green"))
+    let va = unwrap(prism_flag.prism_flag_ab_assign(ab0, "checkout_button", 10))    // even -> deterministic bucket
+    let vb = unwrap(prism_flag.prism_flag_ab_assign(ab0, "checkout_button", 11))    // odd  -> the other bucket
+    check("assign() returns a legal variant (a or b)", va == "a" or va == "b")
+    check("two different user_hash parities land in DIFFERENT buckets (0 and 1 mod 2)", va != vb)
+    check("convert() succeeds for the assigned variant, called EXACTLY once", not is_err(prism_flag.prism_flag_ab_convert(ab0, "checkout_button", va)))
+    let rate = unwrap(prism_flag.prism_flag_ab_rate(ab0, "checkout_button", va))
+    check("1 conversion / 1 impression is exactly 100%", rate == 100)
+    check("the assigned+converted variant has a HIGHER rate than the untouched one", rate > unwrap(prism_flag.prism_flag_ab_rate(ab0, "checkout_button", vb)))
+    let winner = unwrap(prism_flag.prism_flag_ab_winner(ab0, "checkout_button"))
+    check("winner() names the higher-converting variant", winner == va)
+    let report = unwrap(prism_flag.prism_flag_ab_report(ab0, "checkout_button"))
+    check("report() has one row per variant (2 keys: a, b)", "a" in report and "b" in report)
+    print("")
+
+    print("6. A/B validation and underlying error surfacing")
+    check("ab_create rejects an empty experiment name", is_err(prism_flag.prism_flag_ab_create(pf0, "", "a", "b")))
+    check("ab_create rejects identical variant labels (Prism-added check)", is_err(prism_flag.prism_flag_ab_create(pf0, "dup_labels", "same", "same")))
+    check("ab_create rejects re-creating an existing experiment (forge_ab_test's own guard)", is_err(prism_flag.prism_flag_ab_create(pf0, "checkout_button", "x", "y")))
+    check("ab_assign on an unknown experiment is rejected", is_err(prism_flag.prism_flag_ab_assign(pf0, "no_such_experiment", 1)))
+    check("ab_convert with an invalid variant name is rejected", is_err(prism_flag.prism_flag_ab_convert(pf0, "checkout_button", "purple")))
+    check("ab_rate on an unknown experiment is rejected", is_err(prism_flag.prism_flag_ab_rate(pf0, "no_such_experiment", "a")))
+    check("ab_winner on an unknown experiment is rejected", is_err(prism_flag.prism_flag_ab_winner(pf0, "no_such_experiment")))
+    check("ab_assign rejects a non-int user_hash", is_err(prism_flag.prism_flag_ab_assign(pf0, "checkout_button", "10")))
+    print("")
+
+    if STATS[1] == 0
+        print("_kat_prism_flag: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_flag: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

@@ -1,0 +1,236 @@
+// prism_perf -- frame/render timing counters (obs/prism_perf.nova).
+// prism/obs/README.md: "Per-face invalidation counts, latency profiling (#107)". core/prism_face
+// gave every component a name and a render function but no way to answer "how often is this face
+// re-rendering, and how long does each render take" -- the two numbers every UI framework's
+// devtools performance tab leads with (React Profiler's render count + duration, Chrome's Layers
+// panel). This module is that instrumentation, kept independent of prism_face itself: nothing
+// here calls `prism_face_render`, so a caller wraps ITS OWN render call with begin/end, which
+// works whether that render is a real `face`, an ANSI-backend redraw, or any other named unit of
+// work an app wants profiled.
+//
+// ── A PrismPerf IS A VALUE, LIKE prism_face and prism_look ──────────────────────────────────────
+// Every operation returns a NEW `PrismPerf` rather than mutating one in place, the identical
+// discipline prism_face.nova documents for its handler table ("a mutating prism_face_on would let
+// a second caller's registration silently appear on the first caller's copy") and prism_look.nova
+// documents for `merge`. The counters this module accumulates make that guarantee MORE valuable,
+// not less: a leaked reference to an old `PrismPerf` snapshot stays frozen at the numbers it had
+// when captured, which is exactly what a "profiling session" (start, do work, diff against the
+// snapshot) needs and an in-place-mutating counter cannot give you.
+//
+// ── PER-FACE, KEYED BY NAME, NOT ONE GLOBAL COUNTER ──────────────────────────────────────────────
+// #107 asks for PER-FACE counts. A single running total cannot answer "which component is
+// thrashing" -- the entire point of a profiler. Keyed the same way prism_face.nova keys its
+// handler table: by a plain string name, because that name is the one stable identifier a face
+// already has (`prism_face_name`) and matches how `prism_telemetry`/`prism_crash` (obs/README's
+// other two modules) will eventually tag their own events.
+//
+// ── begin/end IS A SPAN, AND MISUSE IS A TYPED REJECTION, NOT SILENT ─────────────────────────────
+// `prism_perf_begin(face)` records a start timestamp; `prism_perf_end(face)` closes it and folds
+// the elapsed time into that face's running count/total/min/max. Calling `end` with no open
+// `begin` (a stray call, or a duplicate `end`) and calling `begin` twice without an intervening
+// `end` (a render path that forgot to close its own span, or a re-entrant render) are BOTH real
+// bugs a profiler must not paper over -- silently overwriting the open timestamp would corrupt
+// every subsequent duration for that face with no visible symptom. Both are rejected with a typed
+// `err` naming the face, mirroring prism_face_on's duplicate-target rejection one layer up.
+//
+// ── min/max/avg REJECT ON ZERO SAMPLES -- 0ms LATENCY IS A REAL, DIFFERENT ANSWER ─────────────────
+// If `prism_perf_avg_ms` returned 0 for "never rendered", that is indistinguishable from a face
+// that renders in under a millisecond every time -- exactly the kind of silent wrong-answer this
+// project's coding standard treats as worse than a loud error. So these three query the render
+// COUNT first and return a typed `err` when it is zero; `render_count`/`invalidate_count`/
+// `total_ms` stay total functions returning 0, because "zero renders so far" IS the correct answer
+// to "how many renders" -- only the derived min/max/average are undefined at zero samples.
+//
+// PUBLIC API
+//   PrismPerf / PrismPerfStat                                     the value types
+//   prism_perf_new()                                 -> PrismPerf
+//   prism_perf_mark_invalidate(perf, face)           -> Result<PrismPerf>
+//   prism_perf_begin(perf, face)                     -> Result<PrismPerf>   opens a span; REJECTS if already open
+//   prism_perf_end(perf, face)                       -> Result<PrismPerf>   closes it; REJECTS if not open
+//   prism_perf_is_open(perf, face)                   -> bool
+//   prism_perf_render_count/_invalidate_count/_total_ms(perf, face) -> int  (0 if never seen)
+//   prism_perf_avg_ms/_min_ms/_max_ms(perf, face)    -> Result<int>         err if 0 samples
+//   prism_perf_faces(perf)                           -> list                tracked face names, insertion order
+//   prism_perf_snapshot(perf)                        -> list                list<PrismPerfStat>, insertion order
+//   prism_perf_reset_face(perf, face)                -> Result<PrismPerf>
+//   prism_perf_reset_all(perf)                       -> PrismPerf
+//   prism_perf_stat_face/_render_count/_invalidate_count/_total_ms/_min_ms/_max_ms(stat) -> string/int
+
+// Fields are `prf_`-prefixed: NOVA's struct field->slot map is GLOBAL, so an unprefixed `total_ms`
+// or `face` would share a slot with any other module's field of that name and silently corrupt
+// dot-access, which reconverge cannot detect (the same rule every other Prism module states).
+type PrismPerfStat
+    prf_face: string
+    prf_render_count: int
+    prf_invalidate_count: int
+    prf_total_ms: int
+    prf_min_ms: int
+    prf_max_ms: int
+
+type PrismPerf
+    prf_stats: dict   // face name(string) -> PrismPerfStat
+    prf_open: dict    // face name(string) -> start_ms(int), spans currently in progress
+
+fn prism_perf_new() -> PrismPerf
+    PrismPerf({}, {})
+
+fn _perf_check_face(face) -> Result<string>
+    if type_of(face) != "string"
+        return err("prism_perf: face must be a string, got {type_of(face)}")
+    if len(face) == 0
+        return err("prism_perf: face name must not be empty")
+    ok(face)
+
+fn _perf_stat_or_zero(perf: PrismPerf, face: string) -> PrismPerfStat
+    if face in perf.prf_stats
+        return perf.prf_stats[face]
+    PrismPerfStat(face, 0, 0, 0, 0, 0)
+
+fn _perf_copy_stats(perf: PrismPerf) -> dict
+    let next = {}
+    for k in perf.prf_stats
+        next[k] = perf.prf_stats[k]
+    next
+
+fn _perf_copy_open(perf: PrismPerf) -> dict
+    let next = {}
+    for k in perf.prf_open
+        next[k] = perf.prf_open[k]
+    next
+
+// ── recording ─────────────────────────────────────────────────────────────────────────────
+fn prism_perf_mark_invalidate(perf: PrismPerf, face) -> Result<PrismPerf>
+    let f = _perf_check_face(face)?
+    let prev = _perf_stat_or_zero(perf, f)
+    let updated = PrismPerfStat(f, prev.prf_render_count, prev.prf_invalidate_count + 1, prev.prf_total_ms, prev.prf_min_ms, prev.prf_max_ms)
+    let next_stats = _perf_copy_stats(perf)
+    next_stats[f] = updated
+    ok(PrismPerf(next_stats, perf.prf_open))
+
+fn prism_perf_begin(perf: PrismPerf, face) -> Result<PrismPerf>
+    let f = _perf_check_face(face)?
+    if f in perf.prf_open
+        return err("prism_perf: begin('{f}') called while a span is already open for this face -- did a previous render forget to call end?")
+    let next_open = _perf_copy_open(perf)
+    next_open[f] = time_ms()
+    ok(PrismPerf(perf.prf_stats, next_open))
+
+fn prism_perf_end(perf: PrismPerf, face) -> Result<PrismPerf>
+    let f = _perf_check_face(face)?
+    if f not in perf.prf_open
+        return err("prism_perf: end('{f}') has no matching begin -- a span cannot be closed before it is opened")
+    let started = perf.prf_open[f]
+    let raw = time_ms() - started
+    // Never negative: a non-monotonic wall clock adjustment mid-span must not corrupt the running
+    // total with a negative duration (which would then make total_ms/min_ms lie).
+    let elapsed = if raw < 0
+        0
+    else
+        raw
+    let prev = _perf_stat_or_zero(perf, f)
+    let new_count = prev.prf_render_count + 1
+    let new_total = prev.prf_total_ms + elapsed
+    let new_min = if prev.prf_render_count == 0
+        elapsed
+    else if elapsed < prev.prf_min_ms
+        elapsed
+    else
+        prev.prf_min_ms
+    let new_max = if prev.prf_render_count == 0
+        elapsed
+    else if elapsed > prev.prf_max_ms
+        elapsed
+    else
+        prev.prf_max_ms
+    let updated = PrismPerfStat(f, new_count, prev.prf_invalidate_count, new_total, new_min, new_max)
+    let next_stats = _perf_copy_stats(perf)
+    next_stats[f] = updated
+    let next_open = {}
+    for k in perf.prf_open
+        if k != f
+            next_open[k] = perf.prf_open[k]
+    ok(PrismPerf(next_stats, next_open))
+
+fn prism_perf_is_open(perf: PrismPerf, face: string) -> bool
+    face in perf.prf_open
+
+// ── query -- counts/totals are TOTAL (0 = never seen); derived stats REJECT at 0 samples ───────
+fn prism_perf_render_count(perf: PrismPerf, face: string) -> int
+    if face not in perf.prf_stats
+        return 0
+    perf.prf_stats[face].prf_render_count
+
+fn prism_perf_invalidate_count(perf: PrismPerf, face: string) -> int
+    if face not in perf.prf_stats
+        return 0
+    perf.prf_stats[face].prf_invalidate_count
+
+fn prism_perf_total_ms(perf: PrismPerf, face: string) -> int
+    if face not in perf.prf_stats
+        return 0
+    perf.prf_stats[face].prf_total_ms
+
+fn prism_perf_avg_ms(perf: PrismPerf, face: string) -> Result<int>
+    if face not in perf.prf_stats or perf.prf_stats[face].prf_render_count == 0
+        return err("prism_perf: no render samples recorded for face '{face}' -- average is undefined")
+    let s = perf.prf_stats[face]
+    ok(s.prf_total_ms / s.prf_render_count)
+
+fn prism_perf_min_ms(perf: PrismPerf, face: string) -> Result<int>
+    if face not in perf.prf_stats or perf.prf_stats[face].prf_render_count == 0
+        return err("prism_perf: no render samples recorded for face '{face}' -- min is undefined")
+    ok(perf.prf_stats[face].prf_min_ms)
+
+fn prism_perf_max_ms(perf: PrismPerf, face: string) -> Result<int>
+    if face not in perf.prf_stats or perf.prf_stats[face].prf_render_count == 0
+        return err("prism_perf: no render samples recorded for face '{face}' -- max is undefined")
+    ok(perf.prf_stats[face].prf_max_ms)
+
+// ── reporting -- both in the dict's own strict insertion order (prism_textmodel's own probe
+// established NOVA dicts iterate in stable insertion order; the same guarantee is relied on here) ──
+fn prism_perf_faces(perf: PrismPerf) -> list
+    let out = []
+    for k in perf.prf_stats
+        push(out, k)
+    out
+
+fn prism_perf_snapshot(perf: PrismPerf) -> list
+    let out = []
+    for k in perf.prf_stats
+        push(out, perf.prf_stats[k])
+    out
+
+// ── reset ─────────────────────────────────────────────────────────────────────────────────
+fn prism_perf_reset_face(perf: PrismPerf, face) -> Result<PrismPerf>
+    let f = _perf_check_face(face)?
+    let next_stats = {}
+    for k in perf.prf_stats
+        if k != f
+            next_stats[k] = perf.prf_stats[k]
+    let next_open = {}
+    for k in perf.prf_open
+        if k != f
+            next_open[k] = perf.prf_open[k]
+    ok(PrismPerf(next_stats, next_open))
+
+fn prism_perf_reset_all(perf: PrismPerf) -> PrismPerf
+    PrismPerf({}, {})
+
+// ── PrismPerfStat accessors (for callers that pulled one out of prism_perf_snapshot) ───────────
+fn prism_perf_stat_face(s: PrismPerfStat) -> string
+    s.prf_face
+
+fn prism_perf_stat_render_count(s: PrismPerfStat) -> int
+    s.prf_render_count
+
+fn prism_perf_stat_invalidate_count(s: PrismPerfStat) -> int
+    s.prf_invalidate_count
+
+fn prism_perf_stat_total_ms(s: PrismPerfStat) -> int
+    s.prf_total_ms
+
+fn prism_perf_stat_min_ms(s: PrismPerfStat) -> int
+    s.prf_min_ms
+
+fn prism_perf_stat_max_ms(s: PrismPerfStat) -> int
+    s.prf_max_ms
