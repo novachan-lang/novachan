@@ -2109,7 +2109,21 @@ void nova_rt_strlit_strict(void) { g_strlit_strict = NOVA_HAVE_STRLIT_MAGIC; }
    literal is never freed. Returns 0 on allocation failure -- the caller then falls back to the
    bare image pointer for that call and retries on the next one. */
 static int64_t nova_lit_intern(const char* txt, size_t len) {
+    /* ⛔ MUST NOT come from the per-task transparent arena. nova_heap_alloc prefers
+       nova_cur()->active_arena when one is active, and arena memory is freed WHOLESALE at arena
+       exit no matter what its refcount says -- while NOVA_LIT caches this pointer in a
+       process-lifetime static. First use inside an arena scope therefore left a DANGLING cached
+       pointer once that scope ended, and the literal came back as garbage or an empty string on
+       every later call. Intermittent by nature: it depended on whether a given call site happened
+       to run inside an arena first, which is why it surfaced as one flaky test
+       (demo_frameworks_v2_test: `api_token` length 0) rather than a reproducible failure.
+       Detaching the arena for this one allocation makes the copy process-lifetime, matching the
+       lifetime of the static that holds it. */
+    NovaTaskState* _lt = nova_cur();
+    struct NovaArena* _saved = _lt ? _lt->active_arena : NULL;
+    if (_lt) _lt->active_arena = NULL;
     char* blk = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (_lt) _lt->active_arena = _saved;
     if (!blk) return 0;
     memcpy(blk, txt, len);
     blk[len] = '\0';
@@ -2120,6 +2134,13 @@ static int64_t nova_lit_intern(const char* txt, size_t len) {
 void nova_rt_lit_reloc_all(void** slot_addrs) {
     int64_t moved = 0, failed = 0;
     if (!slot_addrs) return;
+    /* Same lifetime rule as nova_lit_intern: these pointers live in module slots for the life of
+       the process, so they must never be arena-owned (freed wholesale at arena exit). Today this
+       runs from the prologue before any arena exists; the guard keeps that from being a silent
+       precondition. */
+    NovaTaskState* _lt = nova_cur();
+    struct NovaArena* _saved_arena = _lt ? _lt->active_arena : NULL;
+    if (_lt) _lt->active_arena = NULL;
     for (int64_t i = 0; slot_addrs[i]; i++) {
         char** slot = (char**)slot_addrs[i];
         const char* txt = *slot;
@@ -2141,6 +2162,7 @@ void nova_rt_lit_reloc_all(void** slot_addrs) {
        image and then be silently unrecognised -- a wrong answer, which is worse than the
        collision we are closing. A module with no literals at all (moved == 0, failed == 0) still
        qualifies: there is nothing left in the image to misread. */
+    if (_lt) _lt->active_arena = _saved_arena;
     if (failed == 0) g_lit_relocated = 1;
     (void)moved;
 }
@@ -21634,7 +21656,11 @@ int64_t nova_rt_ct_eq(int64_t a_handle, int64_t b_handle) {
 int64_t nova_rt_hex_encode(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
     if (!s) return NOVA_LIT("");
-    size_t len = strlen(s);
+    /* Length-aware, NOT strlen: hex-encoding exists to render BINARY, so the input routinely
+       contains 0x00 (see nova_rt_random_bytes). strlen stopped at the first zero byte and silently
+       produced a short digest. nova_rt_len returns the fat string's stored length when there is
+       one and falls back to a guarded strlen for plain C strings, so both stay correct. */
+    size_t len = (size_t)nova_rt_len(input);
     char* out = (char*)nova_heap_alloc(len * 2 + 1, NOVA_MEM_RAW);
     if (!out) return NOVA_LIT("");
     static const char hex_chars[] = "0123456789abcdef";
@@ -21781,13 +21807,26 @@ int64_t nova_rt_uuid4(void) {
     return (int64_t)(uintptr_t)out;
 }
 
+/* ⛔ Returns a FAT string (explicit length), never a NUL-terminated C string. Random bytes contain
+   0x00 like any other value, so the old NOVA_MEM_RAW representation silently truncated at the
+   first zero byte. MEASURED over 5000 draws of hex_encode(random_bytes(32)):
+   4375 full · 603 SHORT · 22 EMPTY -- i.e. 12% of tokens carried less entropy than requested and
+   1 in 256 was empty (byte[0]==0, matching the predicted 5000/256 = 19.5). That is a security
+   defect in a bearer-token generator, and the empty case is what made demo_frameworks_v2_test
+   flaky on every platform (`FAIL sentinel: api_token length unexpected`).
+   The buffer is filled BEFORE nova_fat_str_create because that function computes and caches the
+   string's hash -- writing the bytes afterwards would leave a hash that disagrees with the
+   contents and silently corrupt dict lookups. */
 int64_t nova_rt_random_bytes(int64_t n) {
     if (n <= 0 || n > 1048576) return NOVA_LIT("");
-    char* buf = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
-    if (!buf) return NOVA_LIT("");
-    nova_secure_random_bytes((uint8_t*)buf, (size_t)n);
-    buf[n] = '\0';
-    return (int64_t)(uintptr_t)buf;
+    char stackbuf[4096];
+    char* tmp = (n <= (int64_t)sizeof(stackbuf)) ? stackbuf : (char*)malloc((size_t)n);
+    if (!tmp) return NOVA_LIT("");
+    nova_secure_random_bytes((uint8_t*)tmp, (size_t)n);
+    char* fat = nova_fat_str_create(tmp, (size_t)n);
+    if (tmp != stackbuf) free(tmp);
+    if (!fat) return NOVA_LIT("");
+    return (int64_t)(uintptr_t)fat;
 }
 
 /* Secure random bytes as a proper length-carrying bytes buffer (NovaBytes), so
