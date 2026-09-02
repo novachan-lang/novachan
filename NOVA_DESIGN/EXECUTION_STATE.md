@@ -1183,6 +1183,63 @@ HTTP server, which is throttled by the same quantum. Full detail in memory
 
 ---
 
+## Current focus — UPDATED 2026-09-03 (CROSS-PLATFORM SOUNDNESS + PRISM PHASE C)
+
+**Where we are:** two tracks running in parallel. Full detail lives in
+[`PRISM_STATUS.md`](PRISM_STATUS.md) (Prism) and the memory notes named below (macOS); this
+section is the pointer, not a second tracker.
+
+### Track 1 — cross-platform soundness. The macOS wrong-value cluster is CLOSED; one test remains.
+
+| test | was | now |
+|---|---|---|
+| `forge_pg_scram_test` plain | **53%** (32/60) | **0/8** |
+| `forge_pg_scram_test` ASAN | 10/10 | **0/10** |
+| `forge_jwt_test` | — | **0/8 plain, 0/10 ASAN** |
+| `_argon2id_test` | 13% | **~1/6 — STILL OPEN** |
+
+Sanitizer findings run-wide: **zero**. Root causes fixed this campaign, each measured not argued:
+Mach-O `filesize`/ELF `p_filesz` clamp · program literals relocated into the arena · `NOVA_LIT`
+runtime literals interned (the other half — 102 magic-prefixed statics were the last collision
+surface) · `@.strtab` renamed (a **reserved ELF section name**, Linux-only, and the error blamed
+inline asm that did not exist) · **ten binary-truncation defects** including `hmac_sha256`
+computing MACs under an EMPTY KEY 6/2000 and `file_write` writing short files while reporting
+success · unguarded `pthread_create` + `pthread_join` on a garbage `pthread_t` (real UB; the
+Windows branch had guarded the same case all along) · POSIX suite oversubscription (`JOBS x JOBS`
+threads, not `JOBS`).
+
+⛔ **THREE PREMISES REFUTED WITH EVIDENCE — do not rebuild on them.** (1) Carrier dependence:
+`CARRIERS=1 1/6 vs CARRIERS=4 1/6`, equal — the earlier `0/6 vs 2/6` was a six-run artifact.
+(2) Join-on-garbage as the cause: fixed, yet failures persist at `CARRIERS=1` where no carrier
+thread is created at all. (3) That it is a HANG: the failing runs emit ZERO watchdog output and
+the watchdog prints every 4 SECONDS, so a 60s stall would produce ~14 lines — absence is evidence
+AGAINST a hang. `_argon2id_test` is therefore back in the WRONG-ANSWER class, and the open lead is
+the asymmetry: scram and jwt are clean, argon2id alone is not.
+See [[reference_macos_intermittent_crypto_flake_open]] and
+[[reference_elf_reserved_symbol_names_break_linux_only]].
+
+**Method note worth keeping:** four instruments in this campaign reported success while measuring
+NOTHING (a `pwsh` stage that did not exist, a stale `.ll` from the incremental cache, a probe in a
+job that could not resolve its imports, and GNU `timeout` — which does not exist on macOS —
+faking results twice). Every diagnostic now carries a NEGATIVE CONTROL, and an empty result is
+annotated as instrument failure rather than read as clean.
+
+### Track 2 — Prism Phase C: the SUPPORTING layers (`ui/` was never the gap)
+
+`ui/` is over-delivered (67 components vs ~50 planned) while the layers beneath it were near-empty.
+**`core/` 7/7 ✅** (node, event, face, secret, caps, key, journal) and **`text/` 4/4 ✅**
+(text, textmodel, select, find) are now COMPLETE; `obs/` 3/4, `dev/` 2/8, `intl/` 1/4, `render/` 1/4.
+
+★ The finding that reordered the work: **`core/prism_event.nova` did not exist, so 67 UI
+components existed and NOT ONE could respond to anything.** Prism rendered; it was not
+interactive. Two defects were found by the KATs themselves: a **protocol-relative open redirect**
+(`//evil.example` satisfies "starts with /" and navigates off-site), and `prism_key` emitting a
+name (`"ShiftTab"`) it could not parse back — which would have lost Shift+Tab across any
+serialise/restore boundary. Both fixed.
+
+**Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — the gate
+for everything browser-side. Phase C needs no compiler work and proceeds without it.
+
 ## Current focus — UPDATED 2026-08-20 (WEAPON PARITY Phase 1: cross-module soundness)
 
 **Where we are:** New campaign — [`WEAPON_PARITY_PLAN.md`](WEAPON_PARITY_PLAN.md), closing every
