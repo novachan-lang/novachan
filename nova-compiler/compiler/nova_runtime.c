@@ -2034,13 +2034,26 @@ static int nova_addr_in_module(uintptr_t a) {
 
    A compiler without statement expressions cannot build the prefix this way, so it also never
    turns strict mode on and keeps today's behaviour exactly. We build with clang everywhere. */
+/* Copies a runtime C literal into the ARENA on first use and returns the arena pointer, or 0 if
+   the allocation failed. See NOVA_LIT below for why this exists. */
+static int64_t nova_lit_intern(const char* txt, size_t len);
+
 #if defined(__GNUC__) || defined(__clang__)
 #define NOVA_HAVE_STRLIT_MAGIC 1
+/* ⛔ These used to be magic-prefixed statics living in the IMAGE, which made all 102 of them
+   collision targets: an integer equal to one of their addresses passed every check in
+   nova_is_readable_str, because the magic really was in front of it. Relocating the PROGRAM's
+   literals into the arena left these as the last such surface.
+   Interning into the arena removes the surface rather than tracking it -- the static needs no
+   magic prefix once it is never handed out as a NOVA value, so nothing in the image matches the
+   magic any more and a colliding integer is rejected by the existing test.
+   The per-site cache makes this one predictable branch. A thread race can duplicate a copy
+   (identical content, one small block leaked once); it cannot produce a wrong value. On
+   allocation failure it falls back to the bare pointer WITHOUT caching, so a later call retries. */
 #define NOVA_LIT(s) (__extension__({                                              \
-    static const struct { unsigned char m[8]; char t[sizeof(s)]; }                \
-        __attribute__((aligned(8))) _nl =                                         \
-        { { 0xAB,'N','O','V','S','T','R',0xCD }, s };                             \
-    (int64_t)(uintptr_t)_nl.t; }))
+    static int64_t _nl_c = 0;                                                     \
+    if (!_nl_c) _nl_c = nova_lit_intern("" s, sizeof(s) - 1);                     \
+    _nl_c ? _nl_c : (int64_t)(uintptr_t)("" s); }))
 #else
 #define NOVA_HAVE_STRLIT_MAGIC 0
 #define NOVA_LIT(s) ((int64_t)(uintptr_t)(s))
@@ -2091,54 +2104,29 @@ void nova_rt_strlit_strict(void) { g_strlit_strict = NOVA_HAVE_STRLIT_MAGIC; }
    pointers -- so this is a DOUBLE indirection: read the slot to get the text, then write the
    relocated address back into that same slot. Getting this wrong the first time meant strlen()
    ran over a slot holding a pointer rather than a string, which crashed instantly. */
-static uintptr_t* g_lit_orig   = NULL;   /* sorted ORIGINAL text addresses, now unreferenced */
-static int64_t    g_lit_orig_n = 0;
-
-static int nova_lit_cmp_addr(const void* a, const void* b) {
-    uintptr_t x = *(const uintptr_t*)a, y = *(const uintptr_t*)b;
-    return (x < y) ? -1 : ((x > y) ? 1 : 0);
-}
-
-/* Is `a` the address of a literal body we have already copied out of the image? Those bodies
-   keep their magic prefix, so the magic test would still accept them -- and an INTEGER equal to
-   one of them would be misread as that string, which is precisely the bug relocation exists to
-   close. Rejecting these EXACT addresses (and nothing else) closes it without disturbing any
-   other image-resident string: nova_runtime.c's own C literals are not in this table and keep
-   passing the magic test exactly as before. */
-static int nova_lit_is_stale(uintptr_t a) {
-    int64_t lo = 0, hi = g_lit_orig_n - 1;
-    while (lo <= hi) {
-        int64_t mid = lo + (hi - lo) / 2;
-        if (g_lit_orig[mid] == a) return 1;
-        if (g_lit_orig[mid] <  a) lo = mid + 1; else hi = mid - 1;
-    }
-    return 0;
+/* Arena copy of a runtime C literal (NOVA_LIT). Same shape as the program-literal relocation
+   below: RC-headered so nova_mem_find_tag identifies it EXACTLY, and pinned immortal because a
+   literal is never freed. Returns 0 on allocation failure -- the caller then falls back to the
+   bare image pointer for that call and retries on the next one. */
+static int64_t nova_lit_intern(const char* txt, size_t len) {
+    char* blk = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!blk) return 0;
+    memcpy(blk, txt, len);
+    blk[len] = '\0';
+    NOVA_RC_COUNT(blk) |= 0x3FFFFFFF;    /* OR, never assign: preserves NOVA_RC_ARENA_BIT */
+    return (int64_t)(uintptr_t)blk;
 }
 
 void nova_rt_lit_reloc_all(void** slot_addrs) {
-    int64_t moved = 0;
+    int64_t moved = 0, failed = 0;
     if (!slot_addrs) return;
-    /* Record the pre-relocation text addresses first; after the loop below the slots no longer
-       hold them. Failure to allocate is not fatal -- we simply keep honouring the magic test. */
-    {
-        int64_t n = 0;
-        while (slot_addrs[n]) n++;
-        g_lit_orig = (uintptr_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(uintptr_t));
-        if (g_lit_orig) {
-            for (int64_t i = 0; i < n; i++) {
-                const char* t0 = *(char**)slot_addrs[i];
-                if (t0) g_lit_orig[g_lit_orig_n++] = (uintptr_t)t0;
-            }
-            qsort(g_lit_orig, (size_t)g_lit_orig_n, sizeof(uintptr_t), nova_lit_cmp_addr);
-        }
-    }
     for (int64_t i = 0; slot_addrs[i]; i++) {
         char** slot = (char**)slot_addrs[i];
         const char* txt = *slot;
         if (!txt) continue;
         size_t len = strlen(txt);
         char* blk = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
-        if (!blk) continue;                    /* OOM -> keep the image pointer, still correct */
+        if (!blk) { failed++; continue; }      /* OOM -> keeps its image pointer; see below */
         memcpy(blk, txt, len + 1);
         /* OR, never assign: this header word carries FLAG BITS alongside the count
            (NOVA_RC_ARENA_BIT = 0x40000000 marks "bump-allocated, never individually freed").
@@ -2148,9 +2136,13 @@ void nova_rt_lit_reloc_all(void** slot_addrs) {
         *slot = blk;
         moved++;
     }
-    /* Only claim relocation when it actually happened. If every allocation failed we must keep
-       honouring image addresses, or the program would stop recognising its own strings. */
-    if (moved > 0) g_lit_relocated = 1;
+    /* The flag licenses nova_is_readable_str to reject the whole image, so it may be set ONLY if
+       EVERY literal made it out. One straggler left behind would keep its magic prefix in the
+       image and then be silently unrecognised -- a wrong answer, which is worse than the
+       collision we are closing. A module with no literals at all (moved == 0, failed == 0) still
+       qualifies: there is nothing left in the image to misread. */
+    if (failed == 0) g_lit_relocated = 1;
+    (void)moved;
 }
 
 /* SOUND int-vs-string discrimination. Every runtime-created string carries an RC header
@@ -2184,11 +2176,18 @@ static int nova_is_readable_str(const void* ptr) {
        stay in the image WITH their magic prefixes, so without this an integer equal to one of
        those now-unreferenced addresses would still pass the magic test -- the very bug
        relocation exists to close, surviving relocation.
-       Rejecting the whole image instead of these exact addresses was WRONG and cost a full arc:
-       nova_runtime.c's own C literals (what `type_of` returns, among many others) are image
-       addresses too, and blanket-rejecting them stopped 17 tests from recognising their own
-       strings. Reject exactly what we relocated; leave every other image string alone. */
-    if (g_lit_relocated && nova_lit_is_stale(a)) return 0;
+       Rejecting the whole image was WRONG while nova_runtime.c's own literals still lived there
+       carrying the magic (what `type_of` returns, among many others) -- it stopped 17 tests from
+       recognising their own strings, and cost a full arc. It is CORRECT now only because
+       NOVA_LIT interns into the arena too, so the sole magic-prefixed bytes left in the image are
+       the dead @.str.N bodies. The int-str cache is magic-prefixed as well but lives in .bss and
+       is matched by its own range test ABOVE this point, so it is unaffected.
+       This also ends the out-of-bounds `a - 8` read ASAN has been aborting on: we no longer touch
+       memory in front of an arbitrary integer at all.
+       Caveat, deliberate: if nova_lit_intern ever fails (allocation failure), NOVA_LIT hands back
+       a bare image pointer that will be rejected here. That trades a silent misread under OOM --
+       where the process is already failing -- for removing real UB on every normal run. */
+    if (g_lit_relocated) return 0;
 
     /* Literals are emitted `align 8`, so an unaligned address cannot be one. Cheap, and it
        rejects the large majority of colliding integers before any memory is touched. */
