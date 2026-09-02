@@ -776,22 +776,47 @@ jobs:
               # the absence of /usr/bin/timeout, not the scheduler, and I nearly concluded from it
               # that concurrency was exonerated. Fourth instrument this session that reported
               # confidently while measuring nothing.
-              f1=0
+              # ⛔ THE WATCHDOG WAS IN THE WRONG LOOP. It was armed only on the plain 8-run loop
+              # above, which reported 0/8 hangs -- while the hangs actually occur HERE (2/6 at
+              # CARRIERS=4) and in the ASAN loop below. So run #87 produced a hang RATE and ZERO
+              # diagnostic data, which is the same "measuring nothing" failure this file warns
+              # about two lines up. Both loops are now armed, and stderr is KEPT rather than sent
+              # to /dev/null -- discarding it is what left the rate unexplained.
+              # Predicted signature if the cause is the unguarded pthread_join on a garbage
+              # pthread_t: the watchdog lines STOP (its thread exits once live <= 0, which happens
+              # exactly when nova_rt_sched_run returns) and the process then goes silent until the
+              # external alarm kills it. Watchdog output that instead shows a carrier parked with
+              # live > 0 forever means a real scheduler stall -- a different bug.
+              f1=0; wd1=""
               for i in $(seq 1 6); do
-                NOVA_CARRIERS=1 "/tmp/$t.bin" >/dev/null 2>&1 || f1=$((f1+1))
+                o1=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=1 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1) || {
+                  f1=$((f1+1))
+                  [ -z "$wd1" ] && wd1=$(printf "%s" "$o1" | grep -E "^\[watchdog|carrier_fibers" | tail -3 | paste -sd";" - | cut -c1-500)
+                }
               done
-              f4=0
+              f4=0; wd4=""
               for i in $(seq 1 6); do
-                NOVA_CARRIERS=4 "/tmp/$t.bin" >/dev/null 2>&1 || f4=$((f4+1))
+                o4=$(NOVA_SCHED_WATCHDOG=1 NOVA_CARRIERS=4 perl -e 'alarm shift; exec @ARGV' 60 "/tmp/$t.bin" 2>&1) || {
+                  f4=$((f4+1))
+                  [ -z "$wd4" ] && wd4=$(printf "%s" "$o4" | grep -E "^\[watchdog|carrier_fibers" | tail -3 | paste -sd";" - | cut -c1-500)
+                }
               done
               echo "::error title=flaky-bisect::$t CARRIERS=1 $f1/6 FAILED vs CARRIERS=4 $f4/6 FAILED"
+              [ -n "$wd4" ] && echo "::error title=flaky-bisect-watchdog::$t CARRIERS=4 :: $wd4"
+              [ -n "$wd1" ] && echo "::error title=flaky-bisect-watchdog::$t CARRIERS=1 :: $wd1"
+              if [ "$f4" -gt 0 ] && [ -z "$wd4" ]; then
+                echo "::error title=flaky-bisect-watchdog::$t failed $f4/6 at CARRIERS=4 with NO watchdog output -- consistent with a stall AFTER nova_rt_sched_run returned (i.e. in the join/shutdown path), since the watchdog thread exits at that point"
+              fi
             fi
             # ASAN, pointed at the test that actually fails rather than at argon2id.
             clang -O1 -g -fno-omit-frame-pointer -fsanitize=address $PCF -o "/tmp/$t.asan" "/tmp/$t.ll" ../compiler/nova_runtime.c $PLF -w 2>/dev/null
             if [ -x "/tmp/$t.asan" ]; then
               af=0; asan_find=""; asan_frames=""; asan_obj=""
               for i in 1 2 3 4 5 6 7 8 9 10; do
-                out=$(ASAN_OPTIONS=detect_leaks=0 "/tmp/$t.asan" 2>&1); rc=$?
+                # Armed + alarm-bounded for the same reason as the bisect loop above: run #87's
+                # "_argon2id_test ASAN 3/10" had NO sanitizer finding and rc=137, i.e. it HUNG,
+                # and without the watchdog there was nothing to explain it with.
+                out=$(ASAN_OPTIONS=detect_leaks=0 NOVA_SCHED_WATCHDOG=1 perl -e 'alarm shift; exec @ARGV' 120 "/tmp/$t.asan" 2>&1); rc=$?
                 if [ $rc -ne 0 ]; then
                   af=$((af+1))
                   # CAPTURE FROM *THIS* RUN. The previous version re-ran the binary afterwards to

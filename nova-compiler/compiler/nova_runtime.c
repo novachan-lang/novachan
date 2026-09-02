@@ -11701,17 +11701,42 @@ void nova_rt_main_dispatch(int64_t main_fn) {
                 }
                 free(th);
 #else
-                pthread_t* th = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)(ncar - 1));
-                for (int i = 1; i < ncar; i++)
-                    pthread_create(&th[i-1], NULL, nova_carrier_thread, (void*)(intptr_t)i);
+                /* ⛔ pthread_create's return was IGNORED here while the Windows branch above
+                   guards `if (th[i])` before waiting, and the poller two lines down IS checked
+                   (poller_ok). So the check was known to be necessary and this loop was simply
+                   missed -- an authoring asymmetry, not a platform difference.
+                   The consequence was real UB: `th` came from malloc (not calloc), so a failed
+                   creation left th[i-1] holding GARBAGE, which was then handed unconditionally to
+                   pthread_join. Joining a garbage pthread_t is undefined; on Darwin, where
+                   pthread_t is a pointer to the thread's own control block, it can block
+                   indefinitely rather than return an error -- a silent hang needing an external
+                   kill, which is exactly the "no sanitizer finding, rc=137 SIGKILL" signature of
+                   the macOS argon2id hang. Reachable ONLY when ncar > 1 (at ncar <= 1 no thread
+                   is created at all), which matches "clean at CARRIERS=1, fails at CARRIERS=4".
+                   Whether or not it is that hang's root cause, it is UB and is now closed; the
+                   stderr line doubles as the diagnostic that would confirm it. */
+                pthread_t* th = (pthread_t*)calloc((size_t)(ncar - 1), sizeof(pthread_t));
+                int* th_ok = (int*)calloc((size_t)(ncar - 1), sizeof(int));
+                if (!th || !th_ok) {
+                    fprintf(stderr, "[nova] FATAL: cannot allocate carrier thread table for %d carriers\n", ncar);
+                    free(th); free(th_ok);
+                    return;
+                }
+                for (int i = 1; i < ncar; i++) {
+                    int _crc = pthread_create(&th[i-1], NULL, nova_carrier_thread, (void*)(intptr_t)i);
+                    th_ok[i-1] = (_crc == 0);
+                    if (_crc != 0)
+                        fprintf(stderr, "[nova] carrier %d: pthread_create failed rc=%d (%s) -- continuing with fewer carriers\n",
+                                i, _crc, strerror(_crc));
+                }
                 pthread_t poller; int poller_ok = (pthread_create(&poller, NULL, nova_poller_thread, NULL) == 0);   /* S-a */
                 nova_rt_sched_run();
                 g_poller_stop = 1;
                 if (poller_ok) pthread_join(poller, NULL);
                 g_sched_shutdown = 1;
                 for (int i = 0; i < ncar; i++) nova_carrier_signal(i);
-                for (int i = 0; i < ncar - 1; i++) pthread_join(th[i], NULL);
-                free(th);
+                for (int i = 0; i < ncar - 1; i++) if (th_ok[i]) pthread_join(th[i], NULL);
+                free(th); free(th_ok);
 #endif
                 nova_sched_running = 0;       /* all carriers joined => scheduler done */
                 if (getenv("NOVA_CARRIER_STATS")) {
