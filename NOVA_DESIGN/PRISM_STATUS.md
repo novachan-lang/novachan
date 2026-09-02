@@ -169,23 +169,51 @@ is what the evidence supports.
 
 ---
 
-## WHERE WE ARE RIGHT NOW
+## WHERE WE ARE RIGHT NOW — updated 2026-09-02
 
-**Phase:** PRE-PHASE-0 — design proposal exists, nothing is built, nothing is funded.
-**Last action:** wrote the normative spec skeleton (`PRISM_SPEC.md`).
-**Current action:** **STEP 2 — verifying competitive claims** (2 agents dispatched).
-**Blocking decision:** owner GO/NO-GO on Phase 0-1 (~5-6 months to a NOVA app drawing its own pixels).
+⚠ **This block said "PRE-PHASE-0 — nothing is built, ≈2%" until 2026-09-02, long after Phases A
+and B had shipped ~42k lines.** It was written before MA.1 and never revised, so it misdescribed
+the campaign by two whole phases. Corrected here; keep it corrected.
+
+**Phase:** A ✅ complete · B ✅ (67 `ui/` components) · **C in progress — the SUPPORTING layers**.
+
+**As built, counted not estimated:** 93 modules + 90 KATs, **42,163 lines**, all CI-gated through
+`_prism_kat_gate.ps1` (`[CI 2m/3]`, which DISCOVERS `prism/kat/_kat_*.nova` rather than taking a
+hard-coded list).
+
+**Where the real gap is, and it is NOT `ui/`:** `ui/` is OVER-delivered (67 vs ~50 planned) while
+the layers beneath it are near-empty. Built / planned:
+
+| folder | built | planned | still missing |
+|---|---|---|---|
+| `core/` | 3 | 7 | `prism_caps` `prism_key` `prism_journal` `prism_secret` |
+| `text/` | 2 | 4 | `prism_select` `prism_find` `prism_richedit` |
+| `obs/` | 1 | 4 | `prism_telemetry` `prism_perf` `prism_crash` `prism_flag` |
+| `dev/` | 2 | 8 | `prism_test` `prism_visual` `prism_explain` `prism_size` `prism_tokens` `prism_audit_a11y` |
+| `intl/` | 1 | 4 | `prism_i18n` `prism_datetime` `prism_number` |
+| `render/` | 1 | 4 | `prism_render_image` `prism_render_pdf` `prism_render_sheet` |
+
+**★ The finding that reordered the work:** `core/prism_event.nova` did not exist, so **67 UI
+components existed and NOT ONE could respond to anything** — `press`/`entry`/`pick`/`flag` all
+constructed and rendered, but no value represented "this was activated". PRISM rendered; it was
+not interactive. `core/` therefore comes before component #68, and `text/` selection, `a11y/`
+focus and `dev/` interaction tooling all sit on top of it.
+
+**Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — RED, full
+arc, and the gate for everything browser-side (T12 closures-across-WASM, T13 DCE, T14 the DOM
+vertical slice, T15 the Bet-1 falsifier). Phase C needs no compiler work, so it proceeds without
+that decision.
+
+**Tracked debt:** MB.1–MB.59 (~29,887 lines) predate the 2026-08-18 high-level-NOVA mandate and
+carry 346 banned low-level patterns; MB.60+ comply. That retrofit is unscheduled. `T8b` is still
+⛔ BLOCKED (taskboard sources overwritten with LLVM IR dumps).
 
 ### Honest completeness
 
-| | |
-|---|---|
-| Specification written | **~30 pages** |
-| Specification needed to build from | **~1,400 pages** |
-| **Actual completeness** | **≈2%** |
-
-**What exists is enough to decide whether to fund Phase 0-1. It is NOT enough to build from.**
-Do not treat any document here as buildable yet.
+The old ≈2% figure measured the SPECIFICATION against a hypothetical buildable spec. That is the
+wrong denominator now that the library exists and is gated: the `ui/` vocabulary is complete and
+proven to compose, and what is genuinely unbuilt is (a) the ~23 supporting modules above and
+(b) all of Phase 0's runtime work, which is a compiler campaign rather than a spec gap.
 
 ---
 
@@ -267,6 +295,9 @@ criterion passes. Never "done" without the measurement. Killed items stay, with 
 
 | # | Task | Status | Started | Finished | Result / note |
 |---|---|---|---|---|---|
+| **MC.1** | ★★ `core/prism_event.nova` — the event model | ✅ **DONE** | 2026-09-02 | 2026-09-02 | **50 assertions ALL PASS.** ★ **THE FINDING: 67 `ui/` components existed and NOT ONE could respond to anything** — no value represented "this was activated", so PRISM rendered but was not interactive. Closed 6-kind vocabulary, one per §9 primitive (A7: a 7th event kind would need a 7th primitive). **Origin is an ENUM, not a bool** for two independent reasons: a NOVA bool CANNOT be type-validated (`type_name()` never returns `"bool"`, `is_bool()` is self-inconsistent) and a security tag that cannot be validated is a hole; and REPLAY genuinely needs its own state — folded into "synthetic" it makes undo/redo indistinguishable from a self-attack, folded into "user" it lets a replay authorise a privileged action. **Invalid kind/payload combinations are UNREPRESENTABLE**: one constructor per kind, every payload accessor errors on the wrong kind, proven for ALL 30 kind×accessor pairs rather than a sample. §15.7's gate is executable (`Result`), rejecting synthetic AND replay. ⛔ **OPEN REDIRECT found while writing the KAT:** `//evil.example` satisfies "route starts with `/`" but is PROTOCOL-RELATIVE and navigates off-site — §15.1 claims injection is unrepresentable, so accepting it would have made the claim false. Now rejected. **Honest limitation recorded in-file:** NOVA has no module-private linkage, so nothing prevents app code calling a user-origin constructor; the guarantee is conventional until the compositor (§15.8) becomes the sole producer |
+| **MC.2** | `core/prism_face.nova` — the face/view abstraction | ✅ **DONE** | 2026-09-02 | 2026-09-02 | **31 assertions ALL PASS.** Hook registration (show/hide/load/fail) with re-registration rejected. Drafted by a Sonnet agent that **hit its session limit before verifying anything**; I compiled and ran it rather than taking unverified agent output on trust |
+| **MC.3** | ★ `text/prism_textmodel.nova` — document model | ✅ **DONE** | 2026-09-02 | 2026-09-02 | **41 assertions ALL PASS.** One type behind BOTH labels and rich text (a label is a document with one unmarked run), so nothing converts when text becomes editable. **POSITIONS ARE CODE POINTS** — bytes would corrupt every non-ASCII edit (NOVA strings are byte strings, so that is the DEFAULT failure), and cells belong to `prism_text.nova`, which already owns width/wrap/truncate; `prism_tm_width` DELEGATES rather than re-implementing. **Canonical form is an invariant** (empties dropped, equal-mark neighbours merged) because otherwise `mark(0,2)+mark(2,4)` and `mark(0,4)` are the same document with different structures, breaking structural equality AND §15.9 byte-reproducible rendering. Marks payload-free + stored as sorted names (MB.7's rule: a payload needs a field name, and the field→slot table is GLOBAL). ⛔ **TWO NOVA STRING FACTS MEASURED:** `str_chars` is **BYTE-wise** despite its name (`str_chars("héllo")` → SIX elements, é split into two invalid bytes) and `slice` is **STRING-ONLY** (it `strlen`s its argument) so slicing a LIST returns empty **silently**. Correct trio: `char_count` + `code_points` + `from_codepoint`. **Lesson that generalises: an ASCII-only test passes against a completely broken position API** |
 | T0 | Prism status tracker created | ✅ DONE | 2026-08-14 | 2026-08-14 | This file; single entry point |
 | T1 | Architecture + roadmap + matrix + spec skeleton | ✅ DONE | 2026-08-13 | 2026-08-14 | 4 docs; honest completeness ≈2% of a buildable spec |
 | T2 | **Q8 — probe wasi-sdk / m7 blocker** | ✅ DONE | 2026-08-14 | 2026-08-14 | **Blocker MISDIAGNOSED.** clang 22.1.0 emits wasm32 fine; libc surface is only ~46 fns; but runtime needs a **SPLIT** (32,244 lines incl. sockets/epoll/pthreads/OpenSSL/dlopen). M0.3 rescoped 3-6wk → **6-10wk**, now the true critical path |
