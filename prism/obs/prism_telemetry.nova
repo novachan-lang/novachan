@@ -1,0 +1,208 @@
+// prism_telemetry -- typed analytics events (prism/obs/, feature #96). The contract in
+// obs/README.md is "a schema change breaks the BUILD", and the reason is that analytics is the
+// one subsystem where breakage is SILENT: rename a field and the events keep flowing, the
+// dashboard keeps drawing, and the number is quietly wrong for a month. Every guarantee below
+// exists to convert that silence into a failure someone sees.
+//
+// ── PII CANNOT REACH A SINK, AND NOT BY DISCIPLINE ───────────────────────────────────────────
+// A field value is RENDERED AT CONSTRUCTION, not stored as a live value and serialized later.
+// `prism_tel_secret` stores ONLY `sec_redacted(s)` -- the plaintext is never copied into the
+// event at all, so there is no later code path, however wrong, that could emit it. This is the
+// difference between "the serializer masks secrets" and "the secret is not in the object".
+//
+// ⛔ AND IT DELIBERATELY NEVER CALLS THE GENERIC `str()`/`to_json()` BUILTINS. Measured this
+// session (repro committed as test_programs/_tojson_dispatch_test.nova): `to_json()` on an
+// IMPORTED struct DISPATCHES TO AN UNRELATED LOCAL STRUCT'S generated method when the consuming
+// file declares exactly one struct of its own -- emitting the wrong field names AND reading
+// OUT OF BOUNDS past the end of the object, which leaked a raw heap value into the JSON. A
+// telemetry module is precisely where that would exfiltrate adjacent memory to a remote sink.
+// `prism_tel_render` therefore hand-builds its JSON from strings it already holds.
+//
+// ── A SCHEMA IS A VALUE, AND VALIDATION IS TOTAL ─────────────────────────────────────────────
+// `prism_tel_schema(name, keys)` declares the expected shape; `prism_tel_check(ev, schema)`
+// accepts ONLY an exact match -- every declared key present, no undeclared key, no duplicate.
+// Extra keys are rejected as firmly as missing ones: an unexpected field is how a rename shows
+// up (the new name arrives while the old one silently stops), so treating it as harmless would
+// defeat the whole purpose.
+//
+// PUBLIC API (every builder returns Result; nothing mutates in place)
+//   prism_tel_event(name)                      -> Result<PrismTelEvent>
+//   prism_tel_str(ev, key, value)              -> Result<PrismTelEvent>
+//   prism_tel_int(ev, key, value)              -> Result<PrismTelEvent>
+//   prism_tel_bool(ev, key, state)             -> Result<PrismTelEvent>
+//   prism_tel_secret(ev, key, secret)          -> Result<PrismTelEvent>   stores the REDACTION
+//   prism_tel_name(ev) / _field_count(ev) / _keys(ev) / _get(ev, key)
+//   prism_tel_render(ev)                       -> string   hand-built JSON, no generic builtins
+//   prism_tel_schema(name, keys)               -> Result<PrismTelSchema>
+//   prism_tel_check(ev, schema)                -> Result<PrismTelEvent>   exact-match or err
+
+import prism_secret
+
+// `Tel`-prefixed variants: NOVA has ONE flat symbol space and enum constructors resolve across
+// modules, so a bare `Str()`/`Int()` would be a landmine for every other module.
+enum PrismTelKind
+    TelStr()
+    TelInt()
+    TelBool()
+    TelRedacted()
+
+// `tf_`/`te_`/`ts_` prefixes because the struct field->slot map is GLOBAL: a bare `key`/`value`/
+// `name` shares a slot with any other module's field of that name and silently corrupts
+// dot-access in a way reconverge cannot detect.
+type PrismTelField
+    tf_key: string
+    tf_val: string      // ALREADY RENDERED -- a secret's plaintext is never stored here
+    tf_kind: PrismTelKind
+
+type PrismTelEvent
+    te_name: string
+    te_fields: list
+
+type PrismTelSchema
+    ts_name: string
+    ts_keys: list
+
+fn prism_tel_kind_name(k: PrismTelKind) -> string
+    match k
+        TelStr() => "str"
+        TelInt() => "int"
+        TelBool() => "bool"
+        TelRedacted() => "redacted"
+
+fn _tel_check_name(n) -> Result<string>
+    if type_of(n) != "string"
+        return err("prism_telemetry: name must be a string, got {type_of(n)}")
+    if len(n) == 0
+        return err("prism_telemetry: event name is required (an unnamed analytics event cannot be queried)")
+    ok(n)
+
+fn _tel_check_key(ev: PrismTelEvent, k) -> Result<string>
+    if type_of(k) != "string"
+        return err("prism_telemetry: field key must be a string, got {type_of(k)}")
+    if len(k) == 0
+        return err("prism_telemetry: field key is required")
+    // A duplicate key is rejected rather than last-write-wins: two values under one name means
+    // one of them is silently discarded downstream, which is the same silent-wrongness this
+    // module exists to prevent.
+    for f in ev.te_fields
+        if f.tf_key == k
+            return err("prism_telemetry: duplicate field key '{k}' on event '{ev.te_name}'")
+    ok(k)
+
+fn prism_tel_event(name) -> Result<PrismTelEvent>
+    let n = _tel_check_name(name)?
+    ok(PrismTelEvent(n, []))
+
+fn _tel_with(ev: PrismTelEvent, k: string, v: string, kind: PrismTelKind) -> PrismTelEvent
+    let fs = []
+    for f in ev.te_fields
+        push(fs, f)
+    push(fs, PrismTelField(k, v, kind))
+    PrismTelEvent(ev.te_name, fs)
+
+fn prism_tel_str(ev: PrismTelEvent, key, value) -> Result<PrismTelEvent>
+    let k = _tel_check_key(ev, key)?
+    if type_of(value) != "string"
+        return err("prism_telemetry: '{k}' declared str but got {type_of(value)}")
+    ok(_tel_with(ev, k, value, TelStr()))
+
+fn prism_tel_int(ev: PrismTelEvent, key, value) -> Result<PrismTelEvent>
+    let k = _tel_check_key(ev, key)?
+    if type_of(value) != "int"
+        return err("prism_telemetry: '{k}' declared int but got {type_of(value)}")
+    ok(_tel_with(ev, k, "{value}", TelInt()))
+
+fn prism_tel_bool(ev: PrismTelEvent, key, state) -> Result<PrismTelEvent>
+    let k = _tel_check_key(ev, key)?
+    // Normalised to "true"/"false" HERE, at the one boundary, because a NOVA bool cannot be
+    // type-validated and changes representation across a call boundary.
+    let s = if state
+        "true"
+    else
+        "false"
+    ok(_tel_with(ev, k, s, TelBool()))
+
+// ⛔ The plaintext is NEVER copied into the event. Only sec_redacted's output is stored, so no
+// later code path can emit the secret even if it tries -- the value is simply not there.
+fn <T> prism_tel_secret(ev: PrismTelEvent, key, secret: PrismSecret<T>) -> Result<PrismTelEvent>
+    let k = _tel_check_key(ev, key)?
+    ok(_tel_with(ev, k, prism_secret.sec_redacted(secret), TelRedacted()))
+
+fn prism_tel_name(ev: PrismTelEvent) -> string
+    ev.te_name
+
+fn prism_tel_field_count(ev: PrismTelEvent) -> int
+    len(ev.te_fields)
+
+fn prism_tel_keys(ev: PrismTelEvent) -> list
+    ev.te_fields.map(fn(f) f.tf_key)
+
+fn prism_tel_get(ev: PrismTelEvent, key) -> Result<string>
+    if type_of(key) != "string"
+        return err("prism_telemetry: key must be a string, got {type_of(key)}")
+    let hit = [""]
+    let found = [false]
+    for f in ev.te_fields
+        if f.tf_key == key
+            hit[0] = f.tf_val
+            found[0] = true
+    if not found[0]
+        return err("prism_telemetry: no field '{key}' on event '{ev.te_name}'")
+    ok(hit[0])
+
+// JSON escaping for the small set that can appear in an analytics value. Hand-written for the
+// same reason as everything else here: the generic serializer is not trustworthy across a module
+// boundary, and a telemetry sink is the worst place to discover that.
+fn _tel_esc(s: string) -> string
+    let out = []
+    for cp in code_points(s)
+        if cp == 34
+            push(out, "\\\"")
+        else if cp == 92
+            push(out, "\\\\")
+        else if cp == 10
+            push(out, "\\n")
+        else if cp == 13
+            push(out, "\\r")
+        else if cp == 9
+            push(out, "\\t")
+        else if cp < 32
+            push(out, " ")
+        else
+            push(out, from_codepoint(cp))
+    join(out, "")
+
+fn prism_tel_render(ev: PrismTelEvent) -> string
+    let parts = ev.te_fields.map(fn(f) "\"{_tel_esc(f.tf_key)}\":\"{_tel_esc(f.tf_val)}\"")
+    "\{\"event\":\"{_tel_esc(ev.te_name)}\",\"fields\":\{" + join(parts, ",") + "}}"
+
+// ── schema ──────────────────────────────────────────────────────────────────────────────────
+fn prism_tel_schema(name, keys) -> Result<PrismTelSchema>
+    let n = _tel_check_name(name)?
+    if type_of(keys) != "list"
+        return err("prism_telemetry: schema keys must be a list, got {type_of(keys)}")
+    if len(keys) == 0
+        return err("prism_telemetry: schema '{n}' declares no keys")
+    let seen = []
+    for k in keys
+        if type_of(k) != "string"
+            return err("prism_telemetry: schema key must be a string, got {type_of(k)}")
+        if contains(seen, k)
+            return err("prism_telemetry: schema '{n}' declares duplicate key '{k}'")
+        push(seen, k)
+    ok(PrismTelSchema(n, seen))
+
+// Exact match only. An UNDECLARED key is rejected as firmly as a missing one, because that is
+// exactly how a rename presents: the new name starts arriving while the old one stops, and
+// tolerating the extra field is what lets the dashboard go quietly wrong.
+fn prism_tel_check(ev: PrismTelEvent, schema: PrismTelSchema) -> Result<PrismTelEvent>
+    if ev.te_name != schema.ts_name
+        return err("prism_telemetry: event '{ev.te_name}' does not match schema '{schema.ts_name}'")
+    let keys = prism_tel_keys(ev)
+    for want in schema.ts_keys
+        if not contains(keys, want)
+            return err("prism_telemetry: event '{ev.te_name}' is missing declared field '{want}'")
+    for got in keys
+        if not contains(schema.ts_keys, got)
+            return err("prism_telemetry: event '{ev.te_name}' carries undeclared field '{got}' -- a renamed field looks exactly like this, so it is an error, not a warning")
+    ok(ev)

@@ -1,0 +1,94 @@
+// KAT for prism/obs/prism_crash.nova -- crash reports with the replay log attached (#97 #128).
+//
+// ★ THE PROPERTY THIS EXISTS FOR: attaching a replay log must attach the SHAPE of the interaction
+// and never its CONTENT. A journal of real events contains what the user TYPED -- passwords, card
+// numbers, private messages -- and a crash reporter ships its payload off-box. So the test types
+// a distinctive marker into an `entry` event, attaches that journal, and asserts the marker
+// appears NOWHERE in the rendered report. If that assertion ever goes green by accident (e.g. the
+// renderer stops emitting steps at all) the step-count assertions catch it.
+
+import prism_event
+import prism_journal
+import prism_crash
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_crash ==")
+
+    print("1. construction and validation")
+    check("empty message rejected", is_err(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), "", "face.checkout")))
+    check("empty where rejected", is_err(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), "boom", "")))
+    check("non-string message rejected", is_err(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), 7, "x")))
+    check("non-string where rejected", is_err(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), "boom", 7)))
+    let r0 = unwrap(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_assert(), "expected 3 got 4", "face.cart"))
+    check("message stored", prism_crash.prism_crs_message(r0) == "expected 3 got 4")
+    check("where stored", prism_crash.prism_crs_where(r0) == "face.cart")
+    check("kind stored", prism_crash.prism_crs_kind_name(prism_crash.prism_crs_kind(r0)) == "assert")
+    check("a fresh report has no steps", prism_crash.prism_crs_step_count(r0) == 0)
+
+    print("2. the crash-kind vocabulary is closed")
+    let kinds = prism_crash.prism_crs_kind_all()
+    check("4 kinds", len(kinds) == 4)
+    check("names are fault,assert,timeout,cancelled", join(kinds.map(fn(k) prism_crash.prism_crs_kind_name(k)), ",") == "fault,assert,timeout,cancelled")
+
+    print("3. ★ the replay log attaches SHAPE, never CONTENT")
+    // A realistic sequence: the user types a password, then presses submit.
+    let j0 = prism_journal.prism_jrn_new()
+    let j1 = unwrap(prism_journal.prism_jrn_record(j0, unwrap(prism_event.prism_ev_entry_from_input("form.password", "hunter2-TYPED-MARKER"))))
+    let j2 = unwrap(prism_journal.prism_jrn_record(j1, unwrap(prism_event.prism_ev_link_from_input("nav.help", "/help/SECRET-ROUTE-MARKER"))))
+    let j3 = unwrap(prism_journal.prism_jrn_record(j2, unwrap(prism_event.prism_ev_press_from_input("btn.submit"))))
+    let rep = unwrap(prism_crash.prism_crs_attach(r0, j3))
+    check("3 steps attached", prism_crash.prism_crs_step_count(rep) == 3)
+    let rendered = prism_crash.prism_crs_render(rep)
+
+    // THE assertions. The typed text and the route are BOTH payloads and must not survive.
+    check("TYPED TEXT absent from the report", not contains(rendered, "hunter2-TYPED-MARKER"))
+    check("ROUTE payload absent from the report", not contains(rendered, "SECRET-ROUTE-MARKER"))
+    // ...and the report is still USEFUL: the reproduction path survives.
+    check("the reproduction path survives: entry@form.password", contains(rendered, "entry@form.password"))
+    check("the reproduction path survives: press@btn.submit", contains(rendered, "press@btn.submit"))
+    check("step order is preserved", contains(rendered, "\"entry@form.password\",\"link@nav.help\",\"press@btn.submit\""))
+    check("the crash message renders", contains(rendered, "expected 3 got 4"))
+    check("the location renders", contains(rendered, "face.cart"))
+    check("the kind renders", contains(rendered, "\"kind\":\"assert\""))
+
+    print("4. steps expose kind and target, and nothing else")
+    let steps = prism_crash.prism_crs_steps(rep)
+    check("step 0 kind is 'entry'", prism_crash.prism_crs_step_kind(steps[0]) == "entry")
+    check("step 0 target is the control", prism_crash.prism_crs_step_target(steps[0]) == "form.password")
+    // A step is a two-field value: there is no field that COULD hold a payload, which is what
+    // makes this structural rather than a matter of the renderer being careful.
+    check("no step carries the typed text", not contains(prism_crash.prism_crs_step_target(steps[0]), "hunter2"))
+
+    print("5. attach is non-mutating, and honours the undo cursor")
+    check("the ORIGINAL report still has 0 steps", prism_crash.prism_crs_step_count(r0) == 0)
+    // Undone events are NOT part of the applied timeline, so they are not part of the
+    // reproduction path either -- the report describes what actually ran.
+    let undone = unwrap(prism_journal.prism_jrn_undo(j3))
+    let rep2 = unwrap(prism_crash.prism_crs_attach(r0, undone))
+    check("an undone step is excluded from the report", prism_crash.prism_crs_step_count(rep2) == 2)
+    check("attaching an empty journal yields no steps", prism_crash.prism_crs_step_count(unwrap(prism_crash.prism_crs_attach(r0, j0))) == 0)
+
+    print("6. rendering escapes rather than corrupting")
+    let weird = unwrap(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), "say \"hi\"\nbroke", "face.x"))
+    let wr = prism_crash.prism_crs_render(weird)
+    check("quotes escaped", contains(wr, "\\\""))
+    check("newline escaped", contains(wr, "\\n"))
+    let intl = unwrap(prism_crash.prism_crs_report(prism_crash.prism_crs_kind_fault(), "日本語エラー", "face.intl"))
+    check("non-ASCII message survives", contains(prism_crash.prism_crs_render(intl), "日本語エラー"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_crash: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_crash: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

@@ -1,0 +1,98 @@
+// KAT for prism/obs/prism_telemetry.nova -- typed analytics events (feature #96).
+//
+// The three properties this proves, in order of importance:
+//   1. ★ A SECRET'S PLAINTEXT NEVER APPEARS IN THE RENDERED EVENT. Asserted against the rendered
+//      string with a distinctive marker, not against a getter -- the sink sees the rendered form,
+//      so that is what must be checked.
+//   2. A SCHEMA MISMATCH IS AN ERROR IN BOTH DIRECTIONS. A missing field AND an undeclared one,
+//      because a renamed field presents as "new key arrives, old key stops" and tolerating the
+//      extra is exactly how a dashboard goes quietly wrong.
+//   3. Rejection is NON-MUTATING: a rejected duplicate must not corrupt the event it was
+//      rejected from.
+
+import prism_secret
+import prism_telemetry
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_telemetry ==")
+
+    print("1. construction and validation")
+    check("empty name rejected", is_err(prism_telemetry.prism_tel_event("")))
+    check("non-string name rejected", is_err(prism_telemetry.prism_tel_event(7)))
+    let e0 = unwrap(prism_telemetry.prism_tel_event("checkout_started"))
+    check("fresh event has no fields", prism_telemetry.prism_tel_field_count(e0) == 0)
+    check("name is stored", prism_telemetry.prism_tel_name(e0) == "checkout_started")
+
+    print("2. typed fields")
+    let e1 = unwrap(prism_telemetry.prism_tel_str(e0, "plan", "pro"))
+    let e2 = unwrap(prism_telemetry.prism_tel_int(e1, "items", 3))
+    let e3 = unwrap(prism_telemetry.prism_tel_bool(e2, "trial", true))
+    check("3 fields", prism_telemetry.prism_tel_field_count(e3) == 3)
+    check("str field round-trips", unwrap(prism_telemetry.prism_tel_get(e3, "plan")) == "pro")
+    check("int field renders", unwrap(prism_telemetry.prism_tel_get(e3, "items")) == "3")
+    check("bool field renders as true", unwrap(prism_telemetry.prism_tel_get(e3, "trial")) == "true")
+    let e3f = unwrap(prism_telemetry.prism_tel_bool(e2, "trial", false))
+    check("bool false renders as false", unwrap(prism_telemetry.prism_tel_get(e3f, "trial")) == "false")
+    check("keys are in insertion order", join(prism_telemetry.prism_tel_keys(e3), ",") == "plan,items,trial")
+    check("wrong type for str rejected", is_err(prism_telemetry.prism_tel_str(e0, "plan", 5)))
+    check("wrong type for int rejected", is_err(prism_telemetry.prism_tel_int(e0, "items", "3")))
+    check("missing field is an err, not an empty string", is_err(prism_telemetry.prism_tel_get(e3, "nope")))
+
+    print("3. duplicate keys rejected, and rejection does not mutate")
+    check("duplicate key rejected", is_err(prism_telemetry.prism_tel_str(e3, "plan", "enterprise")))
+    // The agent-written draft of this KAT had this idea and it is worth keeping: a rejected
+    // operation must leave the ORIGINAL untouched, not half-applied.
+    check("original still has 3 fields after the rejection", prism_telemetry.prism_tel_field_count(e3) == 3)
+    check("original 'plan' still reads 'pro'", unwrap(prism_telemetry.prism_tel_get(e3, "plan")) == "pro")
+    check("empty key rejected", is_err(prism_telemetry.prism_tel_str(e3, "", "x")))
+
+    print("4. ★ a secret's PLAINTEXT never reaches the rendered event")
+    let pw = unwrap(prism_secret.sec_new("password", "hunter2-PLAINTEXT-MARKER"))
+    let e4 = unwrap(prism_telemetry.prism_tel_secret(e3, "auth", pw))
+    let rendered = prism_telemetry.prism_tel_render(e4)
+    check("the secret field exists", prism_telemetry.prism_tel_field_count(e4) == 4)
+    // THE assertion. The sink sees the RENDERED string, so that is what is checked.
+    check("PLAINTEXT ABSENT from the rendered event", not contains(rendered, "hunter2-PLAINTEXT-MARKER"))
+    check("plaintext absent from the stored field too", not contains(unwrap(prism_telemetry.prism_tel_get(e4, "auth")), "hunter2-PLAINTEXT-MARKER"))
+    check("the label survives (a redaction must still be identifiable)", contains(rendered, "auth"))
+    check("the non-secret fields still render", contains(rendered, "\"plan\":\"pro\"") and contains(rendered, "\"items\":\"3\""))
+    check("event name renders", contains(rendered, "checkout_started"))
+
+    print("5. rendering escapes rather than corrupting")
+    let q = unwrap(prism_telemetry.prism_tel_str(unwrap(prism_telemetry.prism_tel_event("weird")), "note", "say \"hi\"\nline2"))
+    let qr = prism_telemetry.prism_tel_render(q)
+    check("quotes escaped", contains(qr, "\\\""))
+    check("newline escaped, not literal", contains(qr, "\\n"))
+    // Non-ASCII must survive intact -- the renderer walks code points, and a byte-wise walk
+    // would split a multi-byte character into invalid UTF-8.
+    let u = unwrap(prism_telemetry.prism_tel_str(unwrap(prism_telemetry.prism_tel_event("intl")), "city", "日本語"))
+    check("non-ASCII value survives rendering", contains(prism_telemetry.prism_tel_render(u), "日本語"))
+
+    print("6. ★ schema drift is an error in BOTH directions")
+    let sc = unwrap(prism_telemetry.prism_tel_schema("checkout_started", ["plan", "items", "trial"]))
+    check("a conforming event passes", not is_err(prism_telemetry.prism_tel_check(e3, sc)))
+    // Missing: the event lacks a declared key.
+    check("MISSING declared field rejected", is_err(prism_telemetry.prism_tel_check(unwrap(prism_telemetry.prism_tel_str(e0, "plan", "pro")), sc)))
+    // Extra: this is what a RENAME looks like from the sink's side.
+    check("UNDECLARED field rejected (this is how a rename presents)", is_err(prism_telemetry.prism_tel_check(e4, sc)))
+    check("wrong event name rejected", is_err(prism_telemetry.prism_tel_check(unwrap(prism_telemetry.prism_tel_event("other")), sc)))
+    check("empty schema key list rejected", is_err(prism_telemetry.prism_tel_schema("x", [])))
+    check("duplicate schema key rejected", is_err(prism_telemetry.prism_tel_schema("x", ["a", "a"])))
+    check("non-list schema keys rejected", is_err(prism_telemetry.prism_tel_schema("x", "a")))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_telemetry: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_telemetry: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

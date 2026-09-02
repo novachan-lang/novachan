@@ -1,0 +1,139 @@
+// prism_crash -- crash reports with the replay log attached (prism/obs/, features #97 #128).
+// The value of #128 is that a crash report carries the STEPS THAT CAUSED IT, so a bug is
+// reproducible instead of being a stack trace with no story.
+//
+// ── ⛔ THE TRAP IN "ATTACH THE REPLAY LOG" ───────────────────────────────────────────────────
+// A replay log is a list of `PrismEvent`, and an `entry` event carries the TEXT THE USER TYPED.
+// So attaching the log verbatim attaches every password, card number and private message typed
+// into the app, and uploads it to a crash sink. The feature that makes crashes debuggable is,
+// implemented naively, the largest exfiltration channel in the framework -- and it would look
+// completely reasonable in review, because "attach the replay log" is exactly what the roadmap
+// asks for.
+// So the log is attached as REDACTED STEPS: each step keeps the event's KIND and TARGET (which
+// is what makes it reproducible -- "entry on form.password, then press on submit") and DISCARDS
+// every payload. `prism_ev_describe` is deliberately NOT used, because it interpolates
+// `text='...'`, `route='...'` and index values into its output.
+// What survives is the shape of the interaction; what never leaves is its content.
+//
+// ── AND IT NEVER CALLS THE GENERIC SERIALIZER ────────────────────────────────────────────────
+// Same reason as prism_telemetry: `to_json()` on an IMPORTED struct was measured this session
+// mis-dispatching to an unrelated local struct's method and reading OUT OF BOUNDS, leaking a raw
+// heap value (repro: test_programs/_tojson_dispatch_test.nova). A crash reporter is the one place
+// that already collects adjacent state and ships it off-box. Everything here is hand-built.
+//
+// PUBLIC API
+//   prism_crs_report(kind, message, where)      -> Result<PrismCrash>
+//   prism_crs_attach(report, journal)           -> Result<PrismCrash>   redacted steps
+//   prism_crs_kind(r) / _message(r) / _where(r) / _step_count(r) / _steps(r)
+//   prism_crs_render(r)                         -> string   hand-built, payload-free
+//   prism_crs_kind_fault() / _assert() / _timeout() / _cancelled()
+//   prism_crs_kind_name(k)                      -> string
+
+import prism_event
+import prism_journal
+
+// `Crs`-prefixed variants: enum constructors resolve across module boundaries in NOVA's one flat
+// symbol space, so unprefixed names would be a landmine for every other module.
+enum PrismCrashKind
+    CrsFault()
+    CrsAssert()
+    CrsTimeout()
+    CrsCancelled()
+
+// `crs_`/`cs_` prefixes because the struct field->slot map is GLOBAL -- a bare `kind`/`message`
+// shares a slot with any other module's field of that name.
+type PrismCrashStep
+    cs_kind: string     // event kind only -- never the payload
+    cs_target: string   // which control -- the reproduction path
+
+type PrismCrash
+    crs_kind: PrismCrashKind
+    crs_message: string
+    crs_where: string
+    crs_steps: list
+
+fn prism_crs_kind_fault() -> PrismCrashKind
+    CrsFault()
+
+fn prism_crs_kind_assert() -> PrismCrashKind
+    CrsAssert()
+
+fn prism_crs_kind_timeout() -> PrismCrashKind
+    CrsTimeout()
+
+fn prism_crs_kind_cancelled() -> PrismCrashKind
+    CrsCancelled()
+
+fn prism_crs_kind_name(k: PrismCrashKind) -> string
+    match k
+        CrsFault() => "fault"
+        CrsAssert() => "assert"
+        CrsTimeout() => "timeout"
+        CrsCancelled() => "cancelled"
+
+fn prism_crs_kind_all() -> list
+    [CrsFault(), CrsAssert(), CrsTimeout(), CrsCancelled()]
+
+fn prism_crs_report(kind: PrismCrashKind, message, where) -> Result<PrismCrash>
+    if type_of(message) != "string"
+        return err("prism_crash: message must be a string, got {type_of(message)}")
+    if len(message) == 0
+        return err("prism_crash: message is required (a crash with no description is not actionable)")
+    if type_of(where) != "string"
+        return err("prism_crash: 'where' must be a string, got {type_of(where)}")
+    if len(where) == 0
+        return err("prism_crash: 'where' is required -- a report that cannot be located is not actionable")
+    ok(PrismCrash(kind, message, where, []))
+
+// ⛔ Attaches the SHAPE of the interaction, never its content. Each journal event contributes its
+// KIND and TARGET only. This is what keeps a crash report from becoming a keystroke log.
+fn prism_crs_attach(report: PrismCrash, journal: PrismJournal) -> Result<PrismCrash>
+    let steps = []
+    for e in prism_journal.prism_jrn_applied(journal)
+        push(steps, PrismCrashStep(prism_event.prism_ev_kind_str(e), prism_event.prism_ev_target(e)))
+    ok(PrismCrash(report.crs_kind, report.crs_message, report.crs_where, steps))
+
+fn prism_crs_kind(r: PrismCrash) -> PrismCrashKind
+    r.crs_kind
+
+fn prism_crs_message(r: PrismCrash) -> string
+    r.crs_message
+
+fn prism_crs_where(r: PrismCrash) -> string
+    r.crs_where
+
+fn prism_crs_step_count(r: PrismCrash) -> int
+    len(r.crs_steps)
+
+fn prism_crs_steps(r: PrismCrash) -> list
+    r.crs_steps
+
+fn prism_crs_step_kind(s: PrismCrashStep) -> string
+    s.cs_kind
+
+fn prism_crs_step_target(s: PrismCrashStep) -> string
+    s.cs_target
+
+fn _crs_esc(s: string) -> string
+    let out = []
+    for cp in code_points(s)
+        if cp == 34
+            push(out, "\\\"")
+        else if cp == 92
+            push(out, "\\\\")
+        else if cp == 10
+            push(out, "\\n")
+        else if cp == 13
+            push(out, "\\r")
+        else if cp == 9
+            push(out, "\\t")
+        else if cp < 32
+            push(out, " ")
+        else
+            push(out, from_codepoint(cp))
+    join(out, "")
+
+// Hand-built. The steps render as "kind@target" pairs -- reproducible, payload-free.
+fn prism_crs_render(r: PrismCrash) -> string
+    let steps = r.crs_steps.map(fn(s) "\"{_crs_esc(s.cs_kind)}@{_crs_esc(s.cs_target)}\"")
+    "\{\"kind\":\"{prism_crs_kind_name(r.crs_kind)}\",\"message\":\"{_crs_esc(r.crs_message)}\",\"where\":\"{_crs_esc(r.crs_where)}\",\"steps\":[" + join(steps, ",") + "]}"
