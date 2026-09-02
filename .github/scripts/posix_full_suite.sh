@@ -382,7 +382,60 @@ export OUT NOVA LINKF EXTRA_CFLAGS SQLITE_OBJ
 export -f TMO 2>/dev/null || true
 
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-echo "running $(wc -l < "$OUT/_tests.txt" | tr -d ' ') tests with $JOBS parallel workers ..."
+
+# ── OVERSUBSCRIPTION GUARD: NOVA_CARRIERS=1 for the PARALLEL BATCH ONLY ────────────────────
+# WHY THIS EXISTS. Every `run_one` shells out to a freshly linked NOVA binary, and NOVA's M:N
+# scheduler is implicit-async BY DEFAULT: with NOVA_CARRIERS unset, nova_rt_main_dispatch
+# auto-detects the HOST's cpu_count and spawns that many carrier OS threads plus one poller
+# thread, for EVERY program -- even a purely single-threaded one like _argon2id_test that never
+# calls spawn()/channels. So each of the $JOBS test PROCESSES this xargs -P line runs
+# concurrently ALSO fans out to ~JOBS carrier threads internally (JOBS == this same
+# getconf _NPROCESSORS_ONLN), which makes the real OS-thread count contending for the runner's
+# cores JOBS * JOBS, not JOBS. On a 3-4 vCPU macOS runner that is 9-16 runnable threads on 3-4
+# cores -- severe oversubscription, not a slow machine or a slow test.
+#
+# THIS IS A CREDIBLE, EVIDENCED CAUSE of the macos-15-intel _argon2id_test/_argon2id_kat
+# TIMEOUTs. Both are RFC 9106 m=32KiB t=2..3 -- MILLISECONDS of work by design (see the
+# deliberately-NOT-raised timeout for _argon2id_* below) -- so a 60s stall under this load is
+# scheduling starvation, and a longer cap would only delay the same finding, never fix it.
+#
+# THE FIX, and why NOT the alternatives:
+#   * Cap NOVA_CARRIERS alone (say =2) without touching JOBS -- still multiplies against
+#     JOBS==nproc concurrent processes, so total threads stay a multiple of core count. Only a
+#     partial fix.
+#   * Reduce JOBS instead -- does nothing about the per-process fan-out (one process alone still
+#     auto-detects nproc carriers), and directly reopens the wall-clock problem this script's own
+#     history warns about: Linux ran the equivalent serial-ish list for 330 minutes against a
+#     360-minute hard job ceiling; JOBS==nproc throughput is why macOS finishes in 49. Trading
+#     the timeout bug for a slipped job cap is not a fix, it is a different failure.
+#   * NOVA_CARRIERS=1 for the PARALLEL BATCH, JOBS left at nproc. JOBS * 1 == nproc: exactly
+#     matched to the machine, zero oversubscription, full process-level throughput kept. N=1 is
+#     BYTE-IDENTICAL correctness to the pre-M:N scheduler (nova_rt_main_dispatch skips carrier
+#     AND poller thread creation entirely at ncar<=1), so no test's PASS/FAIL verdict changes --
+#     only whether the scheduler ALSO exercises real OS-level parallelism while it runs.
+#
+# WHAT THIS COSTS, STATED PLAINLY. The ~3,500 tests in the parallel batch below no longer get
+# real multi-core execution as an (uncontrolled, oversubscribed) side effect of this script.
+# That coverage is not silently dropped -- it already lives, deliberately and without this
+# script's oversubscription risk, in three other places:
+#   * the SERVER tests just below run strictly SERIALLY (one process alive at a time) and are
+#     deliberately left with NOVA_CARRIERS UNSET, so they keep auto-detecting real N>1
+#     concurrency with no oversubscription risk -- their own in-process green TCP server + client
+#     is exactly the kind of path M:N scheduling exists to exercise;
+#   * the actual N>1 GATE is Windows' nova_ci.ps1 "[CI 2b/3] N>1 multi-core gate" plus
+#     _n_carriers_ci.ps1 / _forge_mn_ci.ps1 / _ws_mn_ci.ps1, which run the concurrency flagships
+#     at NOVA_CARRIERS=4 and 8 with kill-on-timeout;
+#   * cross-platform.yml's "Intermittent-failure probe" step explicitly bisects
+#     NOVA_CARRIERS=1 vs 4 on macOS for the crypto cluster.
+# A future M:N-scheduler bug reachable ONLY at N>1 could therefore go uncaught by the bulk
+# 3,500-test POSIX sweep specifically; it would still be caught by the three points above. That
+# is a real, named tradeoff, not a silent one. (A residual gap this does NOT close: the separate
+# work-stealing thread pool behind pmap/pfilter/pfor/future sizes itself from sysconf directly,
+# not from NOVA_CARRIERS, so a test using those primitives still fans out to nproc pool threads
+# regardless of this guard -- out of scope here; tracked as a follow-up, not silently ignored.)
+export NOVA_CARRIERS=1
+
+echo "running $(wc -l < "$OUT/_tests.txt" | tr -d ' ') tests with $JOBS parallel workers (NOVA_CARRIERS=1 each -- see oversubscription-guard comment above) ..."
 # `xargs -P` because a SERIAL pass over ~3,500 tests would run for hours and risk the job cap.
 xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$OUT/_tests.txt"
 
@@ -395,6 +448,12 @@ xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$OUT/_tests.txt"
 # evidence of how far it actually got.
 PDONE=$(ls "$OUT"/*.res 2>/dev/null | wc -l | tr -d ' ')
 echo "::notice title=posix parallel phase done::$PDONE results after the parallel batch on $(uname -s)"
+
+# Restore auto-detect for the SERVER tests below: they run strictly one at a time (the `while
+# read` loop, not xargs -P), so there is no other process to oversubscribe against -- letting
+# each spawn its natural carrier count is genuine, safe N>1 coverage (see the guard comment
+# above for why that coverage is not otherwise lost).
+unset NOVA_CARRIERS
 
 if [ -s "$OUT/_serial.txt" ]; then
   echo "running $(wc -l < "$OUT/_serial.txt" | tr -d ' ') SERVER tests serially ..."
