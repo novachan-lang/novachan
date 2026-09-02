@@ -1,0 +1,331 @@
+// prism_textmodel -- the document model shared by plain labels and rich text (prism/text/).
+// A document is an ORDERED LIST OF RUNS; a run is a string plus the set of marks covering it.
+// A plain label is simply a document with one unmarked run, which is the point: labels and rich
+// text are the SAME type, so nothing has to be converted when text becomes editable.
+//
+// ── POSITIONS ARE CODE POINTS. NOT BYTES, NOT CELLS. ─────────────────────────────────────────
+// This is the load-bearing decision and it is deliberately different from both neighbours:
+//   * BYTES would corrupt every non-ASCII edit -- inserting at "byte 3" of "héllo" lands inside
+//     the two-byte 'é' and produces invalid UTF-8. NOVA strings are byte strings, so this is the
+//     default failure mode, not a hypothetical one.
+//   * CELLS (display width) belong to prism_text.nova, which already owns width/wrap/truncate
+//     and knows CJK is 2 cells wide. A model indexed by cells could not represent a caret
+//     between two halves of a wide glyph, and would change meaning with the font.
+// So: prism_text answers "how wide is this on screen", prism_textmodel answers "what is at
+// position N". Neither duplicates the other -- prism_text is NOT re-implemented here.
+//
+// ── CANONICAL FORM IS AN INVARIANT, NOT A CLEANUP PASS ───────────────────────────────────────
+// After every operation: empty runs are dropped, and adjacent runs with the SAME mark set are
+// merged. Without this, `bold(0,2)` then `bold(2,4)` yields two bold runs where `bold(0,4)`
+// yields one -- the same document with two different structures. That would break two things at
+// once: structural equality would report "different" for identical text, and §15.9's
+// byte-reproducible rendering (rendering as attestation) would emit different output for the
+// same content. Canonicalising on construction makes the representation a function of the
+// content, so equality and rendering are both total.
+//
+// ── MARKS ARE PAYLOAD-FREE, AND STORED AS SORTED NAMES ───────────────────────────────────────
+// Payload-free follows MB.7's rule for the token enums: a payload needs a FIELD NAME, and NOVA's
+// struct field->slot table is GLOBAL, so payload-bearing variants across modules can collide on
+// a shared field name. A link is therefore NOT a mark -- it is a `link` node at the widget
+// layer, where its route already gets validated (and where the protocol-relative "//host"
+// open-redirect check lives).
+// Marks are stored as a SORTED list of names so that {bold,italic} and {italic,bold} are the
+// same set: mark order must never make two identical runs compare unequal.
+//
+// PUBLIC API (every constructor and every edit returns Result; positions are code points)
+//   prism_tm_plain(text)                      -> Result<PrismDoc>   one unmarked run (a label)
+//   prism_tm_run(text, marks)                 -> Result<PrismRun>
+//   prism_tm_doc(runs)                        -> Result<PrismDoc>   canonicalised
+//   prism_tm_text(doc) / prism_tm_length(doc) -> string / int (code points)
+//   prism_tm_run_count(doc) prism_tm_runs(doc)
+//   prism_tm_slice(doc, from, to)             -> Result<PrismDoc>
+//   prism_tm_insert(doc, at, text)            -> Result<PrismDoc>
+//   prism_tm_delete(doc, from, to)            -> Result<PrismDoc>
+//   prism_tm_mark(doc, from, to, mark)        -> Result<PrismDoc>
+//   prism_tm_unmark(doc, from, to, mark)      -> Result<PrismDoc>
+//   prism_tm_marks_at(doc, pos)               -> Result<list>   sorted mark names
+//   prism_tm_same(a, b)                       -> bool           structural, post-canonical
+//   prism_tm_mark_bold/italic/code/under/strike() -> PrismMark
+//   prism_tm_mark_name(m) prism_tm_mark_all()
+
+import prism_text
+
+// `Tm`-prefixed variants: NOVA has ONE flat symbol space and enum constructors resolve across
+// modules, so a bare `Bold()` would be a landmine for any other module that wants the name.
+enum PrismMark
+    TmBold()
+    TmItalic()
+    TmCode()
+    TmUnder()
+    TmStrike()
+
+// Fields are `tm_`-prefixed because the struct field->slot map is GLOBAL: an unprefixed `text`
+// or `runs` would share a slot with any other module's field of that name and silently corrupt
+// dot-access, which reconverge cannot detect.
+type PrismRun
+    tm_run_text: string
+    tm_run_marks: list      // SORTED mark names (strings), never PrismMark values -- see header
+
+type PrismDoc
+    tm_doc_runs: list       // list<PrismRun>, canonical: no empties, no mergeable neighbours
+
+fn prism_tm_mark_bold() -> PrismMark
+    TmBold()
+
+fn prism_tm_mark_italic() -> PrismMark
+    TmItalic()
+
+fn prism_tm_mark_code() -> PrismMark
+    TmCode()
+
+fn prism_tm_mark_under() -> PrismMark
+    TmUnder()
+
+fn prism_tm_mark_strike() -> PrismMark
+    TmStrike()
+
+fn prism_tm_mark_name(m: PrismMark) -> string
+    match m
+        TmBold() => "bold"
+        TmItalic() => "italic"
+        TmCode() => "code"
+        TmUnder() => "under"
+        TmStrike() => "strike"
+
+fn prism_tm_mark_all() -> list
+    [TmBold(), TmItalic(), TmCode(), TmUnder(), TmStrike()]
+
+// ── code-point helpers ──────────────────────────────────────────────────────────────────────
+// ⛔ `str_chars` is BYTE-wise despite its name -- str_chars("héllo") returns SIX elements with
+// the 'é' split into two invalid bytes. `slice` is string-only (it strlen's its argument), so it
+// cannot slice a list at all. Both were measured, not assumed. The correct pair is
+// `code_points` (UTF-8 decoded, returns code point INTS) and `from_codepoint`.
+// Known limit, stated rather than hidden: code_points is strlen-bounded, so a document
+// containing a literal 0x00 truncates there. Text with an embedded NUL is pathological, and the
+// alternative is a length-carrying model the string builtins do not offer yet.
+fn _tm_len(s: string) -> int
+    char_count(s)
+
+// Code-point-indexed substring. The single-element `[0]` cursor is a deliberate idiom, not a
+// workaround: `let mut` index counters are banned by the high-level standard, and `enumerate()`
+// corrupts struct fields, so a list cell carries the index instead.
+fn _tm_sub(s: string, from: int, to: int) -> string
+    let out = []
+    let i = [0]
+    for cp in code_points(s)
+        let idx = i[0]
+        i[0] = idx + 1
+        if idx >= from and idx < to
+            push(out, from_codepoint(cp))
+    join(out, "")
+
+// ── marks ───────────────────────────────────────────────────────────────────────────────────
+// Sorted + de-duplicated, so a mark set has exactly ONE representation.
+fn _tm_norm_marks(names: list) -> list
+    let uniq = []
+    for n in sort(names)
+        if not contains(uniq, n)
+            push(uniq, n)
+    uniq
+
+fn _tm_marks_equal(a: list, b: list) -> bool
+    if len(a) != len(b)
+        return false
+    join(a, ",") == join(b, ",")
+
+// ── constructors ────────────────────────────────────────────────────────────────────────────
+fn prism_tm_run(text, marks) -> Result<PrismRun>
+    if type_of(text) != "string"
+        return err("prism_textmodel: run text must be a string, got {type_of(text)}")
+    if type_of(marks) != "list"
+        return err("prism_textmodel: run marks must be a list, got {type_of(marks)}")
+    let names = []
+    for m in marks
+        if type_of(m) != "string"
+            push(names, prism_tm_mark_name(m))
+        else
+            push(names, m)
+    ok(PrismRun(text, _tm_norm_marks(names)))
+
+// Canonicalise: drop empty runs, merge adjacent runs whose mark sets agree. Applied on EVERY
+// construction so no caller can observe a non-canonical document.
+fn _tm_canon(runs: list) -> list
+    let out = []
+    for r in runs
+        if _tm_len(r.tm_run_text) > 0
+            if len(out) > 0 and _tm_marks_equal(out[len(out) - 1].tm_run_marks, r.tm_run_marks)
+                let prev = out[len(out) - 1]
+                out[len(out) - 1] = PrismRun(prev.tm_run_text + r.tm_run_text, prev.tm_run_marks)
+            else
+                push(out, r)
+    out
+
+fn prism_tm_doc(runs) -> Result<PrismDoc>
+    if type_of(runs) != "list"
+        return err("prism_textmodel: doc runs must be a list, got {type_of(runs)}")
+    ok(PrismDoc(_tm_canon(runs)))
+
+fn prism_tm_plain(text) -> Result<PrismDoc>
+    let r = prism_tm_run(text, [])?
+    prism_tm_doc([r])
+
+// ── accessors ───────────────────────────────────────────────────────────────────────────────
+fn prism_tm_runs(doc: PrismDoc) -> list
+    doc.tm_doc_runs
+
+fn prism_tm_run_count(doc: PrismDoc) -> int
+    len(doc.tm_doc_runs)
+
+fn prism_tm_text(doc: PrismDoc) -> string
+    join(doc.tm_doc_runs.map(fn(r) r.tm_run_text), "")
+
+fn prism_tm_length(doc: PrismDoc) -> int
+    _tm_len(prism_tm_text(doc))
+
+// Display width delegates to prism_text, which already owns CJK/zero-width handling. Width is
+// deliberately NOT recomputed here -- one owner per concern.
+fn prism_tm_width(doc: PrismDoc) -> int
+    prism_text.prism_text_width(prism_tm_text(doc))
+
+fn _tm_check_range(doc: PrismDoc, from, to) -> Result<int>
+    if type_of(from) != "int" or type_of(to) != "int"
+        return err("prism_textmodel: range bounds must be ints, got {type_of(from)}/{type_of(to)}")
+    let n = prism_tm_length(doc)
+    if from < 0 or to < from or to > n
+        return err("prism_textmodel: range [{from},{to}) is outside the document (length {n})")
+    ok(n)
+
+// ── slicing ─────────────────────────────────────────────────────────────────────────────────
+// Walks runs while tracking each run's code-point span, clipping to the requested range. Marks
+// are carried through, so slicing a bold region yields a bold document.
+fn prism_tm_slice(doc: PrismDoc, from, to) -> Result<PrismDoc>
+    let _n = _tm_check_range(doc, from, to)?
+    let out = []
+    let cursor = [0]
+    for r in doc.tm_doc_runs
+        let start = cursor[0]
+        let rlen = _tm_len(r.tm_run_text)
+        let stop = start + rlen
+        cursor[0] = stop
+        let lo = if start > from
+            start
+        else
+            from
+        let hi = if stop < to
+            stop
+        else
+            to
+        if hi > lo
+            push(out, PrismRun(_tm_sub(r.tm_run_text, lo - start, hi - start), r.tm_run_marks))
+    prism_tm_doc(out)
+
+// ── editing (every edit returns a NEW document; nothing mutates) ────────────────────────────
+fn prism_tm_insert(doc: PrismDoc, at, text) -> Result<PrismDoc>
+    let _n = _tm_check_range(doc, at, at)?
+    if type_of(text) != "string"
+        return err("prism_textmodel: inserted text must be a string, got {type_of(text)}")
+    let head = prism_tm_slice(doc, 0, at)?
+    let tail = prism_tm_slice(doc, at, prism_tm_length(doc))?
+    // Inserted text takes the marks of the run it lands INSIDE, matching every editor's
+    // behaviour (typing inside a bold word stays bold). At a boundary it takes the LEFT run's
+    // marks, which is the convention that makes "type at the end of a bold word" stay bold.
+    let marks = if at > 0
+        unwrap(prism_tm_marks_at(doc, at - 1))
+    else
+        []
+    let mid = prism_tm_run(text, marks)?
+    let runs = []
+    for r in prism_tm_runs(head)
+        push(runs, r)
+    push(runs, mid)
+    for r in prism_tm_runs(tail)
+        push(runs, r)
+    prism_tm_doc(runs)
+
+fn prism_tm_delete(doc: PrismDoc, from, to) -> Result<PrismDoc>
+    let _n = _tm_check_range(doc, from, to)?
+    let head = prism_tm_slice(doc, 0, from)?
+    let tail = prism_tm_slice(doc, to, prism_tm_length(doc))?
+    let runs = []
+    for r in prism_tm_runs(head)
+        push(runs, r)
+    for r in prism_tm_runs(tail)
+        push(runs, r)
+    prism_tm_doc(runs)
+
+// ── marks over a range ──────────────────────────────────────────────────────────────────────
+fn _tm_apply(doc: PrismDoc, from, to, name: string, add: bool) -> Result<PrismDoc>
+    let _n = _tm_check_range(doc, from, to)?
+    let out = []
+    let cursor = [0]
+    for r in doc.tm_doc_runs
+        let start = cursor[0]
+        let rlen = _tm_len(r.tm_run_text)
+        let stop = start + rlen
+        cursor[0] = stop
+        // Split the run into the part before the range, the covered part, and the part after.
+        // Only the covered part changes, which is what keeps marks from leaking outside [from,to).
+        let lo = if start > from
+            start
+        else
+            from
+        let hi = if stop < to
+            stop
+        else
+            to
+        if hi <= lo
+            push(out, r)
+        else
+            if lo > start
+                push(out, PrismRun(_tm_sub(r.tm_run_text, 0, lo - start), r.tm_run_marks))
+            let inner = []
+            for m in r.tm_run_marks
+                if m != name
+                    push(inner, m)
+            if add
+                push(inner, name)
+            push(out, PrismRun(_tm_sub(r.tm_run_text, lo - start, hi - start), _tm_norm_marks(inner)))
+            if stop > hi
+                push(out, PrismRun(_tm_sub(r.tm_run_text, hi - start, rlen), r.tm_run_marks))
+    prism_tm_doc(out)
+
+fn prism_tm_mark(doc: PrismDoc, from, to, mark: PrismMark) -> Result<PrismDoc>
+    _tm_apply(doc, from, to, prism_tm_mark_name(mark), true)
+
+fn prism_tm_unmark(doc: PrismDoc, from, to, mark: PrismMark) -> Result<PrismDoc>
+    _tm_apply(doc, from, to, prism_tm_mark_name(mark), false)
+
+// Marks covering the character AT `pos` (not a cursor position -- a character index).
+fn prism_tm_marks_at(doc: PrismDoc, pos) -> Result<list>
+    if type_of(pos) != "int"
+        return err("prism_textmodel: position must be an int, got {type_of(pos)}")
+    let n = prism_tm_length(doc)
+    if pos < 0 or pos >= n
+        return err("prism_textmodel: position {pos} is outside the document (length {n})")
+    let found = [[]]
+    let cursor = [0]
+    for r in doc.tm_doc_runs
+        let start = cursor[0]
+        let stop = start + _tm_len(r.tm_run_text)
+        cursor[0] = stop
+        if pos >= start and pos < stop
+            found[0] = r.tm_run_marks
+    ok(found[0])
+
+// Structural equality. Safe to compare run-by-run precisely BECAUSE both documents are
+// canonical -- without that invariant this would report identical text as different.
+fn prism_tm_same(a: PrismDoc, b: PrismDoc) -> bool
+    if len(a.tm_doc_runs) != len(b.tm_doc_runs)
+        return false
+    if prism_tm_text(a) != prism_tm_text(b)
+        return false
+    let ok_all = [true]
+    let cursor = [0]
+    for r in a.tm_doc_runs
+        let other = b.tm_doc_runs[cursor[0]]
+        cursor[0] = cursor[0] + 1
+        if r.tm_run_text != other.tm_run_text
+            ok_all[0] = false
+        else if not _tm_marks_equal(r.tm_run_marks, other.tm_run_marks)
+            ok_all[0] = false
+    ok_all[0]

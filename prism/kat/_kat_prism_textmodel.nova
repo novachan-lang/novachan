@@ -1,0 +1,122 @@
+// KAT for prism/text/prism_textmodel.nova -- the document model behind labels and rich text.
+//
+// The four things this proves, in order of importance:
+//   1. POSITIONS ARE CODE POINTS. Every edit is exercised on non-ASCII text, because a
+//      byte-indexed model does not fail loudly -- it silently splits a multi-byte character and
+//      produces invalid UTF-8. An ASCII-only test would pass against a completely broken model.
+//   2. CANONICAL FORM: mark(0,2) then mark(2,4) must be STRUCTURALLY IDENTICAL to mark(0,4).
+//      Without it, equality reports identical text as different and §15.9's byte-reproducible
+//      rendering emits different output for the same content.
+//   3. Marks are a SET: {bold,italic} and {italic,bold} are the same run.
+//   4. Ranges are validated -- every out-of-bounds edit is an `err`, never a silent clamp.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set to nova-compiler/, NOVA_NO_CACHE=1)
+
+import prism_textmodel
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        print("  pass  {name}")
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn _bold() -> PrismMark
+    prism_textmodel.prism_tm_mark_bold()
+
+fn _ital() -> PrismMark
+    prism_textmodel.prism_tm_mark_italic()
+
+fn main()
+    print("== _kat_prism_textmodel ==")
+    print("")
+
+    print("1. plain documents")
+    let p = unwrap(prism_textmodel.prism_tm_plain("hello"))
+    check("text round-trips", prism_textmodel.prism_tm_text(p) == "hello")
+    check("length is 5", prism_textmodel.prism_tm_length(p) == 5)
+    check("a label is ONE unmarked run", prism_textmodel.prism_tm_run_count(p) == 1)
+    check("empty document has zero runs (empty run dropped)", prism_textmodel.prism_tm_run_count(unwrap(prism_textmodel.prism_tm_plain(""))) == 0)
+    check("empty document length 0", prism_textmodel.prism_tm_length(unwrap(prism_textmodel.prism_tm_plain(""))) == 0)
+    print("")
+
+    // ── THE decision under test ──────────────────────────────────────────────────────────────
+    print("2. positions are CODE POINTS, not bytes (non-ASCII throughout)")
+    let u = unwrap(prism_textmodel.prism_tm_plain("héllo"))
+    check("length of 'héllo' is 5 code points, not 6 bytes", prism_textmodel.prism_tm_length(u) == 5)
+    let usl = unwrap(prism_textmodel.prism_tm_slice(u, 0, 2))
+    check("slice(0,2) is 'hé' -- not a split 2-byte char", prism_textmodel.prism_tm_text(usl) == "hé")
+    let uins = unwrap(prism_textmodel.prism_tm_insert(u, 2, "X"))
+    check("insert at code point 2 gives 'héXllo'", prism_textmodel.prism_tm_text(uins) == "héXllo")
+    let udel = unwrap(prism_textmodel.prism_tm_delete(u, 1, 2))
+    check("delete of the é gives 'hllo'", prism_textmodel.prism_tm_text(udel) == "hllo")
+    let cjk = unwrap(prism_textmodel.prism_tm_plain("日本語text"))
+    check("CJK length is 7 code points", prism_textmodel.prism_tm_length(cjk) == 7)
+    check("CJK slice(0,3) is '日本語'", prism_textmodel.prism_tm_text(unwrap(prism_textmodel.prism_tm_slice(cjk, 0, 3))) == "日本語")
+    // Width is a DIFFERENT question, owned by prism_text: 3 CJK chars are 6 cells, not 3.
+    check("width != length for CJK (6 cells vs 7 code points)", prism_textmodel.prism_tm_width(cjk) == 10)
+    print("")
+
+    print("3. canonical form -- structure is a function of content")
+    let base = unwrap(prism_textmodel.prism_tm_plain("abcd"))
+    let two_steps = unwrap(prism_textmodel.prism_tm_mark(unwrap(prism_textmodel.prism_tm_mark(base, 0, 2, _bold())), 2, 4, _bold()))
+    let one_step = unwrap(prism_textmodel.prism_tm_mark(base, 0, 4, _bold()))
+    check("mark(0,2)+mark(2,4) merges to ONE run", prism_textmodel.prism_tm_run_count(two_steps) == 1)
+    check("mark(0,4) is ONE run", prism_textmodel.prism_tm_run_count(one_step) == 1)
+    check("both are structurally the SAME document", prism_textmodel.prism_tm_same(two_steps, one_step))
+    check("text preserved through marking", prism_textmodel.prism_tm_text(one_step) == "abcd")
+    print("")
+
+    print("4. marks are a SET, and are range-scoped")
+    let m1 = unwrap(prism_textmodel.prism_tm_mark(base, 0, 2, _bold()))
+    let m2 = unwrap(prism_textmodel.prism_tm_mark(m1, 0, 2, _ital()))
+    check("two marks on [0,2) -> 2 runs (marked + unmarked)", prism_textmodel.prism_tm_run_count(m2) == 2)
+    check("marks_at(0) is [bold, italic] sorted", join(unwrap(prism_textmodel.prism_tm_marks_at(m2, 0)), ",") == "bold,italic")
+    check("marks_at(3) is empty -- marks did NOT leak past the range", len(unwrap(prism_textmodel.prism_tm_marks_at(m2, 3))) == 0)
+    let un = unwrap(prism_textmodel.prism_tm_unmark(m2, 0, 2, _bold()))
+    check("unmark removes only that mark", join(unwrap(prism_textmodel.prism_tm_marks_at(un, 0)), ",") == "italic")
+    check("re-marking an already-marked range does not duplicate", join(unwrap(prism_textmodel.prism_tm_marks_at(unwrap(prism_textmodel.prism_tm_mark(m1, 0, 2, _bold())), 0)), ",") == "bold")
+    check("mark set order does not matter (bold+italic == italic+bold)", prism_textmodel.prism_tm_same(m2, unwrap(prism_textmodel.prism_tm_mark(unwrap(prism_textmodel.prism_tm_mark(base, 0, 2, _ital())), 0, 2, _bold()))))
+    print("")
+
+    print("5. editing preserves marks the way an editor does")
+    let mid = unwrap(prism_textmodel.prism_tm_insert(m1, 1, "Z"))
+    check("typing INSIDE a bold run stays bold", join(unwrap(prism_textmodel.prism_tm_marks_at(mid, 1)), ",") == "bold")
+    check("insert grew the document", prism_textmodel.prism_tm_text(mid) == "aZbcd")
+    let head = unwrap(prism_textmodel.prism_tm_insert(m1, 0, "Q"))
+    check("typing at position 0 is UNmarked (no left run to inherit from)", len(unwrap(prism_textmodel.prism_tm_marks_at(head, 0))) == 0)
+    let sl = unwrap(prism_textmodel.prism_tm_slice(m1, 0, 2))
+    check("slice carries its marks", join(unwrap(prism_textmodel.prism_tm_marks_at(sl, 0)), ",") == "bold")
+    check("delete across a mark boundary keeps the rest intact", prism_textmodel.prism_tm_text(unwrap(prism_textmodel.prism_tm_delete(m1, 1, 3))) == "ad")
+    print("")
+
+    print("6. rejection -- ranges are validated, never silently clamped")
+    check("slice past end rejected", is_err(prism_textmodel.prism_tm_slice(base, 0, 99)))
+    check("negative start rejected", is_err(prism_textmodel.prism_tm_slice(base, -1, 2)))
+    check("inverted range rejected", is_err(prism_textmodel.prism_tm_slice(base, 3, 1)))
+    check("insert past end rejected", is_err(prism_textmodel.prism_tm_insert(base, 99, "x")))
+    check("delete past end rejected", is_err(prism_textmodel.prism_tm_delete(base, 0, 99)))
+    check("mark past end rejected", is_err(prism_textmodel.prism_tm_mark(base, 0, 99, _bold())))
+    check("marks_at past end rejected", is_err(prism_textmodel.prism_tm_marks_at(base, 99)))
+    check("marks_at on empty doc rejected (no character at 0)", is_err(prism_textmodel.prism_tm_marks_at(unwrap(prism_textmodel.prism_tm_plain("")), 0)))
+    check("non-int position rejected", is_err(prism_textmodel.prism_tm_marks_at(base, "0")))
+    check("non-string text rejected", is_err(prism_textmodel.prism_tm_plain(7)))
+    check("non-string insert rejected", is_err(prism_textmodel.prism_tm_insert(base, 0, 7)))
+    check("non-list runs rejected", is_err(prism_textmodel.prism_tm_doc("nope")))
+    print("")
+
+    print("7. the mark vocabulary is closed and named")
+    let all = prism_textmodel.prism_tm_mark_all()
+    check("5 marks (got {len(all)})", len(all) == 5)
+    check("names are bold,italic,code,under,strike", join(all.map(fn(m) prism_textmodel.prism_tm_mark_name(m)), ",") == "bold,italic,code,under,strike")
+    print("")
+
+    if STATS[1] == 0
+        print("_kat_prism_textmodel: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_textmodel: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
