@@ -1,0 +1,96 @@
+// KAT for prism/core/prism_journal.nova -- undo/redo, replay and audit over PrismEvent.
+//
+// The three properties this exists to prove:
+//   1. THE AUDIT LOG NEVER SHRINKS. Undo three, record something new, and the redo tail leaves
+//      the TIMELINE but stays in the LOG. The obvious one-list implementation destroys exactly
+//      this evidence, which is the thing an audit log exists to keep.
+//   2. REPLAY IS RE-TAGGED, so §15.7's gate rejects it. Replaying history must restore state
+//      without re-granting a privilege -- asserted by running the replay stream through
+//      prism_ev_require_user and requiring it to FAIL.
+//   3. Boundaries ERROR rather than clamp: undo at the start and redo at the end are `err`, so a
+//      caller looping on undo terminates on a value it must handle instead of spinning.
+
+import prism_event
+import prism_journal
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn _ev(target: string) -> PrismEvent
+    unwrap(prism_event.prism_ev_press_from_input(target))
+
+fn main()
+    print("== _kat_prism_journal ==")
+
+    print("1. empty journal")
+    let j0 = prism_journal.prism_jrn_new()
+    check("nothing applied", prism_journal.prism_jrn_pos(j0) == 0)
+    check("empty audit", prism_journal.prism_jrn_audit_len(j0) == 0)
+    check("cannot undo", not prism_journal.prism_jrn_can_undo(j0))
+    check("cannot redo", not prism_journal.prism_jrn_can_redo(j0))
+    check("undo at start of time is an err, not a clamp", is_err(prism_journal.prism_jrn_undo(j0)))
+    check("redo at end of time is an err", is_err(prism_journal.prism_jrn_redo(j0)))
+    check("current on an empty journal is an err", is_err(prism_journal.prism_jrn_current(j0)))
+
+    print("2. record and undo/redo move the cursor, not the history")
+    let j1 = unwrap(prism_journal.prism_jrn_record(j0, _ev("a")))
+    let j2 = unwrap(prism_journal.prism_jrn_record(j1, _ev("b")))
+    let j3 = unwrap(prism_journal.prism_jrn_record(j2, _ev("c")))
+    check("3 recorded", prism_journal.prism_jrn_pos(j3) == 3 and prism_journal.prism_jrn_audit_len(j3) == 3)
+    check("current is the last recorded", prism_event.prism_ev_target(unwrap(prism_journal.prism_jrn_current(j3))) == "c")
+    let u1 = unwrap(prism_journal.prism_jrn_undo(j3))
+    check("undo moves the cursor back", prism_journal.prism_jrn_pos(u1) == 2)
+    check("undo does NOT shrink the timeline", prism_journal.prism_jrn_timeline_len(u1) == 3)
+    check("undo does NOT shrink the audit", prism_journal.prism_jrn_audit_len(u1) == 3)
+    check("current follows the cursor", prism_event.prism_ev_target(unwrap(prism_journal.prism_jrn_current(u1))) == "b")
+    check("applied is the active prefix", len(prism_journal.prism_jrn_applied(u1)) == 2)
+    let r1 = unwrap(prism_journal.prism_jrn_redo(u1))
+    check("redo restores the cursor", prism_journal.prism_jrn_pos(r1) == 3)
+    check("redo returns to the same event", prism_event.prism_ev_target(unwrap(prism_journal.prism_jrn_current(r1))) == "c")
+    // The original must be untouched by either operation -- these are values, not mutations.
+    check("the ORIGINAL journal is unchanged (non-mutating)", prism_journal.prism_jrn_pos(j3) == 3)
+
+    print("3. ★ undo-then-record: the timeline forks, the AUDIT DOES NOT SHRINK")
+    let u2 = unwrap(prism_journal.prism_jrn_undo(unwrap(prism_journal.prism_jrn_undo(j3))))
+    check("undone twice -> 1 applied of 3", prism_journal.prism_jrn_pos(u2) == 1 and prism_journal.prism_jrn_timeline_len(u2) == 3)
+    let forked = unwrap(prism_journal.prism_jrn_record(u2, _ev("d")))
+    check("timeline dropped the redo tail (1 kept + 1 new = 2)", prism_journal.prism_jrn_timeline_len(forked) == 2)
+    check("cursor is at the new end", prism_journal.prism_jrn_pos(forked) == 2)
+    check("redo is no longer possible on the fork", not prism_journal.prism_jrn_can_redo(forked))
+    // THE property. A one-list implementation reports 2 here and has destroyed the record of
+    // "b" and "c" ever happening.
+    check("AUDIT GREW to 4 -- b and c are still recorded", prism_journal.prism_jrn_audit_len(forked) == 4)
+    let targets = prism_journal.prism_jrn_audit(forked).map(fn(e) prism_event.prism_ev_target(e))
+    check("audit order is a,b,c,d (append-only, never reordered)", join(targets, ",") == "a,b,c,d")
+    check("the ACTIVE timeline is a,d", join(prism_journal.prism_jrn_applied(forked).map(fn(e) prism_event.prism_ev_target(e)), ",") == "a,d")
+
+    print("4. ★ replay is re-tagged, so §15.7 REJECTS it")
+    let stream = unwrap(prism_journal.prism_jrn_replay_stream(forked))
+    check("replay stream covers the applied events", len(stream) == 2)
+    check("every replayed event is origin=replay", join(stream.map(fn(e) prism_event.prism_ev_origin_str(e)), ",") == "replay,replay")
+    // The security interaction: a replayed event must not authorise a privileged action.
+    let gated = stream.map(fn(e) is_err(prism_event.prism_ev_require_user(e)))
+    check("prism_ev_require_user REJECTS every replayed event", not contains(gated, false))
+    // ...while the ORIGINALS were genuine user input, so the gate is not vacuously rejecting.
+    let orig_ok = prism_journal.prism_jrn_applied(forked).map(fn(e) not is_err(prism_event.prism_ev_require_user(e)))
+    check("the ORIGINAL events still pass the gate (rejection is not vacuous)", not contains(orig_ok, false))
+    // The audit deliberately keeps the ORIGINAL origin -- that is what makes it an audit.
+    check("audit preserves original origins (user), unlike the replay stream", join(prism_journal.prism_jrn_audit(forked).map(fn(e) prism_event.prism_ev_origin_str(e)), ",") == "user,user,user,user")
+    check("payload survives replay re-tagging", prism_event.prism_ev_target(stream[1]) == "d")
+
+    print("5. describe")
+    check("describe reports cursor/timeline/audit", prism_journal.prism_jrn_describe(forked) == "journal: 2/2 applied, 4 recorded")
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_journal: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_journal: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

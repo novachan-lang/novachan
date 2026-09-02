@@ -1,0 +1,135 @@
+// prism_journal -- the message log that gives Prism undo/redo, replay and audit (prism/core/).
+// Records `PrismEvent` values (core/prism_event.nova) and nothing else: an event already carries
+// its target, its payload and its ORIGIN, so a journal entry needs no parallel bookkeeping that
+// could drift from the event it describes.
+//
+// ── AUDIT AND UNDO WANT OPPOSITE THINGS, SO THEY GET SEPARATE STRUCTURES ─────────────────────
+// This is the design decision the module exists to get right. The obvious implementation keeps
+// ONE list and truncates it on undo-then-act: you undo three steps, do something new, and the
+// three undone entries are dropped so redo cannot resurrect them. That is correct for UNDO and
+// catastrophic for AUDIT -- "what did this user actually do?" is exactly the question an audit
+// log must answer, and truncation destroys the evidence of the actions that were undone. An
+// attacker who can undo their way out of the record is the whole reason audit logs exist.
+// So there are two:
+//   * `jrn_log`   -- APPEND-ONLY. Every event ever recorded, in order, including ones later
+//                    undone and superseded. Never truncated, never reordered. This is the audit.
+//   * `jrn_time`  -- the ACTIVE timeline, plus `jrn_pos`, the undo cursor. Undo moves the cursor;
+//                    recording after an undo drops the redo tail FROM THE TIMELINE ONLY.
+// The invariant that makes it trustworthy: `len(jrn_log)` never decreases, for any sequence of
+// operations. The KAT asserts exactly that across an undo-then-record sequence.
+//
+// ── REPLAY IS RE-TAGGED, WHICH IS WHAT MAKES IT SAFE ────────────────────────────────────────
+// Everything handed back for re-application goes through `prism_ev_replay`, which re-tags origin
+// as REPLAY and is already proven non-mutating. That composes with §15.7's gate: replayed events
+// are REJECTED by `prism_ev_require_user`, so replaying history can never authorise a
+// security-relevant action that requires genuine user input. Undo/redo of a privileged action
+// therefore restores UI state without re-granting the privilege -- the confused-deputy step this
+// avoids is subtle and would be invisible if replay kept the original origin.
+// The audit log keeps the ORIGINAL origin (that is the point of an audit), so `jrn_log` and the
+// replay stream deliberately disagree about origin. Stated here so that is read as design.
+//
+// PUBLIC API (every mutator returns a NEW journal; nothing mutates in place)
+//   prism_jrn_new()                       -> PrismJournal
+//   prism_jrn_record(j, ev)               -> Result<PrismJournal>
+//   prism_jrn_undo(j)                     -> Result<PrismJournal>   err at the start of time
+//   prism_jrn_redo(j)                     -> Result<PrismJournal>   err with nothing to redo
+//   prism_jrn_can_undo(j) / _can_redo(j)  -> bool
+//   prism_jrn_pos(j) / _timeline_len(j) / _audit_len(j) -> int
+//   prism_jrn_current(j)                  -> Result<PrismEvent>     last APPLIED event
+//   prism_jrn_applied(j)                  -> list   the active prefix, in order
+//   prism_jrn_audit(j)                    -> list   every event ever recorded, original origins
+//   prism_jrn_replay_stream(j)            -> list   applied events, each re-tagged REPLAY
+//   prism_jrn_describe(j)                 -> string
+
+import prism_event
+
+// `jrn_`-prefixed fields: NOVA's struct field->slot map is GLOBAL, so a bare `log`, `pos` or
+// `time` would share a slot with any other module's field of that name and silently corrupt
+// dot-access -- a class of corruption reconverge cannot detect.
+type PrismJournal
+    jrn_log: list       // append-only audit; ORIGINAL origins preserved
+    jrn_time: list      // active timeline
+    jrn_pos: int        // how many of jrn_time are currently applied
+
+fn prism_jrn_new() -> PrismJournal
+    PrismJournal([], [], 0)
+
+fn prism_jrn_pos(j: PrismJournal) -> int
+    j.jrn_pos
+
+fn prism_jrn_timeline_len(j: PrismJournal) -> int
+    len(j.jrn_time)
+
+fn prism_jrn_audit_len(j: PrismJournal) -> int
+    len(j.jrn_log)
+
+fn prism_jrn_can_undo(j: PrismJournal) -> bool
+    j.jrn_pos > 0
+
+fn prism_jrn_can_redo(j: PrismJournal) -> bool
+    j.jrn_pos < len(j.jrn_time)
+
+// The active prefix, in order. Built with a cursor cell rather than an index counter: `let mut`
+// counters are banned by the high-level standard and `enumerate()` corrupts struct fields, which
+// a list of PrismEvent would hit.
+fn prism_jrn_applied(j: PrismJournal) -> list
+    let out = []
+    let i = [0]
+    for e in j.jrn_time
+        let idx = i[0]
+        i[0] = idx + 1
+        if idx < j.jrn_pos
+            push(out, e)
+    out
+
+fn prism_jrn_audit(j: PrismJournal) -> list
+    j.jrn_log
+
+fn prism_jrn_current(j: PrismJournal) -> Result<PrismEvent>
+    if j.jrn_pos == 0
+        return err("prism_journal: nothing applied yet -- no current event")
+    ok(j.jrn_time[j.jrn_pos - 1])
+
+// Recording after an UNDO drops the redo tail from the TIMELINE, which is standard editor
+// behaviour -- but the dropped entries stay in jrn_log, so the audit still shows that they
+// happened. That asymmetry is the entire point of keeping two structures.
+fn prism_jrn_record(j: PrismJournal, ev: PrismEvent) -> Result<PrismJournal>
+    let kept = []
+    let i = [0]
+    for e in j.jrn_time
+        let idx = i[0]
+        i[0] = idx + 1
+        if idx < j.jrn_pos
+            push(kept, e)
+    push(kept, ev)
+    let log2 = []
+    for e in j.jrn_log
+        push(log2, e)
+    push(log2, ev)
+    ok(PrismJournal(log2, kept, j.jrn_pos + 1))
+
+// Undo does NOT remove anything -- it moves the cursor. `err` rather than a silent no-op at the
+// start of time, so a caller that undoes in a loop terminates on a value it must handle instead
+// of spinning against a clamp.
+fn prism_jrn_undo(j: PrismJournal) -> Result<PrismJournal>
+    if j.jrn_pos == 0
+        return err("prism_journal: nothing to undo (already at the start of the timeline)")
+    ok(PrismJournal(j.jrn_log, j.jrn_time, j.jrn_pos - 1))
+
+fn prism_jrn_redo(j: PrismJournal) -> Result<PrismJournal>
+    if j.jrn_pos >= len(j.jrn_time)
+        return err("prism_journal: nothing to redo (already at the end of the timeline)")
+    ok(PrismJournal(j.jrn_log, j.jrn_time, j.jrn_pos + 1))
+
+// The applied events, each re-tagged REPLAY so §15.7's gate rejects them. A caller re-applying
+// this stream restores state WITHOUT re-granting any privilege the original events carried.
+// `?` cannot appear inside a lambda in NOVA, so this is a `for` loop rather than a `.map()`.
+fn prism_jrn_replay_stream(j: PrismJournal) -> Result<list>
+    let out = []
+    for e in prism_jrn_applied(j)
+        let r = prism_event.prism_ev_replay(e)?
+        push(out, r)
+    ok(out)
+
+fn prism_jrn_describe(j: PrismJournal) -> string
+    "journal: {j.jrn_pos}/{len(j.jrn_time)} applied, {len(j.jrn_log)} recorded"
