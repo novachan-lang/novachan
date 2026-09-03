@@ -1,0 +1,137 @@
+// prism_test -- the testing API (prism/dev/, feature #47). Queries a finished node tree BY
+// DERIVED ROLE AND ACCESSIBLE LABEL, never by internal structure.
+//
+// ── WHY ROLE/LABEL AND NOT A TREE PATH ───────────────────────────────────────────────────────
+// A test that says "the second child of the third band" asserts the IMPLEMENTATION, so it breaks
+// on every harmless refactor and passes when the UI is unusable. A test that says "the button
+// labelled Submit" asserts what a USER (and an assistive technology) can actually perceive, so
+// it survives refactors and fails exactly when the thing a user needs stops being findable.
+// PRISM_SPEC.md §9 makes this stronger than the equivalent web tooling: the role is DERIVED from
+// the widget's type, so a query-by-role cannot drift from the behaviour the way a hand-written
+// `role=` attribute can. The derivation lives in core/prism_node.nova (`prism_node_role_of`) so
+// there is exactly one of it.
+//
+// ── ⛔ ZERO MATCHES AND MULTIPLE MATCHES ARE BOTH ERRORS ─────────────────────────────────────
+// `prism_tst_one` returns `err` for both. Returning the FIRST of several matches is the single
+// most damaging convenience a testing API can offer: the test goes green while asserting against
+// an element the user never sees, and it keeps passing after the real one is deleted. Ambiguity
+// is a defect in the test OR in the UI (two identically-labelled buttons is itself an a11y
+// problem), so it is reported rather than resolved by guessing -- the same "never guess" rule
+// prism_key applies to unknown key names.
+// `prism_tst_all` returns the list, for tests that legitimately expect N.
+//
+// PUBLIC API
+//   prism_tst_role(n)                        -> string    derived role ("" if none)
+//   prism_tst_label(n)                       -> string    accessible name
+//   prism_tst_all(tree, role, label)         -> list      "" matches ANY for either filter
+//   prism_tst_one(tree, role, label)         -> Result<PrismNode>   exactly one, else err
+//   prism_tst_count(tree, role, label)       -> int
+//   prism_tst_exists(tree, role, label)      -> bool
+//   prism_tst_roles(tree)                    -> list      every non-empty role, in tree order
+//   prism_tst_labels(tree)                   -> list
+//   prism_tst_assert_one(tree, role, label)  -> Result<string>  "" on success, else why
+
+import prism_node
+
+fn prism_tst_role(n: PrismNode) -> string
+    prism_node.prism_node_role(n)
+
+// The accessible name, in the order a screen reader would resolve it: an explicit label wins,
+// then the visible text, then alt text for an image. Checked in that order so an explicit
+// override is honoured rather than silently losing to the visible text.
+fn prism_tst_label(n: PrismNode) -> string
+    let explicit = prism_node.prism_node_attr_str(n, "label", "")
+    if len(explicit) > 0
+        return explicit
+    let text = prism_node.prism_node_attr_str(n, "text", "")
+    if len(text) > 0
+        return text
+    prism_node.prism_node_attr_str(n, "alt", "")
+
+// Depth-first, pre-order: results come back in the order a reader encounters them, which is the
+// order a test author expects when they ask for "the third checkbox".
+fn _tst_walk(n: PrismNode, out: list)
+    push(out, n)
+    for c in prism_node.prism_node_children(n)
+        _tst_walk(c, out)
+
+fn _tst_flatten(tree: PrismNode) -> list
+    let out = []
+    _tst_walk(tree, out)
+    out
+
+// An empty filter means ANY -- so all("", "") is every node, all("button", "") is every button.
+// Deliberately NOT a wildcard string like "*": "" is already the "no value" answer from
+// prism_tst_role/label, so one concept covers both instead of introducing a second sentinel.
+fn prism_tst_all(tree: PrismNode, role, label) -> list
+    let hits = []
+    for n in _tst_flatten(tree)
+        let r = prism_tst_role(n)
+        let l = prism_tst_label(n)
+        let role_ok = if type_of(role) != "string"
+            false
+        else if len(role) == 0
+            true
+        else
+            r == role
+        let label_ok = if type_of(label) != "string"
+            false
+        else if len(label) == 0
+            true
+        else
+            l == label
+        if role_ok and label_ok
+            push(hits, n)
+    hits
+
+fn prism_tst_count(tree: PrismNode, role, label) -> int
+    len(prism_tst_all(tree, role, label))
+
+fn prism_tst_exists(tree: PrismNode, role, label) -> bool
+    prism_tst_count(tree, role, label) > 0
+
+// ⛔ Exactly one, or an error naming WHICH failure it was. The message carries the count, because
+// "not found" and "found 3" need completely different fixes and a bare "no match" sends the
+// author looking in the wrong place.
+fn prism_tst_one(tree: PrismNode, role, label) -> Result<PrismNode>
+    let hits = prism_tst_all(tree, role, label)
+    let what = if len(role) > 0 and len(label) > 0
+        "role '{role}' labelled '{label}'"
+    else if len(role) > 0
+        "role '{role}'"
+    else if len(label) > 0
+        "label '{label}'"
+    else
+        "any node"
+    if len(hits) == 0
+        return err("prism_test: no node matches {what}")
+    if len(hits) > 1
+        return err("prism_test: {len(hits)} nodes match {what} -- ambiguous. Two identically-labelled controls is an accessibility defect in the UI, not just in the test; use prism_tst_all if N matches are intended")
+    ok(hits[0])
+
+fn prism_tst_roles(tree: PrismNode) -> list
+    let out = []
+    for n in _tst_flatten(tree)
+        let r = prism_tst_role(n)
+        if len(r) > 0
+            push(out, r)
+    out
+
+fn prism_tst_labels(tree: PrismNode) -> list
+    let out = []
+    for n in _tst_flatten(tree)
+        let l = prism_tst_label(n)
+        if len(l) > 0
+            push(out, l)
+    out
+
+// Assertion form for test bodies: ok("") means it held. The count check is re-derived here rather
+// than forwarding prism_tst_one's Result -- that Result carries a PrismNode, and returning it
+// from a Result<string> function is a type error the compiler catches (it caught mine).
+fn prism_tst_assert_one(tree: PrismNode, role, label) -> Result<string>
+    let n = prism_tst_count(tree, role, label)
+    if n == 1
+        return ok("")
+    if n == 0
+        return err("prism_test: expected exactly one node with role '{role}' label '{label}', found NONE")
+    err("prism_test: expected exactly one node with role '{role}' label '{label}', found {n} -- ambiguous")
