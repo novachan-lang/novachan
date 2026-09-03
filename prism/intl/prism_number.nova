@@ -1,0 +1,167 @@
+// prism_number (intl/) -- locale-aware number, percent and currency formatting.
+//
+// ── ⛔ NO FLOATS ANYWHERE IN THIS MODULE, AND THAT IS THE DESIGN ─────────────────────────────
+// Money is passed as MINOR UNITS (an int: 1234 = $12.34) and the scale is explicit. Every
+// currency bug of consequence starts with a float: 0.1 + 0.2 != 0.3, a rounding mode nobody
+// chose, and a total that disagrees with the sum of its rows by a cent. NOVA has its own reasons
+// on top of the universal one -- float compare is documented unsound here and float FORMATTING is
+// platform-sensitive, so the same invoice could render differently on two machines.
+// Integer minor units make the arithmetic exact, the rounding explicit, and the output identical
+// on every platform. This is the same call obs/prism_telemetry made when it omitted float fields.
+//
+// ── GROUPING IS DERIVED, NOT TABULATED PER LOCALE ────────────────────────────────────────────
+// A locale supplies three things -- the group separator, the decimal separator and the group SIZE
+// -- and everything else follows. A per-locale table of formatted examples would rot; three
+// parameters cannot. The Indian grouping (2;3: 12,34,567) is included because it is the common
+// case that breaks a naive "every three digits" implementation, and getting it wrong is invisible
+// to anyone who only tests en-US.
+//
+// PUBLIC API
+//   prism_num_locale(group_sep, decimal_sep, group_size, lead_size) -> Result<PrismNumLocale>
+//   prism_num_en_us() / _de_de() / _fr_fr() / _en_in()             -> PrismNumLocale
+//   prism_num_int(loc, n)                    -> string   grouped integer
+//   prism_num_fixed(loc, minor, scale)       -> Result<string>   minor units + decimal places
+//   prism_num_percent(loc, minor, scale)     -> Result<string>
+//   prism_num_money(loc, symbol, minor, scale, symbol_first) -> Result<string>
+//   prism_num_group_sep(l) / _decimal_sep(l) / _group_size(l) / _lead_size(l)
+
+// `nl_` prefix: the struct field->slot map is GLOBAL, so a bare `group_sep`/`size` would share a
+// slot with any other module's field of that name.
+type PrismNumLocale
+    nl_group: string
+    nl_decimal: string
+    nl_size: int        // digits per group after the first
+    nl_lead: int        // digits in the FIRST group; differs from nl_size only for Indian-style
+
+fn prism_num_locale(group_sep, decimal_sep, group_size, lead_size) -> Result<PrismNumLocale>
+    if type_of(group_sep) != "string" or type_of(decimal_sep) != "string"
+        return err("prism_number: separators must be strings, got {type_of(group_sep)}/{type_of(decimal_sep)}")
+    if type_of(group_size) != "int" or type_of(lead_size) != "int"
+        return err("prism_number: group sizes must be ints, got {type_of(group_size)}/{type_of(lead_size)}")
+    if group_size < 1 or lead_size < 1
+        return err("prism_number: group size must be >= 1 (got {group_size}/{lead_size}); a size of 0 would group forever")
+    if group_sep == decimal_sep
+        return err("prism_number: group and decimal separators are both '{group_sep}' -- 1{group_sep}234 would be unreadable")
+    ok(PrismNumLocale(group_sep, decimal_sep, group_size, lead_size))
+
+fn prism_num_en_us() -> PrismNumLocale
+    PrismNumLocale(",", ".", 3, 3)
+
+fn prism_num_de_de() -> PrismNumLocale
+    PrismNumLocale(".", ",", 3, 3)
+
+fn prism_num_fr_fr() -> PrismNumLocale
+    PrismNumLocale(" ", ",", 3, 3)
+
+// Indian grouping: the LAST three digits, then twos. 12345678 -> 1,23,45,678.
+fn prism_num_en_in() -> PrismNumLocale
+    PrismNumLocale(",", ".", 2, 3)
+
+fn prism_num_group_sep(l: PrismNumLocale) -> string
+    l.nl_group
+
+fn prism_num_decimal_sep(l: PrismNumLocale) -> string
+    l.nl_decimal
+
+fn prism_num_group_size(l: PrismNumLocale) -> int
+    l.nl_size
+
+fn prism_num_lead_size(l: PrismNumLocale) -> int
+    l.nl_lead
+
+// Groups from the RIGHT, which is the only direction that works: the first group is nl_lead
+// digits and every group after it is nl_size. Walking left-to-right would need the digit count
+// up front and still get Indian grouping wrong.
+fn _num_group(digits: string, l: PrismNumLocale) -> string
+    let cps = code_points(digits)
+    let n = len(cps)
+    if n <= l.nl_lead
+        return digits
+    let out = []
+    let idx = [0]
+    for cp in cps
+        let i = idx[0]
+        idx[0] = i + 1
+        // Distance from the right-hand end. A separator belongs here when this position starts
+        // the TRAILING group (from_right == nl_lead), or when it starts one of the fixed-size
+        // groups above it. Both clauses are needed: with only the second, the trailing group
+        // never gets its separator (1234567 came out "1,234567"), and with only the first,
+        // nothing above the trailing group is grouped at all.
+        let from_right = n - i
+        let starts_trailing = from_right == l.nl_lead
+        let starts_upper = from_right > l.nl_lead and (from_right - l.nl_lead) % l.nl_size == 0
+        if i > 0 and (starts_trailing or starts_upper)
+            push(out, l.nl_group)
+        push(out, from_codepoint(cp))
+    join(out, "")
+
+fn prism_num_int(l: PrismNumLocale, n) -> string
+    if type_of(n) != "int"
+        return ""
+    let neg = n < 0
+    let mag = if neg
+        0 - n
+    else
+        n
+    let body = _num_group("{mag}", l)
+    if neg
+        return "-{body}"
+    body
+
+// minor + scale: 123456 at scale 2 is 1,234.56. The integer and fractional halves are split by
+// arithmetic, never by string surgery on a float's rendering.
+fn prism_num_fixed(l: PrismNumLocale, minor, scale) -> Result<string>
+    if type_of(minor) != "int" or type_of(scale) != "int"
+        return err("prism_number: minor units and scale must be ints, got {type_of(minor)}/{type_of(scale)}")
+    if scale < 0 or scale > 9
+        return err("prism_number: scale {scale} is outside 0..9")
+    let neg = minor < 0
+    let mag = if neg
+        0 - minor
+    else
+        minor
+    if scale == 0
+        let whole0 = prism_num_int(l, mag)
+        if neg
+            return ok("-{whole0}")
+        return ok(whole0)
+    let div = [1]
+    for _i in code_points(_num_repeat("x", scale))
+        div[0] = div[0] * 10
+    let whole = mag / div[0]
+    let frac = mag % div[0]
+    // Zero-pad the fraction to `scale` digits: 5 at scale 2 is ".05", not ".5".
+    let fs = "{frac}"
+    let pad = scale - char_count(fs)
+    let padded = _num_repeat("0", pad) + fs
+    let body = "{prism_num_int(l, whole)}{l.nl_decimal}{padded}"
+    if neg
+        return ok("-{body}")
+    ok(body)
+
+fn _num_repeat(s: string, n: int) -> string
+    if n <= 0
+        return ""
+    let out = []
+    let i = [0]
+    while i[0] < n
+        push(out, s)
+        i[0] = i[0] + 1
+    join(out, "")
+
+fn prism_num_percent(l: PrismNumLocale, minor, scale) -> Result<string>
+    let body = prism_num_fixed(l, minor, scale)?
+    ok("{body}%")
+
+// symbol_first distinguishes "$12.34" from "12,34 €". Passed explicitly rather than derived from
+// the locale, because the same locale formats different currencies differently and guessing is
+// how a price ends up rendered as "€12.34" in a country that writes "12,34 €".
+fn prism_num_money(l: PrismNumLocale, symbol, minor, scale, symbol_first) -> Result<string>
+    if type_of(symbol) != "string"
+        return err("prism_number: currency symbol must be a string, got {type_of(symbol)}")
+    if len(symbol) == 0
+        return err("prism_number: currency symbol is required -- an unlabelled amount is not a price")
+    let body = prism_num_fixed(l, minor, scale)?
+    if symbol_first
+        return ok("{symbol}{body}")
+    ok("{body} {symbol}")
