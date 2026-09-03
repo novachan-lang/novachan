@@ -1,0 +1,136 @@
+// prism_motion (style/) -- animation curves, with REDUCED MOTION RESPECTED BY DEFAULT
+// (features #70 #102).
+//
+// ── ⛔ REDUCED MOTION IS THE DEFAULT, NOT AN OPT-IN ──────────────────────────────────────────
+// `prism_mo_new()` starts with reduced motion ON. That is deliberate and it is the whole feature:
+// every system that made accessible motion an opt-in shipped animations that trigger vestibular
+// symptoms -- nausea, dizziness, migraine -- for the people who needed the setting, because the
+// developer who never enabled it never saw the problem. Making the SAFE state the default means
+// forgetting produces a still interface, not a harmful one. A caller who wants animation must
+// say so, and saying so is one call.
+// When reduced, durations collapse to 0 and every curve becomes linear -- the animation still
+// RUNS and still ENDS, it simply arrives immediately. That matters: code that waits for an
+// animation to finish keeps working, where a "skip animations" flag that never fires the
+// completion leaves a UI stuck mid-transition.
+//
+// ── CURVES ARE INTEGER MATH ON A 0..1000 PROGRESS SCALE ─────────────────────────────────────
+// No floats anywhere, for the same reason prism_number uses minor units: float formatting and
+// comparison are platform-sensitive here, and an animation that lands on 0.9999 instead of 1.0
+// on one platform leaves a control permanently a pixel short of its resting position.
+// Progress is 0..1000 in, 0..1000 out, exact at both endpoints on every platform.
+//
+// PUBLIC API
+//   prism_mo_new() / prism_mo_with_motion()   -> PrismMotion   (new() is REDUCED)
+//   prism_mo_reduced(m)                       -> bool
+//   prism_mo_duration(m, ms)                  -> Result<int>   0 when reduced
+//   prism_mo_ease(m, curve, progress)         -> Result<int>   0..1000
+//   prism_mo_curve_linear/_in/_out/_in_out/_spring() -> PrismCurve
+//   prism_mo_curve_name(c)                    -> string
+//   prism_mo_curve_all()                      -> list
+
+// `Mo`-prefixed variants: enum constructors resolve across modules in NOVA's one flat symbol
+// space, so bare `Linear()`/`Spring()` would be a landmine for any other module.
+enum PrismCurve
+    MoLinear()
+    MoEaseIn()
+    MoEaseOut()
+    MoEaseInOut()
+    MoSpring()
+
+// `mo_` prefix: the struct field->slot map is GLOBAL.
+type PrismMotion
+    mo_reduced: int     // 0/1, never a bool -- a NOVA bool cannot be type-validated and changes
+                        // representation across a call boundary
+
+// ⛔ The DEFAULT is reduced. See the header: forgetting must produce a still interface.
+fn prism_mo_new() -> PrismMotion
+    PrismMotion(1)
+
+fn prism_mo_with_motion() -> PrismMotion
+    PrismMotion(0)
+
+fn prism_mo_reduced(m: PrismMotion) -> bool
+    m.mo_reduced == 1
+
+fn prism_mo_curve_linear() -> PrismCurve
+    MoLinear()
+
+fn prism_mo_curve_in() -> PrismCurve
+    MoEaseIn()
+
+fn prism_mo_curve_out() -> PrismCurve
+    MoEaseOut()
+
+fn prism_mo_curve_in_out() -> PrismCurve
+    MoEaseInOut()
+
+fn prism_mo_curve_spring() -> PrismCurve
+    MoSpring()
+
+fn prism_mo_curve_name(c: PrismCurve) -> string
+    match c
+        MoLinear() => "linear"
+        MoEaseIn() => "ease-in"
+        MoEaseOut() => "ease-out"
+        MoEaseInOut() => "ease-in-out"
+        MoSpring() => "spring"
+
+fn prism_mo_curve_all() -> list
+    [MoLinear(), MoEaseIn(), MoEaseOut(), MoEaseInOut(), MoSpring()]
+
+// Duration collapses to 0 under reduced motion -- the animation still runs and still completes,
+// it simply arrives at once.
+fn prism_mo_duration(m: PrismMotion, ms) -> Result<int>
+    if type_of(ms) != "int"
+        return err("prism_motion: duration must be an int (milliseconds), got {type_of(ms)}")
+    if ms < 0
+        return err("prism_motion: duration {ms} is negative")
+    if m.mo_reduced == 1
+        return ok(0)
+    ok(ms)
+
+// Progress 0..1000 -> eased 0..1000, integer only. Every curve is EXACT at both endpoints, which
+// is the property that keeps a control from resting a pixel short of where it belongs.
+fn prism_mo_ease(m: PrismMotion, curve: PrismCurve, progress) -> Result<int>
+    if type_of(progress) != "int"
+        return err("prism_motion: progress must be an int in 0..1000, got {type_of(progress)}")
+    if progress < 0 or progress > 1000
+        return err("prism_motion: progress {progress} is outside 0..1000")
+    // Under reduced motion every curve is LINEAR -- not frozen. A caller sampling progress still
+    // sees a well-formed 0..1000 ramp, so interpolation code needs no special case.
+    if m.mo_reduced == 1
+        return ok(progress)
+    match curve
+        MoLinear() => ok(progress)
+        // Quadratic in: p^2. Divided by 1000 to stay on the same scale; exact at 0 and 1000.
+        MoEaseIn() => ok((progress * progress) / 1000)
+        // Quadratic out: 1-(1-p)^2, written on the integer scale.
+        MoEaseOut() => ok(1000 - (((1000 - progress) * (1000 - progress)) / 1000))
+        MoEaseInOut() => _mo_in_out(progress)
+        MoSpring() => _mo_spring(progress)
+
+fn _mo_in_out(p: int) -> Result<int>
+    if p < 500
+        // 2p^2 on the first half.
+        return ok((2 * p * p) / 1000)
+    // Mirrored on the second half, so the two halves meet exactly at 500 and it ends exactly at
+    // 1000 -- an eased curve that overshoots its endpoint by one unit is a visible glitch.
+    let q = 1000 - p
+    ok(1000 - ((2 * q * q) / 1000))
+
+// A single-overshoot spring: rises past 1000 near the end, then settles exactly on it. Modelled
+// with integer arithmetic rather than a damped sine, because the only property that matters for
+// layout is "overshoots once, lands exactly".
+fn _mo_spring(p: int) -> Result<int>
+    if p >= 1000
+        return ok(1000)
+    if p < 700
+        // Fast rise to ~1000 over the first 70%.
+        return ok((p * 1000) / 700)
+    // Overshoot then settle: a small triangular bump above 1000 that returns to exactly 1000.
+    let over = p - 700
+    let bump = if over < 150
+        (over * 80) / 150
+    else
+        (80 * (300 - over)) / 150
+    ok(1000 + bump)

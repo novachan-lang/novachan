@@ -1,0 +1,166 @@
+// prism_richedit (text/) -- rich-text EDITING (feature #62). The editing layer over
+// prism_textmodel (the document) and prism_select (the caret/selection).
+//
+// ── AN EDIT IS A PURE FUNCTION OF STATE, WHICH IS THE WHOLE DESIGN ──────────────────────────
+// Every command here takes `PrismEditor` and returns a NEW `PrismEditor`. Nothing mutates.
+// That is not stylistic tidiness: it is what makes undo/redo free. `core/prism_journal` already
+// stores a timeline and moves a cursor over it, so an editor whose state is a VALUE can be
+// journalled by storing values -- no inverse-operation table, no "undo delete" command that has
+// to reconstruct what was deleted and gets it subtly wrong for the one case nobody tested.
+// The ProseMirror-class systems that do this well all landed on the same answer.
+//
+// ── ⛔ DOC AND SELECTION MUST MOVE TOGETHER, OR THE CARET LIES ───────────────────────────────
+// The bug that defines this layer: insert 5 characters and leave the caret where it was, and it
+// is now 5 positions behind the text -- every subsequent edit lands in the wrong place, and the
+// user sees their typing appear somewhere else. So an editor pairs the two and NO command may
+// return one without the other. Concretely:
+//   * insert at a collapsed caret advances the caret BY THE INSERTED LENGTH (code points).
+//   * insert over a RANGE replaces it: delete, then insert, and the caret lands after the new
+//     text -- not at the old range end, which would be past the content if the replacement is
+//     shorter.
+//   * delete collapses the caret to the range START (backspace's own answer), never to the end.
+//
+// ── A COLLAPSED SELECTION CANNOT BE MARKED ──────────────────────────────────────────────────
+// Toggling bold with nothing selected is REJECTED rather than silently doing nothing or
+// inventing a "pending mark" that applies to the next keystroke. Pending marks are real editor
+// behaviour, but they are STATE, and inventing that state here would put a second source of
+// truth beside the document. Rejecting says so honestly; the pending-mark feature can be added
+// as an explicit field when it is actually designed.
+//
+// PUBLIC API (every command returns a new PrismEditor)
+//   prism_re_new(doc)                        -> Result<PrismEditor>
+//   prism_re_doc(e) / _sel(e) / _text(e) / _caret(e)
+//   prism_re_insert(e, text)                 -> Result<PrismEditor>
+//   prism_re_delete_selection(e)             -> Result<PrismEditor>
+//   prism_re_backspace(e) / _delete_forward(e) -> Result<PrismEditor>
+//   prism_re_toggle_mark(e, mark)            -> Result<PrismEditor>
+//   prism_re_has_mark(e, mark)               -> Result<bool>
+//   prism_re_select(e, from, to) / _move_to(e, pos) / _select_all(e) -> Result<PrismEditor>
+
+import prism_textmodel
+import prism_select
+
+// `re_` prefix: the struct field->slot map is GLOBAL, so a bare `doc`/`sel` would share a slot
+// with any other module's field of that name.
+type PrismEditor
+    re_doc: PrismDoc
+    re_sel: PrismSelection
+
+fn prism_re_new(doc: PrismDoc) -> Result<PrismEditor>
+    // The caret starts at the END, which is where a text field puts it when focused with
+    // existing content -- position 0 would put it before the user's own text.
+    let s = prism_select.prism_sel_at(prism_textmodel.prism_tm_length(doc))?
+    ok(PrismEditor(doc, s))
+
+fn prism_re_doc(e: PrismEditor) -> PrismDoc
+    e.re_doc
+
+fn prism_re_sel(e: PrismEditor) -> PrismSelection
+    e.re_sel
+
+fn prism_re_text(e: PrismEditor) -> string
+    prism_textmodel.prism_tm_text(e.re_doc)
+
+fn prism_re_caret(e: PrismEditor) -> int
+    prism_select.prism_sel_head(e.re_sel)
+
+// ⛔ Insert. Over a RANGE this is a replace: delete first, then insert at the range start, and
+// the caret lands AFTER the inserted text. Landing it at the old range end would put it past the
+// content whenever the replacement is shorter than what it replaced.
+fn prism_re_insert(e: PrismEditor, text) -> Result<PrismEditor>
+    if type_of(text) != "string"
+        return err("prism_richedit: inserted text must be a string, got {type_of(text)}")
+    let lo = prism_select.prism_sel_lo(e.re_sel)
+    let hi = prism_select.prism_sel_hi(e.re_sel)
+    let cleared = if lo == hi
+        e.re_doc
+    else
+        prism_textmodel.prism_tm_delete(e.re_doc, lo, hi)?
+    let grown = prism_textmodel.prism_tm_insert(cleared, lo, text)?
+    // Advance by the CODE POINT count, not the byte length: a byte count would put the caret
+    // inside a multi-byte character for any non-ASCII input.
+    let after = lo + char_count(text)
+    let s = prism_select.prism_sel_new(grown, after, after)?
+    ok(PrismEditor(grown, s))
+
+// Delete the selection and collapse the caret to the range START -- backspace's own answer, and
+// the only one that leaves the caret on content that still exists.
+fn prism_re_delete_selection(e: PrismEditor) -> Result<PrismEditor>
+    let lo = prism_select.prism_sel_lo(e.re_sel)
+    let hi = prism_select.prism_sel_hi(e.re_sel)
+    if lo == hi
+        return ok(e)
+    let d = prism_textmodel.prism_tm_delete(e.re_doc, lo, hi)?
+    let s = prism_select.prism_sel_new(d, lo, lo)?
+    ok(PrismEditor(d, s))
+
+// Backspace: with a selection, delete it; with a collapsed caret, remove the character BEFORE it.
+// At position 0 it is a no-op rather than an error -- pressing backspace at the start of a field
+// is something users do constantly and it is not a mistake to report.
+fn prism_re_backspace(e: PrismEditor) -> Result<PrismEditor>
+    if not prism_select.prism_sel_is_collapsed(e.re_sel)
+        return prism_re_delete_selection(e)
+    let at = prism_select.prism_sel_head(e.re_sel)
+    if at == 0
+        return ok(e)
+    let d = prism_textmodel.prism_tm_delete(e.re_doc, at - 1, at)?
+    let s = prism_select.prism_sel_new(d, at - 1, at - 1)?
+    ok(PrismEditor(d, s))
+
+// Forward delete removes the character AFTER the caret and leaves the caret put -- at the end of
+// the document it is a no-op, for the same reason as backspace at 0.
+fn prism_re_delete_forward(e: PrismEditor) -> Result<PrismEditor>
+    if not prism_select.prism_sel_is_collapsed(e.re_sel)
+        return prism_re_delete_selection(e)
+    let at = prism_select.prism_sel_head(e.re_sel)
+    if at >= prism_textmodel.prism_tm_length(e.re_doc)
+        return ok(e)
+    let d = prism_textmodel.prism_tm_delete(e.re_doc, at, at + 1)?
+    let s = prism_select.prism_sel_new(d, at, at)?
+    ok(PrismEditor(d, s))
+
+// True when EVERY character in the selection carries the mark. "Any" would make the toggle
+// ambiguous: with a half-bold selection, "any" reports bold, so toggling would UNBOLD the half
+// that was not bold -- the opposite of what the user asked for. "All" makes the toggle's meaning
+// total: bold if not all bold, otherwise unbold.
+fn prism_re_has_mark(e: PrismEditor, mark: PrismMark) -> Result<bool>
+    let lo = prism_select.prism_sel_lo(e.re_sel)
+    let hi = prism_select.prism_sel_hi(e.re_sel)
+    if lo == hi
+        return err("prism_richedit: a collapsed caret has no marked range to report -- select text first")
+    let want = prism_textmodel.prism_tm_mark_name(mark)
+    let all = [true]
+    let i = [lo]
+    while i[0] < hi
+        let ms = prism_textmodel.prism_tm_marks_at(e.re_doc, i[0])?
+        if not contains(ms, want)
+            all[0] = false
+        i[0] = i[0] + 1
+    ok(all[0])
+
+// ⛔ Rejected on a collapsed caret -- see the header: a pending mark is STATE, and inventing it
+// here would create a second source of truth beside the document.
+fn prism_re_toggle_mark(e: PrismEditor, mark: PrismMark) -> Result<PrismEditor>
+    let lo = prism_select.prism_sel_lo(e.re_sel)
+    let hi = prism_select.prism_sel_hi(e.re_sel)
+    if lo == hi
+        return err("prism_richedit: cannot toggle a mark with nothing selected. A 'pending mark' that applies to the next keystroke is real editor behaviour but it is STATE -- inventing it here would put a second source of truth beside the document")
+    let on = prism_re_has_mark(e, mark)?
+    let d = if on
+        prism_textmodel.prism_tm_unmark(e.re_doc, lo, hi, mark)?
+    else
+        prism_textmodel.prism_tm_mark(e.re_doc, lo, hi, mark)?
+    // The selection is PRESERVED across a mark toggle: the text did not move, and clearing it
+    // would force the user to reselect for every mark they want to apply.
+    ok(PrismEditor(d, e.re_sel))
+
+fn prism_re_select(e: PrismEditor, from, to) -> Result<PrismEditor>
+    let s = prism_select.prism_sel_new(e.re_doc, from, to)?
+    ok(PrismEditor(e.re_doc, s))
+
+fn prism_re_move_to(e: PrismEditor, pos) -> Result<PrismEditor>
+    let s = prism_select.prism_sel_new(e.re_doc, pos, pos)?
+    ok(PrismEditor(e.re_doc, s))
+
+fn prism_re_select_all(e: PrismEditor) -> Result<PrismEditor>
+    ok(PrismEditor(e.re_doc, prism_select.prism_sel_select_all(e.re_doc)))
