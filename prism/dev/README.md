@@ -13,4 +13,9 @@ every prior system that shipped inferred reactivity also shipped these.
 | `prism_visual.nova` | Pixel-exact visual regression against deterministic renders (#104) |
 | `prism_audit_a11y.nova` | Audits only the 4 residual manual a11y annotations (#105) |
 | `prism_size.nova` | Per-route bundle budget (#106) |
-| `prism_tokens.nova` | Design-token export (#108) |
+| `prism_tokens_dev.nova` | Design-token export (#108) |
+
+> **Naming note.** This layer's token exporter is `prism_tokens_dev.nova`, NOT `prism_tokens.nova`.
+> `prism/**/*.nova` is FLATTENED into `$NOVA_HOME/lib`, so a second `prism_tokens.nova` would collide
+> with `style/prism_tokens.nova` and one would silently win. Module basenames are a GLOBAL namespace
+> in this project, not a per-folder one.
