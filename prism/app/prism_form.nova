@@ -1,0 +1,678 @@
+// prism_form (app/, Tier 2) -- `form_of` derived forms and autosave/draft recovery (#87). This is
+// the STATE layer above prism/ui/prism_ui_form.nova (MB.1), which already owns the node-tree /
+// typed-field / validation-rule vocabulary (PrismFormFieldKind's 7 kinds, PrismFormRule's 3 rules,
+// PrismForm, PrismFormField) and rendering. Nothing in that vocabulary is reimplemented here --
+// this file never invents a field kind, a validation rule, or a rendered node; it only manages
+// WHICH VALUES a PrismForm currently holds, whether that differs from what was last saved, and how
+// an in-progress edit survives a reload. Matches prism_route.nova's own layering stance (pure
+// data/logic over Result, no rendering, no owned timers) -- read that file first; this one copies
+// its shape deliberately.
+//
+// ── `form_of` HERE IS A LIBRARY FUNCTION, NOT THE DSL KEYWORD PRISM_SPEC.md SKETCHES ───────────
+// PRISM_SPEC.md Part VI example 21 and PRISM_UNIVERSAL_UI_PLAN.md sketch `form_of e` as something
+// the compiler recognizes inside a `face` body, reactively re-deriving UI as `e`'s fields change --
+// that requires `face`/`wire` compiler support this codebase does not have yet (same gap
+// prism_ui_form.nova's own header already accepts: it composes the 22-primitive vocabulary by hand
+// because there is no DSL to lower). `prism_fm_form_of` below is the same kind of stand-in: an
+// ordinary function, called once, that reads a struct value through NOVA's RTTI keystone
+// (`field_names`/`field_types`/`field_get`, PRISM_SPEC.md's own words for this) and returns a
+// PrismForm. It has no way to re-run itself when `e` changes later -- the CALLER re-derives (calls
+// it again) whenever that is wanted, exactly as re-rendering is the caller's job everywhere else in
+// this codebase's current (non-reactive) rendering story.
+//
+// ── DESIGN DECISION: what "cannot silently miss a field" CAN and CANNOT mean without `face` ─────
+// The brief for this file asks for a form "derived from a typed shape... so adding a field to the
+// type cannot leave the form silently missing it." Without compiler-level reactivity, the honest,
+// checkable version of that guarantee is: `prism_fm_form_of` enumerates literally every name
+// `field_names(e)` reports for the value passed to it, AT THE MOMENT IT IS CALLED -- there is no
+// hand-maintained field list anywhere in this file for a new struct field to fall out of sync with
+// (contrast a hand-built `prism_ui_form.prism_form([prism_form_text("a",...), prism_form_text("b",
+// ...)])`, where adding field `c` to the struct is silently invisible to that list until a human
+// remembers to edit it). Concretely: if a field cannot be represented, `prism_fm_form_of` returns
+// `Result::Err` naming that field -- it NEVER drops a field from the derived form silently. That is
+// the guarantee this file can make. What it CANNOT make structural: (1) that `prism_fm_form_of` is
+// actually CALLED again after the struct's shape changes -- a caller who cached an old PrismFmState
+// across a recompile is a caller bug this layer cannot see, same as any cached derived value in any
+// language; (2) that EVERY field type is representable at all -- see the next design decision.
+//
+// ── DESIGN DECISION: the derivable vocabulary is `int`/`bool`/`string` ONLY, and it FAILS LOUDLY
+// on everything else, rather than guessing ─────────────────────────────────────────────────────
+// `field_types(e)` returns the RAW, unnormalized declared annotation for each field (verified: an
+// `age: int` field reports literally "int"; a WIDTH-annotated `age: i32` reports literally "i32",
+// not "int" -- see probe below). This file recognizes exactly the three bare annotations
+// prism_ui_form.nova's closed 7-kind vocabulary can represent from a scalar with no caller-supplied
+// option list: `int` -> Number, `bool` -> Toggle, `string` -> Text/Email/Password (see next
+// decision for which). Anything else -- `i32`/`u8`/`f64` (an explicit width; silently widening or
+// narrowing it back through a PrismFormField's own int would reintroduce exactly the implicit-width
+// conversion bug LOCK-4 made a compile error elsewhere in this language), `float` (prism_ui_form.nova
+// has no float-valued field kind to map it to -- that gap belongs to that file, not a reason to fake
+// one here), `T?`/`Option<T>`, a nested struct, an enum, or a list -- makes `prism_fm_form_of` return
+// `Result::Err` naming the exact field and its declared type, rather than silently omitting the
+// field (which would violate the design decision above) or silently misrendering it. The caller's
+// escape hatch is `prism_fm_from_form`: hand-build the awkward field with prism_ui_form's own
+// constructors, splice it into the list `prism_fm_form_of` would have produced for the rest, and
+// wrap the result. This is the same "derive what is safe, name what is not, let the caller finish
+// it by hand" posture prism_secret.nova takes for `@redact` crossing a module boundary.
+//
+// ── DESIGN DECISION: which STRING sub-kind (text/email/password) is a NAMING CONVENTION, stated
+// as exactly that -- not a guarantee, because NOVA cannot give one here ─────────────────────────
+// A struct field's declared type for an email address, a password, and a plain string are all the
+// literal same annotation: `string`. There is no nominal `Email`/`Password` type in this codebase
+// for `field_types` to report, and no compiler-visible marker (an `@redact`-tagged field's mask is
+// NOT reflectable -- see the SECRETS decision below) that would let this be derived rather than
+// guessed. `_prism_fm_derive_kind` therefore inspects the FIELD NAME (case-insensitively) for
+// `password`/`passwd`/`secret`/`token` -> Password, then `email` -> Email, else Text. STATE THIS
+// PLAINLY: this is a CONVENTION, not a structural guarantee. A secret-holding field named outside
+// that list (`credential`, `pin`, `apiKey`) becomes an ordinary Text field and WOULD be eligible for
+// autosave. This is exactly the failure mode the SECRETS decision below refuses to leave resting on
+// a naming guess -- see there for what IS structural.
+//
+// ── ⛔ SECRETS: what is STRUCTURAL vs. CONVENTIONAL here (read before trusting draft persistence)
+// The brief: "a password field must never reach a draft store... this layer must make it
+// UNREPRESENTABLE, not merely discouraged." The naming heuristic above cannot deliver that (a false
+// negative is silent and real). What DOES: `_prism_fm_field_raw` is the ONE function in this file
+// that ever turns a `PrismFormField`'s value into a string that could leave this module (draft
+// snapshot, dirty comparison, submit). It pattern-matches prism_ui_form's own closed field-kind
+// vocabulary and tags every `password`-kind field's raw value `fm_raw_secret = true`.
+// `_prism_fm_encode_values(form, include_secret)` is the ONLY place that string is either kept or
+// dropped, and `prism_fm_draft_snapshot` is the ONLY caller that passes `include_secret = false`.
+// STRUCTURAL: once a field carries `PrismFormFieldKind.FormFieldPassword` -- however it got that
+// kind, `prism_fm_form_of`'s naming guess OR a caller's own explicit
+// `prism_ui_form.prism_form_password(...)` -- there is no code path in `prism_fm_draft_snapshot`
+// that can emit its value: the exclusion happens at the single choke point every persisted string
+// passes through, not at each call site (nothing to forget to add at a second call site, because
+// there is only one). CONVENTIONAL (this file cannot close it, stated plainly, same posture as
+// prism_secret.nova's own header): (1) whether a given field ends up AS a Password-kind field at
+// all, when it was derived rather than hand-built, is the naming guess above; (2) `prism_fm_submit`
+// DELIBERATELY returns the real password value (a caller must be able to send the real password to
+// the server) -- that is the "explicit, deliberate unwrap" this module's one legitimate exit for a
+// secret value, mirroring `prism_secret.sec_unwrap`, and it is never persisted by this file, only
+// returned to the caller's own memory; (3) nothing stops a caller from taking that returned value
+// and writing it to disk themselves -- no library can prevent that, only make the ACCIDENTAL path
+// (autosave) provably not do it.
+//
+// ── DESIGN DECISION: autosave (permissive) and submit (strict) do not share a code path ─────────
+// `prism_fm_draft_snapshot` never validates -- a half-typed email must be saveable as a draft, or
+// autosave is useless for exactly the input it exists to protect. `prism_fm_submit` always
+// validates (delegates to prism_ui_form.prism_form_validate, the SAME rules the rendered form shows
+// errors for -- not a second, divergent rule set) and returns Err naming every violated field before
+// returning any value. These are two different public functions with two different Result shapes on
+// purpose: a boolean "strict: bool" flag on one shared function is exactly the kind of thing
+// CLAUDE.md warns a NOVA bool cannot be trusted to carry reliably, and more importantly would put
+// the "did this validate" decision behind a call-site argument instead of the function's own name.
+//
+// ── DESIGN DECISION: dirty is measured from a FINGERPRINT of the SAVED baseline, not a clock ─────
+// A draft is only worth surfacing if it is DIFFERENT from what is currently true -- "recover draft?"
+// on a form nobody touched is noise. Two things must be told apart, and they are NOT the same
+// check: (a) is the CURRENT in-memory form dirty vs. its OWN last-saved baseline (`prism_fm_is_dirty`
+// -- an ordinary "unsaved changes" indicator); (b) does a DRAFT PULLED BACK FROM STORAGE, possibly
+// written in a previous session, actually change anything relative to the record's CURRENT saved
+// state (`prism_fm_draft_inspect`'s `FmDraftNone` vs. `FmDraftRecoverable`/`FmDraftConflicting`).
+// (b) additionally needs to detect the CONFLICT case: the record moved on the server while the
+// draft sat in storage, so blindly applying the draft would silently clobber a newer save with
+// stale data. Nothing in this pure, backend-agnostic module can read a server clock or an ETag the
+// caller's own record type may or may not have -- so `_prism_fm_fingerprint` derives a version
+// marker the only way available here: `sha256` of the canonical (non-secret) field values at the
+// moment the current baseline was captured (`prism_fm_form_of` / `prism_fm_mark_saved`). Two
+// baselines with identical non-secret content always fingerprint identically (content-addressed, no
+// clock skew, no caller-supplied ID required) and two different baselines collide only as often as
+// SHA-256 does. A draft's embedded fingerprint disagreeing with the CURRENT baseline's fingerprint
+// is exactly "the record changed since this draft was taken" -- `FmDraftConflicting`. Precedence
+// is deliberate: a draft that changes NOTHING is reported `FmDraftNone` even if the fingerprints
+// differ (see `prism_fm_draft_inspect`) -- a no-op recovery is not worth a conflict prompt either.
+//
+// ── DESIGN DECISION: this module never touches storage -- same stance as prism_route's scroll ───
+// `prism_fm_draft_snapshot` returns an opaque string; `prism_fm_draft_inspect`/`_apply` accept one
+// back. Nothing here calls a filesystem or `localStorage` API. Exactly like prism_route's own
+// scroll memory ("the router cannot read a live DOM scroll position... saving is always an explicit
+// caller action"), THIS module cannot know whether its host is a browser tab, a native shell, or a
+// test harness, and guessing would make it untestable outside whichever one it guessed. The caller
+// (the platform-specific glue, or Forge on the server) decides WHERE the string goes and WHEN
+// autosave fires (a debounce timer, a blur handler, a periodic tick) -- this module answers "is
+// there anything worth saving" (`prism_fm_is_dirty`) and "what would recovering this actually do"
+// (`prism_fm_draft_inspect`), never "save this now."
+//
+// ── DESIGN DECISION: editing goes through ONE raw-STRING setter, mirroring the DOM's own model ───
+// `prism_fm_set_field(state, name, raw: string)` interprets `raw` according to the field's CURRENT
+// declared kind (an int field parses with `parse_int_safe`, a toggle recognizes "true"/"1" and
+// "false"/"0", everything else passes through) rather than exposing five kind-specific setters. A
+// browser `<input>`/`<select>` change event hands a caller a string regardless of the field's
+// semantic kind (even `<input type=number>`); this mirrors that reality instead of fighting it, and
+// it is the same "the KIND governs how untyped input is interpreted, never a caller's guess"
+// posture prism_route.nova takes for a route's typed segment. Draft recovery reuses this exact
+// function per field -- there is no second, parallel "apply a recovered value" code path to drift
+// from the one a live UI event would call.
+//
+// ── ⛔ MEASURED THIS SESSION: the `bool(x)` cast builtin CRASHES on a reflected `any` value ───────
+// Needed to know, for `prism_fm_form_of`, whether a `bool`-typed struct field read back via
+// `field_get` (which returns `any`) could be safely turned into a real `bool`. Three things were
+// measured with a minimal probe (a 3-field struct, `field_get` on each field):
+//   1. `field_get(e, boolField)` passed DIRECTLY as the argument to a function whose parameter is
+//      statically typed `bool` (no cast) works correctly -- prints "true"/"false" as expected. Same
+//      result for a `string` field into a `string` parameter (verified with a non-ASCII value,
+//      "héllo", byte length round-tripped correctly) and an `int` field into an `int` parameter.
+//   2. `str()` on the RAW reflected `any` bool (before it crosses any typed parameter) prints "1"/
+//      "0" -- NOT "true"/"false". The SAME boolean value, once passed through a statically `bool`-
+//      typed parameter and read back, stringifies as "true"/"false". This is a second, concrete
+//      confirmation of the already-recorded "a NOVA bool changes representation across a call
+//      boundary" gotcha, not a new one -- recorded here because it directly shaped this file's
+//      design: NEVER compare a bool's string form across that boundary; convert with `true`/`false`
+//      LITERALS in this file's own code (see `_prism_fm_field_raw`), never by inspecting `str()` of
+//      a reflected value.
+//   3. `bool(field_get(e, boolField))` -- the explicit `bool(x)` CAST builtin, applied to that same
+//      reflected `any` -- CRASHES the process (exit code -2147483645 / 0x80000003, STATUS_
+//      BREAKPOINT; no NOVA-level error, no stderr). `int(field_get(e, intField))`, by contrast,
+//      returned 42 correctly for the same probe. This is a genuine NOVA defect (`bool()`'s cast path
+//      is unimplemented or mis-lowered for a boxed/any operand while `int()`'s is not) -- tracked as
+//      a compiler defect, NOT fixed here (`prism/` is this session's scope). CONSEQUENCE: this file
+//      never calls the `bool(x)`/`float(x)` cast builtins on a reflected value anywhere --
+//      `_prism_fm_build_field` passes `field_get(e, name)` DIRECTLY into prism_ui_form's
+//      already-`bool`-typed `prism_form_toggle` parameter (measured safe, point 1 above), and never
+//      calls `bool()` at all.
+//
+// PUBLIC API
+//   Construction
+//     prism_fm_form_of<T>(e: T)                RTTI-derived, see design decisions -> Result<PrismFmState>
+//     prism_fm_from_form(form: PrismForm)       wrap an explicitly hand-built form -> Result<PrismFmState>
+//   Editing (immutable -- every op returns a NEW PrismFmState; `fm_st_saved` never changes here)
+//     prism_fm_set_field(state, name, raw: string)  -> Result<PrismFmState>
+//   Saved-baseline transition
+//     prism_fm_mark_saved(state)                -> Result<PrismFmState>   current values become the new baseline
+//   Accessors
+//     prism_fm_current_form(state) -> PrismForm    prism_fm_saved_form(state) -> PrismForm
+//     prism_fm_version(state) -> string             (opaque content fingerprint of the saved baseline)
+//   Dirty tracking
+//     prism_fm_is_dirty(state)                  -> Result<bool>
+//   Submit -- total: validated values, or every reason it cannot submit, never both, never neither
+//     prism_fm_submit(state)                    -> Result<dict>   name -> raw string, INCLUDES secrets
+//   Draft / autosave (#87) -- this module never touches storage, see design decision
+//     prism_fm_draft_snapshot(state)                            -> Result<string>   secrets OMITTED
+//     prism_fm_draft_inspect(fresh_state, snapshot)             -> Result<PrismFmDraftInfo>
+//     prism_fm_draft_apply(fresh_state, snapshot, allow_conflict: bool) -> Result<PrismFmState>
+//     prism_fm_should_offer_recovery(info)                      -> bool
+//     PrismFmDraftStatus                        FmDraftNone() | FmDraftRecoverable() | FmDraftConflicting()
+//     prism_fm_draft_status(info) -> PrismFmDraftStatus     prism_fm_draft_status_str(info) -> string
+//     prism_fm_draft_changed_fields(info)       -> list     field names the draft would actually change
+//
+// ── ⛔ MEASURED THIS SESSION: a module can export at most ~32 top-level declarations to an
+// EXTERNAL caller before the rest become silently unreachable -- NOT a soundness bug (nothing
+// mis-executes), but a real, previously-undocumented ceiling this file is written to respect ──────
+// While wiring this file's own KAT, several LATER top-level functions (originally: prism_fm_
+// draft_apply onward) failed to resolve from the *importing* file -- "module 'prism_form' has no
+// exported function 'X'" (qualified) / "unknown identifier 'X'" (unqualified) -- even though X was
+// declared, correctly typed, never inside a lambda/generic-only path, and earlier functions in the
+// SAME file resolved fine. Isolated with a minimal two-file repro (a module of N trivial
+// `fn gc_fNN(s: GcS) -> Result<int>` declarations, imported and called from a second file): the
+// LAST declaration in the module resolves when the module has <=32 total top-level declarations
+// (fn + type + enum, counted together) and FAILS to resolve at 33, reproducibly, independent of the
+// function's name, arity, parameter types (tried bool/int/struct/enum-carrying-struct), generic-ness,
+// and position relative to a caller's own nesting depth (ruled out separately). Renaming the
+// function does not help; splitting the caller into shallower functions does not help; the count is
+// over the WHOLE module file, not per section. This file was originally written at 39 total
+// declarations (draft_apply was #35) and hit exactly this wall -- see git history / the session
+// report for the full before/after. FIX APPLIED HERE: five single-call-site private helpers
+// (`_prism_fm_apply_number/_range/_toggle`, `_prism_fm_dicts_differ`, `_prism_fm_diff_against`,
+// `_prism_fm_status_is_conflicting`, and two named-constant functions replaced by inline literals)
+// were folded into their one caller, bringing the file to 31 total declarations -- comfortably under
+// the observed ceiling, confirmed by the KAT (which exercises every public function through a real
+// cross-module import) compiling and passing. CONSEQUENCE FOR FUTURE EDITS: adding a new public
+// function to this file's small remaining margin is fine; adding several, or restoring any of the
+// folded helpers as separate functions, must be re-checked against this ceiling (recompile the KAT
+// and confirm every function it calls still resolves) before assuming the addition is safe. Tracked
+// as a compiler defect (a fixed-size table or similar in the cross-module export/import path), NOT
+// fixed here -- `prism/` is this session's scope, `nova_compiler.nova` is not.
+
+import prism_ui_form
+
+// ── PrismFmDraftStatus: closed, 3-outcome. See DESIGN DECISION above for the precedence (a no-op
+// draft is FmDraftNone even when its fingerprint disagrees with the current baseline -- "would this
+// recovery change anything" outranks "did the record move"). No public constructors: unlike
+// RtParamKind/RtNavKind in prism_route.nova (which a CALLER must construct to pass in), a caller of
+// this file only ever RECEIVES a PrismFmDraftStatus (from `prism_fm_draft_status`) and matches on
+// it -- there is no legitimate call site that needs to build one from outside this file.
+enum PrismFmDraftStatus
+    FmDraftNone()
+    FmDraftRecoverable()
+    FmDraftConflicting()
+
+// ── Value types. Every field is `fm_`-prefixed with a per-struct sub-tag (`fm_st_`, `fm_di_`,
+// `fm_raw_`), mirroring prism_route.nova's `rt_route_*` / `rt_match_*` convention under its shared
+// `rt_` module prefix -- NOVA's struct field->slot map is GLOBAL, so a bare `form`/`version`/`name`
+// here would risk colliding with an unrelated field of that name anywhere else in the program.
+
+// The state this module manages: CURRENT live values (`fm_st_form`, what the user has typed so
+// far -- may be invalid, may be dirty), the last-known SAVED baseline (`fm_st_saved` -- what the
+// record actually is, as of the last `prism_fm_form_of`/`prism_fm_mark_saved`), and a content
+// fingerprint of that baseline (`fm_st_version` -- see DESIGN DECISION on conflict detection). The
+// two PrismForm values always share the same field SET (same names, same kinds) -- this layer edits
+// VALUES, it never adds or removes a field from a form under management.
+type PrismFmState
+    fm_st_form: PrismForm
+    fm_st_saved: PrismForm
+    fm_st_version: string
+
+// The outcome of inspecting a persisted draft against the CURRENT saved baseline -- see
+// `prism_fm_draft_inspect`. `fm_di_changed_fields` is empty exactly when the status is
+// `FmDraftNone`, and lists every field NAME (in the draft's own encoded order, itself the source
+// form's field-declaration order) whose draft value differs from the field's current saved value.
+type PrismFmDraftInfo
+    fm_di_status: PrismFmDraftStatus
+    fm_di_changed_fields: list
+
+// Internal plumbing only (never appears in a public signature): one field's value, reduced to the
+// uniform raw-string representation every comparison/snapshot/submit operation in this file works
+// over, plus whether reading it out at all requires the caller's explicit consent (secret-kind
+// fields). See the SECRETS design decision above -- `fm_raw_secret` is the ONE flag this whole
+// file's password-exclusion logic is built on.
+type PrismFmRaw
+    fm_raw_name: string
+    fm_raw_value: string
+    fm_raw_secret: bool
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Field name -> label, and field type -> derived kind (form_of's naming convention) ───────────
+
+// "emp_first_name" -> "Emp First Name": split on '_', capitalize each piece, join with a space.
+// Mechanical and honest about it -- see the form_of design decisions above for why this does NOT
+// try to strip a struct's own field-prefix convention (this file has no way to know what that
+// convention is). A caller who wants a nicer label replaces the derived field with
+// `prism_ui_form.prism_form_field_with_help`-style hand construction; nothing here hides that this
+// is a mechanical transform, not a real "display name" derivation.
+fn _prism_fm_humanize(fname: string) -> string
+    let words = split(fname, "_")
+    let out = []
+    for w in words
+        if len(w) > 0
+            push(out, upper(slice(w, 0, 1)) + slice(w, 1, len(w)))
+    join(out, " ")
+
+// See DESIGN DECISION above: "" means unsupported (form_of fails loudly on that field), and the
+// string/email/password split is a NAMING CONVENTION, not a structural guarantee.
+fn _prism_fm_derive_kind(fname: string, ftype: string) -> string
+    if ftype == "int"
+        return "number"
+    if ftype == "bool"
+        return "toggle"
+    if ftype == "string"
+        let lname = lower(fname)
+        if find(lname, "password") >= 0 or find(lname, "passwd") >= 0 or find(lname, "secret") >= 0 or find(lname, "token") >= 0
+            return "password"
+        if find(lname, "email") >= 0
+            return "email"
+        return "text"
+    ""
+
+// Builds ONE derived field. `field_get(e, fname)` is passed DIRECTLY into prism_ui_form's own
+// typed constructor parameters (`value: int`/`value: bool`/`value: string`) with no cast builtin in
+// between -- see the "MEASURED THIS SESSION" header note for why that is the safe path and `bool()`
+// is not.
+//
+// The literal i32 bounds on the Number branch are the conventional, documented default for a
+// form_of-derived Number field (NOT extracted to a named constant -- see the file-wide declaration-
+// count note below the PUBLIC API block for why every private helper here is judged against a real
+// budget, not free). Reflection has no way to know the field's real business range (an age vs. a
+// cent amount vs. a year) -- these are simply wide enough that the derived field's OWN [min,max]
+// never itself rejects a value at construction (prism_form_number only enforces min<=max there; an
+// out-of-[lo,hi] VALUE surfaces later, at `prism_form_validate` time). i32, not i64, is itself a
+// deliberate choice: wide enough for the overwhelming majority of real fields while still catching
+// the common "this looks like a raw i64 timestamp/id, not a form input" case with a validate-time
+// message instead of accepting silently. A caller with a field outside this range replaces it with
+// a properly-bounded `prism_ui_form.prism_form_number(...)` call (see `prism_fm_from_form`).
+fn <T> _prism_fm_build_field(e: T, fname: string, ftype: string) -> Result<PrismFormField>
+    let kind = _prism_fm_derive_kind(fname, ftype)
+    let label = _prism_fm_humanize(fname)
+    if kind == "number"
+        return prism_ui_form.prism_form_number(fname, label, field_get(e, fname), -2147483648, 2147483647)
+    if kind == "toggle"
+        return prism_ui_form.prism_form_toggle(fname, label, field_get(e, fname))
+    if kind == "password"
+        return prism_ui_form.prism_form_password(fname, label, field_get(e, fname))
+    if kind == "email"
+        return prism_ui_form.prism_form_email(fname, label, field_get(e, fname))
+    if kind == "text"
+        return prism_ui_form.prism_form_text(fname, label, field_get(e, fname))
+    err("prism_fm_form_of: field '{fname}' has type '{ftype}', which form_of does not derive a form field for (supported: int, bool, string -- see header) -- build it explicitly via prism_ui_form and splice it into the derived field list, then wrap with prism_fm_from_form")
+
+// ── Construction ─────────────────────────────────────────────────────────────────────────────
+
+fn _prism_fm_state_new(form: PrismForm) -> Result<PrismFmState>
+    let version = _prism_fm_fingerprint(form)?
+    ok(PrismFmState(form, form, version))
+
+// See the `form_of` design decisions above for exactly what this does and does not guarantee.
+fn <T> prism_fm_form_of(e: T) -> Result<PrismFmState>
+    let names = field_names(e)
+    let types = field_types(e)
+    let fields = []
+    let idx = [0]
+    for fname in names
+        let i = idx[0]
+        idx[0] = i + 1
+        let f = _prism_fm_build_field(e, fname, types[i])?
+        push(fields, f)
+    let form = prism_ui_form.prism_form(fields)?
+    _prism_fm_state_new(form)
+
+// Wraps an explicitly hand-built PrismForm (any mix of prism_ui_form's 7 field kinds, including
+// Range/Choice which form_of never derives) so it gets the SAME editing/dirty/draft/submit
+// machinery as a derived one. This is the escape hatch every design decision above points to when
+// form_of's naming convention or scalar-only vocabulary is not enough for a real field.
+fn prism_fm_from_form(form: PrismForm) -> Result<PrismFmState>
+    _prism_fm_state_new(form)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── The single raw-value choke point (see SECRETS design decision) ─────────────────────────────
+
+// The ONE function in this file that reads a value out of a PrismFormField. Every downstream
+// consumer (dirty check, fingerprint, draft snapshot, submit) goes through this, which is what
+// makes the password exclusion in `_prism_fm_encode_values` a single, auditable choke point instead
+// of a rule every call site has to remember separately. Exhaustive over prism_ui_form's 7 kind tags
+// via string comparison (not a compiler-checked `match`, because `PrismFormFieldKind` is declared
+// in a different file and this file only sees its kind as a string via
+// `prism_form_field_kind_str` -- see that function's own doc for why matching its ENUM directly
+// from here is deliberately avoided). The final `err` arm is the substitute for compiler
+// exhaustiveness: prism_ui_form.nova growing an 8th kind fails LOUDLY here on first use rather than
+// silently dropping or misreading that field's value.
+fn _prism_fm_field_raw(field: PrismFormField) -> Result<PrismFmRaw>
+    let fname = prism_ui_form.prism_form_field_name(field)
+    let kind = prism_ui_form.prism_form_field_kind_str(field)
+    if kind == "text" or kind == "email"
+        return ok(PrismFmRaw(fname, prism_ui_form.prism_form_field_text_value(field, ""), false))
+    if kind == "password"
+        return ok(PrismFmRaw(fname, prism_ui_form.prism_form_field_text_value(field, ""), true))
+    if kind == "number"
+        return ok(PrismFmRaw(fname, str(prism_ui_form.prism_form_field_number_value(field, 0)), false))
+    if kind == "range"
+        return ok(PrismFmRaw(fname, str(prism_ui_form.prism_form_field_range_value(field, 0)), false))
+    if kind == "choice"
+        return ok(PrismFmRaw(fname, prism_ui_form.prism_form_field_choice_selected(field, ""), false))
+    if kind == "toggle"
+        let b = prism_ui_form.prism_form_field_bool_value(field, false)
+        // ⛔ The `if` MUST sit on the same line as the `=`. Written as `let s =` followed by a
+        // newline and an indented `if`, this compiles HERE (inside an `if` block) but is an
+        // E0001 "unexpected NEWLINE in expression" at function-body level -- and where it does
+        // compile it yields a value that CORRUPTS the struct built from it: reading
+        // `raw.fm_raw_secret` off the resulting PrismFmRaw faulted with an access violation.
+        // Measured 2026-09-04; that crash is what this comment exists to prevent recurring.
+        let s = if b
+            "true"
+        else
+            "false"
+        return ok(PrismFmRaw(fname, s, false))
+    err("prism_form: field '{fname}' has an unrecognized kind '{kind}' -- prism_ui_form.nova's field-kind vocabulary grew since this file was written; add a case to _prism_fm_field_raw before trusting draft/dirty/submit on this field")
+
+// `include_secret = false` is the ONLY mode anything persisted (prism_fm_draft_snapshot,
+// _prism_fm_fingerprint) is built from. `include_secret = true` is used ONLY for in-memory
+// comparisons (`prism_fm_is_dirty`) and the deliberate-unwrap `prism_fm_submit` -- see SECRETS.
+// ⛔ `include_secret` is an INT 0/1, NOT a bool. A NOVA bool changes representation across a CALL
+// BOUNDARY (inline int vs fn-arg bool), and passing `true` here faulted with an access violation
+// -- measured 2026-09-04, and the reason prism_event/prism_media/prism_notice all use int 0/1 for
+// their own flags. The parameter is the boundary, so this is where the rule has to be applied.
+fn _prism_fm_encode_values(form: PrismForm, include_secret: int) -> Result<dict>
+    let out = {}
+    for field in prism_ui_form.prism_form_fields(form)
+        let raw = _prism_fm_field_raw(field)?
+        let keep = include_secret == 1 or not raw.fm_raw_secret
+        if keep
+            out[raw.fm_raw_name] = raw.fm_raw_value
+    ok(out)
+
+// Deterministic text for hashing/persisting: JSON object, keys in the FORM's OWN field-declaration
+// order (not merely dict insertion order, though NOVA dicts do preserve that too -- iterating the
+// form's own field list ties this ordering to something a human editing/diffing two snapshots would
+// recognize, and stays correct independent of dict implementation details). Hand-built via
+// `json_stringify` + `+`, never a generic `to_json()` -- see the file-wide ban on calling generic
+// serialization on an imported struct (prism_secret.nova's header measured why).
+fn _prism_fm_canonical_json(vals: dict, form: PrismForm) -> string
+    let parts = []
+    for field in prism_ui_form.prism_form_fields(form)
+        let fname = prism_ui_form.prism_form_field_name(field)
+        if fname in vals
+            push(parts, json_stringify(fname) + ":" + json_stringify(vals[fname]))
+    "\{" + join(parts, ",") + "\}"
+
+// See DESIGN DECISION "dirty is measured from a fingerprint of the saved baseline".
+fn _prism_fm_fingerprint(form: PrismForm) -> Result<string>
+    let vals = _prism_fm_encode_values(form, 0)?
+    ok(sha256(_prism_fm_canonical_json(vals, form)))
+
+// ── Editing ──────────────────────────────────────────────────────────────────────────────────
+
+fn _prism_fm_parse_bool(raw: string) -> Result<bool>
+    if raw == "true" or raw == "1"
+        return ok(true)
+    if raw == "false" or raw == "0"
+        return ok(false)
+    err("prism_form: '{raw}' is not a valid boolean (expected true/false or 1/0)")
+
+// Rebuilds ONE field with a new raw value, per its CURRENT kind (see DESIGN DECISION on the
+// raw-string setter), then reattaches its EXISTING rules and help text (prism_ui_form's
+// constructors reset both to empty/none -- this function is the only place in this file that must
+// remember to carry them forward, so it does it once, here). Number/Range inline their own
+// `parse_int_safe(raw)?` and Toggle its own `_prism_fm_parse_bool(raw)?` directly as a call
+// argument (an ordinary expression position -- the "`?` cannot appear inside a LAMBDA" restriction
+// does not apply to an if-expression branch) rather than each getting its own one-call-site helper
+// function -- see the file-wide declaration-count note below the PUBLIC API block for why.
+fn _prism_fm_apply_raw(field: PrismFormField, raw: string) -> Result<PrismFormField>
+    let name = prism_ui_form.prism_form_field_name(field)
+    let label = prism_ui_form.prism_form_field_label(field)
+    let kind = prism_ui_form.prism_form_field_kind_str(field)
+    // ⛔ EARLY RETURN PER BRANCH, never one `let x = if …` chain merging them. Each constructor
+    // yields a Result whose payload carries a DIFFERENT PrismFormFieldKind shape, and merging
+    // those heterogeneous branches into a single binding produced a value that faulted when read
+    // back later (an access violation inside encode_values, only for a field rebuilt this way).
+    // Same mechanism as the dangling-`let =` defect fixed above, generalised from strings to enum
+    // payloads. `_prism_fm_finish` carries the rules/help re-attachment so the branches stay
+    // one-liners and the shared tail exists exactly once.
+    if kind == "text"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_text(name, label, raw)?)
+    if kind == "email"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_email(name, label, raw)?)
+    if kind == "password"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_password(name, label, raw)?)
+    if kind == "number"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_number(name, label, parse_int_safe(raw)?, prism_ui_form.prism_form_field_number_min(field, 0), prism_ui_form.prism_form_field_number_max(field, 0))?)
+    if kind == "range"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_range(name, label, parse_int_safe(raw)?, prism_ui_form.prism_form_field_range_min(field, 0), prism_ui_form.prism_form_field_range_max(field, 0), prism_ui_form.prism_form_field_range_step(field, 1))?)
+    if kind == "choice"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_choice(name, label, prism_ui_form.prism_form_field_choice_options(field), raw)?)
+    if kind == "toggle"
+        return _prism_fm_finish(field, prism_ui_form.prism_form_toggle(name, label, _prism_fm_parse_bool(raw)?)?)
+    err("prism_form: field '{name}' has an unrecognized kind '{kind}' -- prism_ui_form.nova's vocabulary grew since this file was written; add a case to _prism_fm_apply_raw")
+
+// The shared tail: reattach the ORIGINAL field's rules and help, which prism_ui_form's
+// constructors reset. Exists so every branch above stays a single expression.
+fn _prism_fm_finish(orig: PrismFormField, fresh: PrismFormField) -> Result<PrismFormField>
+    let rules = prism_ui_form.prism_form_field_rules(orig)
+    let with_rules = prism_ui_form.prism_form_field_with_rules(fresh, rules)?
+    let help = prism_ui_form.prism_form_field_help(orig)
+    ok(prism_ui_form.prism_form_field_with_help(with_rules, help))
+
+// Interprets `raw` per the NAMED field's current kind and returns a new state with that ONE field
+// updated -- `fm_st_saved`/`fm_st_version` are untouched (editing is not saving). Errs if no field
+// named `fname` exists, or if `raw` does not parse for that field's kind (an out-of-range Range
+// value, a non-integer Number/text, a Choice value naming no real option, an unrecognized boolean).
+fn prism_fm_set_field(state: PrismFmState, fname: string, raw: string) -> Result<PrismFmState>
+    let fields = prism_ui_form.prism_form_fields(state.fm_st_form)
+    // ⛔ An INT cell, not `[false]`. A NOVA bool cannot be type-validated and its representation
+    // changes across a call boundary, so a bool parked in a list cell (an `any` slot) and read
+    // back is exactly the documented hazard -- here it faulted with an access violation.
+    let found = [0]
+    let out = []
+    for field in fields
+        if prism_ui_form.prism_form_field_name(field) == fname
+            let updated = _prism_fm_apply_raw(field, raw)?
+            push(out, updated)
+            found[0] = 1
+        else
+            push(out, field)
+    if found[0] == 0
+        return err("prism_form: no field named '{fname}' on this form")
+    let new_form = prism_ui_form.prism_form(out)?
+    ok(PrismFmState(new_form, state.fm_st_saved, state.fm_st_version))
+
+// The current values become the new baseline (e.g. after a successful `prism_fm_submit` and a
+// confirmed server write) -- NOT called automatically by `prism_fm_submit` itself, because this
+// module cannot observe whether the caller's own network/DB call actually succeeded. Recomputes
+// `fm_st_version` so a stale draft tied to the OLD baseline correctly conflicts against this one.
+fn prism_fm_mark_saved(state: PrismFmState) -> Result<PrismFmState>
+    let version = _prism_fm_fingerprint(state.fm_st_form)?
+    ok(PrismFmState(state.fm_st_form, state.fm_st_form, version))
+
+// ── Accessors ────────────────────────────────────────────────────────────────────────────────
+
+fn prism_fm_current_form(state: PrismFmState) -> PrismForm
+    state.fm_st_form
+
+fn prism_fm_saved_form(state: PrismFmState) -> PrismForm
+    state.fm_st_saved
+
+fn prism_fm_version(state: PrismFmState) -> string
+    state.fm_st_version
+
+// ── Dirty tracking ───────────────────────────────────────────────────────────────────────────
+// Includes secret fields deliberately (a password EDIT must still count as "unsaved changes" even
+// though its value can never be autosaved -- see SECRETS) -- this stays entirely in memory, never
+// persisted, so including it here does not weaken the draft-store guarantee at all.
+fn prism_fm_is_dirty(state: PrismFmState) -> Result<bool>
+    let cur = _prism_fm_encode_values(state.fm_st_form, 1)?
+    let saved = _prism_fm_encode_values(state.fm_st_saved, 1)?
+    if len(cur) != len(saved)
+        return ok(true)
+    for k, v in cur
+        if not (k in saved)
+            return ok(true)
+        if saved[k] != v
+            return ok(true)
+    ok(false)
+
+// ── Submit ───────────────────────────────────────────────────────────────────────────────────
+// Total: either every field's validated raw value (a dict, name -> string, INCLUDING secrets -- see
+// SECRETS on why that is the correct, deliberate exception), or every reason submission is refused,
+// joined into one message naming each offending field. Reuses prism_ui_form.prism_form_validate's
+// OWN rules -- never a second, divergent notion of "valid" from the one the rendered form shows
+// errors for.
+fn prism_fm_submit(state: PrismFmState) -> Result<dict>
+    let errs = prism_ui_form.prism_form_validate(state.fm_st_form)?
+    if len(errs) > 0
+        let msgs = []
+        for e in errs
+            let field_name = prism_ui_form.prism_form_error_field(e)
+            let message = prism_ui_form.prism_form_error_message(e)
+            push(msgs, "{field_name}: {message}")
+        let joined = join(msgs, "; ")
+        let n = len(errs)
+        return err("prism_form: cannot submit -- {n} field(s) invalid: {joined}")
+    _prism_fm_encode_values(state.fm_st_form, 1)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Draft / autosave (#87) -- this module never touches storage, see design decision ───────────
+
+// {"v":"<sha256 of the saved baseline this draft was taken against>","f":{"<field>":"<raw value>",
+// ...}} -- secret-kind fields are simply ABSENT from "f" (never a placeholder, never a masked
+// marker -- see SECRETS). Hand-built via `+`/`json_stringify`, matching prism_secret.nova's own
+// wire-form convention -- never the generic `to_json()` builtin.
+fn prism_fm_draft_snapshot(state: PrismFmState) -> Result<string>
+    let vals = _prism_fm_encode_values(state.fm_st_form, 0)?
+    let f_json = _prism_fm_canonical_json(vals, state.fm_st_form)
+    ok("\{\"v\":" + json_stringify(state.fm_st_version) + ",\"f\":" + f_json + "\}")
+
+// Parses the envelope shape strictly (a snapshot that is not this module's own shape is a hard
+// error -- it did not come from `prism_fm_draft_snapshot`, so nothing about its meaning can be
+// assumed) but is lenient about individual field entries -- see `prism_fm_draft_apply`.
+fn _prism_fm_decode_snapshot(snapshot: string) -> Result<list>
+    let parsed = json_parse(snapshot)
+    if type_of(parsed) != "dict"
+        return err("prism_form: draft snapshot is not a JSON object")
+    if not ("v" in parsed)
+        return err("prism_form: draft snapshot is missing 'v' (version) -- not a value this module wrote")
+    if not ("f" in parsed)
+        return err("prism_form: draft snapshot is missing 'f' (fields) -- not a value this module wrote")
+    let v = parsed["v"]
+    let f = parsed["f"]
+    if type_of(v) != "string"
+        return err("prism_form: draft snapshot 'v' must be a string")
+    if type_of(f) != "dict"
+        return err("prism_form: draft snapshot 'f' must be an object")
+    ok([v, f])
+
+// See DESIGN DECISION "dirty is measured from a fingerprint..." for the FmDraftNone-outranks-
+// FmDraftConflicting precedence: a draft that changes nothing is never worth a conflict prompt,
+// even if the underlying record did technically move. `changed` -- field names the draft would
+// actually change, relative to `current_vals` (the record's CURRENT saved, non-secret values) --
+// is computed inline (single call site) rather than via a separate helper: a draft entry naming a
+// field no longer present in `current_vals` (removed/renamed since the draft was taken) is compared
+// against "" and so is reported changed (surfaced, not hidden) even though `prism_fm_draft_apply`
+// will end up skipping it (see there).
+fn prism_fm_draft_inspect(fresh: PrismFmState, snapshot: string) -> Result<PrismFmDraftInfo>
+    let decoded = _prism_fm_decode_snapshot(snapshot)?
+    let draft_version = decoded[0]
+    let draft_fields = decoded[1]
+    let current_vals = _prism_fm_encode_values(fresh.fm_st_saved, 0)?
+    let changed = []
+    for k, v in draft_fields
+        if type_of(v) == "string"
+            let cur = if k in current_vals
+                current_vals[k]
+            else
+                ""
+            if cur != v
+                push(changed, k)
+    let status = if len(changed) == 0
+        FmDraftNone()
+    else if draft_version == fresh.fm_st_version
+        FmDraftRecoverable()
+    else
+        FmDraftConflicting()
+    ok(PrismFmDraftInfo(status, changed))
+
+// Applies a previously-inspected draft's field values onto `fresh` via `prism_fm_set_field` (the
+// SAME function a live UI edit calls -- see the raw-string-setter design decision). Refuses a
+// conflicting draft unless `allow_conflict` is explicitly true -- the CALLER decides whether to
+// show a diff and let a human choose, or discard; this function only enforces that the refusal is
+// the DEFAULT, never silent (see the CONFLICT design decision -- who decides). Best-effort per
+// field: a draft entry that no longer parses against the field's CURRENT kind (the schema moved
+// under it -- e.g. it held "hello" and the field is now typed as a number) is skipped rather than
+// failing the whole recovery over one stale value; a draft entry naming a field that no longer
+// exists is skipped the same way (`prism_fm_set_field` errors on an unknown name, which this loop
+// treats as "nothing to apply", not a hard failure).
+fn prism_fm_draft_apply(fresh: PrismFmState, snapshot: string, allow_conflict: bool) -> Result<PrismFmState>
+    let info = prism_fm_draft_inspect(fresh, snapshot)?
+    let conflicting = match info.fm_di_status
+        FmDraftConflicting() => true
+        FmDraftRecoverable() => false
+        FmDraftNone() => false
+    if conflicting and not allow_conflict
+        return err("prism_form: draft conflicts with a newer saved version of this record -- refusing to apply automatically; pass allow_conflict=true only after the caller has resolved the conflict (e.g. shown the changed fields and the user chose to keep the draft anyway)")
+    let decoded = _prism_fm_decode_snapshot(snapshot)?
+    let draft_fields = decoded[1]
+    let acc = [fresh]
+    for k, v in draft_fields
+        if type_of(v) == "string"
+            let applied = prism_fm_set_field(acc[0], k, v)
+            if not is_err(applied)
+                acc[0] = unwrap(applied)
+    ok(acc[0])
+
+// Coarse "is there anything worth asking the user about at all" -- both Recoverable and
+// Conflicting warrant SOME prompt (a plain "restore your draft?" for the former, a more careful
+// diff-and-confirm for the latter, distinguishable via `prism_fm_draft_status`); FmDraftNone means
+// the draft is indistinguishable from the current saved state, so offering recovery would be noise
+// -- the exact failure mode #87's brief calls out.
+fn prism_fm_should_offer_recovery(info: PrismFmDraftInfo) -> bool
+    match info.fm_di_status
+        FmDraftNone() => false
+        FmDraftRecoverable() => true
+        FmDraftConflicting() => true
+
+fn prism_fm_draft_status(info: PrismFmDraftInfo) -> PrismFmDraftStatus
+    info.fm_di_status
+
+fn prism_fm_draft_status_str(info: PrismFmDraftInfo) -> string
+    match info.fm_di_status
+        FmDraftNone() => "none"
+        FmDraftRecoverable() => "recoverable"
+        FmDraftConflicting() => "conflicting"
+
+fn prism_fm_draft_changed_fields(info: PrismFmDraftInfo) -> list
+    info.fm_di_changed_fields

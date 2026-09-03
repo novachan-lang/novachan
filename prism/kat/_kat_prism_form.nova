@@ -1,0 +1,305 @@
+// KAT for prism/app/prism_form.nova -- `form_of` + autosave/draft recovery (#87).
+//
+// Proves, against a MARKER password value that would be unmistakable if it leaked:
+//   1. form_of: correct kind derivation (int->number, bool->toggle, string->text/email/password by
+//      name heuristic), correct value round-trip (including a non-ASCII field value), mechanical
+//      label humanization, a fresh version fingerprint, and NOT dirty immediately after derivation.
+//   2. form_of FAILS LOUDLY (Result::Err naming the field+type) on an unsupported field type,
+//      rather than silently dropping it.
+//   3. Editing: prism_fm_set_field per kind (text/number/toggle), rejects a bad parse, marks dirty,
+//      leaves the saved baseline untouched.
+//   4. Submit is total: an invalid form (a Required rule violated) is rejected NAMING the field; a
+//      valid form's submit result INCLUDES the real secret value (deliberate unwrap).
+//   5. SECRETS: draft_snapshot's output string contains neither the secret KEY nor its plaintext
+//      VALUE, byte-for-byte -- the round trip that matters most for this module.
+//   6. Draft round trip: save draft -> recover draft -> values identical, for a NON-ASCII edited
+//      value, AND the untouched secret field is left alone (recovery does not blank it).
+//   7. "Nothing to recover": a draft identical to the current saved state reports FmDraftNone and
+//      should NOT offer recovery -- the exact noise #87's brief warns against.
+//   8. Conflict: a draft taken against an OLDER saved baseline, inspected against a NEWER one,
+//      reports FmDraftConflicting; apply() refuses it unless allow_conflict=true.
+//   9. Corrupt/foreign snapshot strings are rejected, not silently accepted.
+//   10. prism_fm_mark_saved promotes current values to the new baseline and clears dirty.
+//   11. prism_fm_from_form escape hatch: a hand-built Range field (a kind form_of never derives)
+//       gets the same set_field/dirty machinery, including range-bounds validation delegated to
+//       prism_interact via prism_ui_form.
+//
+// Split into one top-level function per feature area (each rebuilds its own prerequisites) rather
+// than one giant nested main() -- see prism_form.nova's report for why: a single deeply-nested
+// main() containing this whole suite made several LATER top-level functions in prism_form.nova
+// (prism_fm_draft_apply onward) unresolvable ("unknown identifier"/"not exported") from within the
+// most deeply-nested match arms, in BOTH qualified and unqualified call form, while the exact same
+// functions resolved fine from a shallower nesting depth. Splitting the suite into separate,
+// shallower functions made every call resolve correctly; kept this way even after isolating the
+// cause, since it is also plainly more readable.
+//
+// RUN (from nova-compiler/test_programs/, NOVA_HOME set, NOVA_NO_CACHE=1; prism/**/*.nova already
+// synced into $NOVA_HOME/lib):
+//   ./gen3_test.exe _kat_prism_form.nova
+//   clang -O2 -o _kat_prism_form.exe _kat_prism_form.ll ../compiler/nova_runtime.o -lws2_32 -ladvapi32
+//   ./_kat_prism_form.exe
+
+import prism_form
+import prism_ui_form
+
+let PASSED = [0]
+let FAILED = [0]
+
+fn _ok(label: string)
+    print("  ok  " + label)
+    PASSED[0] = PASSED[0] + 1
+
+fn _fail(label: string, detail: string)
+    print("FAIL " + label + ": " + detail)
+    FAILED[0] = FAILED[0] + 1
+
+fn _check_true(label: string, cond: bool, detail: string)
+    if cond
+        _ok(label)
+    else
+        _fail(label, detail)
+
+type KfEmployee
+    kf_name: string
+    kf_email: string
+    kf_password: string
+    kf_age: int
+    kf_active: bool
+
+type KfBad
+    kf_bad_amount: float
+
+let MARKER = "hunter2-TOP-SECRET-MARKER-9f3c"
+let NAME0 = "Dévi 日本語"
+let NAME1 = "新しい名前 é"
+
+fn _fresh_employee() -> KfEmployee
+    KfEmployee(NAME0, "devi@example.com", MARKER, 30, true)
+
+// ── (1) form_of: derivation, values, labels, version, not-dirty ────────────────────────────────
+fn test_form_of()
+    match prism_fm_form_of(_fresh_employee())
+        Err(m) => _fail("form_of: valid struct constructs", m)
+        Ok(st0) =>
+            let fields0 = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(st0))
+            _check_true("form_of: derives 5 fields", len(fields0) == 5, "got " + str(len(fields0)))
+
+            let name_f = fields0[0]
+            let email_f = fields0[1]
+            let pass_f = fields0[2]
+            let age_f = fields0[3]
+            let active_f = fields0[4]
+
+            _check_true("form_of: kf_name -> text", prism_ui_form.prism_form_field_kind_str(name_f) == "text", prism_ui_form.prism_form_field_kind_str(name_f))
+            _check_true("form_of: kf_email -> email", prism_ui_form.prism_form_field_kind_str(email_f) == "email", prism_ui_form.prism_form_field_kind_str(email_f))
+            _check_true("form_of: kf_password -> password", prism_ui_form.prism_form_field_kind_str(pass_f) == "password", prism_ui_form.prism_form_field_kind_str(pass_f))
+            _check_true("form_of: kf_age -> number", prism_ui_form.prism_form_field_kind_str(age_f) == "number", prism_ui_form.prism_form_field_kind_str(age_f))
+            _check_true("form_of: kf_active -> toggle", prism_ui_form.prism_form_field_kind_str(active_f) == "toggle", prism_ui_form.prism_form_field_kind_str(active_f))
+
+            _check_true("form_of: kf_name value round-trips (non-ASCII)", prism_ui_form.prism_form_field_text_value(name_f, "") == NAME0, prism_ui_form.prism_form_field_text_value(name_f, ""))
+            _check_true("form_of: kf_email value round-trips", prism_ui_form.prism_form_field_text_value(email_f, "") == "devi@example.com", prism_ui_form.prism_form_field_text_value(email_f, ""))
+            _check_true("form_of: kf_password value round-trips (in-memory)", prism_ui_form.prism_form_field_text_value(pass_f, "") == MARKER, "value did not round-trip")
+            _check_true("form_of: kf_age value round-trips", prism_ui_form.prism_form_field_number_value(age_f, -1) == 30, str(prism_ui_form.prism_form_field_number_value(age_f, -1)))
+            _check_true("form_of: kf_active value round-trips", prism_ui_form.prism_form_field_bool_value(active_f, false) == true, "expected true")
+
+            _check_true("form_of: label is humanized", prism_ui_form.prism_form_field_label(name_f) == "Kf Name", prism_ui_form.prism_form_field_label(name_f))
+
+            let ver0 = prism_form.prism_fm_version(st0)
+            _check_true("form_of: version fingerprint is 64 hex chars", len(ver0) == 64, "len=" + str(len(ver0)))
+
+            match prism_form.prism_fm_is_dirty(st0)
+                Err(m) => _fail("form_of: is_dirty computable", m)
+                Ok(d) => _check_true("form_of: fresh state is not dirty", d == false, "expected not dirty")
+
+// ── (2) unsupported type fails loudly ───────────────────────────────────────────────────────────
+fn test_form_of_unsupported()
+    match prism_fm_form_of(KfBad(1.5))
+        Ok(b) => _fail("form_of: unsupported type rejected", "unexpectedly constructed")
+        Err(m) =>
+            _check_true("form_of: error names the field", contains(m, "kf_bad_amount"), m)
+            _check_true("form_of: error names the type", contains(m, "float"), m)
+
+// ── (3) editing ──────────────────────────────────────────────────────────────────────────────────
+fn test_editing()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+    match prism_form.prism_fm_set_field(st0, "kf_name", NAME1)
+        Err(m) => _fail("set_field: kf_name valid edit", m)
+        Ok(st1) =>
+            let cur1 = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(st1))[0]
+            _check_true("set_field: new value applied", prism_ui_form.prism_form_field_text_value(cur1, "") == NAME1, prism_ui_form.prism_form_field_text_value(cur1, ""))
+            let saved1 = prism_ui_form.prism_form_fields(prism_form.prism_fm_saved_form(st1))[0]
+            _check_true("set_field: saved baseline untouched", prism_ui_form.prism_form_field_text_value(saved1, "") == NAME0, prism_ui_form.prism_form_field_text_value(saved1, ""))
+            match prism_form.prism_fm_is_dirty(st1)
+                Err(m) => _fail("set_field: is_dirty computable", m)
+                Ok(d) => _check_true("set_field: edited state is dirty", d == true, "expected dirty")
+
+    let st0b = unwrap(prism_fm_form_of(_fresh_employee()))
+    let st1b = unwrap(prism_form.prism_fm_set_field(st0b, "kf_name", NAME1))
+    match prism_form.prism_fm_set_field(st1b, "kf_age", "notanumber")
+        Ok(x) => _fail("set_field: bad int rejected", "unexpectedly accepted")
+        Err(m) => _ok("set_field: bad int rejected")
+
+    match prism_form.prism_fm_set_field(st1b, "kf_active", "0")
+        Err(m) => _fail("set_field: bool via 0/1", m)
+        Ok(st1c) =>
+            let af = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(st1c))[4]
+            _check_true("set_field: bool '0' -> false", prism_ui_form.prism_form_field_bool_value(af, true) == false, "expected false")
+
+    match prism_form.prism_fm_set_field(st1b, "kf_active", "maybe")
+        Ok(x) => _fail("set_field: bad bool rejected", "unexpectedly accepted")
+        Err(m) => _ok("set_field: bad bool rejected")
+
+    match prism_form.prism_fm_set_field(st1b, "no_such_field", "x")
+        Ok(x) => _fail("set_field: unknown field rejected", "unexpectedly accepted")
+        Err(m) => _ok("set_field: unknown field rejected")
+
+// ── (4) submit: total function ──────────────────────────────────────────────────────────────────
+fn test_submit()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+    let st1 = unwrap(prism_form.prism_fm_set_field(st0, "kf_name", NAME1))
+    let cur1 = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(st1))[0]
+    let req = [prism_ui_form.prism_form_rule_required()]
+    let name_req = unwrap(prism_ui_form.prism_form_field_with_rules(cur1, req))
+    let others = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(st1))
+    let form_req = unwrap(prism_ui_form.prism_form([name_req, others[1], others[2], others[3], others[4]]))
+    let st_req = unwrap(prism_form.prism_fm_from_form(form_req))
+
+    let st_blank = unwrap(prism_form.prism_fm_set_field(st_req, "kf_name", ""))
+    match prism_form.prism_fm_submit(st_blank)
+        Ok(d) => _fail("submit: invalid form rejected", "unexpectedly accepted")
+        Err(m) => _check_true("submit: invalid form names the field", contains(m, "kf_name"), m)
+
+    match prism_form.prism_fm_submit(st_req)
+        Err(m) => _fail("submit: valid form accepted", m)
+        Ok(d) =>
+            _check_true("submit: includes real secret value", d["kf_password"] == MARKER, "got: " + str(d["kf_password"]))
+            _check_true("submit: includes edited name", d["kf_name"] == NAME1, str(d["kf_name"]))
+
+// ── (5)+(6)+(7): secrets exclusion and draft round trip ──────────────────────────────────────────
+fn test_draft_roundtrip()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+    let st1 = unwrap(prism_form.prism_fm_set_field(st0, "kf_name", NAME1))
+
+    match prism_form.prism_fm_draft_snapshot(st1)
+        Err(m) => _fail("draft_snapshot: builds", m)
+        Ok(snap1) =>
+            print("snapshot = " + snap1)
+            _check_true("draft_snapshot: secret VALUE absent", contains(snap1, MARKER) == false, "leaked: " + snap1)
+            _check_true("draft_snapshot: secret KEY absent", contains(snap1, "kf_password") == false, "leaked key: " + snap1)
+            _check_true("draft_snapshot: edited value present (non-ASCII)", contains(snap1, "新しい"), snap1)
+
+            match prism_form.prism_fm_draft_inspect(st0, snap1)
+                Err(m) => _fail("draft_inspect: recoverable case", m)
+                Ok(info1) =>
+                    _check_true("draft_inspect: status recoverable", prism_form.prism_fm_draft_status_str(info1) == "recoverable", prism_form.prism_fm_draft_status_str(info1))
+                    _check_true("draft_inspect: should offer recovery", prism_form.prism_fm_should_offer_recovery(info1) == true, "expected true")
+                    let changed1 = prism_form.prism_fm_draft_changed_fields(info1)
+                    _check_true("draft_inspect: kf_name listed as changed", contains(changed1, "kf_name"), str(changed1))
+                    _check_true("draft_inspect: kf_password NOT listed as changed", contains(changed1, "kf_password") == false, str(changed1))
+
+            match prism_form.prism_fm_draft_apply(st0, snap1, false)
+                Err(m) => _fail("draft_apply: recoverable case applies", m)
+                Ok(applied1) =>
+                    let applied_fields = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(applied1))
+                    _check_true("draft_apply: recovered value identical (non-ASCII)", prism_ui_form.prism_form_field_text_value(applied_fields[0], "") == NAME1, prism_ui_form.prism_form_field_text_value(applied_fields[0], ""))
+                    _check_true("draft_apply: untouched secret left alone", prism_ui_form.prism_form_field_text_value(applied_fields[2], "") == MARKER, "secret was blanked or altered")
+                    let applied_saved = prism_ui_form.prism_form_fields(prism_form.prism_fm_saved_form(applied1))
+                    _check_true("draft_apply: saved baseline untouched", prism_ui_form.prism_form_field_text_value(applied_saved[0], "") == NAME0, "saved baseline moved")
+
+    match prism_form.prism_fm_draft_snapshot(st0)
+        Err(m) => _fail("draft_snapshot: noop case builds", m)
+        Ok(snap0) =>
+            match prism_form.prism_fm_draft_inspect(st0, snap0)
+                Err(m) => _fail("draft_inspect: noop case", m)
+                Ok(info0) =>
+                    _check_true("draft_inspect: identical draft -> none", prism_form.prism_fm_draft_status_str(info0) == "none", prism_form.prism_fm_draft_status_str(info0))
+                    _check_true("draft_inspect: none -> do not offer recovery", prism_form.prism_fm_should_offer_recovery(info0) == false, "expected false")
+                    _check_true("draft_inspect: none -> no changed fields", len(prism_form.prism_fm_draft_changed_fields(info0)) == 0, str(prism_form.prism_fm_draft_changed_fields(info0)))
+
+// ── (8) conflict ─────────────────────────────────────────────────────────────────────────────────
+fn test_draft_conflict()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+    let st1 = unwrap(prism_form.prism_fm_set_field(st0, "kf_name", NAME1))
+    let snap1 = unwrap(prism_form.prism_fm_draft_snapshot(st1))
+
+    let emp_server = KfEmployee(NAME0, "devi@example.com", MARKER, 31, true)
+    match prism_fm_form_of(emp_server)
+        Err(m) => _fail("conflict setup: server state", m)
+        Ok(st_server) =>
+            match prism_form.prism_fm_draft_inspect(st_server, snap1)
+                Err(m) => _fail("draft_inspect: conflict case", m)
+                Ok(info_c) => _check_true("draft_inspect: status conflicting", prism_form.prism_fm_draft_status_str(info_c) == "conflicting", prism_form.prism_fm_draft_status_str(info_c))
+
+            match prism_form.prism_fm_draft_apply(st_server, snap1, false)
+                Ok(x) => _fail("draft_apply: conflict refused by default", "unexpectedly applied")
+                Err(m) => _ok("draft_apply: conflict refused by default")
+
+            match prism_form.prism_fm_draft_apply(st_server, snap1, true)
+                Err(m) => _fail("draft_apply: conflict forced with allow_conflict", m)
+                Ok(forced) =>
+                    let forced_name = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(forced))[0]
+                    _check_true("draft_apply: forced conflict applies value", prism_ui_form.prism_form_field_text_value(forced_name, "") == NAME1, prism_ui_form.prism_form_field_text_value(forced_name, ""))
+
+// ── (9) corrupt/foreign snapshots ───────────────────────────────────────────────────────────────
+fn test_corrupt_snapshots()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+
+    match prism_form.prism_fm_draft_inspect(st0, "not json")
+        Ok(x) => _fail("draft_inspect: rejects non-JSON", "unexpectedly accepted")
+        Err(m) => _ok("draft_inspect: rejects non-JSON")
+
+    match prism_form.prism_fm_draft_inspect(st0, "\{\"foo\":1\}")
+        Ok(x) => _fail("draft_inspect: rejects missing v/f", "unexpectedly accepted")
+        Err(m) => _ok("draft_inspect: rejects missing v/f")
+
+    match prism_form.prism_fm_draft_inspect(st0, "\{\"v\":1,\"f\":\{\}\}")
+        Ok(x) => _fail("draft_inspect: rejects non-string v", "unexpectedly accepted")
+        Err(m) => _ok("draft_inspect: rejects non-string v")
+
+// ── (10) mark_saved ─────────────────────────────────────────────────────────────────────────────
+fn test_mark_saved()
+    let st0 = unwrap(prism_fm_form_of(_fresh_employee()))
+    let st1 = unwrap(prism_form.prism_fm_set_field(st0, "kf_name", NAME1))
+
+    match prism_form.prism_fm_mark_saved(st1)
+        Err(m) => _fail("mark_saved: promotes baseline", m)
+        Ok(marked) =>
+            match prism_form.prism_fm_is_dirty(marked)
+                Err(m) => _fail("mark_saved: is_dirty computable", m)
+                Ok(d) => _check_true("mark_saved: no longer dirty", d == false, "expected not dirty")
+            let marked_saved = prism_ui_form.prism_form_fields(prism_form.prism_fm_saved_form(marked))
+            _check_true("mark_saved: saved promoted to edited value", prism_ui_form.prism_form_field_text_value(marked_saved[0], "") == NAME1, prism_ui_form.prism_form_field_text_value(marked_saved[0], ""))
+            _check_true("mark_saved: version changed", prism_form.prism_fm_version(marked) != prism_form.prism_fm_version(st1), "version did not change")
+
+// ── (11) from_form escape hatch: a Range field, kind form_of never derives ────────────────────────
+fn test_from_form_range()
+    let range_field = unwrap(prism_ui_form.prism_form_range("kf_score", "Score", 5, 0, 10, 1))
+    let range_form = unwrap(prism_ui_form.prism_form([range_field]))
+    let rst = unwrap(prism_form.prism_fm_from_form(range_form))
+
+    match prism_form.prism_fm_set_field(rst, "kf_score", "7")
+        Err(m) => _fail("from_form: set_field in-range", m)
+        Ok(rst2) =>
+            let rf = prism_ui_form.prism_form_fields(prism_form.prism_fm_current_form(rst2))[0]
+            _check_true("from_form: range value applied", prism_ui_form.prism_form_field_range_value(rf, -1) == 7, str(prism_ui_form.prism_form_field_range_value(rf, -1)))
+
+    match prism_form.prism_fm_set_field(rst, "kf_score", "99")
+        Ok(x) => _fail("from_form: out-of-range rejected", "unexpectedly accepted")
+        Err(m) => _ok("from_form: out-of-range rejected")
+
+fn main()
+    test_form_of()
+    test_form_of_unsupported()
+    test_editing()
+    test_submit()
+    test_draft_roundtrip()
+    test_draft_conflict()
+    test_corrupt_snapshots()
+    test_mark_saved()
+    test_from_form_range()
+
+    print("passed=" + str(PASSED[0]) + " failed=" + str(FAILED[0]))
+    if FAILED[0] == 0
+        print("KAT prism_form PASS")
+    else
+        print("KAT prism_form FAIL")
