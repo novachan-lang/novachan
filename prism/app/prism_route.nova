@@ -1,0 +1,732 @@
+// prism_route (app/, Tier 2) -- routing, deep-linked sheets (#89), breadcrumbs (#100), and scroll
+// restore (#69). This is the FIRST module in app/ ("everything npm would otherwise supply") and
+// is deliberately built as the shape the other nine (form, wire, guard, session, sync, wizard,
+// shortcut, clipboard, download) will copy: pure data/logic over `Result`, no rendering. Like
+// react-router, this module does not draw a breadcrumb or a sheet -- it tells the caller what
+// matched, and app/ face code composes that with widget/'s prism_link / prism_label itself.
+//
+// ── DESIGN DECISION: a route param's TYPE is part of the PATTERN, not a post-hoc cast ─────────
+// The bug this layer exists to make unrepresentable: "/users/:id" matches "/users/abc" and hands
+// "abc" to code expecting a number. The fix is NOT a typed accessor bolted on after a stringly
+// match -- it is making the TYPE A MATCH CONSTRAINT. ":id:int" only matches a segment that parses
+// as an integer; "/users/abc" against a route registered ":id:int" does not match AT ALL (it falls
+// through to whatever else is registered, or 404s), so there is no code path where a non-numeric
+// value is ever bound to an int param. `rt_match_param_int` is therefore a formality, not a safety
+// net -- matching already proved the string parses. Syntax: ':name' (string, the default) or
+// ':name:int'. No other suffix is accepted (rejected at registration with a clear message).
+//
+// ── DESIGN DECISION: ambiguity is a REGISTRATION-TIME error, never a runtime coin-flip ────────
+// A first-registered-wins router (Express, historically) makes registration ORDER load-bearing and
+// invisible -- reordering two `app.get()` calls silently changes which one a shared path resolves
+// to, and nothing announces it. This module instead computes, PER SEGMENT, a specificity: a
+// literal ("new") is more specific than a typed dynamic (":id:int"), which is more specific than an
+// untyped dynamic (":slug") -- because each narrows the set of concrete strings it accepts. Two
+// patterns of the same segment COUNT conflict only if every segment ties (same literal text, or
+// same dynamic kind) all the way through -- meaning no concrete path could ever tell them apart.
+// That is rejected AT REGISTRATION, with the reason, before the app ever ships. Where specificity
+// differs at the first diverging segment, the routes coexist and the more specific one wins
+// deterministically at match time -- this is how "/users/new" beats "/users/:id" (literal beats
+// dynamic) and how "/users/:id:int" beats "/users/:slug" for a numeric segment (typed beats
+// untyped) WITHOUT registration order ever being consulted. Patterns of DIFFERENT segment counts
+// never conflict (a concrete path has one fixed segment count), which is also why this module has
+// no catch-all/wildcard segment -- adding one would reopen exactly the ambiguity class this design
+// closes, for a feature PRISM_SPEC.md does not ask for.
+//
+// ── DESIGN DECISION: breadcrumbs (#100) are DERIVED from the route TABLE, never hand-listed ────
+// A route R's ancestors are exactly the OTHER registered (non-sheet) routes whose pattern is a
+// SEGMENT-WISE PREFIX of R's pattern (same literal text, or same param name+kind, at every shared
+// position) -- computed fresh from the route table on every call, not authored as a separate
+// parent pointer or a hand-maintained string list anywhere else. Concretely: for a leaf matched at
+// depth N, depth 0..N-1 are each looked up as "is there a registered page whose OWN full pattern is
+// exactly this prefix"; whichever exist become crumbs, in order; the leaf itself is always the
+// final crumb. Renaming a segment or a title changes exactly one registration call and every
+// breadcrumb that touches it updates for free, because there is only ONE place the segment's text
+// and the crumb's title are written down. A depth with nothing registered is simply skipped -- an
+// app is not forced to register every intermediate level just to get a breadcrumb for the ones it
+// cares about.
+//
+// ── DESIGN DECISION: a deep-linked sheet (#89) declares its BACKGROUND, validated as a prefix ──
+// "Back closes the sheet" only holds together if the sheet's URL, minus its own trailing segments,
+// IS the background's URL -- so a sheet route must name a `background` (an already-registered,
+// non-sheet route) whose pattern is REQUIRED to be a segment-wise prefix of the sheet's own
+// pattern, checked at registration. This is the exact same prefix relation breadcrumbs use, reused
+// rather than reinvented: `rt_match_background` reconstructs the background's own match (name +
+// params, restricted to the params it actually declares) DIRECTLY from the sheet's already-matched
+// params, with no second lookup against browser history. That is what makes a sheet URL
+// stand-alone-addressable (PRISM_SPEC.md's actual "deep-linked" requirement) -- a cold load
+// straight onto "/photos/42/comments" can render the photo page underneath the comments sheet with
+// no prior navigation, because the background is DERIVED from the sheet's own match, never from
+// "whatever was on screen before". This module deliberately holds NO "current sheet" state of its
+// own for the same reason: state belongs to the render layer that owns history.pushState, not to a
+// stateless matcher.
+//
+// ── DESIGN DECISION: scroll restore (#69) keys on the exact URL, and PUSH vs TRAVERSE differ ───
+// Offsets are remembered per (normalized path + raw query string) -- "/users/42" and "/users/99"
+// are different scroll contexts even though both match ":id:int", and "?tab=a" is different from
+// "?tab=b". The router cannot read a live DOM scroll position (it is backend-agnostic and pure), so
+// saving is always an explicit caller action (`rt_scroll_save`), never bundled into navigation.
+// Restoring, though, genuinely depends on WHICH KIND of navigation happened, which only the caller
+// (wired to the History API) knows: a PUSH (a fresh link click / programmatic navigation) always
+// targets scroll 0, matching every browser's own pushState behaviour; a TRAVERSE (the popstate
+// event fired by Back/Forward -- the direction is irrelevant, both are "return to an existing
+// history entry") restores whatever was last saved for that exact URL, defaulting to 0 if this
+// specific URL was never actually scrolled. That default is indistinguishable from "fresh" and
+// that is correct: a URL that is technically "ahead" in history but was never scrolled has nothing
+// to restore either way.
+//
+// ── DESIGN DECISION: path segments are never percent-decoded; query VALUES are ────────────────
+// Decoding a path segment before comparing it against a literal would let an encoded "%2F" smuggle
+// an extra "/" past the segment-count check -- a well-known path-confusion bypass class in other
+// stacks. Segments are matched on their raw bytes. Query values go through std/net/querystring's
+// `qs_parse` (percent-decoding, '+' as space) because PRISM_SPEC.md §15.1 is explicit that a
+// route's OWN query content is the application's concern, not this layer's -- decoding it for
+// readability is fine precisely because it is never compared against anything security-relevant
+// here.
+//
+// ── DESIGN DECISION: trailing slash on an incoming URL is normalized; on a PATTERN it is not ───
+// A concrete URL a browser hands you may or may not have a trailing slash depending on how the
+// link was written ("/users" vs "/users/") and both must reach the same route -- so exactly ONE
+// trailing slash is stripped from an incoming path before matching. A registered PATTERN is
+// authored once, by a developer who can simply not add one; a trailing slash there produces an
+// empty final segment and is rejected at registration (the same "empty segment" check that rejects
+// an internal "//"), which is a clearer signal than silently normalizing the author's own typo.
+//
+// ── SECURITY: reuses PRISM_SPEC.md §15.1's route rule directly, independently re-checked here ──
+// Every path this module accepts -- pattern or concrete URL -- must start with exactly one '/',
+// with neither '/' nor '\' following (the browser-normalizes-backslash-to-slash open-redirect
+// bypass §15.1 documents for `link`) and no control byte (<0x20 or 0x7F -- response-splitting).
+// widget/prism_interact.nova and core/prism_event.nova each already enforce a version of this at
+// THEIR OWN untrusted-input boundary (a link's `href`, an event's `route`); this module is a THIRD,
+// independent boundary (raw browser history / a cold-load deep link never touched `link`), so it
+// re-derives the full check locally rather than reaching into another module's `_`-prefixed helper
+// (a leading `_` is convention only in NOVA, not enforcement -- see CLAUDE.md -- so reaching in
+// would compile, but would not be a boundary re-check any more, just a shared assumption).
+//
+// PUBLIC API
+//   RtParamKind + rt_param_kind_str() / rt_param_kind_int()
+//   RtNavKind   + rt_nav_push() / rt_nav_traverse()
+//   RtRouter, RtMatch, RtCrumb                          opaque value types callers hold and pass back
+//   rt_router_new()                                                    -> RtRouter
+//   rt_router_register(router, pattern, name, title)                  -> Result<RtRouter>
+//   rt_router_register_sheet(router, pattern, name, title, background) -> Result<RtRouter>
+//   rt_router_resolve(router, url)                    -> Result<RtMatch>  restore_scroll always 0
+//   rt_router_navigate(router, url, kind: RtNavKind)  -> Result<RtMatch>  restore_scroll per kind
+//   rt_route_build_url(router, route_name, params)    -> Result<string>  reverse routing
+//   rt_router_breadcrumbs(router, m)                  -> Result<list>    of RtCrumb, DERIVED (#100)
+//   rt_match_background(router, m)                    -> Result<RtMatch> sheet's page underneath (#89)
+//   rt_scroll_save(router, url, offset_px)            -> Result<RtRouter>
+//   rt_scroll_for(router, url)                        -> int
+//   rt_match_route(m) / _pattern(m) / _url(m)         -> string
+//   rt_match_param(m, name)                           -> Result<string>
+//   rt_match_param_int(m, name)                       -> Result<int>
+//   rt_match_query_get(m, key)                        -> string
+//   rt_match_is_sheet(m)                              -> bool
+//   rt_match_restore_scroll(m)                        -> int
+//   rt_crumb_route(c) / _title(c) / _url(c)           -> string
+
+import std/net/querystring as qs
+
+// ── RtParamKind: whether a dynamic segment accepts ANY string or ONLY an int-parseable one ─────
+enum RtParamKind
+    RtParamStr()
+    RtParamInt()
+
+fn rt_param_kind_str() -> RtParamKind
+    RtParamStr()
+
+fn rt_param_kind_int() -> RtParamKind
+    RtParamInt()
+
+fn _rt_seg_is_int_kind(kind: RtParamKind) -> bool
+    match kind
+        RtParamInt() => true
+        RtParamStr() => false
+
+// ── RtNavKind: the ONE thing a stateless matcher cannot infer on its own -- see header ─────────
+enum RtNavKind
+    RtNavPush()
+    RtNavTraverse()
+
+fn rt_nav_push() -> RtNavKind
+    RtNavPush()
+
+fn rt_nav_traverse() -> RtNavKind
+    RtNavTraverse()
+
+// ── Value types. Every field is `rt_`-prefixed: NOVA's struct field->slot map is GLOBAL, and an
+// unprefixed `name`/`params`/`kind` would silently share a slot with an unrelated field of the
+// same bare name declared anywhere else in the program (verified real bug class, see CLAUDE.md).
+
+// One pattern segment: either a literal (matched by exact text) or a dynamic param (matched by
+// kind, capturing the concrete text under `rt_seg_text` as the param NAME rather than the value).
+type RtSegment
+    rt_seg_lit: int             // 1 = literal, 0 = dynamic param (never a bool -- see CLAUDE.md)
+    rt_seg_text: string         // literal text, OR the param name when rt_seg_lit == 0
+    rt_seg_kind: RtParamKind    // meaningful only when rt_seg_lit == 0
+
+// A registered route. `rt_route_background` is "" for an ordinary page and a route NAME for a
+// sheet (validated at registration to be a real, non-sheet, prefix-compatible route).
+type RtRoute
+    rt_route_name: string
+    rt_route_pattern: string
+    rt_route_segs: list             // list<RtSegment>
+    rt_route_title: string          // breadcrumb/display title template -- see _rt_interpolate
+                                     // below for why this string must be AUTHORED with escaped
+                                     // braces ("Invoice #\{id\}"), not literal ones
+    rt_route_is_sheet: int          // 0/1
+    rt_route_background: string     // route name this sheet overlays; "" for a page route
+
+// The router: the registered route table plus remembered scroll offsets. Both are threaded
+// non-mutating (every operation returns a NEW RtRouter), matching this codebase's established
+// style (e.g. prism_media's `_md_with`) -- a caller holding an older router value never sees a
+// later registration or scroll save reach through it.
+type RtRouter
+    rt_router_routes: list          // list<RtRoute>
+    rt_router_scroll: dict          // "path?query" (or bare "path") -> int offset
+
+// The result of a successful match. `rt_match_params` stores every dynamic value as its RAW TEXT
+// (even for an :int param) -- `rt_match_param_int` re-parses on demand. Storing raw text uniformly
+// (rather than a mixed-type dict) is what lets `_rt_interpolate` below concatenate a param
+// straight into a title with no per-kind branch.
+type RtMatch
+    rt_match_route: string
+    rt_match_pattern: string
+    rt_match_params: dict           // name -> string
+    rt_match_query: dict            // parsed query string (qs_parse)
+    rt_match_is_sheet: int          // 0/1
+    rt_match_url: string            // normalized "path" or "path?query" -- the scroll-restore key
+    rt_match_restore_scroll: int    // target scroll offset; only meaningful from rt_router_navigate
+
+// One breadcrumb entry: an interpolated, navigable crumb.
+type RtCrumb
+    rt_crumb_route: string
+    rt_crumb_title: string
+    rt_crumb_url: string
+
+// Internal plumbing only (never appears in a public signature): a route paired with the params it
+// extracted, used while collecting every structurally-matching route during resolve.
+type RtCandidate
+    rt_cand_route: RtRoute
+    rt_cand_params: dict
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Path/URL shape validation (the §15.1-mirroring security boundary -- see header) ────────────
+
+// Byte-wise scan for a control character (<0x20 or ==0x7F). `str_chars` is BYTE-wise (see
+// CLAUDE.md) which is exactly what control-byte scanning wants: a UTF-8 continuation/lead byte is
+// always >= 0x80, so a multi-byte character can never be misread as a control byte here. The index
+// is carried in a one-element list cell rather than a manual counter (the sanctioned idiom for a
+// for-each loop that also needs a position -- see prism_textmodel.nova's `_tm_sub`).
+fn _rt_first_control_char(s: string) -> int
+    let idx = [0]
+    for b in str_chars(s)
+        let i = idx[0]
+        idx[0] = i + 1
+        if ord(b) < 32 or ord(b) == 127
+            return i
+    -1
+
+fn _rt_valid_path_shape(path: string) -> Result<string>
+    if type_of(path) != "string"
+        return err("prism_route: path must be a string, got {type_of(path)}")
+    let n = len(path)
+    if n == 0
+        return err("prism_route: path is required (empty string)")
+    if path[0] != "/"
+        return err("prism_route: path '{path}' must start with '/'")
+    // Route authority-escape (PRISM_SPEC.md §15.1): neither '/' nor '\' may follow the leading
+    // '/' -- a browser normalizes a leading backslash to '/' in authority position, so "/\evil"
+    // is the SAME off-site navigation as "//evil" wearing a different byte.
+    if n >= 2 and (path[1] == "/" or path[1] == chr(92))
+        return err("prism_route: path '{path}' is protocol-relative (starts '//' or '/\\') -- a browser resolves that as an off-site navigation (PRISM_SPEC.md §15.1); use a single-slash path")
+    let bad = _rt_first_control_char(path)
+    if bad >= 0
+        return err("prism_route: path '{path}' has a control character (code {ord(path[bad])}) at byte {bad} -- rejected (response-splitting / header-injection risk)")
+    ok(path)
+
+// Splits a raw "/a/b/..." (already shape-validated, and for a concrete URL already trailing-slash
+// normalized) into its non-empty segments. An interior OR trailing empty segment ("//" or a
+// trailing "/") is rejected here rather than silently collapsed -- see header on why a pattern's
+// trailing slash is a rejection while a concrete URL's is normalized BEFORE reaching this function.
+fn _rt_raw_segments(path: string) -> Result<list>
+    let rest = slice(path, 1, len(path))
+    if len(rest) == 0
+        return ok([])
+    let raw = split(rest, "/")
+    let out = []
+    for seg in raw
+        if len(seg) == 0
+            return err("prism_route: '{path}' has an empty segment (from a double slash, or a trailing slash where none is allowed)")
+        push(out, seg)
+    ok(out)
+
+// Strips exactly ONE trailing slash from a concrete incoming path ("/users/" -> "/users"; "/" is
+// left alone). A SECOND trailing slash ("/users//") is deliberately NOT also stripped -- that is
+// treated as a malformed path (caught by `_rt_raw_segments`'s empty-segment check) rather than
+// silently collapsed, since collapsing an unusual double-slash risks masking a real bug in
+// whatever constructed the URL.
+fn _rt_normalize_path(path: string) -> string
+    let n = len(path)
+    if n > 1 and path[n - 1] == "/"
+        return slice(path, 0, n - 1)
+    path
+
+// Splits a raw URL into [path, raw_query_string], dropping any "#fragment" (never sent to a
+// router in any real stack, and PRISM routing has nothing to do with it). "?" is located AFTER
+// fragment-stripping so a literal "?" inside a fragment can never be mistaken for the query
+// separator.
+fn _rt_split_url(raw: string) -> list
+    let no_frag = raw
+    let hpos = find(raw, "#")
+    if hpos >= 0
+        no_frag = slice(raw, 0, hpos)
+    let qpos = find(no_frag, "?")
+    if qpos >= 0
+        return [slice(no_frag, 0, qpos), slice(no_frag, qpos + 1, len(no_frag))]
+    [no_frag, ""]
+
+// ── Pattern parsing ─────────────────────────────────────────────────────────────────────────
+
+// A param name must be an identifier: letters, digits, '_', not starting with a digit. This keeps
+// every params-dict key predictable (never empty, never punctuation) for both matching and
+// interpolation.
+fn _rt_valid_ident(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let c0 = ord(s[0])
+    if c0 >= 48 and c0 <= 57
+        return false
+    for ch in str_chars(s)
+        let b = ord(ch)
+        let is_lower = b >= 97 and b <= 122
+        let is_upper = b >= 65 and b <= 90
+        let is_digit = b >= 48 and b <= 57
+        if not (is_lower or is_upper or is_digit or b == 95)
+            return false
+    true
+
+// Parses "/users/:id:int/posts/:slug" into RtSegment values. See header for why a param's type is
+// grammar, not a later cast, and why a duplicate param name within ONE pattern is rejected (it
+// would silently overwrite itself in the params dict -- which value would even be "the" id?).
+fn _rt_parse_pattern(pattern: string) -> Result<list>
+    let valid = _rt_valid_path_shape(pattern)?
+    let raw = _rt_raw_segments(valid)?
+    let out = []
+    let seen = {}
+    for piece in raw
+        if piece[0] == ":"
+            let body = slice(piece, 1, len(piece))
+            if len(body) == 0
+                return err("prism_route: pattern '{pattern}' has an empty param name (a bare ':')")
+            let bparts = split(body, ":")
+            let pname = bparts[0]
+            if len(pname) == 0
+                return err("prism_route: pattern '{pattern}' has an empty param name in ':{body}'")
+            if not _rt_valid_ident(pname)
+                return err("prism_route: pattern '{pattern}' has an invalid param name ':{pname}' -- names must be letters, digits or '_', and cannot start with a digit")
+            if pname in seen
+                return err("prism_route: pattern '{pattern}' uses param name '{pname}' more than once")
+            seen[pname] = true
+            if len(bparts) == 1
+                push(out, RtSegment(0, pname, RtParamStr()))
+            else if len(bparts) == 2 and bparts[1] == "int"
+                push(out, RtSegment(0, pname, RtParamInt()))
+            else if len(bparts) == 2 and bparts[1] == "str"
+                push(out, RtSegment(0, pname, RtParamStr()))
+            else
+                return err("prism_route: pattern '{pattern}' has an unrecognized param type in segment ':{body}' -- only ':name' (string, the default) and ':name:int' are supported")
+        else
+            push(out, RtSegment(1, piece, RtParamStr()))
+    ok(out)
+
+// ── Specificity, conflict detection, and the prefix relation (see header) ──────────────────────
+
+// Literal > typed dynamic > untyped dynamic, because each strictly narrows the set of concrete
+// segment strings it accepts.
+fn _rt_seg_specificity(seg: RtSegment) -> int
+    if seg.rt_seg_lit == 1
+        return 2
+    if _rt_seg_is_int_kind(seg.rt_seg_kind)
+        return 1
+    0
+
+// "" (no conflict -- either the shapes differ, or some segment resolves deterministically by
+// specificity, or a literal-vs-literal pair diverges outright) or a human-readable reason the two
+// patterns are genuinely ambiguous (identical specificity at EVERY segment).
+fn _rt_conflict_reason(segs_a: list, segs_b: list) -> string
+    if len(segs_a) != len(segs_b)
+        return ""
+    let idx = [0]
+    for a in segs_a
+        let i = idx[0]
+        idx[0] = i + 1
+        let b = segs_b[i]
+        if a.rt_seg_lit == 1 and b.rt_seg_lit == 1
+            if a.rt_seg_text != b.rt_seg_text
+                return ""
+        else
+            let sa = _rt_seg_specificity(a)
+            let sb = _rt_seg_specificity(b)
+            if sa != sb
+                return ""
+    "identical shape and specificity at every segment -- no concrete path could ever tell them apart"
+
+// True iff `short_segs` is a genuine prefix of `long_segs`: same length-or-shorter, and every
+// shared position matches EXACTLY (same literal text, or same dynamic name AND kind). Powers BOTH
+// breadcrumb ancestor discovery and sheet-background validation -- one relation, two features.
+fn _rt_is_prefix(short_segs: list, long_segs: list) -> bool
+    if len(short_segs) > len(long_segs)
+        return false
+    let idx = [0]
+    for s in short_segs
+        let i = idx[0]
+        idx[0] = i + 1
+        let l = long_segs[i]
+        if s.rt_seg_lit == 1 and l.rt_seg_lit == 1
+            if s.rt_seg_text != l.rt_seg_text
+                return false
+        else if s.rt_seg_lit == 0 and l.rt_seg_lit == 0
+            if s.rt_seg_text != l.rt_seg_text
+                return false
+            if _rt_seg_is_int_kind(s.rt_seg_kind) != _rt_seg_is_int_kind(l.rt_seg_kind)
+                return false
+        else
+            return false
+    true
+
+// Among two SAME-LENGTH patterns that both structurally matched one concrete path, which wins.
+// Lexicographic comparison of per-segment specificity is a genuine total order (registration-time
+// conflict rejection guarantees no two same-length registered routes tie all the way through), so
+// this reduction over a candidate set always has a single, order-independent winner.
+fn _rt_more_specific(a_segs: list, b_segs: list) -> bool
+    let idx = [0]
+    for a in a_segs
+        let i = idx[0]
+        idx[0] = i + 1
+        let b = b_segs[i]
+        let sa = _rt_seg_specificity(a)
+        let sb = _rt_seg_specificity(b)
+        if sa > sb
+            return true
+        if sa < sb
+            return false
+    false
+
+// Attempts to match one route's segments against one concrete path's segments. Err means "this
+// route does not match this path" (an ordinary, expected outcome during resolve, not a failure of
+// the route itself) -- Result is reused here rather than introducing Option purely so the whole
+// file stays on one uniform error-signalling idiom.
+fn _rt_try_match(route: RtRoute, segs: list) -> Result<dict>
+    if len(route.rt_route_segs) != len(segs)
+        return err("prism_route: segment count mismatch")
+    let params = {}
+    let idx = [0]
+    for seg in route.rt_route_segs
+        let i = idx[0]
+        idx[0] = i + 1
+        let text = segs[i]
+        if seg.rt_seg_lit == 1
+            if seg.rt_seg_text != text
+                return err("prism_route: literal segment mismatch")
+        else if _rt_seg_is_int_kind(seg.rt_seg_kind)
+            if is_err(parse_int_safe(text))
+                return err("prism_route: '{text}' is not a valid int for param '{seg.rt_seg_text}'")
+            params[seg.rt_seg_text] = text
+        else
+            params[seg.rt_seg_text] = text
+    ok(params)
+
+// ── Router construction and registration ────────────────────────────────────────────────────
+
+fn rt_router_new() -> RtRouter
+    RtRouter([], {})
+
+fn _rt_find(router: RtRouter, name: string) -> Result<RtRoute>
+    for r in router.rt_router_routes
+        if r.rt_route_name == name
+            return ok(r)
+    err("prism_route: no route named '{name}' is registered")
+
+// `name`/`title`/`pattern` are all statically `string`-typed on every public entry point that
+// reaches here, so (matching this codebase's own convention -- e.g. prism_range's fully-typed
+// params carry no redundant `type_of` check, only the VALUE checks below) there is no `type_of`
+// re-check on them here; `_rt_valid_path_shape` still runtime-checks `pattern`'s shape because
+// `_rt_parse_pattern` shares it with the genuinely untyped-list-sourced concrete-path call site.
+fn _rt_register(router: RtRouter, pattern: string, name: string, title: string, is_sheet: int, background: string) -> Result<RtRouter>
+    if len(name) == 0
+        return err("prism_route: a route name is required")
+    if len(title) == 0
+        return err("prism_route: route '{name}' needs a non-empty title -- it is what a breadcrumb (and any generated nav UI) shows; a routable page with no display name is a UX gap waiting to happen")
+    let existing = _rt_find(router, name)
+    if not is_err(existing)
+        let ex = unwrap(existing)
+        return err("prism_route: route name '{name}' is already registered (pattern '{ex.rt_route_pattern}') -- names must be unique so links and breadcrumbs can address a route without ambiguity")
+    let segs = _rt_parse_pattern(pattern)?
+    for r in router.rt_router_routes
+        let reason = _rt_conflict_reason(r.rt_route_segs, segs)
+        if len(reason) > 0
+            return err("prism_route: '{pattern}' ('{name}') conflicts with already-registered '{r.rt_route_pattern}' ('{r.rt_route_name}'): {reason}")
+    if is_sheet == 1
+        let bgr = _rt_find(router, background)?
+        if bgr.rt_route_is_sheet == 1
+            return err("prism_route: sheet '{name}' cannot declare another sheet ('{background}') as its background -- a sheet overlays a real page, not another overlay")
+        if not _rt_is_prefix(bgr.rt_route_segs, segs)
+            return err("prism_route: sheet '{name}' pattern '{pattern}' is not an extension of its background '{background}' pattern '{bgr.rt_route_pattern}' -- every segment of the background must appear, in the same order and with the same param name/type, as a PREFIX of the sheet's own pattern, so closing the sheet is just dropping the trailing segments")
+    let new_route = RtRoute(name, pattern, segs, title, is_sheet, background)
+    let routes = copy(router.rt_router_routes)
+    push(routes, new_route)
+    ok(RtRouter(routes, dict_copy(router.rt_router_scroll)))
+
+fn rt_router_register(router: RtRouter, pattern: string, name: string, title: string) -> Result<RtRouter>
+    _rt_register(router, pattern, name, title, 0, "")
+
+fn rt_router_register_sheet(router: RtRouter, pattern: string, name: string, title: string, background: string) -> Result<RtRouter>
+    if len(background) == 0
+        return err("prism_route: a sheet route must declare a background route by name -- a sheet with nothing behind it has nothing for Back to reveal")
+    _rt_register(router, pattern, name, title, 1, background)
+
+// ── Resolve / navigate ──────────────────────────────────────────────────────────────────────
+
+fn _rt_resolve_core(router: RtRouter, raw_url: string) -> Result<RtMatch>
+    let parts = _rt_split_url(raw_url)
+    let valid = _rt_valid_path_shape(parts[0])?
+    let norm_path = _rt_normalize_path(valid)
+    let segs = _rt_raw_segments(norm_path)?
+    let query = qs.qs_parse(parts[1])
+    let scroll_key = if len(parts[1]) > 0
+        norm_path + "?" + parts[1]
+    else
+        norm_path
+    let candidates = []
+    for r in router.rt_router_routes
+        let pr = _rt_try_match(r, segs)
+        if not is_err(pr)
+            push(candidates, RtCandidate(r, unwrap(pr)))
+    if len(candidates) == 0
+        return err("prism_route: no registered route matches '{norm_path}'")
+    let best = candidates[0]
+    for c in candidates
+        if _rt_more_specific(c.rt_cand_route.rt_route_segs, best.rt_cand_route.rt_route_segs)
+            best = c
+    ok(RtMatch(best.rt_cand_route.rt_route_name, best.rt_cand_route.rt_route_pattern, best.rt_cand_params, query, best.rt_cand_route.rt_route_is_sheet, scroll_key, 0))
+
+// A pure lookup: matches a URL and reports params/query, but never consults or updates scroll
+// memory (restore_scroll is always 0). Use `rt_router_navigate` for real browser navigation.
+fn rt_router_resolve(router: RtRouter, raw_url: string) -> Result<RtMatch>
+    _rt_resolve_core(router, raw_url)
+
+fn _rt_target_scroll(router: RtRouter, url: string, kind: RtNavKind) -> int
+    match kind
+        RtNavPush() => 0
+        RtNavTraverse() => rt_scroll_for(router, url)
+
+// Matches a URL AND decides the scroll offset the caller should apply after render, per the
+// push-vs-traverse distinction in the header (a push always starts at 0; a traverse restores
+// whatever was last saved for this exact URL, or 0 if nothing was ever saved for it).
+fn rt_router_navigate(router: RtRouter, raw_url: string, kind: RtNavKind) -> Result<RtMatch>
+    let m0 = _rt_resolve_core(router, raw_url)?
+    let restore = _rt_target_scroll(router, m0.rt_match_url, kind)
+    ok(RtMatch(m0.rt_match_route, m0.rt_match_pattern, m0.rt_match_params, m0.rt_match_query, m0.rt_match_is_sheet, m0.rt_match_url, restore))
+
+// ── Scroll memory ───────────────────────────────────────────────────────────────────────────
+
+fn rt_scroll_for(router: RtRouter, url: string) -> int
+    if url in router.rt_router_scroll
+        return router.rt_router_scroll[url]
+    0
+
+// `offset_px` is statically `int`-typed on this signature (matching prism_range's convention: a
+// typed param gets a VALUE check, not a redundant type check), so only the sign is checked here.
+fn rt_scroll_save(router: RtRouter, url: string, offset_px: int) -> Result<RtRouter>
+    if offset_px < 0
+        return err("prism_route: scroll offset {offset_px} cannot be negative")
+    let scroll = dict_copy(router.rt_router_scroll)
+    scroll[url] = offset_px
+    ok(RtRouter(copy(router.rt_router_routes), scroll))
+
+// ── Reverse routing (build a concrete URL from a route name + typed params) ────────────────────
+
+// Shared builder: `params` here is ALREADY string-uniform (used both as the implementation behind
+// the strict public `rt_route_build_url`, and internally by breadcrumbs -- see header on why
+// storing every match param as raw text pays for itself here too). Rejects a param value
+// containing '/' (it would smuggle extra path segments into the built URL) or an empty value
+// (would round-trip back through matching as a malformed empty segment).
+fn _rt_build_url_from_segs(segs: list, pattern: string, params: dict) -> Result<string>
+    let parts = []
+    for seg in segs
+        if seg.rt_seg_lit == 1
+            push(parts, seg.rt_seg_text)
+        else
+            if not (seg.rt_seg_text in params)
+                return err("prism_route: cannot build a URL for '{pattern}' -- missing value for param '{seg.rt_seg_text}'")
+            let v = params[seg.rt_seg_text]
+            if len(v) == 0
+                return err("prism_route: cannot build a URL for '{pattern}' -- param '{seg.rt_seg_text}' value is empty")
+            if find(v, "/") >= 0
+                return err("prism_route: cannot build a URL for '{pattern}' -- param '{seg.rt_seg_text}' value '{v}' contains '/', which would smuggle extra path segments into the URL")
+            push(parts, v)
+    let url = "/" + join(parts, "/")
+    _rt_valid_path_shape(url)
+
+// The strict public entry point: mirrors matching's own type discipline in the other direction --
+// an :int param REQUIRES a real `int` value (never a string the caller happened to already have),
+// and a plain param REQUIRES a real `string`. This is the same "unrepresentable mismatch" the
+// header opens with, applied to building instead of parsing.
+fn rt_route_build_url(router: RtRouter, route_name: string, params: dict) -> Result<string>
+    let r = _rt_find(router, route_name)?
+    let str_params = {}
+    for seg in r.rt_route_segs
+        if seg.rt_seg_lit == 0
+            if not (seg.rt_seg_text in params)
+                return err("prism_route: cannot build a URL for '{r.rt_route_pattern}' -- missing value for param '{seg.rt_seg_text}'")
+            let v = params[seg.rt_seg_text]
+            if _rt_seg_is_int_kind(seg.rt_seg_kind)
+                if type_of(v) != "int"
+                    return err("prism_route: param '{seg.rt_seg_text}' of route '{route_name}' is typed :int -- pass an int, not {type_of(v)}")
+                str_params[seg.rt_seg_text] = str(v)
+            else
+                if type_of(v) != "string"
+                    return err("prism_route: param '{seg.rt_seg_text}' of route '{route_name}' expects a string, got {type_of(v)}")
+                str_params[seg.rt_seg_text] = v
+    _rt_build_url_from_segs(r.rt_route_segs, r.rt_route_pattern, str_params)
+
+// ── Breadcrumbs (#100) ──────────────────────────────────────────────────────────────────────
+
+// A tiny hand-rolled `{name}` substitution over a title template -- NOT NOVA's own `"{x}"` string
+// interpolation, which only ever substitutes an expression in the CALLER's lexical scope at the
+// point a literal is written; a title template is authored once at registration time and must be
+// filled in LATER from whatever params a specific match produced, which native interpolation
+// cannot do. Implemented via `split` (never a manual index scan -- list slicing is broken for
+// non-string values in NOVA, see CLAUDE.md, so a `{`-delimited split plus a flag cell for "am I
+// past the first chunk" is the loop-free, high-level way to walk delimiter pairs).
+// ⛔ MEASURED, NOVA GOTCHA NOT PREVIOUSLY DOCUMENTED: a title template CANNOT be authored as a
+// plain literal like `"Invoice #{id}"` at the `rt_router_register` call site. NOVA's own `"{x}"`
+// interpolation fires the INSTANT the lexer sees the string, at the CALLER's registration call --
+// there is no "this string is data, not code" mode. Worse than a compile error: if `id` is not a
+// real local binding in the caller's scope at that point (the normal case -- id is a MATCH-TIME
+// value that does not exist yet at REGISTRATION time), NOVA does not reject it -- it silently
+// interpolates the literal text "0" in its place. Measured directly: `let t = "Invoice #{id}"`
+// with no `id` anywhere in scope compiles clean and PRINTS "Invoice #0" at runtime. So a template
+// author who writes the "obvious" unescaped form gets a route that silently, permanently shows
+// "Invoice #0" for every invoice, with no error anywhere -- exactly the class of bug this
+// project's other design decisions (typed params, closed enums) exist to make impossible, except
+// here it is NOVA's own interpolation doing the silently-wrong thing.
+// The fix: author every template with ESCAPED braces -- `"Invoice #\{id\}"`. `\{`/`\}` are NOVA's
+// own literal-brace escapes (CLAUDE.md documents them for testing string CONTENTS, e.g.
+// `starts_with(s, "\{")`; this is the same escape used for AUTHORING a deferred template instead).
+// That produces the real runtime string `Invoice #{id}` (13 bytes, braces included, verified with
+// a standalone probe), which is exactly the raw text `_rt_interpolate` below is written to expect.
+fn _rt_interpolate(template: string, params: dict) -> Result<string>
+    // A bare '{' inside a NOVA string literal starts an INTERPOLATION (CLAUDE.md) -- these two
+    // single-character delimiters must be written escaped, `"\{"` / `"\}"`, or the LEXER itself
+    // (not this function) tries to parse an expression after the brace and never finds the `}`
+    // it wants, misreporting an unrelated "unterminated string literal" for the whole file.
+    let pieces = split(template, "\{")
+    let out = pieces[0]
+    let first = [true]
+    for piece in pieces
+        if first[0]
+            first[0] = false
+        else
+            let sub = split(piece, "\}")
+            if len(sub) != 2
+                return err("prism_route: title template '{template}' has a placeholder that never closes (an opening curly brace with no matching closing one)")
+            let name = sub[0]
+            if not (name in params)
+                return err("prism_route: title template '{template}' references param '{name}', which this route does not have")
+            out += params[name]
+            out += sub[1]
+    ok(out)
+
+// The registered (non-sheet) route whose OWN full pattern is exactly the first `depth` segments of
+// `leaf_segs`, or "" if none is registered at that depth. Registration-time ambiguity rejection
+// guarantees at most one route can ever match here (see header).
+fn _rt_ancestor_at_depth(router: RtRouter, leaf_segs: list, depth: int) -> string
+    let out = ""
+    for r in router.rt_router_routes
+        if r.rt_route_is_sheet == 0 and len(r.rt_route_segs) == depth
+            if _rt_is_prefix(r.rt_route_segs, leaf_segs)
+                out = r.rt_route_name
+    out
+
+// DERIVED breadcrumb trail for a match -- see header. Every crumb's title and url come straight
+// from that ancestor's OWN registration plus the CURRENT match's params (shared-position params are
+// guaranteed identical by `_rt_is_prefix`'s own definition, so no re-matching is needed).
+fn rt_router_breadcrumbs(router: RtRouter, m: RtMatch) -> Result<list>
+    let leaf = _rt_find(router, m.rt_match_route)?
+    let n = len(leaf.rt_route_segs)
+    let out = []
+    for depth in 0..n
+        let name = _rt_ancestor_at_depth(router, leaf.rt_route_segs, depth)
+        if len(name) > 0
+            let r = _rt_find(router, name)?
+            let title = _rt_interpolate(r.rt_route_title, m.rt_match_params)?
+            let url = _rt_build_url_from_segs(r.rt_route_segs, r.rt_route_pattern, m.rt_match_params)?
+            push(out, RtCrumb(name, title, url))
+    let leaf_title = _rt_interpolate(leaf.rt_route_title, m.rt_match_params)?
+    push(out, RtCrumb(leaf.rt_route_name, leaf_title, m.rt_match_url))
+    ok(out)
+
+// ── Sheets (#89) ────────────────────────────────────────────────────────────────────────────
+
+// Given a match on a SHEET route, reconstructs the match for the page it overlays -- straight from
+// the sheet's own already-extracted params, no second URL lookup. See header for why this makes a
+// sheet URL stand-alone-addressable on a cold load. Errs on a non-sheet match (gated accessor, same
+// shape as prism_event's payload accessors -- reading a background off a page is a caller mistake,
+// reported as one).
+fn rt_match_background(router: RtRouter, m: RtMatch) -> Result<RtMatch>
+    let leaf = _rt_find(router, m.rt_match_route)?
+    if leaf.rt_route_is_sheet == 0
+        return err("prism_route: '{m.rt_match_route}' is not a sheet route -- only a sheet has a background to render underneath it")
+    let bg = _rt_find(router, leaf.rt_route_background)?
+    let bg_params = {}
+    for seg in bg.rt_route_segs
+        if seg.rt_seg_lit == 0
+            bg_params[seg.rt_seg_text] = m.rt_match_params[seg.rt_seg_text]
+    let bg_url = _rt_build_url_from_segs(bg.rt_route_segs, bg.rt_route_pattern, bg_params)?
+    ok(RtMatch(bg.rt_route_name, bg.rt_route_pattern, bg_params, {}, 0, bg_url, rt_scroll_for(router, bg_url)))
+
+// ── Accessors ───────────────────────────────────────────────────────────────────────────────
+
+fn rt_match_route(m: RtMatch) -> string
+    m.rt_match_route
+
+fn rt_match_pattern(m: RtMatch) -> string
+    m.rt_match_pattern
+
+fn rt_match_url(m: RtMatch) -> string
+    m.rt_match_url
+
+fn rt_match_param(m: RtMatch, name: string) -> Result<string>
+    if name in m.rt_match_params
+        return ok(m.rt_match_params[name])
+    err("prism_route: no param named '{name}' on this match (route '{m.rt_match_route}')")
+
+// The typed accessor constrained matching exists for. This should never fail for a name that is
+// genuinely an :int param, since matching already
+// validated it parses -- it is written defensively anyway (same posture as the rest of this
+// codebase), and correctly still fails for a :str param whose live value is not numeric.
+fn rt_match_param_int(m: RtMatch, name: string) -> Result<int>
+    let raw = rt_match_param(m, name)?
+    match parse_int_safe(raw)
+        Ok(v) => ok(v)
+        Err(e) => err("prism_route: param '{name}' = '{raw}' is not a valid int ({e})")
+
+fn rt_match_query_get(m: RtMatch, key: string) -> string
+    qs.qs_get(m.rt_match_query, key)
+
+fn rt_match_is_sheet(m: RtMatch) -> bool
+    m.rt_match_is_sheet == 1
+
+fn rt_match_restore_scroll(m: RtMatch) -> int
+    m.rt_match_restore_scroll
+
+fn rt_crumb_route(c: RtCrumb) -> string
+    c.rt_crumb_route
+
+fn rt_crumb_title(c: RtCrumb) -> string
+    c.rt_crumb_title
+
+fn rt_crumb_url(c: RtCrumb) -> string
+    c.rt_crumb_url

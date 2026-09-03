@@ -1,0 +1,229 @@
+// KAT for prism/app/prism_route.nova -- routing, deep-linked sheets (#89), breadcrumbs (#100),
+// scroll restore (#69).
+//
+// The properties this exists to prove:
+//   1. ★ TYPED PARAMS ARE A MATCH CONSTRAINT, not a post-hoc cast -- "/users/:id:int" must never
+//      match "/users/abc" at all. This is the exact bug the task brief names.
+//   2. ★ AMBIGUITY IS REJECTED AT REGISTRATION, never resolved by registration order -- and
+//      specificity (literal > typed dynamic > untyped dynamic) resolves the cases that are NOT
+//      truly ambiguous, without ever consulting order.
+//   3. ★ BREADCRUMBS ARE DERIVED from the route table (title + prefix relation), never hand-listed
+//      -- proven by using a title that reads NOTHING like its own URL slug ("settings" -> "Account
+//      Settings") and by a "gap" depth with nothing registered simply being skipped.
+//   4. ★ A DEEP-LINKED SHEET's background is reconstructed from the sheet's OWN match, with no
+//      dependency on prior navigation history (the actual "deep-linked" requirement).
+//   5. ★ SCROLL RESTORE distinguishes a PUSH (always 0) from a TRAVERSE (restores per-URL memory,
+//      keyed on the exact query string too), and is non-mutating.
+//   6. A route matcher tested with a NON-ASCII path segment, not just ASCII.
+
+import prism_route as rt
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+// ── Shared route table used by most sections ────────────────────────────────────────────────
+// Title text is deliberately NOT a re-formatting of the URL slug (e.g. "settings" -> "Account
+// Settings") specifically so a passing breadcrumb test proves the trail is pulled from the
+// route's OWN registered title, not guessed from the path.
+fn _setup_router() -> Result<RtRouter>
+    let r0 = rt.rt_router_new()
+    let r1 = rt.rt_router_register(r0, "/", "home", "Home")?
+    let r2 = rt.rt_router_register(r1, "/users", "users_list", "Users")?
+    let r3 = rt.rt_router_register(r2, "/users/new", "user_new", "New User")?
+    let r4 = rt.rt_router_register(r3, "/users/:id:int", "user_detail", "User \{id\}")?
+    let r5 = rt.rt_router_register_sheet(r4, "/users/:id:int/quick", "user_quick", "Quick View", "user_detail")?
+    let r6 = rt.rt_router_register(r5, "/settings", "settings", "Account Settings")?
+    let r7 = rt.rt_router_register(r6, "/settings/billing", "billing", "Billing")?
+    let r8 = rt.rt_router_register(r7, "/settings/billing/invoices/:id:int", "invoice_detail", "Invoice #\{id\}")?
+    let r9 = rt.rt_router_register(r8, "/archive/:id:int", "archive_by_id", "Archive Item \{id\}")?
+    let r10 = rt.rt_router_register(r9, "/archive/:slug", "archive_by_slug", "Archive \{slug\}")?
+    let r11 = rt.rt_router_register(r10, "/search/:q", "search_page", "Search: \{q\}")?
+    let r12 = rt.rt_router_register(r11, "/café", "cafe_page", "Café")?
+    ok(r12)
+
+fn main()
+    print("== _kat_prism_route ==")
+
+    let router_r = _setup_router()
+    check("router setup (12 registrations across pages, a sheet, typed/untyped params) succeeds", not is_err(router_r))
+    let router = unwrap(router_r)
+
+    // ── 1. ★ typed params are a MATCH CONSTRAINT -- the exact bug this layer prevents ──────────
+    print("1. ★ typed :int params constrain the match, they do not just cast after the fact")
+    let m1 = unwrap(rt.rt_router_resolve(router, "/users/42"))
+    check("'/users/42' matches user_detail", rt.rt_match_route(m1) == "user_detail")
+    check("param 'id' round-trips as the raw string \"42\"", unwrap(rt.rt_match_param(m1, "id")) == "42")
+    check("★ rt_match_param_int returns the actual int 42, not the string", unwrap(rt.rt_match_param_int(m1, "id")) == 42)
+
+    // A FRESH router with ONLY the typed route registered (no literal "/users/new" and no
+    // untyped fallback) -- proves ":int" genuinely rejects a non-numeric segment at the MATCH
+    // level, not merely at the accessor level.
+    let only_typed = unwrap(rt.rt_router_register(rt.rt_router_new(), "/users/:id:int", "ut", "U"))
+    check("★ '/users/abc' against a LONE ':id:int' route does not match AT ALL (no route)", is_err(rt.rt_router_resolve(only_typed, "/users/abc")))
+    check("...while '/users/42' still matches it", not is_err(rt.rt_router_resolve(only_typed, "/users/42")))
+
+    // ── 2. specificity resolves non-ambiguous overlaps deterministically ───────────────────────
+    print("2. specificity: literal beats dynamic, typed dynamic beats untyped dynamic")
+    let m2 = unwrap(rt.rt_router_resolve(router, "/users/new"))
+    check("'/users/new' matches the LITERAL route, not user_detail", rt.rt_match_route(m2) == "user_new")
+    let m3 = unwrap(rt.rt_router_resolve(router, "/archive/42"))
+    check("'/archive/42' matches the :int route (more specific) over the untyped one", rt.rt_match_route(m3) == "archive_by_id")
+    check("...with id bound as an int", unwrap(rt.rt_match_param_int(m3, "id")) == 42)
+    let m4 = unwrap(rt.rt_router_resolve(router, "/archive/not-a-number"))
+    check("'/archive/not-a-number' falls through to the untyped route (the :int one structurally excludes it)", rt.rt_match_route(m4) == "archive_by_slug")
+    check("...with slug bound as the raw text", unwrap(rt.rt_match_param(m4, "slug")) == "not-a-number")
+
+    // ── 3. ★ ambiguity is REJECTED AT REGISTRATION, never resolved by order ────────────────────
+    print("3. ★ ambiguous routes are rejected at REGISTRATION time, with a reason")
+    let f0 = rt.rt_router_new()
+    let f1 = unwrap(rt.rt_router_register(f0, "/x/:id", "r1", "R1"))
+    let dup_untyped = rt.rt_router_register(f1, "/x/:other", "r2", "R2")
+    check("★ two untyped dynamic routes of identical shape are REJECTED (param NAME alone cannot disambiguate)", is_err(dup_untyped))
+    check("...and the error explains WHY, not just 'invalid'", contains(unwrap_err(dup_untyped), "no concrete path could ever tell them apart"))
+    let f2 = unwrap(rt.rt_router_register(f0, "/y/:id:int", "r3", "R3"))
+    check("★ two SAME-KIND typed dynamic routes are also REJECTED", is_err(rt.rt_router_register(f2, "/y/:uid:int", "r4", "R4")))
+    check("★ an exact duplicate pattern is REJECTED", is_err(rt.rt_router_register(f1, "/x/:renamed", "r5", "R5")))
+    check("★ a duplicate ROUTE NAME (different pattern) is REJECTED", is_err(rt.rt_router_register(f1, "/z/:q", "r1", "R1 again")))
+
+    // Must NOT reject: these look similar but can never collide on any concrete path.
+    let f3 = unwrap(rt.rt_router_register(f0, "/w/aa", "r6", "R6"))
+    check("two DIFFERENT literal branches coexist without conflict", not is_err(rt.rt_router_register(f3, "/w/bb", "r7", "R7")))
+    check("DIFFERENT segment counts never conflict (a concrete path has one fixed count)", not is_err(rt.rt_router_register(f3, "/w/aa/more", "r8", "R8")))
+    check("literal vs dynamic at the same position coexists (specificity resolves it)", not is_err(rt.rt_router_register(f2, "/y/newest", "r9", "R9")))
+
+    // ── 4. pattern authoring hygiene ────────────────────────────────────────────────────────────
+    print("4. malformed pattern authoring is rejected with a clear reason")
+    check("a bare ':' with no name is rejected", is_err(rt.rt_router_register(f0, "/a/:", "bad1", "Bad")))
+    check("an unknown param type suffix (':id:float') is rejected", is_err(rt.rt_router_register(f0, "/a/:id:float", "bad2", "Bad")))
+    check("a duplicate param name WITHIN one pattern is rejected", is_err(rt.rt_router_register(f0, "/a/:id/b/:id", "bad3", "Bad")))
+    check("a param name starting with a digit is rejected", is_err(rt.rt_router_register(f0, "/a/:9bad", "bad4", "Bad")))
+    check("a trailing slash on a PATTERN is rejected (author's job to omit it)", is_err(rt.rt_router_register(f0, "/a/", "bad5", "Bad")))
+    check("a pattern not starting with '/' is rejected", is_err(rt.rt_router_register(f0, "a/b", "bad6", "Bad")))
+    check("an empty title is rejected", is_err(rt.rt_router_register(f0, "/ok", "okname", "")))
+    check("an empty name is rejected", is_err(rt.rt_router_register(f0, "/ok2", "", "Title")))
+
+    // ── 5. ★ deep-linked sheets (#89) ───────────────────────────────────────────────────────────
+    print("5. ★ deep-linked sheets: background validated at registration, reconstructed from the match")
+    let sm = unwrap(rt.rt_router_resolve(router, "/users/42/quick"))
+    check("'/users/42/quick' matches the sheet route", rt.rt_match_route(sm) == "user_quick")
+    check("★ the match reports itself as a sheet", rt.rt_match_is_sheet(sm))
+    check("the sheet's own param still binds correctly", unwrap(rt.rt_match_param_int(sm, "id")) == 42)
+    let bg = unwrap(rt.rt_match_background(router, sm))
+    check("★ the reconstructed background is the underlying page, not the sheet", rt.rt_match_route(bg) == "user_detail")
+    check("the background is NOT itself flagged as a sheet", not rt.rt_match_is_sheet(bg))
+    check("the background carries the SAME id, pulled from the sheet's own match", unwrap(rt.rt_match_param_int(bg, "id")) == 42)
+    check("the background's URL is exactly what Back should land on", rt.rt_match_url(bg) == "/users/42")
+    let page_match = unwrap(rt.rt_router_resolve(router, "/users/42"))
+    check("asking a NON-sheet match for a background is REJECTED, not a silent no-op", is_err(rt.rt_match_background(router, page_match)))
+
+    // Registration-time validation of the background relationship itself.
+    let s0 = unwrap(rt.rt_router_register(rt.rt_router_new(), "/users", "u2", "Users"))
+    check("★ a sheet whose background is NOT a prefix of its own pattern is REJECTED", is_err(rt.rt_router_register_sheet(s0, "/photos/:id:int/comments", "bad_sheet", "Comments", "u2")))
+    let s1 = unwrap(rt.rt_router_register_sheet(s0, "/users/:id:int", "sheetA", "Sheet A", "u2"))
+    check("★ a sheet declaring ANOTHER SHEET as its background is REJECTED", is_err(rt.rt_router_register_sheet(s1, "/users/:id:int/nested", "sheetB", "Sheet B", "sheetA")))
+    check("a sheet with an empty background name is REJECTED (nothing for Back to reveal)", is_err(rt.rt_router_register_sheet(s0, "/x", "s3", "S3", "")))
+
+    // ── 6. ★ breadcrumbs (#100) are DERIVED, not hand-listed ───────────────────────────────────
+    print("6. ★ breadcrumbs are derived from the route table's own titles + the prefix relation")
+    let m5 = unwrap(rt.rt_router_resolve(router, "/settings/billing/invoices/77"))
+    let crumbs = unwrap(rt.rt_router_breadcrumbs(router, m5))
+    check("4 crumbs: home, settings, billing, invoice_detail -- 'invoices' itself was never registered and is silently SKIPPED", len(crumbs) == 4)
+    check("crumb 0 is home", rt.rt_crumb_route(crumbs[0]) == "home")
+    check("crumb 1's TITLE is the route's own registered title ('Account Settings'), NOT a re-formatting of the slug 'settings' -- proves derivation, not guessing", rt.rt_crumb_title(crumbs[1]) == "Account Settings")
+    check("crumb 1's url is the real navigable path", rt.rt_crumb_url(crumbs[1]) == "/settings")
+    check("crumb 2 is billing", rt.rt_crumb_route(crumbs[2]) == "billing" and rt.rt_crumb_url(crumbs[2]) == "/settings/billing")
+    check("the LEAF is always the final crumb, title interpolated from the match's own param", rt.rt_crumb_title(crumbs[3]) == "Invoice #77")
+    check("the leaf crumb's url is the match's own url", rt.rt_crumb_url(crumbs[3]) == "/settings/billing/invoices/77")
+
+    // Root's own breadcrumb is just itself.
+    let m_home = unwrap(rt.rt_router_resolve(router, "/"))
+    let crumbs_home = unwrap(rt.rt_router_breadcrumbs(router, m_home))
+    check("the root route's breadcrumb is a single crumb", len(crumbs_home) == 1 and rt.rt_crumb_route(crumbs_home[0]) == "home")
+
+    // A sheet's breadcrumb chains through its background, then appends itself.
+    let crumbs_sheet = unwrap(rt.rt_router_breadcrumbs(router, sm))
+    let sheet_n = len(crumbs_sheet)
+    check("a sheet's breadcrumb ends with the sheet itself", rt.rt_crumb_route(crumbs_sheet[sheet_n - 1]) == "user_quick")
+    check("...preceded by its background page (home, users_list, user_detail, user_quick)", rt.rt_crumb_route(crumbs_sheet[sheet_n - 2]) == "user_detail")
+
+    // ── 7. ★ scroll restore (#69): push vs traverse, per-URL, non-mutating ─────────────────────
+    print("7. ★ scroll restore: PUSH always resets, TRAVERSE restores, keyed on the exact URL")
+    check("never-saved url starts at 0", rt.rt_scroll_for(router, "/users/42") == 0)
+    let router_s = unwrap(rt.rt_scroll_save(router, "/users/42", 350))
+    check("saved offset reads back exactly", rt.rt_scroll_for(router_s, "/users/42") == 350)
+    check("★ the ORIGINAL router is unaffected (non-mutating)", rt.rt_scroll_for(router, "/users/42") == 0)
+    check("a negative offset is rejected", is_err(rt.rt_scroll_save(router, "/users/42", -1)))
+
+    let nav_push = unwrap(rt.rt_router_navigate(router_s, "/users/42", rt.rt_nav_push()))
+    check("★ a PUSH to a url WITH a saved offset still targets 0 (a fresh navigation always starts at the top)", rt.rt_match_restore_scroll(nav_push) == 0)
+    let nav_trav = unwrap(rt.rt_router_navigate(router_s, "/users/42", rt.rt_nav_traverse()))
+    check("★ a TRAVERSE (Back/Forward) restores the saved offset", rt.rt_match_restore_scroll(nav_trav) == 350)
+    let nav_trav_fresh = unwrap(rt.rt_router_navigate(router_s, "/users/new", rt.rt_nav_traverse()))
+    check("★ a TRAVERSE to a url NEVER scrolled defaults to 0 -- indistinguishable from fresh, and that is correct", rt.rt_match_restore_scroll(nav_trav_fresh) == 0)
+
+    // Scroll memory is keyed on the exact query string too -- two query variants of the same
+    // route pattern are independent scroll contexts.
+    let router_q = unwrap(rt.rt_scroll_save(router, "/search/x?tag=a", 100))
+    check("saving one query variant's offset does not leak into a different query on the same route", rt.rt_scroll_for(router_q, "/search/x?tag=b") == 0)
+    check("...the saved variant itself still reads back correctly", rt.rt_scroll_for(router_q, "/search/x?tag=a") == 100)
+
+    // ── 8. reverse routing (build_url) -- the SAME type discipline, in the other direction ─────
+    print("8. reverse routing: typed build, and a round-trip back through resolve")
+    let built = unwrap(rt.rt_route_build_url(router, "user_detail", {"id": 42}))
+    check("build_url produces the expected concrete path", built == "/users/42")
+    let back = unwrap(rt.rt_router_resolve(router, built))
+    check("★ round-trip: building then resolving lands on the SAME route with the SAME param", rt.rt_match_route(back) == "user_detail" and unwrap(rt.rt_match_param_int(back, "id")) == 42)
+    check("★ passing a STRING for an :int param is REJECTED (the mismatch this layer exists to make unrepresentable, in the build direction)", is_err(rt.rt_route_build_url(router, "user_detail", {"id": "42"})))
+    check("a missing param is REJECTED", is_err(rt.rt_route_build_url(router, "user_detail", {})))
+    check("★ a param VALUE containing '/' is REJECTED (would smuggle extra path segments)", is_err(rt.rt_route_build_url(router, "archive_by_slug", {"slug": "a/b"})))
+    check("building for an unknown route name is REJECTED", is_err(rt.rt_route_build_url(router, "no_such_route", {"id": 1})))
+
+    // ── 9. query strings + trailing slash normalisation ────────────────────────────────────────
+    print("9. query strings and trailing-slash normalisation")
+    let mt = unwrap(rt.rt_router_resolve(router, "/users/"))
+    check("exactly ONE trailing slash is normalized away", rt.rt_match_route(mt) == "users_list")
+    check("a DOUBLE trailing slash is a malformed path, rejected rather than silently collapsed", is_err(rt.rt_router_resolve(router, "/users//")))
+    let mq = unwrap(rt.rt_router_resolve(router, "/users/42?tab=profile&flag=1"))
+    check("query values are parsed and reachable", rt.rt_match_query_get(mq, "tab") == "profile")
+    check("a missing query key returns \"\"", rt.rt_match_query_get(mq, "nope") == "")
+    let mq2 = unwrap(rt.rt_router_resolve(router, "/users/42?note=hello%20world"))
+    check("query values are percent-decoded (reusing std/net/querystring, not re-derived)", rt.rt_match_query_get(mq2, "note") == "hello world")
+
+    // ── 10. security: the router is an INDEPENDENT untrusted-input boundary ────────────────────
+    print("10. malformed/hostile paths are rejected at the resolve() boundary")
+    check("protocol-relative '//evil.com' is rejected", is_err(rt.rt_router_resolve(router, "//evil.com")))
+    let bs = chr(92)
+    check("backslash-authority-escape '/\\evil.com' is rejected", is_err(rt.rt_router_resolve(router, "/" + bs + "evil.com")))
+    let cr = chr(13)
+    let nl = chr(10)
+    check("an embedded CR/LF control character is rejected (response-splitting)", is_err(rt.rt_router_resolve(router, "/ok" + cr + nl + "X: 1")))
+    check("an empty url is rejected", is_err(rt.rt_router_resolve(router, "")))
+    check("a url with no leading '/' is rejected", is_err(rt.rt_router_resolve(router, "users/42")))
+
+    // ── 11. ★ non-ASCII path segments -- mandatory per the task brief ──────────────────────────
+    print("11. ★ non-ASCII path segments -- both a literal segment and a captured param value")
+    let m_cafe = unwrap(rt.rt_router_resolve(router, "/café"))
+    check("a literal non-ASCII pattern segment matches its own literal non-ASCII path", rt.rt_match_route(m_cafe) == "cafe_page")
+    let m_jp = unwrap(rt.rt_router_resolve(router, "/search/日本語"))
+    check("★ a dynamic param captures a non-ASCII VALUE byte-for-byte, not truncated or corrupted", unwrap(rt.rt_match_param(m_jp, "q")) == "日本語")
+    let crumbs_jp = unwrap(rt.rt_router_breadcrumbs(router, m_jp))
+    let jp_n = len(crumbs_jp)
+    check("★ the non-ASCII value survives TITLE INTERPOLATION too ('Search: 日本語')", rt.rt_crumb_title(crumbs_jp[jp_n - 1]) == "Search: 日本語")
+    let built_jp = unwrap(rt.rt_route_build_url(router, "search_page", {"q": "日本語"}))
+    check("★ build_url round-trips a non-ASCII param value", built_jp == "/search/日本語")
+    let back_jp = unwrap(rt.rt_router_resolve(router, built_jp))
+    check("...and resolving the built url recovers the exact same value", unwrap(rt.rt_match_param(back_jp, "q")) == "日本語")
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_route: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_route: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
