@@ -1,0 +1,105 @@
+// prism_size -- per-route size budgets (prism/dev/, feature #106).
+//
+// ── WHY A BUDGET AND NOT A REPORT ────────────────────────────────────────────────────────────
+// A size REPORT is read once, at the moment someone is already worried. A size BUDGET fails the
+// build on the commit that crossed it, which is the only time the information is cheap to act
+// on: the diff that added 40 KB is still on screen. Every route regression that ever shipped got
+// there one harmless-looking commit at a time, each too small to notice in a report.
+//
+// ── ⛔ THE ERROR MUST NAME THE LIMIT AND THE OVERAGE ─────────────────────────────────────────
+// "Route too large" is useless -- it does not say which of three budgets blew, by how much, or
+// whether the author is 2% over (trim something) or 4x over (they imported the wrong thing).
+// Every failure below reports the limit, the actual, and the overage, and reports ALL exceeded
+// limits rather than stopping at the first, so one build tells the whole story.
+//
+// ── BACKEND-AGNOSTIC BY CONSTRUCTION ─────────────────────────────────────────────────────────
+// Node count and depth are read from the tree, but BYTES are not: this module never imports a
+// renderer. The caller passes the rendered string from whichever backend it targets, because a
+// tree costs a different number of bytes as HTML than as canvas ops, and a `dev/` module that
+// hard-coded one backend would silently measure the wrong thing for the other. This is the same
+// argument MA.6 made when the ANSI backend existed to falsify the node tree's backend-agnosticism.
+// Pass "" to measure structure only.
+//
+// PUBLIC API
+//   prism_siz_measure(route, tree, rendered)  -> Result<PrismSize>
+//   prism_siz_route(m) / _nodes(m) / _depth(m) / _bytes(m)
+//   prism_siz_budget(max_nodes, max_depth, max_bytes) -> Result<PrismBudget>
+//   prism_siz_check(m, budget)                -> Result<PrismSize>   err lists EVERY overage
+//   prism_siz_overages(m, budget)             -> list   empty when within budget
+//   prism_siz_render(m)                       -> string  hand-built, no generic serializer
+
+import prism_node
+
+// `sz_`/`bd_` prefixes: the struct field->slot map is GLOBAL, so a bare `route`/`nodes`/`bytes`
+// would share a slot with any other module's field of that name.
+type PrismSize
+    sz_route: string
+    sz_nodes: int
+    sz_depth: int
+    sz_bytes: int
+
+type PrismBudget
+    bd_max_nodes: int
+    bd_max_depth: int
+    bd_max_bytes: int
+
+// Bytes, not code points: a budget is about what goes over the wire, and a 3-byte character
+// costs 3 bytes regardless of how it is counted for display. `len()` on a NOVA string is the
+// BYTE length (char_count is the code-point one), which is exactly what is wanted here -- the
+// one place in this codebase where len()'s byte semantics is the correct choice rather than a trap.
+fn _siz_bytes(rendered: string) -> int
+    len(rendered)
+
+fn prism_siz_measure(route, tree: PrismNode, rendered) -> Result<PrismSize>
+    if type_of(route) != "string"
+        return err("prism_size: route must be a string, got {type_of(route)}")
+    if len(route) == 0
+        return err("prism_size: route is required -- a budget that cannot be attributed to a route cannot be enforced")
+    if type_of(rendered) != "string"
+        return err("prism_size: rendered output must be a string (pass \"\" to measure structure only), got {type_of(rendered)}")
+    ok(PrismSize(route, prism_node.prism_node_count(tree), prism_node.prism_node_depth(tree), _siz_bytes(rendered)))
+
+fn prism_siz_route(m: PrismSize) -> string
+    m.sz_route
+
+fn prism_siz_nodes(m: PrismSize) -> int
+    m.sz_nodes
+
+fn prism_siz_depth(m: PrismSize) -> int
+    m.sz_depth
+
+fn prism_siz_bytes(m: PrismSize) -> int
+    m.sz_bytes
+
+// A limit of 0 means UNLIMITED for that dimension, so a caller can budget bytes without being
+// forced to invent a node ceiling. Negative is rejected rather than treated as unlimited: it is
+// far more likely a computed value went wrong than that someone meant it.
+fn prism_siz_budget(max_nodes, max_depth, max_bytes) -> Result<PrismBudget>
+    if type_of(max_nodes) != "int" or type_of(max_depth) != "int" or type_of(max_bytes) != "int"
+        return err("prism_size: budget limits must be ints, got {type_of(max_nodes)}/{type_of(max_depth)}/{type_of(max_bytes)}")
+    if max_nodes < 0 or max_depth < 0 or max_bytes < 0
+        return err("prism_size: a negative budget limit ({max_nodes}/{max_depth}/{max_bytes}) is almost certainly a computed value gone wrong; use 0 for 'unlimited'")
+    ok(PrismBudget(max_nodes, max_depth, max_bytes))
+
+// EVERY exceeded limit, not just the first -- one build should tell the whole story rather than
+// making the author fix, rebuild, and discover the next one.
+fn prism_siz_overages(m: PrismSize, b: PrismBudget) -> list
+    let out = []
+    if b.bd_max_nodes > 0 and m.sz_nodes > b.bd_max_nodes
+        push(out, "nodes {m.sz_nodes} exceeds {b.bd_max_nodes} by {m.sz_nodes - b.bd_max_nodes}")
+    if b.bd_max_depth > 0 and m.sz_depth > b.bd_max_depth
+        push(out, "depth {m.sz_depth} exceeds {b.bd_max_depth} by {m.sz_depth - b.bd_max_depth}")
+    if b.bd_max_bytes > 0 and m.sz_bytes > b.bd_max_bytes
+        push(out, "bytes {m.sz_bytes} exceeds {b.bd_max_bytes} by {m.sz_bytes - b.bd_max_bytes}")
+    out
+
+fn prism_siz_check(m: PrismSize, b: PrismBudget) -> Result<PrismSize>
+    let over = prism_siz_overages(m, b)
+    if len(over) == 0
+        return ok(m)
+    err("prism_size: route '{m.sz_route}' is over budget -- " + join(over, "; "))
+
+// Hand-built, like every other emitter in this codebase: to_json() on an imported struct was
+// measured mis-dispatching and reading out of bounds (test_programs/_tojson_dispatch_test.nova).
+fn prism_siz_render(m: PrismSize) -> string
+    "\{\"route\":\"{m.sz_route}\",\"nodes\":{m.sz_nodes},\"depth\":{m.sz_depth},\"bytes\":{m.sz_bytes}}"

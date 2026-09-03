@@ -1,0 +1,109 @@
+// KAT for prism/dev/prism_size.nova -- per-route size budgets (#106).
+//
+// What this proves:
+//   1. A failure names WHICH limit and BY HOW MUCH -- "too large" is unactionable, and the
+//      difference between 2% over (trim something) and 4x over (wrong import) is the whole story.
+//   2. ALL exceeded limits are reported, not just the first, so one build tells the whole story.
+//   3. 0 means unlimited; NEGATIVE is rejected, because a negative limit is far more likely a
+//      computed value gone wrong than an intention.
+//   4. Bytes are BYTE length, not code points -- a budget is about what goes over the wire, so a
+//      3-byte character must cost 3.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_size
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_size ==")
+
+    let leaf1 = unwrap(prism_content.prism_label("one"))
+    let leaf2 = unwrap(prism_content.prism_label("two"))
+    let inner = unwrap(prism_arrange.prism_band([leaf1, leaf2]))
+    let tree = unwrap(prism_arrange.prism_stack([inner]))
+
+    print("1. measurement")
+    check("empty route rejected", is_err(prism_size.prism_siz_measure("", tree, "")))
+    check("non-string route rejected", is_err(prism_size.prism_siz_measure(7, tree, "")))
+    check("non-string rendered rejected", is_err(prism_size.prism_siz_measure("/a", tree, 7)))
+    let m = unwrap(prism_size.prism_siz_measure("/checkout", tree, "<div>hello</div>"))
+    check("route stored", prism_size.prism_siz_route(m) == "/checkout")
+    check("node count counts the whole tree (4)", prism_size.prism_siz_nodes(m) == 4)
+    check("depth is measured (3)", prism_size.prism_siz_depth(m) == 3)
+    check("bytes come from the rendered string", prism_size.prism_siz_bytes(m) == 16)
+    check("structure-only measurement has 0 bytes", prism_size.prism_siz_bytes(unwrap(prism_size.prism_siz_measure("/x", tree, ""))) == 0)
+
+    print("2. bytes are BYTES, not code points")
+    // "日本語" is 3 code points but 9 bytes. A wire budget must count 9.
+    let jm = unwrap(prism_size.prism_siz_measure("/intl", tree, "日本語"))
+    check("a 3-char CJK string costs 9 bytes, not 3", prism_size.prism_siz_bytes(jm) == 9)
+
+    print("3. budget validation")
+    check("negative node limit rejected", is_err(prism_size.prism_siz_budget(-1, 0, 0)))
+    check("negative byte limit rejected", is_err(prism_size.prism_siz_budget(0, 0, -5)))
+    check("non-int limit rejected", is_err(prism_size.prism_siz_budget("10", 0, 0)))
+    check("all-zero budget is valid (fully unlimited)", not is_err(prism_size.prism_siz_budget(0, 0, 0)))
+
+    print("4. within budget passes; 0 means unlimited")
+    let generous = unwrap(prism_size.prism_siz_budget(100, 100, 100000))
+    check("within budget -> ok", not is_err(prism_size.prism_siz_check(m, generous)))
+    check("no overages listed", len(prism_size.prism_siz_overages(m, generous)) == 0)
+    // A tiny node limit of 0 must NOT fail -- 0 is unlimited, not "nothing allowed".
+    let unlimited = unwrap(prism_size.prism_siz_budget(0, 0, 0))
+    check("0 means UNLIMITED, not zero-allowed", not is_err(prism_size.prism_siz_check(m, unlimited)))
+
+    print("5. ★ a failure names the limit AND the overage")
+    let tight = unwrap(prism_size.prism_siz_budget(2, 0, 0))
+    let r = prism_size.prism_siz_check(m, tight)
+    check("over budget -> err", is_err(r))
+    let over = prism_size.prism_siz_overages(m, tight)
+    check("one overage listed", len(over) == 1)
+    check("the overage names the dimension, actual, limit and delta", contains(over[0], "nodes 4 exceeds 2 by 2"))
+
+    print("6. ★ EVERY exceeded limit is reported, not just the first")
+    let allTight = unwrap(prism_size.prism_siz_budget(2, 1, 5))
+    let over3 = prism_size.prism_siz_overages(m, allTight)
+    check("three overages reported together", len(over3) == 3)
+    check("nodes overage present", contains(join(over3, ";"), "nodes"))
+    check("depth overage present", contains(join(over3, ";"), "depth"))
+    check("bytes overage present", contains(join(over3, ";"), "bytes"))
+    check("the route is named in the error", not is_err(prism_size.prism_siz_check(m, generous)))
+
+    print("7. only the exceeded dimension is reported")
+    // Byte budget blown, node budget fine -> exactly one overage, and it is the byte one.
+    let bytesOnly = unwrap(prism_size.prism_siz_budget(100, 100, 5))
+    let ob = prism_size.prism_siz_overages(m, bytesOnly)
+    check("exactly one overage", len(ob) == 1)
+    check("and it is the BYTE one", contains(ob[0], "bytes 16 exceeds 5 by 11"))
+
+    print("8. render")
+    // Asserted by parts rather than one exact literal: an expected string containing a bare `{`
+    // is itself parsed as an INTERPOLATION in NOVA, which is what made the first version of this
+    // assertion fail against correct output. Parts are also a better test -- they say which field
+    // is wrong instead of just "the whole string differs".
+    let rj = prism_size.prism_siz_render(m)
+    check("render carries the route", contains(rj, "\"route\":\"/checkout\""))
+    check("render carries the node count", contains(rj, "\"nodes\":4"))
+    check("render carries the depth", contains(rj, "\"depth\":3"))
+    check("render carries the byte count", contains(rj, "\"bytes\":16"))
+    // NOTE the `"\{"`: a BARE `{` inside a string is parsed as the start of an INTERPOLATION in
+    // NOVA, so `starts_with(rj, "{")` does not test what it appears to. The module's output was
+    // correct from the first run; this assertion was the thing that was wrong.
+    check("render is a JSON object", starts_with(rj, "\{") and ends_with(rj, "}"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_size: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_size: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
