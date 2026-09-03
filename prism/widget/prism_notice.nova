@@ -1,0 +1,170 @@
+// prism_notice (widget/) -- toasts, snackbars and the notification centre (feature #71).
+//
+// ── WHY THIS IS A widget/ MODULE AND NOT JUST obs/prism_telemetry's cousin ──────────────────
+// A notice is a UI PRIMITIVE COMPOSITION -- it builds `PrismNode` trees from the closed
+// 22-primitive vocabulary (axiom A7), exactly like the rest of widget/. `ui/prism_ui_toast`
+// (MB.67) already renders one toast; this is the QUEUE and the POLICY around them, which is
+// where the real design questions live.
+//
+// ── ⛔ A NOTICE THAT CANNOT BE DISMISSED MUST NOT BE DISMISSIBLE-BY-TIMEOUT EITHER ───────────
+// The rule that shapes this module: an ERROR notice never auto-dismisses. Auto-dismissing an
+// error is how a failure becomes invisible -- the user looks away for four seconds and the only
+// report that something went wrong is gone, with no way to get it back. Info and success may
+// time out; error and warning require an explicit dismissal. That is enforced in the
+// constructor, not left to each caller's timeout argument, so it cannot be forgotten.
+//
+// ── ⛔ THE QUEUE IS BOUNDED, AND OVERFLOW DROPS THE OLDEST *DISMISSIBLE* ONE ─────────────────
+// An unbounded notice queue is a memory leak with a UI attached: a retry loop that posts on every
+// failure will happily queue ten thousand toasts. But dropping the OLDEST unconditionally would
+// discard the error the user still needs while keeping a "Saved!" that does not matter. So
+// overflow evicts the oldest AUTO-DISMISSING notice, and only refuses when every slot holds
+// something that requires acknowledgement -- at which point refusing is the honest answer.
+//
+// PUBLIC API
+//   prism_nt_info(text) / _success(text) / _warning(text) / _error(text) -> Result<PrismNotice>
+//   prism_nt_level(n) / _text(n) / _auto_dismiss(n) / _ttl_ms(n)
+//   prism_nt_queue(capacity)              -> Result<PrismNoticeQueue>
+//   prism_nt_post(q, notice)              -> Result<PrismNoticeQueue>
+//   prism_nt_dismiss(q, index)            -> Result<PrismNoticeQueue>
+//   prism_nt_count(q) / _at(q, i) / _pending_ack(q)
+//   prism_nt_node(notice)                 -> Result<PrismNode>   a renderable band
+//   prism_nt_level_name(l)                -> string
+
+import prism_node
+import prism_arrange
+import prism_content
+
+// `Nt`-prefixed variants: enum constructors resolve across modules in NOVA's flat symbol space.
+enum PrismNoticeLevel
+    NtInfo()
+    NtSuccess()
+    NtWarning()
+    NtError()
+
+// `nn_`/`nq_` prefixes: the struct field->slot map is GLOBAL.
+type PrismNotice
+    nn_level: PrismNoticeLevel
+    nn_text: string
+    nn_auto: int        // 0/1, never a bool
+    nn_ttl: int         // milliseconds; 0 when it does not auto-dismiss
+
+type PrismNoticeQueue
+    nq_items: list
+    nq_cap: int
+
+fn prism_nt_level_name(l: PrismNoticeLevel) -> string
+    match l
+        NtInfo() => "info"
+        NtSuccess() => "success"
+        NtWarning() => "warning"
+        NtError() => "error"
+
+fn prism_nt_level_all() -> list
+    [NtInfo(), NtSuccess(), NtWarning(), NtError()]
+
+fn _nt_make(level: PrismNoticeLevel, text, auto: int, ttl: int) -> Result<PrismNotice>
+    if type_of(text) != "string"
+        return err("prism_notice: text must be a string, got {type_of(text)}")
+    if len(text) == 0
+        return err("prism_notice: text is required -- an empty notice tells the user nothing and still steals their attention")
+    ok(PrismNotice(level, text, auto, ttl))
+
+// Info and success auto-dismiss after 4s: long enough to read a short line, short enough not to
+// linger. Warning and error do NOT -- see the header.
+fn prism_nt_info(text) -> Result<PrismNotice>
+    _nt_make(NtInfo(), text, 1, 4000)
+
+fn prism_nt_success(text) -> Result<PrismNotice>
+    _nt_make(NtSuccess(), text, 1, 4000)
+
+fn prism_nt_warning(text) -> Result<PrismNotice>
+    _nt_make(NtWarning(), text, 0, 0)
+
+fn prism_nt_error(text) -> Result<PrismNotice>
+    _nt_make(NtError(), text, 0, 0)
+
+fn prism_nt_level(n: PrismNotice) -> PrismNoticeLevel
+    n.nn_level
+
+fn prism_nt_text(n: PrismNotice) -> string
+    n.nn_text
+
+fn prism_nt_auto_dismiss(n: PrismNotice) -> bool
+    n.nn_auto == 1
+
+fn prism_nt_ttl_ms(n: PrismNotice) -> int
+    n.nn_ttl
+
+fn prism_nt_queue(capacity) -> Result<PrismNoticeQueue>
+    if type_of(capacity) != "int"
+        return err("prism_notice: capacity must be an int, got {type_of(capacity)}")
+    if capacity < 1
+        return err("prism_notice: capacity must be >= 1, got {capacity} -- a queue that can hold nothing silently swallows every notice")
+    ok(PrismNoticeQueue([], capacity))
+
+fn prism_nt_count(q: PrismNoticeQueue) -> int
+    len(q.nq_items)
+
+fn prism_nt_at(q: PrismNoticeQueue, i) -> Result<PrismNotice>
+    if type_of(i) != "int"
+        return err("prism_notice: index must be an int, got {type_of(i)}")
+    if i < 0 or i >= len(q.nq_items)
+        return err("prism_notice: index {i} is outside the queue (size {len(q.nq_items)})")
+    ok(q.nq_items[i])
+
+// How many notices in the queue REQUIRE acknowledgement. This is what a UI shows as a badge, and
+// what tells a caller whether overflow can still make room.
+fn prism_nt_pending_ack(q: PrismNoticeQueue) -> int
+    let n = [0]
+    for it in q.nq_items
+        if it.nn_auto == 0
+            n[0] = n[0] + 1
+    n[0]
+
+// ⛔ Overflow evicts the oldest AUTO-DISMISSING notice, never the oldest outright -- see header.
+// When every slot requires acknowledgement, posting is REFUSED rather than dropping something the
+// user has not seen.
+fn prism_nt_post(q: PrismNoticeQueue, notice: PrismNotice) -> Result<PrismNoticeQueue>
+    if len(q.nq_items) < q.nq_cap
+        let grown = []
+        for it in q.nq_items
+            push(grown, it)
+        push(grown, notice)
+        return ok(PrismNoticeQueue(grown, q.nq_cap))
+    // Full: find the oldest auto-dismissing entry to evict.
+    let victim = [0 - 1]
+    let i = [0]
+    for it in q.nq_items
+        let idx = i[0]
+        i[0] = idx + 1
+        if victim[0] < 0 and it.nn_auto == 1
+            victim[0] = idx
+    if victim[0] < 0
+        return err("prism_notice: queue is full and every one of its {q.nq_cap} notices requires acknowledgement -- refusing rather than dropping something the user has not seen")
+    let kept = []
+    let j = [0]
+    for it2 in q.nq_items
+        let jdx = j[0]
+        j[0] = jdx + 1
+        if jdx != victim[0]
+            push(kept, it2)
+    push(kept, notice)
+    ok(PrismNoticeQueue(kept, q.nq_cap))
+
+fn prism_nt_dismiss(q: PrismNoticeQueue, index) -> Result<PrismNoticeQueue>
+    let _chk = prism_nt_at(q, index)?
+    let kept = []
+    let i = [0]
+    for it in q.nq_items
+        let idx = i[0]
+        i[0] = idx + 1
+        if idx != index
+            push(kept, it)
+    ok(PrismNoticeQueue(kept, q.nq_cap))
+
+// A renderable node: a band of [level glyph-as-label, message]. Composed from the closed
+// vocabulary -- no new PrismNodeKind, per axiom A7.
+fn prism_nt_node(n: PrismNotice) -> Result<PrismNode>
+    let tag = prism_content.prism_label(prism_nt_level_name(n.nn_level))?
+    let msg = prism_content.prism_label(n.nn_text)?
+    prism_arrange.prism_band([tag, msg])
