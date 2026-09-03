@@ -1,0 +1,111 @@
+// KAT for prism/render/prism_render_pdf.nova -- PrismNode -> a real PDF (#117).
+//
+// The properties this exists for:
+//   1. ★ DETERMINISM. The same tree renders BYTE-IDENTICAL output twice. PRISM_SPEC §15.9 makes
+//      this a security property ("a rendered frame can be hashed and attested"), and a PDF is the
+//      output people archive and compare -- a timestamp would destroy it for the format that
+//      needs it most.
+//   2. ★ THE xref OFFSETS MUST BE RIGHT. They are byte offsets a reader seeks by, and they are
+//      fixed-width: a short field shifts every later entry. Asserted structurally -- the offset
+//      recorded for object 1 is checked against where "1 0 obj" actually appears.
+//   3. PDF string escaping: an unbalanced ( or ) terminates the literal early and corrupts every
+//      object after it, the same silent structural break as an unquoted CSV comma.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_render_pdf
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_render_pdf ==")
+
+    let a = unwrap(prism_content.prism_label("First line"))
+    let b = unwrap(prism_content.prism_label("Second line"))
+    let tree = unwrap(prism_arrange.prism_stack([a, b]))
+
+    print("1. text collection in document order")
+    let lines = prism_render_pdf.prism_pdf_lines(tree)
+    check("both labels collected", len(lines) == 2)
+    check("document order preserved", join(lines, "|") == "First line|Second line")
+
+    print("2. structure of the emitted document")
+    let pdf = unwrap(prism_render_pdf.prism_pdf_render(tree, "Report"))
+    check("starts with the PDF header", starts_with(pdf, "%PDF-1.4"))
+    check("ends with %%EOF", ends_with(pdf, "%%EOF\n"))
+    check("has a catalog", contains(pdf, "/Type /Catalog"))
+    check("has a page tree", contains(pdf, "/Type /Pages"))
+    check("has one page", contains(pdf, "/Count 1"))
+    check("declares a MediaBox", contains(pdf, "/MediaBox [0 0 612 792]"))
+    check("embeds a base-14 font", contains(pdf, "/BaseFont /Helvetica"))
+    check("has an xref table", contains(pdf, "xref"))
+    check("has a trailer with the root", contains(pdf, "/Root 1 0 R"))
+    check("declares startxref", contains(pdf, "startxref"))
+    check("the free-list head entry is exact", contains(pdf, "0000000000 65535 f "))
+    check("the title reaches the Info dictionary", contains(pdf, "/Title (Report)"))
+
+    print("3. the content stream carries the text")
+    check("text is drawn with Tj", contains(pdf, "(First line) Tj"))
+    check("second line too", contains(pdf, "(Second line) Tj"))
+    check("a font size is set", contains(pdf, "/F1 12 Tf"))
+    // Absolute positioning per line: a missing line must not shift the rest of the page.
+    check("absolute positioning is used", contains(pdf, "72 720 Td"))
+    check("the second line steps down by the leading", contains(pdf, "72 706 Td"))
+    check("stream length is declared", contains(pdf, "/Length "))
+
+    print("4. ★ determinism -- byte-identical across runs")
+    let again = unwrap(prism_render_pdf.prism_pdf_render(tree, "Report"))
+    check("two renders of the same tree are IDENTICAL", pdf == again)
+    check("no creation timestamp leaked in", not contains(pdf, "CreationDate"))
+    check("no producer string leaked in", not contains(pdf, "Producer"))
+    // A different title must actually change the bytes -- otherwise "identical" is vacuous.
+    let other = unwrap(prism_render_pdf.prism_pdf_render(tree, "Other"))
+    check("a DIFFERENT input produces different bytes (determinism is not vacuous)", pdf != other)
+
+    print("5. ★ xref offsets point where they claim")
+    // Object 1 begins immediately after the 9-byte "%PDF-1.4\n" header, so its recorded offset
+    // must be 0000000009. If the accumulator drifted, this is where it shows.
+    check("object 1's offset is 9 (just past the header)", contains(pdf, "0000000009 00000 n "))
+    check("offsets are FIXED WIDTH at 10 digits", not contains(pdf, " 9 00000 n "))
+    check("there are as many n-entries as objects (5)", len(pdf.split("00000 n ")) == 6)
+
+    print("6. ★ PDF string escaping")
+    let paren = unwrap(prism_content.prism_label("a (nested) paren"))
+    let bs = unwrap(prism_content.prism_label("back\\slash"))
+    let ptree = unwrap(prism_arrange.prism_stack([paren, bs]))
+    let ppdf = unwrap(prism_render_pdf.prism_pdf_render(ptree, "T"))
+    check("parens are escaped, not left to terminate the literal", contains(ppdf, "a \\(nested\\) paren"))
+    check("a backslash is escaped", contains(ppdf, "back\\\\slash"))
+    check("escape() is directly correct for parens", prism_render_pdf.prism_pdf_escape("(x)") == "\\(x\\)")
+    check("escape() leaves ordinary text alone", prism_render_pdf.prism_pdf_escape("plain") == "plain")
+
+    print("7. capacity is enforced, not silently truncated")
+    // (792 - 72 - 72) / 14 = 46 by integer division. Asserted as a NUMBER rather than recomputed
+    // from the module's own constants, so a change to the page geometry has to be noticed here
+    // instead of silently agreeing with itself.
+    check("page capacity is reported", prism_render_pdf.prism_pdf_page_capacity() == 46)
+    // Build more lines than fit. A PDF that quietly drops content is worse than one that refuses.
+    let many = []
+    let i = [0]
+    while i[0] < 60
+        push(many, unwrap(prism_content.prism_label("line {i[0]}")))
+        i[0] = i[0] + 1
+    let big = unwrap(prism_arrange.prism_stack(many))
+    check("overflowing content is an ERROR, not a truncation", is_err(prism_render_pdf.prism_pdf_render(big, "T")))
+    check("non-string title rejected", is_err(prism_render_pdf.prism_pdf_render(tree, 7)))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_render_pdf: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_render_pdf: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

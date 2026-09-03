@@ -1,0 +1,118 @@
+// prism_render_sheet (render/) -- a `grid` node to delimited text (#117). Same PrismNode tree
+// that renders to HTML renders to a spreadsheet, which is the point of render/: a "bar chart" or
+// a data table has ONE implementation, not one per output.
+//
+// ── SCOPE, STATED HONESTLY: DELIMITED TEXT, NOT .xlsx ────────────────────────────────────────
+// README says "-> Excel". This emits RFC 4180 CSV (and TSV), which Excel, Numbers and Sheets all
+// open natively. A real .xlsx is a ZIP of XML parts, and neither ZIP (deflate) nor the packaging
+// exists in this runtime yet -- so emitting a file named .xlsx that is not one would be worse
+// than emitting honest CSV. The escaping and shaping below is the part that would be reused when
+// the packaging lands; nothing here would need rewriting.
+//
+// ── ⛔ THE GRID NODE DOES NOT RETAIN ITS COLUMN NAMES ────────────────────────────────────────
+// `prism_grid(rows, key_fn, columns, cell_fn)` validates its column names and then stores only
+// `{"columns": N}` on the node -- the names are consumed and dropped. So a sheet cannot recover
+// its own header row from the tree, and headers are a REQUIRED argument here.
+// Rather than trust the caller, the header COUNT is checked against the node's `columns` attr: a
+// mismatch means the caller is exporting a different grid than they think, which in a spreadsheet
+// shows up as every column being shifted by one -- data that looks plausible and is wrong. That
+// is the failure mode worth an error.
+// (Tracked as a `widget/` gap: retaining the names on the node would let this be derived.)
+//
+// PUBLIC API
+//   prism_sht_csv(grid, headers)        -> Result<string>   RFC 4180, comma
+//   prism_sht_tsv(grid, headers)        -> Result<string>   tab
+//   prism_sht_delimited(grid, headers, sep) -> Result<string>
+//   prism_sht_rows(grid)                -> Result<list>     list of list of cell text
+//   prism_sht_row_count(grid) / _col_count(grid) -> Result<int>
+
+import prism_node
+
+// RFC 4180: quote a field iff it contains the delimiter, a double quote, CR or LF; escape an
+// embedded quote by DOUBLING it. Getting this wrong is how a CSV export corrupts every row after
+// the first cell that happens to contain a comma -- silently, because the file still parses.
+fn _sht_field(v: string, sep: string) -> string
+    let needs = [false]
+    for cp in code_points(v)
+        if cp == 34 or cp == 10 or cp == 13
+            needs[0] = true
+    if contains(v, sep)
+        needs[0] = true
+    if not needs[0]
+        return v
+    let out = []
+    for cp2 in code_points(v)
+        if cp2 == 34
+            push(out, "\"\"")
+        else
+            push(out, from_codepoint(cp2))
+    "\"" + join(out, "") + "\""
+
+// A cell's text is its accessible content: an explicit label, else the visible text, else alt.
+// Same resolution order dev/prism_test uses for accessible names, so a sheet cell and a test
+// query agree about what a cell "says".
+fn _sht_cell_text(cell: PrismNode) -> string
+    let lbl = prism_node.prism_node_attr_str(cell, "label", "")
+    if len(lbl) > 0
+        return lbl
+    let txt = prism_node.prism_node_attr_str(cell, "text", "")
+    if len(txt) > 0
+        return txt
+    prism_node.prism_node_attr_str(cell, "alt", "")
+
+fn _sht_check_grid(grid: PrismNode) -> Result<int>
+    if prism_node.prism_node_kind_str(grid) != "grid"
+        return err("prism_render_sheet: expected a grid node, got '{prism_node.prism_node_kind_str(grid)}' -- a sheet is a table, and exporting an arbitrary subtree would produce a shape nobody can read")
+    ok(prism_node.prism_node_attr_int(grid, "columns", 0))
+
+fn prism_sht_col_count(grid: PrismNode) -> Result<int>
+    _sht_check_grid(grid)
+
+fn prism_sht_row_count(grid: PrismNode) -> Result<int>
+    let _c = _sht_check_grid(grid)?
+    ok(prism_node.prism_node_child_count(grid))
+
+// Cell text per row, in order. A ragged row (fewer cells than the grid declares) is reported
+// rather than padded: padding would put a value under the wrong header for every column after
+// the gap, which is exactly the plausible-but-wrong output this module refuses to emit.
+fn prism_sht_rows(grid: PrismNode) -> Result<list>
+    let cols = _sht_check_grid(grid)?
+    let out = []
+    let rn = [0]
+    for row in prism_node.prism_node_children(grid)
+        let i = rn[0]
+        rn[0] = i + 1
+        let cells = prism_node.prism_node_children(row)
+        if len(cells) != cols
+            return err("prism_render_sheet: row {i} has {len(cells)} cells but the grid declares {cols} columns -- padding it would shift every later column under the wrong header")
+        let vals = []
+        for c in cells
+            push(vals, _sht_cell_text(c))
+        push(out, vals)
+    ok(out)
+
+fn prism_sht_delimited(grid: PrismNode, headers, sep) -> Result<string>
+    if type_of(sep) != "string" or len(sep) == 0
+        return err("prism_render_sheet: delimiter must be a non-empty string, got {type_of(sep)}")
+    if type_of(headers) != "list"
+        return err("prism_render_sheet: headers must be a list, got {type_of(headers)}")
+    let cols = _sht_check_grid(grid)?
+    if len(headers) != cols
+        return err("prism_render_sheet: {len(headers)} headers supplied but the grid declares {cols} columns -- every column would be shifted, producing output that looks plausible and is wrong")
+    for h in headers
+        if type_of(h) != "string"
+            return err("prism_render_sheet: header must be a string, got {type_of(h)}")
+    let rows = prism_sht_rows(grid)?
+    let lines = []
+    push(lines, join(headers.map(fn(h) _sht_field(h, sep)), sep))
+    for r in rows
+        push(lines, join(r.map(fn(v) _sht_field(v, sep)), sep))
+    // CRLF per RFC 4180. Excel accepts LF, but a spec-conformant reader is entitled to CRLF and
+    // this is the format's own answer.
+    ok(join(lines, "\r\n"))
+
+fn prism_sht_csv(grid: PrismNode, headers) -> Result<string>
+    prism_sht_delimited(grid, headers, ",")
+
+fn prism_sht_tsv(grid: PrismNode, headers) -> Result<string>
+    prism_sht_delimited(grid, headers, "\t")

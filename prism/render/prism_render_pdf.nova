@@ -1,0 +1,149 @@
+// prism_render_pdf (render/) -- a PrismNode tree to a real, openable PDF (#117).
+//
+// ── DETERMINISTIC BY CONSTRUCTION, WHICH IS A SPEC REQUIREMENT NOT A NICETY ──────────────────
+// No creation date, no producer string, no object ID that depends on iteration order. The same
+// tree produces byte-identical PDF output on every run and every platform. PRISM_SPEC §15.9
+// makes that a security property -- "a rendered frame can be hashed and attested" -- and a PDF
+// is the one output people actually archive and compare, so a timestamp in the header would
+// destroy the property for the format that needs it most. It is also what makes a golden-file
+// test possible at all.
+//
+// ── WHY THE xref TABLE IS THE WHOLE DIFFICULTY ───────────────────────────────────────────────
+// A PDF is not text-with-markers: the trailer must carry BYTE OFFSETS to every object, and a
+// reader uses them to seek. Get one offset wrong by a byte and the file opens in some viewers,
+// fails in others, and looks fine in a diff. So offsets are ACCUMULATED as the objects are
+// emitted -- never recomputed from a second pass over the finished string, which is how the two
+// copies drift apart.
+// Offsets are byte counts (`len`), not code-point counts, because that is what a reader seeks by.
+// This is the second place in Prism where len()'s byte semantics is the CORRECT choice rather
+// than the trap it usually is (the first was prism_size's wire budget).
+//
+// ── SCOPE ────────────────────────────────────────────────────────────────────────────────────
+// Text only, Helvetica, one page, uncompressed content stream. No images, no embedded fonts, no
+// deflate -- deflate does not exist in this runtime, and an "uncompressed PDF" is a valid PDF
+// while a fake compressed one is not. Every text node in the tree is emitted in document order,
+// one line each, top to bottom, with the page clipping anything past the bottom margin (reported
+// rather than silently dropped).
+//
+// PUBLIC API
+//   prism_pdf_render(tree, title)      -> Result<string>   a complete PDF document
+//   prism_pdf_lines(tree)              -> list             the text lines, document order
+//   prism_pdf_escape(s)                -> string           PDF string-literal escaping
+//   prism_pdf_page_capacity()          -> int              lines that fit on one page
+
+import prism_node
+
+// US Letter at 72dpi, 1-inch margins, 12pt text on 14pt leading. Named rather than inlined so a
+// later page-size capability has one place to change.
+let PDF_PAGE_W = 612
+let PDF_PAGE_H = 792
+let PDF_MARGIN = 72
+let PDF_FONT_PT = 12
+let PDF_LEADING = 14
+
+fn prism_pdf_page_capacity() -> int
+    (PDF_PAGE_H - PDF_MARGIN - PDF_MARGIN) / PDF_LEADING
+
+// PDF string literals are delimited by ( ), so an unbalanced paren inside the text terminates
+// the string early and corrupts every object after it -- the same class of silent structural
+// break as an unquoted CSV comma. Backslash, ( and ) are escaped; control bytes are dropped
+// because a raw CR inside a literal is not portable across readers.
+fn prism_pdf_escape(s: string) -> string
+    let out = []
+    for cp in code_points(s)
+        if cp == 92
+            push(out, "\\\\")
+        else if cp == 40
+            push(out, "\\(")
+        else if cp == 41
+            push(out, "\\)")
+        else if cp < 32
+            push(out, " ")
+        else
+            push(out, from_codepoint(cp))
+    join(out, "")
+
+fn _pdf_text_of(n: PrismNode) -> string
+    let lbl = prism_node.prism_node_attr_str(n, "label", "")
+    if len(lbl) > 0
+        return lbl
+    let txt = prism_node.prism_node_attr_str(n, "text", "")
+    if len(txt) > 0
+        return txt
+    prism_node.prism_node_attr_str(n, "alt", "")
+
+fn _pdf_collect(n: PrismNode, out: list)
+    let t = _pdf_text_of(n)
+    if len(t) > 0
+        push(out, t)
+    for c in prism_node.prism_node_children(n)
+        _pdf_collect(c, out)
+
+fn prism_pdf_lines(tree: PrismNode) -> list
+    let out = []
+    _pdf_collect(tree, out)
+    out
+
+fn prism_pdf_render(tree: PrismNode, title) -> Result<string>
+    if type_of(title) != "string"
+        return err("prism_render_pdf: title must be a string, got {type_of(title)}")
+    let lines = prism_pdf_lines(tree)
+    let cap = prism_pdf_page_capacity()
+    if len(lines) > cap
+        return err("prism_render_pdf: {len(lines)} text lines exceed the {cap} that fit on one page -- reported rather than silently truncated, because a PDF that quietly drops content is worse than one that refuses to build. Multi-page output is not implemented")
+    // Content stream: one Td per line, absolute positioning, so a missing line cannot shift the
+    // rest of the page the way a relative TL/T* sequence would.
+    let ops = []
+    let y = [PDF_PAGE_H - PDF_MARGIN]
+    for ln in lines
+        push(ops, "BT /F1 {PDF_FONT_PT} Tf {PDF_MARGIN} {y[0]} Td ({prism_pdf_escape(ln)}) Tj ET")
+        y[0] = y[0] - PDF_LEADING
+    let content = join(ops, "\n")
+
+    let objs = []
+    push(objs, "<< /Type /Catalog /Pages 2 0 R >>")
+    push(objs, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    push(objs, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_W} {PDF_PAGE_H}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+    push(objs, "<< /Length {len(content)} >>\nstream\n" + content + "\nendstream")
+    push(objs, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+
+    // Header, then each object, ACCUMULATING the byte offset of each as it is appended. The xref
+    // table is built from these accumulated values -- never from a second scan of the finished
+    // document, which is how the table and the body drift apart.
+    let head = "%PDF-1.4\n"
+    let body = [head]
+    let offsets = []
+    let pos = [len(head)]
+    let idx = [0]
+    for o in objs
+        let i = idx[0]
+        idx[0] = i + 1
+        push(offsets, pos[0])
+        let chunk = "{i + 1} 0 obj\n" + o + "\nendobj\n"
+        push(body, chunk)
+        pos[0] = pos[0] + len(chunk)
+
+    let xref_at = pos[0]
+    let xr = []
+    push(xr, "xref\n0 {len(objs) + 1}\n")
+    // Object 0 is the head of the free list and its entry is fixed by the spec.
+    push(xr, "0000000000 65535 f \n")
+    for off in offsets
+        push(xr, _pdf_off10(off) + " 00000 n \n")
+    push(xr, "trailer\n<< /Size {len(objs) + 1} /Root 1 0 R /Info << /Title ({prism_pdf_escape(title)}) >> >>\nstartxref\n{xref_at}\n%%EOF\n")
+    ok(join(body, "") + join(xr, ""))
+
+// xref entries are FIXED WIDTH: exactly 10 digits, zero-padded. A reader indexes the table by
+// byte position, so a short field shifts every subsequent entry and the file becomes unreadable
+// from that point on.
+fn _pdf_off10(n: int) -> string
+    let s = "{n}"
+    let pad = 10 - char_count(s)
+    if pad <= 0
+        return s
+    let zs = []
+    let i = [0]
+    while i[0] < pad
+        push(zs, "0")
+        i[0] = i[0] + 1
+    join(zs, "") + s
