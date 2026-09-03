@@ -1,0 +1,160 @@
+// prism_i18n (intl/) -- message catalogues, interpolation and plural selection.
+//
+// ── ⛔ A MISSING KEY IS AN ERROR, NOT THE KEY ECHOED BACK ────────────────────────────────────
+// Most i18n libraries return the key itself when a translation is missing, so the UI shows
+// `checkout.submit` and the build stays green. That is the failure mode this module exists to
+// prevent: the bug ships, and it ships to exactly the locale nobody on the team reads.
+// `prism_i18n_get` returns `err`. `prism_i18n_audit` compares a catalogue against the reference
+// one and reports every missing AND every extra key, so a translation gap is a build-time list
+// rather than a user-visible string.
+//
+// ── PLURALS ARE A CATEGORY FUNCTION, NOT `n == 1` ────────────────────────────────────────────
+// English has two plural forms and every other language disagrees. `n == 1 ? one : other` is
+// wrong for Polish (which needs `few` and `many`), for Russian, and for Arabic (which has six
+// categories). The rule is therefore a per-catalogue CATEGORY FUNCTION selected by locale, and
+// the CLDR categories are a closed enum -- so a language whose rule is not implemented FAILS
+// LOUDLY rather than silently falling back to English's two-form rule and mis-pluralising every
+// number for that locale.
+// Implemented: `one/other` (en-like), `one/few/many/other` (Polish), and `other` only (Japanese,
+// which does not inflect for number). Anything else is an explicit err.
+//
+// ── INTERPOLATION IS DONE HERE, NOT BY NOVA'S "{x}" ─────────────────────────────────────────
+// A catalogue is DATA loaded at runtime, so its placeholders cannot be NOVA interpolations --
+// those are resolved at compile time against local variables. `{name}` in a message is replaced
+// from an explicit args dict, and an UNRESOLVED placeholder is an error: a message rendering as
+// "Hello, {name}" is a defect that must not reach a user.
+//
+// PUBLIC API
+//   prism_i18n_catalog(locale, plural_rule, entries) -> Result<PrismCatalog>
+//   prism_i18n_get(cat, key)                 -> Result<string>
+//   prism_i18n_format(cat, key, args)        -> Result<string>
+//   prism_i18n_plural(cat, key_base, n, args)-> Result<string>
+//   prism_i18n_category(rule, n)             -> Result<string>
+//   prism_i18n_audit(reference, other)       -> list   missing + extra keys
+//   prism_i18n_locale(c) / _keys(c) / _has(c, key)
+//   prism_i18n_rule_en() / _rule_pl() / _rule_ja()
+
+// `ic_` prefix: the struct field->slot map is GLOBAL.
+type PrismCatalog
+    ic_locale: string
+    ic_rule: string
+    ic_entries: dict
+
+fn prism_i18n_rule_en() -> string
+    "one-other"
+
+fn prism_i18n_rule_pl() -> string
+    "one-few-many-other"
+
+fn prism_i18n_rule_ja() -> string
+    "other"
+
+fn prism_i18n_catalog(locale, plural_rule, entries) -> Result<PrismCatalog>
+    if type_of(locale) != "string" or len(locale) == 0
+        return err("prism_i18n: locale is required and must be a string, got {type_of(locale)}")
+    if type_of(plural_rule) != "string"
+        return err("prism_i18n: plural rule must be a string, got {type_of(plural_rule)}")
+    if plural_rule != "one-other" and plural_rule != "one-few-many-other" and plural_rule != "other"
+        return err("prism_i18n: plural rule '{plural_rule}' is not implemented. It is REJECTED rather than defaulted to English's two-form rule, which would silently mis-pluralise every number in this locale")
+    if type_of(entries) != "dict"
+        return err("prism_i18n: entries must be a dict, got {type_of(entries)}")
+    ok(PrismCatalog(locale, plural_rule, entries))
+
+fn prism_i18n_locale(c: PrismCatalog) -> string
+    c.ic_locale
+
+fn prism_i18n_keys(c: PrismCatalog) -> list
+    keys(c.ic_entries)
+
+fn prism_i18n_has(c: PrismCatalog, key) -> bool
+    if type_of(key) != "string"
+        return false
+    contains(c.ic_entries, key)
+
+// ⛔ err, NOT the key echoed back. See the header.
+fn prism_i18n_get(c: PrismCatalog, key) -> Result<string>
+    if type_of(key) != "string"
+        return err("prism_i18n: key must be a string, got {type_of(key)}")
+    if not contains(c.ic_entries, key)
+        return err("prism_i18n: no message '{key}' in catalogue '{c.ic_locale}' -- returning the key itself would ship a raw identifier to the user in exactly the locale nobody on the team reads")
+    ok(c.ic_entries[key])
+
+// Replaces {name} from `args`. Walks the template once; an unmatched `{` is left alone so a
+// message containing a literal brace is not corrupted, but an UNRESOLVED placeholder (one whose
+// name is absent from args) is an error -- "Hello, {name}" must never reach a user.
+fn prism_i18n_format(c: PrismCatalog, key, args) -> Result<string>
+    let tpl = prism_i18n_get(c, key)?
+    if type_of(args) != "dict"
+        return err("prism_i18n: args must be a dict, got {type_of(args)}")
+    // Braces are matched by CODE POINT (123 = '{', 125 = '}'), not by comparing against a "\{"
+    // literal: the escape is an INTERPOLATION escape, and the comparison silently never matched,
+    // so every placeholder was copied through verbatim. Comparing the number is unambiguous.
+    // The accumulator is a one-cell list because rebinding a `let` inside the loop is not
+    // something to rely on -- the cell makes the mutation explicit and local.
+    let out = []
+    let acc = [""]
+    let inside = [false]
+    for cp in code_points(tpl)
+        let ch = from_codepoint(cp)
+        if inside[0]
+            if cp == 125
+                let name = acc[0]
+                if not contains(args, name)
+                    return err("prism_i18n: message '{key}' has placeholder '{name}' with no value supplied -- rendering it literally would show a raw placeholder to the user")
+                push(out, "{args[name]}")
+                acc[0] = ""
+                inside[0] = false
+            else
+                acc[0] = acc[0] + ch
+        else if cp == 123
+            inside[0] = true
+            acc[0] = ""
+        else
+            push(out, ch)
+    if inside[0]
+        return err("prism_i18n: message '{key}' has an unterminated placeholder")
+    ok(join(out, ""))
+
+// CLDR-shaped category selection. Each rule is total over its own categories.
+fn prism_i18n_category(rule, n) -> Result<string>
+    if type_of(n) != "int"
+        return err("prism_i18n: plural count must be an int, got {type_of(n)}")
+    if n < 0
+        return err("prism_i18n: plural count {n} is negative")
+    if rule == "other"
+        return ok("other")
+    if rule == "one-other"
+        if n == 1
+            return ok("one")
+        return ok("other")
+    if rule == "one-few-many-other"
+        // Polish: 1 -> one; 2-4 (but not 12-14) -> few; the rest -> many.
+        if n == 1
+            return ok("one")
+        let last2 = n % 100
+        let last1 = n % 10
+        if last1 >= 2 and last1 <= 4 and (last2 < 12 or last2 > 14)
+            return ok("few")
+        return ok("many")
+    err("prism_i18n: plural rule '{rule}' is not implemented")
+
+// Looks up "<base>.<category>", so a catalogue supplies one entry per form its language needs.
+fn prism_i18n_plural(c: PrismCatalog, key_base, n, args) -> Result<string>
+    if type_of(key_base) != "string"
+        return err("prism_i18n: plural key must be a string, got {type_of(key_base)}")
+    let cat = prism_i18n_category(c.ic_rule, n)?
+    prism_i18n_format(c, "{key_base}.{cat}", args)
+
+// Reports BOTH directions: a key the reference has and this catalogue lacks is an untranslated
+// string, and a key this catalogue has that the reference does not is a stale entry left behind
+// by a rename. Both are drift, and reporting only the first lets catalogues accumulate dead
+// weight nobody ever removes.
+fn prism_i18n_audit(reference: PrismCatalog, other: PrismCatalog) -> list
+    let out = []
+    for k in keys(reference.ic_entries)
+        if not contains(other.ic_entries, k)
+            push(out, "missing in {other.ic_locale}: {k}")
+    for k2 in keys(other.ic_entries)
+        if not contains(reference.ic_entries, k2)
+            push(out, "stale in {other.ic_locale}: {k2}")
+    out

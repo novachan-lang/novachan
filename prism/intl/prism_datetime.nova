@@ -1,0 +1,175 @@
+// prism_datetime (intl/) -- locale-aware date and time formatting from an EPOCH SECOND.
+//
+// ── ⛔ UTC ONLY, AND THE OFFSET IS AN EXPLICIT ARGUMENT ──────────────────────────────────────
+// There is no "local time" here and no hidden reference to a system timezone. A formatter that
+// silently uses the host's zone produces a different string on a server than on a laptop for the
+// same instant, and the difference only shows up in production. The caller passes the UTC offset
+// in minutes; if they do not know it, that is a fact they need to discover, not one this module
+// should invent.
+// DST is deliberately NOT modelled: a correct DST answer needs the IANA database, which this
+// runtime does not have, and a WRONG DST answer is worse than none because it looks authoritative.
+// An offset the caller supplies is honest; a zone name this module pretended to understand
+// would not be.
+//
+// ── CIVIL DATE FROM A DAY NUMBER, NOT A LOOKUP TABLE ─────────────────────────────────────────
+// The date conversion is Howard Hinnant's civil-from-days algorithm: exact integer arithmetic
+// valid across the whole int64 range, with no month-length table and no leap-year special case
+// sprinkled through the code. A table-driven implementation gets February 29 in 1900 vs 2000
+// wrong -- 1900 is NOT a leap year (divisible by 100, not by 400) and that is the case naive
+// implementations miss, so it is asserted in the KAT.
+//
+// PUBLIC API
+//   prism_dt_civil(epoch_s, offset_min)   -> Result<PrismCivil>
+//   prism_dt_year(c) / _month(c) / _day(c) / _hour(c) / _minute(c) / _second(c) / _weekday(c)
+//   prism_dt_iso(c)                       -> string   2026-09-03T14:05:09
+//   prism_dt_date(c, loc)                 -> string   locale-ordered date
+//   prism_dt_time(c, hour12)              -> string
+//   prism_dt_locale(order, sep)           -> Result<PrismDtLocale>
+//   prism_dt_ymd() / _dmy() / _mdy()      -> PrismDtLocale
+//   prism_dt_month_name(c) / _weekday_name(c) -> string
+
+// `dc_`/`dl_` prefixes: the struct field->slot map is GLOBAL.
+type PrismCivil
+    dc_year: int
+    dc_month: int
+    dc_day: int
+    dc_hour: int
+    dc_minute: int
+    dc_second: int
+    dc_weekday: int     // 0 = Sunday
+
+type PrismDtLocale
+    dl_order: string    // "ymd" | "dmy" | "mdy"
+    dl_sep: string
+
+fn prism_dt_locale(order, sep) -> Result<PrismDtLocale>
+    if type_of(order) != "string" or type_of(sep) != "string"
+        return err("prism_datetime: order and separator must be strings, got {type_of(order)}/{type_of(sep)}")
+    if order != "ymd" and order != "dmy" and order != "mdy"
+        return err("prism_datetime: unknown date order '{order}' -- expected ymd, dmy or mdy. This module never guesses an order")
+    if len(sep) == 0
+        return err("prism_datetime: date separator is required")
+    ok(PrismDtLocale(order, sep))
+
+fn prism_dt_ymd() -> PrismDtLocale
+    PrismDtLocale("ymd", "-")
+
+fn prism_dt_dmy() -> PrismDtLocale
+    PrismDtLocale("dmy", "/")
+
+fn prism_dt_mdy() -> PrismDtLocale
+    PrismDtLocale("mdy", "/")
+
+// Floor division and modulo, which is what calendar arithmetic needs: NOVA's `/` truncates
+// toward zero, so -1 / 86400 is 0 rather than -1, and every pre-1970 instant would land on the
+// wrong day without this.
+fn _dt_fdiv(a: int, b: int) -> int
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0))
+        return q - 1
+    q
+
+fn _dt_fmod(a: int, b: int) -> int
+    a - _dt_fdiv(a, b) * b
+
+// Howard Hinnant's civil_from_days. Shifts the era so March is month 1, which removes the leap
+// day from the middle of the year and makes the whole thing branch-free integer arithmetic.
+fn _dt_civil_from_days(z0: int) -> list
+    let z = z0 + 719468
+    let era = _dt_fdiv(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10
+        mp + 3
+    else
+        mp - 9
+    let yy = if m <= 2
+        y + 1
+    else
+        y
+    [yy, m, d]
+
+fn prism_dt_civil(epoch_s, offset_min) -> Result<PrismCivil>
+    if type_of(epoch_s) != "int" or type_of(offset_min) != "int"
+        return err("prism_datetime: epoch seconds and offset must be ints, got {type_of(epoch_s)}/{type_of(offset_min)}")
+    if offset_min < -1080 or offset_min > 1080
+        return err("prism_datetime: UTC offset {offset_min} minutes is outside -1080..+1080 (-18h..+18h)")
+    let local = epoch_s + offset_min * 60
+    let days = _dt_fdiv(local, 86400)
+    let secs = _dt_fmod(local, 86400)
+    let ymd = _dt_civil_from_days(days)
+    // 1970-01-01 was a Thursday (4). Floor-mod keeps this correct for negative day numbers.
+    let wd = _dt_fmod(days + 4, 7)
+    ok(PrismCivil(ymd[0], ymd[1], ymd[2], secs / 3600, (secs % 3600) / 60, secs % 60, wd))
+
+fn prism_dt_year(c: PrismCivil) -> int
+    c.dc_year
+
+fn prism_dt_month(c: PrismCivil) -> int
+    c.dc_month
+
+fn prism_dt_day(c: PrismCivil) -> int
+    c.dc_day
+
+fn prism_dt_hour(c: PrismCivil) -> int
+    c.dc_hour
+
+fn prism_dt_minute(c: PrismCivil) -> int
+    c.dc_minute
+
+fn prism_dt_second(c: PrismCivil) -> int
+    c.dc_second
+
+fn prism_dt_weekday(c: PrismCivil) -> int
+    c.dc_weekday
+
+fn _dt_pad2(n: int) -> string
+    if n < 10
+        return "0{n}"
+    "{n}"
+
+fn prism_dt_iso(c: PrismCivil) -> string
+    "{c.dc_year}-{_dt_pad2(c.dc_month)}-{_dt_pad2(c.dc_day)}T{_dt_pad2(c.dc_hour)}:{_dt_pad2(c.dc_minute)}:{_dt_pad2(c.dc_second)}"
+
+fn prism_dt_date(c: PrismCivil, loc: PrismDtLocale) -> string
+    let y = "{c.dc_year}"
+    let m = _dt_pad2(c.dc_month)
+    let d = _dt_pad2(c.dc_day)
+    if loc.dl_order == "dmy"
+        return "{d}{loc.dl_sep}{m}{loc.dl_sep}{y}"
+    if loc.dl_order == "mdy"
+        return "{m}{loc.dl_sep}{d}{loc.dl_sep}{y}"
+    "{y}{loc.dl_sep}{m}{loc.dl_sep}{d}"
+
+// 12-hour rendering treats midnight and noon explicitly, because 0 -> "0 AM" and 12 -> "0 PM" are
+// the two cases every hand-rolled version gets wrong.
+fn prism_dt_time(c: PrismCivil, hour12) -> string
+    if not hour12
+        return "{_dt_pad2(c.dc_hour)}:{_dt_pad2(c.dc_minute)}:{_dt_pad2(c.dc_second)}"
+    let suffix = if c.dc_hour < 12
+        "AM"
+    else
+        "PM"
+    let h12 = if c.dc_hour == 0
+        12
+    else if c.dc_hour > 12
+        c.dc_hour - 12
+    else
+        c.dc_hour
+    "{h12}:{_dt_pad2(c.dc_minute)}:{_dt_pad2(c.dc_second)} {suffix}"
+
+fn prism_dt_month_name(c: PrismCivil) -> string
+    let names = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    if c.dc_month < 1 or c.dc_month > 12
+        return ""
+    names[c.dc_month]
+
+fn prism_dt_weekday_name(c: PrismCivil) -> string
+    let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    if c.dc_weekday < 0 or c.dc_weekday > 6
+        return ""
+    names[c.dc_weekday]
