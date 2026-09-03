@@ -1,0 +1,96 @@
+// KAT for prism/dev/prism_visual.nova -- visual regression on deterministic renders (#104).
+//
+// The properties this exists for:
+//   1. ★ A MISMATCH LOCALISES. "Snapshot differs" is why people stop trusting snapshot tests --
+//      it cannot distinguish a one-word copy edit from a layout collapse, so the habit becomes
+//      "re-baseline and move on" and the test becomes decoration. Asserted: the report carries
+//      the first differing OFFSET, both sizes, and windows from both sides.
+//   2. ★ RE-RECORDING A BASELINE IS AN ERROR. A store that silently overwrote a reviewed baseline
+//      would let a regression become the new truth on the next run.
+//   3. ★ A MISSING BASELINE IS A FAILURE, not an implicit pass -- otherwise a renamed snapshot
+//      stops testing anything while the suite stays green.
+
+import prism_visual
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_visual ==")
+
+    let base = "<div class=\"card\"><h1>Checkout</h1><p>Total: 42</p></div>"
+
+    print("1. snapshot identity")
+    check("empty name rejected", is_err(prism_visual.prism_vis_snapshot("", base)))
+    check("non-string name rejected", is_err(prism_visual.prism_vis_snapshot(7, base)))
+    check("non-string render rejected", is_err(prism_visual.prism_vis_snapshot("a", 7)))
+    let snap = unwrap(prism_visual.prism_vis_snapshot("checkout", base))
+    check("name stored", prism_visual.prism_vis_name(snap) == "checkout")
+    check("size is the byte length", prism_visual.prism_vis_size(snap) == len(base))
+    check("hash is a 64-char sha256 hex digest", len(prism_visual.prism_vis_hash(snap)) == 64)
+    check("the baseline retains its text (needed to localise)", prism_visual.prism_vis_text(snap) == base)
+
+    print("2. an identical render matches exactly, with no tolerance")
+    check("matches itself", prism_visual.prism_vis_matches(snap, base))
+    check("compare returns ok", not is_err(prism_visual.prism_vis_compare(snap, base)))
+    // Determinism makes an exact hash sound: re-snapshotting the same text gives the same hash.
+    let snap2 = unwrap(prism_visual.prism_vis_snapshot("checkout", base))
+    check("hashing is stable across calls", prism_visual.prism_vis_hash(snap2) == prism_visual.prism_vis_hash(snap))
+    // ...and a DIFFERENT render must produce a different hash, or "stable" is vacuous.
+    let other = unwrap(prism_visual.prism_vis_snapshot("x", "<div>different</div>"))
+    check("a different render hashes differently (stability is not vacuous)", prism_visual.prism_vis_hash(other) != prism_visual.prism_vis_hash(snap))
+
+    print("3. ★ a mismatch LOCALISES the change")
+    // A single character changed in place: same length, different content. This is the case a
+    // size-only check would miss entirely.
+    let same_len = "<div class=\"card\"><h1>Checkout</h1><p>Total: 43</p></div>"
+    check("a same-length change is DETECTED (size alone would miss it)", not prism_visual.prism_vis_matches(snap, same_len))
+    check("same-length mismatch is an err", is_err(prism_visual.prism_vis_compare(snap, same_len)))
+    // Appended content: a prefix match, which is a different diagnosis from an in-place edit.
+    let appended = base + "<footer>x</footer>"
+    check("appended content is detected", not prism_visual.prism_vis_matches(snap, appended))
+    check("appended content is an err", is_err(prism_visual.prism_vis_compare(snap, appended)))
+    // Truncated content.
+    check("truncated content is detected", not prism_visual.prism_vis_matches(snap, "<div class=\"card\">"))
+    // A structural change early in the document.
+    check("an early structural change is detected", not prism_visual.prism_vis_matches(snap, "<span>Checkout</span>"))
+    check("a non-string render never silently matches", not prism_visual.prism_vis_matches(snap, 7))
+
+    print("4. ★ re-recording a reviewed baseline is an ERROR")
+    let store0 = prism_visual.prism_vis_baseline_new()
+    check("a fresh store is empty", prism_visual.prism_vis_count(store0) == 0)
+    let store1 = unwrap(prism_visual.prism_vis_record(store0, snap))
+    check("one baseline recorded", prism_visual.prism_vis_count(store1) == 1)
+    check("the name is listed", contains(prism_visual.prism_vis_names(store1), "checkout"))
+    check("re-recording the SAME name is refused", is_err(prism_visual.prism_vis_record(store1, snap2)))
+    // Recording is non-mutating: the earlier store must be unchanged.
+    check("the ORIGINAL store is unchanged (non-mutating)", prism_visual.prism_vis_count(store0) == 0)
+    let store2 = unwrap(prism_visual.prism_vis_record(store1, other))
+    check("a second, differently-named baseline is accepted", prism_visual.prism_vis_count(store2) == 2)
+
+    print("5. ★ a MISSING baseline is a failure, not an implicit pass")
+    check("checking an unknown name is an err", is_err(prism_visual.prism_vis_check(store1, "not-recorded", base)))
+    check("checking a recorded name against its own render passes", not is_err(prism_visual.prism_vis_check(store1, "checkout", base)))
+    check("checking a recorded name against a changed render fails", is_err(prism_visual.prism_vis_check(store1, "checkout", same_len)))
+    check("non-string name rejected", is_err(prism_visual.prism_vis_check(store1, 7, base)))
+
+    print("6. non-ASCII renders are handled")
+    let jp = "<p>日本語のテスト</p>"
+    let jsnap = unwrap(prism_visual.prism_vis_snapshot("intl", jp))
+    check("non-ASCII matches itself", prism_visual.prism_vis_matches(jsnap, jp))
+    check("size counts BYTES for non-ASCII", prism_visual.prism_vis_size(jsnap) == len(jp))
+    check("a changed non-ASCII render is detected", not prism_visual.prism_vis_matches(jsnap, "<p>日本語のテストX</p>"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_visual: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_visual: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

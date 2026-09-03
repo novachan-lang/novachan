@@ -1,0 +1,129 @@
+// prism_explain (dev/) -- `nova prism explain <face>`: why a subtree repaints (feature, §12.7).
+//
+// ── ⛔ WHAT THIS DELIBERATELY DOES NOT DO YET, AND WHY SAYING SO MATTERS ─────────────────────
+// dev/README.md describes this as "read-sets + why a node's invalidation escalated". READ-SETS
+// ARE NOT IMPLEMENTED HERE, because the dependency-inference pass they come from does not exist:
+// it is M3.4, and M3.4 is gated on M1.7 -- the Bet-1 FALSIFIER, whose entire purpose is to
+// measure whether zero-annotation reactivity is survivable at all (>20-30% read-set per face
+// kills the bet). Emitting a plausible-looking "read-set" before that pass exists would be
+// inventing the number the falsifier is supposed to measure, which is worse than emitting
+// nothing: it would make the bet look settled.
+//
+// So this explains the half that is REAL TODAY: INVALIDATION SCOPE, which follows from IDENTITY,
+// which the node tree already carries. That is not a placeholder -- identity is what decides
+// whether a change repaints one row or rebuilds a list, and it is the question developers
+// actually ask when a UI feels slow.
+//
+// ── IDENTITY IS THE THING ────────────────────────────────────────────────────────────────────
+// A KEYED node can be matched across renders, so a diff can update it in place. An UNKEYED node
+// cannot: the only sound thing to do is replace it and everything under it. So an unkeyed branch
+// high in the tree makes its whole subtree repaint, and the cost is not the node -- it is the
+// DESCENDANT COUNT underneath it. That is what this module reports and ranks, because "this
+// unkeyed band owns 340 nodes" is actionable and "this node is unkeyed" is not.
+// §10 already forces `by` on `each`/`grid`, so the common list case is safe by construction --
+// which is exactly why the REMAINING unkeyed branches are worth surfacing.
+//
+// PUBLIC API
+//   prism_exp_explain(tree)          -> Result<PrismExplain>
+//   prism_exp_total(e) / _keyed(e) / _unkeyed(e) / _depth(e)
+//   prism_exp_hotspots(e)            -> list<PrismHotspot>   ranked, widest scope first
+//   prism_exp_hot_kind(h) / _hot_scope(h) / _hot_depth(h)
+//   prism_exp_report(e)              -> string   human-readable, hand-built
+//   prism_exp_readsets_available()   -> bool     FALSE until M3.4 -- see the header
+
+import prism_node
+
+// `ex_`/`hs_` prefixes: the struct field->slot map is GLOBAL.
+type PrismHotspot
+    hs_kind: string
+    hs_scope: int       // descendants that repaint with it, itself included
+    hs_depth: int
+
+type PrismExplain
+    ex_total: int
+    ex_keyed: int
+    ex_unkeyed: int
+    ex_depth: int
+    ex_hotspots: list
+
+// Honest capability probe rather than a silent lie. A caller that wants read-sets can ASK, get
+// `false`, and say so to its user -- instead of being handed a fabricated number.
+fn prism_exp_readsets_available() -> bool
+    false
+
+fn _exp_walk(n: PrismNode, depth: int, acc: list, hots: list)
+    // acc = [total, keyed, unkeyed, maxdepth]
+    acc[0] = acc[0] + 1
+    if prism_node.prism_node_has_key(n)
+        acc[1] = acc[1] + 1
+    else
+        acc[2] = acc[2] + 1
+    if depth > acc[3]
+        acc[3] = depth
+    // A node is a hotspot when it is UNKEYED and has children: it cannot be matched across
+    // renders, so it and everything beneath it is replaced wholesale. A childless unkeyed leaf
+    // is not interesting -- replacing one label costs nothing, and reporting it would bury the
+    // branches that matter under noise.
+    let kids = prism_node.prism_node_children(n)
+    if not prism_node.prism_node_has_key(n) and len(kids) > 0
+        push(hots, PrismHotspot(prism_node.prism_node_kind_str(n), prism_node.prism_node_count(n), depth))
+    for c in kids
+        _exp_walk(c, depth + 1, acc, hots)
+
+fn prism_exp_explain(tree: PrismNode) -> Result<PrismExplain>
+    let acc = [0, 0, 0, 0]
+    let hots = []
+    _exp_walk(tree, 0, acc, hots)
+    // Ranked by SCOPE, widest first: the developer wants the branch that costs the most, not the
+    // first one encountered. Insertion sort -- the hotspot list is short by construction (only
+    // unkeyed branches), so an O(n^2) sort here is cheaper than building a comparator machine.
+    let ranked = []
+    for h in hots
+        let at = [len(ranked)]
+        let i = [0]
+        while i[0] < len(ranked)
+            if at[0] == len(ranked) and h.hs_scope > ranked[i[0]].hs_scope
+                at[0] = i[0]
+            i[0] = i[0] + 1
+        insert(ranked, at[0], h)
+    ok(PrismExplain(acc[0], acc[1], acc[2], acc[3], ranked))
+
+fn prism_exp_total(e: PrismExplain) -> int
+    e.ex_total
+
+fn prism_exp_keyed(e: PrismExplain) -> int
+    e.ex_keyed
+
+fn prism_exp_unkeyed(e: PrismExplain) -> int
+    e.ex_unkeyed
+
+fn prism_exp_depth(e: PrismExplain) -> int
+    e.ex_depth
+
+fn prism_exp_hotspots(e: PrismExplain) -> list
+    e.ex_hotspots
+
+fn prism_exp_hot_kind(h: PrismHotspot) -> string
+    h.hs_kind
+
+fn prism_exp_hot_scope(h: PrismHotspot) -> int
+    h.hs_scope
+
+fn prism_exp_hot_depth(h: PrismHotspot) -> int
+    h.hs_depth
+
+// Human-readable, hand-built. States the read-set limitation IN THE REPORT, not only in this
+// file's header -- the person reading the output is the one who needs to know it is missing, and
+// a tool that quietly omits half of what it promised teaches its users to trust the other half
+// more than they should.
+fn prism_exp_report(e: PrismExplain) -> string
+    let lines = []
+    push(lines, "nodes {e.ex_total} (keyed {e.ex_keyed}, unkeyed {e.ex_unkeyed}), depth {e.ex_depth}")
+    if len(e.ex_hotspots) == 0
+        push(lines, "no unkeyed branches: every subtree can be matched across renders")
+    else
+        push(lines, "unkeyed branches, widest repaint scope first:")
+        for h in e.ex_hotspots
+            push(lines, "  {h.hs_kind} at depth {h.hs_depth} repaints {h.hs_scope} node(s)")
+    push(lines, "read-sets: UNAVAILABLE -- the dependency-inference pass is M3.4, gated on M1.7 (the Bet-1 falsifier). No number is shown rather than a fabricated one")
+    join(lines, "\n")

@@ -1,0 +1,160 @@
+// prism_visual (dev/) -- visual regression against DETERMINISTIC renders (feature #104).
+//
+// ── WHY THIS IS POSSIBLE HERE AND PAINFUL ELSEWHERE ─────────────────────────────────────────
+// Screenshot testing is notoriously flaky in every other stack because the render is not
+// deterministic: font hinting, GPU driver, subpixel AA and the OS compositor all vary, so teams
+// end up with per-platform baselines and a tolerance threshold that hides real regressions.
+// Prism's renderers are byte-reproducible by construction (PRISM_SPEC §15.9 -- "byte-reproducible
+// output means a rendered frame can be hashed and attested"), so a baseline can be an EXACT
+// hash with NO tolerance at all. That is only sound because determinism is a property the
+// renderers actually hold -- prism_render_pdf asserts it directly.
+//
+// ── ⛔ A MISMATCH MUST LOCALISE THE CHANGE, NOT JUST REPORT ONE ──────────────────────────────
+// "Snapshot differs" is the reason people stop trusting snapshot tests: it says nothing about
+// whether a deliberate one-word copy edit or an entire layout collapse just happened, so the
+// habit becomes "re-baseline and move on" -- at which point the test is decoration. Every
+// mismatch here reports the byte length of both sides, the FIRST DIFFERING OFFSET, and a short
+// window of text around it, which is enough to tell a copy tweak from a structural break
+// without opening anything.
+//
+// ── THE HASH IS SHA-256 OVER THE RENDERED BYTES ──────────────────────────────────────────────
+// Not a cheap checksum: a baseline is a claim that this exact output was reviewed, and a 32-bit
+// checksum collides often enough to matter across thousands of snapshots. sha256 is also the
+// binary-safe one after this session's truncation fixes -- it now hashes the full byte length
+// rather than stopping at the first 0x00, which matters because a canvas or PDF render is
+// binary and WILL contain zero bytes.
+//
+// PUBLIC API
+//   prism_vis_snapshot(name, rendered)        -> Result<PrismSnapshot>
+//   prism_vis_name(s) / _hash(s) / _size(s)
+//   prism_vis_matches(s, rendered)            -> bool
+//   prism_vis_compare(s, rendered)            -> Result<string>   ok("") or a localised report
+//   prism_vis_baseline_new()                  -> PrismBaselines
+//   prism_vis_record(store, snapshot)         -> Result<PrismBaselines>
+//   prism_vis_check(store, name, rendered)    -> Result<string>
+//   prism_vis_names(store) / _count(store)
+
+// `vs_`/`vb_` prefixes: the struct field->slot map is GLOBAL.
+// ⛔ The baseline keeps the rendered TEXT, not only its hash. My first version stored just the
+// hash and then tried to report a first-differing offset -- which is impossible: there is nothing
+// to diff against. A hash alone can say "changed" and never "changed HERE", and "changed" is
+// exactly the useless verdict this module's header argues against. The text is the cost of
+// localisation, and localisation is the whole point.
+type PrismSnapshot
+    vs_name: string
+    vs_hash: string
+    vs_size: int
+    vs_text: string
+
+type PrismBaselines
+    vb_by_name: dict
+
+fn prism_vis_snapshot(name, rendered) -> Result<PrismSnapshot>
+    if type_of(name) != "string" or len(name) == 0
+        return err("prism_visual: snapshot name is required and must be a string, got {type_of(name)}")
+    if type_of(rendered) != "string"
+        return err("prism_visual: rendered output must be a string, got {type_of(rendered)}")
+    // Byte length, not code points: this is a hash of the exact output, so the discriminator
+    // must count what was hashed.
+    ok(PrismSnapshot(name, sha256(rendered), len(rendered), rendered))
+
+fn prism_vis_name(s: PrismSnapshot) -> string
+    s.vs_name
+
+fn prism_vis_hash(s: PrismSnapshot) -> string
+    s.vs_hash
+
+fn prism_vis_size(s: PrismSnapshot) -> int
+    s.vs_size
+
+fn prism_vis_text(s: PrismSnapshot) -> string
+    s.vs_text
+
+fn prism_vis_matches(s: PrismSnapshot, rendered) -> bool
+    if type_of(rendered) != "string"
+        return false
+    // Size is checked first: it is free, and it makes the common "content changed length" case
+    // report without hashing. The hash still decides, so a same-length change is never missed.
+    if len(rendered) != s.vs_size
+        return false
+    sha256(rendered) == s.vs_hash
+
+// First differing BYTE offset, or -1 when the prefix of the shorter side matches entirely. Byte
+// offsets are what the size report is in, so mixing in a code-point index here would make the
+// two numbers describe different things.
+fn _vis_first_diff(a: string, b: string) -> int
+    let ca = code_points(a)
+    let cb = code_points(b)
+    let n = if len(ca) < len(cb)
+        len(ca)
+    else
+        len(cb)
+    let i = [0]
+    let found = [0 - 1]
+    while i[0] < n
+        if found[0] < 0 and ca[i[0]] != cb[i[0]]
+            found[0] = i[0]
+        i[0] = i[0] + 1
+    found[0]
+
+fn _vis_window(s: string, at: int) -> string
+    let from = if at > 12
+        at - 12
+    else
+        0
+    let cps = code_points(s)
+    let out = []
+    let i = [from]
+    while i[0] < len(cps) and i[0] < from + 30
+        push(out, from_codepoint(cps[i[0]]))
+        i[0] = i[0] + 1
+    join(out, "")
+
+// ok("") when it matches; otherwise a report that LOCALISES the change -- see the header.
+fn prism_vis_compare(s: PrismSnapshot, rendered) -> Result<string>
+    if type_of(rendered) != "string"
+        return err("prism_visual: rendered output must be a string, got {type_of(rendered)}")
+    if prism_vis_matches(s, rendered)
+        return ok("")
+    let at = _vis_first_diff(s.vs_text, rendered)
+    let size_note = "size {s.vs_size} -> {len(rendered)}"
+    if at < 0
+        // One side is a strict prefix of the other: nothing differs up to the shorter length, so
+        // the change is purely appended or truncated content. Worth saying explicitly -- it is a
+        // very different diagnosis from "byte 40 changed".
+        return err("prism_visual: '{s.vs_name}' is a PREFIX match -- {size_note}, so content was appended or truncated rather than altered in place")
+    let same_len = if s.vs_size == len(rendered)
+        " (SAME LENGTH -- usually a value or attribute change, not a layout change)"
+    else
+        ""
+    err("prism_visual: '{s.vs_name}' differs at offset {at}{same_len} -- {size_note}. expected near: '{_vis_window(s.vs_text, at)}' | got near: '{_vis_window(rendered, at)}'")
+
+fn prism_vis_baseline_new() -> PrismBaselines
+    PrismBaselines({})
+
+// Recording is NON-destructive: re-recording an existing name is an error. A store that silently
+// overwrote a reviewed baseline would let a regression become the new truth on the next run,
+// which is the failure mode that makes snapshot suites worthless.
+fn prism_vis_record(store: PrismBaselines, snap: PrismSnapshot) -> Result<PrismBaselines>
+    if contains(store.vb_by_name, snap.vs_name)
+        return err("prism_visual: a baseline named '{snap.vs_name}' already exists -- overwriting a reviewed baseline would let a regression silently become the new truth. Remove it explicitly first")
+    let d = {}
+    for k in keys(store.vb_by_name)
+        d[k] = store.vb_by_name[k]
+    d[snap.vs_name] = snap
+    ok(PrismBaselines(d))
+
+fn prism_vis_count(store: PrismBaselines) -> int
+    len(keys(store.vb_by_name))
+
+fn prism_vis_names(store: PrismBaselines) -> list
+    keys(store.vb_by_name)
+
+// A MISSING baseline is an error, not an implicit pass. "No baseline yet, so it's fine" is how a
+// renamed snapshot stops testing anything while the suite stays green.
+fn prism_vis_check(store: PrismBaselines, name, rendered) -> Result<string>
+    if type_of(name) != "string"
+        return err("prism_visual: name must be a string, got {type_of(name)}")
+    if not contains(store.vb_by_name, name)
+        return err("prism_visual: no baseline named '{name}' -- treated as a FAILURE, not an implicit pass, because a renamed snapshot would otherwise stop testing anything while the suite stayed green")
+    prism_vis_compare(store.vb_by_name[name], rendered)
