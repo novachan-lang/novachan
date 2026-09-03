@@ -1,0 +1,115 @@
+// KAT for prism/render/prism_render_image.nova -- a deterministic PNG encoder (#118).
+//
+// The properties this exists for:
+//   1. ★ CRC-32 AND ADLER-32 ARE VERIFIED AGAINST KNOWN ANSWERS, not just "it returns a number".
+//      A checksum that is self-consistently wrong produces a file every decoder rejects, and no
+//      structural assertion would catch it. CRC-32 of "IEND" is a published constant.
+//   2. ★ STRUCTURE IS ASSERTED BYTE BY BYTE: the 8-byte signature, IHDR's declared dimensions,
+//      the per-row FILTER BYTE (omitting it is the classic skew bug), and the stored-deflate
+//      LEN/NLEN pair a decoder validates.
+//   3. DETERMINISM: two encodes of the same pixels are byte-identical, and different pixels
+//      differ -- so "identical" cannot pass vacuously.
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_render_image
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn _b(vals: list)
+    let b = bytes_create(0)
+    for v in vals
+        bytes_append(b, v)
+    b
+
+fn main()
+    print("== _kat_prism_render_image ==")
+
+    print("1. ★ checksums against KNOWN answers")
+    // CRC-32 of the 4 ASCII bytes "IEND" is 0xAE426082 -- the value that appears in the IEND
+    // chunk of every PNG ever written, so it is a real external check on the implementation.
+    let iend = _b([73, 69, 78, 68])
+    check("crc32(\"IEND\") == 0xAE426082", prism_render_image.prism_img_crc32(iend) == 0xAE426082)
+    // CRC-32 of "IHDR" is 0x52494844's chunk-type CRC... use the published value for the ASCII
+    // bytes themselves: crc32("IHDR") = 0x9A2D77B5? Verified instead against the empty case,
+    // which is fixed by the algorithm: crc32 of no bytes is 0.
+    check("crc32 of an empty buffer is 0", prism_render_image.prism_img_crc32(bytes_create(0)) == 0)
+    // Adler-32 of "abc" is 0x024D0127 -- also a published constant.
+    check("adler32(\"abc\") == 0x024D0127", prism_render_image.prism_img_adler32(_b([97, 98, 99])) == 0x024D0127)
+    // Adler-32 of the empty string is 1 (a=1, b=0), fixed by definition.
+    check("adler32 of an empty buffer is 1", prism_render_image.prism_img_adler32(bytes_create(0)) == 1)
+
+    print("2. the signature")
+    let sig = prism_render_image.prism_img_signature()
+    check("signature is 8 bytes", bytes_len(sig) == 8)
+    check("byte 0 is 137", bytes_get(sig, 0) == 137)
+    check("bytes 1..3 are PNG", bytes_get(sig, 1) == 80 and bytes_get(sig, 2) == 78 and bytes_get(sig, 3) == 71)
+    check("the CRLF transfer check is present", bytes_get(sig, 4) == 13 and bytes_get(sig, 5) == 10)
+    check("the 26 (EOF) and final LF are present", bytes_get(sig, 6) == 26 and bytes_get(sig, 7) == 10)
+
+    print("3. a 1x1 red pixel -- structure byte by byte")
+    let one = unwrap(prism_render_image.prism_img_png(1, 1, [255, 0, 0]))
+    check("the file starts with the signature", bytes_get(one, 0) == 137 and bytes_get(one, 1) == 80)
+    // IHDR: length 13, then "IHDR", then width/height as big-endian u32.
+    check("IHDR length is 13", bytes_get(one, 8) == 0 and bytes_get(one, 9) == 0 and bytes_get(one, 10) == 0 and bytes_get(one, 11) == 13)
+    check("chunk type is IHDR", bytes_get(one, 12) == 73 and bytes_get(one, 13) == 72 and bytes_get(one, 14) == 68 and bytes_get(one, 15) == 82)
+    check("width is 1 (big-endian)", bytes_get(one, 16) == 0 and bytes_get(one, 19) == 1)
+    check("height is 1", bytes_get(one, 20) == 0 and bytes_get(one, 23) == 1)
+    check("bit depth 8", bytes_get(one, 24) == 8)
+    check("colour type 2 = truecolour RGB", bytes_get(one, 25) == 2)
+    check("compression 0, filter 0, interlace 0", bytes_get(one, 26) == 0 and bytes_get(one, 27) == 0 and bytes_get(one, 28) == 0)
+    check("the file is a plausible size for 1 pixel", bytes_len(one) > 40 and bytes_len(one) < 100)
+
+    print("4. ★ the stored-deflate block and the per-row filter byte")
+    // Raw data for 1x1 RGB is 4 bytes: one filter byte + 3 colour bytes. The stored block's LEN
+    // must therefore be 4, and NLEN its one's complement -- a decoder verifies that pair.
+    let hex = bytes_to_hex(one)
+    check("zlib header 78 01 is present", contains(hex, "7801"))
+    // 01 = final stored block, 0400 = LEN 4 little-endian, fbff = NLEN, then 00 ff 00 00 =
+    // filter byte 0 then red. The filter byte is the classic omission: without it every row
+    // starts a byte early and the image skews.
+    check("final stored block with LEN=4 and NLEN=~4", contains(hex, "010400fbff"))
+    check("the row's FILTER BYTE 0 precedes the pixel", contains(hex, "010400fbff00ff0000"))
+    check("IEND terminates the file", ends_with(hex, "49454e44ae426082"))
+
+    print("5. ★ determinism")
+    let again = unwrap(prism_render_image.prism_img_png(1, 1, [255, 0, 0]))
+    check("two encodes are byte-identical", bytes_equal(one, again))
+    let green = unwrap(prism_render_image.prism_img_png(1, 1, [0, 255, 0]))
+    check("different pixels differ (determinism is not vacuous)", not bytes_equal(one, green))
+
+    print("6. validation")
+    check("zero width rejected", is_err(prism_render_image.prism_img_png(0, 1, [])))
+    check("negative height rejected", is_err(prism_render_image.prism_img_png(1, -1, [])))
+    check("oversized rejected", is_err(prism_render_image.prism_img_png(5000, 5000, [])))
+    check("a short pixel buffer is an ERROR, not a torn image", is_err(prism_render_image.prism_img_png(2, 2, [255, 0, 0])))
+    check("a long pixel buffer is rejected too", is_err(prism_render_image.prism_img_png(1, 1, [1, 2, 3, 4])))
+    check("non-list pixels rejected", is_err(prism_render_image.prism_img_png(1, 1, "red")))
+    check("non-int component rejected", is_err(prism_render_image.prism_img_png(1, 1, [255, 0, "x"])))
+
+    print("7. solid fills and the layout skeleton")
+    let solid = unwrap(prism_render_image.prism_img_solid(4, 3, 10, 20, 30))
+    check("a 4x3 solid encodes", bytes_len(solid) > 40)
+    check("its IHDR declares width 4", bytes_get(solid, 19) == 4)
+    check("its IHDR declares height 3", bytes_get(solid, 23) == 3)
+    let tree = unwrap(prism_arrange.prism_stack([unwrap(prism_content.prism_label("x"))]))
+    let skel = unwrap(prism_render_image.prism_img_skeleton(tree, 8, 8))
+    check("a skeleton encodes", bytes_len(skel) > 40)
+    check("skeletons are deterministic", bytes_equal(skel, unwrap(prism_render_image.prism_img_skeleton(tree, 8, 8))))
+    check("skeleton rejects bad dimensions", is_err(prism_render_image.prism_img_skeleton(tree, 0, 8)))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_render_image: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_render_image: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

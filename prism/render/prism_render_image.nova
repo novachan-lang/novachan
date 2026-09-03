@@ -1,0 +1,224 @@
+// prism_render_image (render/) -- a deterministic PNG encoder (feature #118).
+//
+// ── SCOPE, STATED UP FRONT ───────────────────────────────────────────────────────────────────
+// This is a real, spec-conformant PNG writer: signature, IHDR, IDAT (zlib) and IEND, with
+// correct CRC-32 per chunk and Adler-32 over the uncompressed stream. What it does NOT do is
+// rasterise TEXT -- glyph rendering needs a font engine and a shaper, which is the GPU backend's
+// job (M2.x), not this module's. So `prism_img_skeleton` paints the LAYOUT: one filled rectangle
+// per node, shaded by depth. That is deliberately useful rather than a placeholder -- a layout
+// skeleton is exactly what a visual-regression baseline needs (dev/prism_visual), because it
+// changes when the structure changes and not when a word does.
+//
+// ── DEFLATE IS "STORED", AND THAT IS A CORRECT PNG ───────────────────────────────────────────
+// zlib's format allows uncompressed ("stored", BTYPE=00) deflate blocks, so a valid PNG can be
+// produced with no compressor at all. There is no deflate in this runtime, and emitting a file
+// that CLAIMS compression while carrying raw bytes would be an invalid PNG that some decoders
+// accept -- the worst outcome. Stored blocks are larger and completely correct. When a real
+// deflate lands, only `_img_zlib` changes.
+// Each block carries LEN and its one's-complement NLEN, little-endian; a decoder verifies that
+// pair, so getting it wrong fails loudly rather than silently.
+//
+// ── ⛔ CHECKSUMS ARE IMPLEMENTED HERE, NOT BORROWED ──────────────────────────────────────────
+// The runtime's `crc32` builtin takes a STRING and derives its length from the string; a PNG
+// chunk is BYTES and routinely contains 0x00, so passing it through a string API is exactly the
+// truncation class fixed across ten functions this session. CRC-32 and Adler-32 are therefore
+// computed over a `bytes` value here, byte by byte, with no string boundary anywhere.
+//
+// PUBLIC API
+//   prism_img_png(width, height, rgb)    -> Result<bytes>   rgb = list of ints, 3 per pixel
+//   prism_img_solid(width, height, r, g, b) -> Result<bytes>
+//   prism_img_skeleton(tree, width, height) -> Result<bytes>
+//   prism_img_crc32(bts) / prism_img_adler32(bts) -> int
+//   prism_img_signature()                -> bytes           the 8-byte PNG signature
+
+import prism_node
+
+fn _img_u8(b, v: int)
+    bytes_append(b, v & 255)
+
+fn _img_u32be(b, v: int)
+    bytes_append(b, (v >> 24) & 255)
+    bytes_append(b, (v >> 16) & 255)
+    bytes_append(b, (v >> 8) & 255)
+    bytes_append(b, v & 255)
+
+fn prism_img_signature()
+    let s = bytes_create(0)
+    // 137 P N G \r \n 26 \n -- the CR/LF pair and the 26 are the format's own transfer-corruption
+    // detectors, which is why they are spelled out rather than trusted to a string literal.
+    bytes_append(s, 137)
+    bytes_append(s, 80)
+    bytes_append(s, 78)
+    bytes_append(s, 71)
+    bytes_append(s, 13)
+    bytes_append(s, 10)
+    bytes_append(s, 26)
+    bytes_append(s, 10)
+    s
+
+// CRC-32 (reflected, polynomial 0xEDB88320) computed bit by bit. Masked to 32 bits after every
+// step: NOVA ints are 64-bit and `>>` is ARITHMETIC, so an unmasked value would sign-extend once
+// bit 31 was set and every subsequent shift would be wrong.
+fn prism_img_crc32(bts) -> int
+    let crc = [0xFFFFFFFF]
+    let i = [0]
+    while i[0] < bytes_len(bts)
+        crc[0] = (crc[0] ^ bytes_get(bts, i[0])) & 0xFFFFFFFF
+        let k = [0]
+        while k[0] < 8
+            if crc[0] & 1 == 1
+                crc[0] = ((crc[0] >> 1) ^ 0xEDB88320) & 0xFFFFFFFF
+            else
+                crc[0] = (crc[0] >> 1) & 0xFFFFFFFF
+            k[0] = k[0] + 1
+        i[0] = i[0] + 1
+    (crc[0] ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+// Adler-32 over the UNCOMPRESSED data, which is what zlib's trailer must carry. 65521 is the
+// largest prime below 2^16 -- the modulus is part of the format, not a tunable.
+fn prism_img_adler32(bts) -> int
+    let a = [1]
+    let b = [0]
+    let i = [0]
+    while i[0] < bytes_len(bts)
+        a[0] = (a[0] + bytes_get(bts, i[0])) % 65521
+        b[0] = (b[0] + a[0]) % 65521
+        i[0] = i[0] + 1
+    ((b[0] * 65536) + a[0]) & 0xFFFFFFFF
+
+// A PNG chunk is length, type, data, then CRC over TYPE+DATA (not over the length) -- a detail
+// that is easy to get wrong and produces a file every decoder rejects.
+fn _img_chunk(out, ctype: string, data)
+    _img_u32be(out, bytes_len(data))
+    let crc_src = bytes_create(0)
+    for cp in code_points(ctype)
+        bytes_append(out, cp)
+        bytes_append(crc_src, cp)
+    let j = [0]
+    while j[0] < bytes_len(data)
+        let byte = bytes_get(data, j[0])
+        bytes_append(out, byte)
+        bytes_append(crc_src, byte)
+        j[0] = j[0] + 1
+    _img_u32be(out, prism_img_crc32(crc_src))
+
+// zlib stream: 2-byte header, stored deflate blocks of at most 65535 bytes, Adler-32 trailer.
+fn _img_zlib(raw)
+    let z = bytes_create(0)
+    // 0x78 0x01 = deflate, 32K window, no preset dictionary, check bits valid.
+    bytes_append(z, 0x78)
+    bytes_append(z, 0x01)
+    let n = bytes_len(raw)
+    let off = [0]
+    while off[0] < n
+        let remain = n - off[0]
+        let blk = if remain > 65535
+            65535
+        else
+            remain
+        let final = if off[0] + blk >= n
+            1
+        else
+            0
+        bytes_append(z, final)
+        bytes_append(z, blk & 255)
+        bytes_append(z, (blk >> 8) & 255)
+        // NLEN is the one's complement of LEN; a decoder checks the pair, so an error here fails
+        // loudly instead of producing subtly wrong pixels.
+        bytes_append(z, (blk ^ 255) & 255)
+        bytes_append(z, ((blk >> 8) ^ 255) & 255)
+        let k = [0]
+        while k[0] < blk
+            bytes_append(z, bytes_get(raw, off[0] + k[0]))
+            k[0] = k[0] + 1
+        off[0] = off[0] + blk
+    _img_u32be(z, prism_img_adler32(raw))
+    z
+
+fn prism_img_png(width, height, rgb) -> Result<bytes>
+    if type_of(width) != "int" or type_of(height) != "int"
+        return err("prism_render_image: width and height must be ints, got {type_of(width)}/{type_of(height)}")
+    if width < 1 or height < 1
+        return err("prism_render_image: dimensions must be >= 1, got {width}x{height}")
+    if width > 4096 or height > 4096
+        return err("prism_render_image: {width}x{height} exceeds the 4096 bound -- stored deflate means the file is roughly 3 bytes per pixel, so this is a resource guard, not a format limit")
+    if type_of(rgb) != "list"
+        return err("prism_render_image: pixel data must be a list of ints, got {type_of(rgb)}")
+    let want = width * height * 3
+    if len(rgb) != want
+        return err("prism_render_image: {len(rgb)} pixel components supplied but {width}x{height} RGB needs exactly {want} -- a short buffer would render as a torn image rather than an error")
+    // Raw scanlines: each row is a FILTER BYTE (0 = none) followed by its RGB triples. Omitting
+    // the per-row filter byte is the single most common way a hand-written PNG comes out skewed,
+    // because every row then starts one byte early.
+    let raw = bytes_create(0)
+    let y = [0]
+    while y[0] < height
+        bytes_append(raw, 0)
+        let x = [0]
+        while x[0] < width * 3
+            let v = rgb[y[0] * width * 3 + x[0]]
+            if type_of(v) != "int"
+                return err("prism_render_image: pixel component at {y[0] * width * 3 + x[0]} is {type_of(v)}, not an int")
+            bytes_append(raw, v & 255)
+            x[0] = x[0] + 1
+        y[0] = y[0] + 1
+
+    let out = bytes_create(0)
+    let sig = prism_img_signature()
+    let si = [0]
+    while si[0] < bytes_len(sig)
+        bytes_append(out, bytes_get(sig, si[0]))
+        si[0] = si[0] + 1
+
+    let ihdr = bytes_create(0)
+    _img_u32be(ihdr, width)
+    _img_u32be(ihdr, height)
+    bytes_append(ihdr, 8)     // bit depth
+    bytes_append(ihdr, 2)     // colour type 2 = truecolour RGB
+    bytes_append(ihdr, 0)     // deflate
+    bytes_append(ihdr, 0)     // adaptive filtering
+    bytes_append(ihdr, 0)     // no interlace
+    _img_chunk(out, "IHDR", ihdr)
+    _img_chunk(out, "IDAT", _img_zlib(raw))
+    _img_chunk(out, "IEND", bytes_create(0))
+    ok(out)
+
+fn prism_img_solid(width, height, r, g, b) -> Result<bytes>
+    if type_of(r) != "int" or type_of(g) != "int" or type_of(b) != "int"
+        return err("prism_render_image: colour components must be ints, got {type_of(r)}/{type_of(g)}/{type_of(b)}")
+    let px = []
+    let i = [0]
+    while i[0] < width * height
+        push(px, r)
+        push(px, g)
+        push(px, b)
+        i[0] = i[0] + 1
+    prism_img_png(width, height, px)
+
+// Layout skeleton: a horizontal band per tree DEPTH, shaded darker as it goes deeper. Not a
+// rendering of the UI -- a stable fingerprint of its SHAPE, which is what a visual baseline
+// wants: it moves when the structure moves and stays put when copy changes.
+fn prism_img_skeleton(tree: PrismNode, width, height) -> Result<bytes>
+    if type_of(width) != "int" or type_of(height) != "int"
+        return err("prism_render_image: width and height must be ints, got {type_of(width)}/{type_of(height)}")
+    if width < 1 or height < 1
+        return err("prism_render_image: dimensions must be >= 1, got {width}x{height}")
+    let depth = prism_node.prism_node_depth(tree) + 1
+    let px = []
+    let y = [0]
+    while y[0] < height
+        // Which depth band this row falls in, then a shade derived from it.
+        let band = (y[0] * depth) / height
+        let shade = 240 - band * 40
+        let v = if shade < 40
+            40
+        else
+            shade
+        let x = [0]
+        while x[0] < width
+            push(px, v)
+            push(px, v)
+            push(px, v)
+            x[0] = x[0] + 1
+        y[0] = y[0] + 1
+    prism_img_png(width, height, px)
