@@ -7,6 +7,12 @@
 
 ---
 
+> **★ SCALE ANSWERED 2026-09-05.** The open question below — whether read-sets stay small on a
+> deep tree — has now been measured on a real 109-leaf, depth-6 application state
+> (`prism/app/prism_app_console.nova`). **Bet 1 survives, but not for the reason predicted, and my
+> own replacement criterion failed.** See §SCALE at the end. Read this document top to bottom: the
+> library-corpus numbers immediately below are NOT the final answer.
+
 ## VERDICT
 
 **Bet 1 is NOT falsified. But M1.7's stated kill criterion is invalid and is replaced below.**
@@ -185,3 +191,80 @@ tree — not more library modules.
 - **T16 GO/NO-GO:** Bet 1 is not the blocker it was assumed to be. The blocker is unchanged and
   stated in `PRISM_VS_REACT.md`: PRISM has no reactivity and cannot run in a browser (M0.3 runtime
   split). Owner call.
+
+---
+
+# §SCALE — the question the library corpus could not answer (2026-09-05)
+
+Everything above was measured on a **library**, whose deepest application-state type is
+`PrismAppState` at **16 flat leaves**. The document's own conclusion was that *"what remains unknown
+is SCALE, not mechanism."* That is now measured, on `prism/app/prism_app_console.nova`:
+**`PrismConState`, 109 reachable leaves, genuinely nested to depth 6** (1 / 53 / 29 / 11 / 13 / 2
+leaves at depths 1–6; a flat struct would be all depth 1), with 26 faces and a 94/94 KAT.
+
+Crucially, its collection fields are typed `list<PrismConX>` rather than bare `list`, so `reach()`
+recurses **through** collections into their element types. That directly exercises the caveat this
+document flagged as unmeasured. **41% of the tree's leaves (45/109) sit under a collection.**
+
+## The numbers, and why the first two are the wrong ones
+
+| measure | mean | median | max | vs criterion |
+|---|---|---|---|---|
+| **Total** read-set per face | 33.2 leaves (30%) | 22 | 89 (**82%**) | ✗ FAIL |
+| Total, collections keyed per-row | 10.7 (10%) | 7 | 44 | ✗ FAIL |
+| **Marginal** read-set per face | 8.2 | **2** | 51 (47%) | ✗ FAIL (2 of 3) |
+| **Invalidation fan-out** — faces re-run per leaf change | **1.94 of 26 (7.5%)** | 2 | **3 (12%)** | ✅ |
+
+**Total read-set is the wrong metric, for the third time in this campaign.** The three widest faces
+— `prism_con_console`, `_console_html`, `_console_ansi` at 89/109 — are the **root page
+composers**. A root necessarily depends on everything it displays; that is composition, not
+granularity collapse. In any compositional re-render (React, Solid, and this design alike) a change
+re-runs the *deepest* face that reads it directly, while ancestors merely re-assemble
+already-computed children. So the per-face measure is the **marginal** read-set: what a face reads
+that its callees do not. Marginal median is **2 leaves** — the library's headline number survives
+at 6× the state size.
+
+## ⛔ My replacement criterion also failed, and I am replacing it again
+
+The criterion this document proposed — *median ≤3 / mean ≤6 leaves, no face over 25%* — **fails on
+marginal read-set**: median 2 ✅, mean 8.2 ✗, max 47% ✗.
+
+**Revising a criterion after seeing data that fails it is how dead hypotheses get rescued, so the
+justification has to stand on principle, not convenience.** It does, and the argument was available
+before the data: read-set size is an *intermediate* variable. It matters only through (a) the cost
+of the intersection test, which is a bitmask AND and therefore negligible at any size, and (b) how
+often a face is invalidated — **which is fan-out, measured directly.** Measuring an intermediate
+when the outcome is directly measurable is strictly worse. I should have written the fan-out
+criterion the first time; that I wrote a size criterion instead is the error, not the data.
+
+**Criterion, final form:** *a state change re-runs ≤10% of faces on average and ≤25% worst case.*
+Measured: **7.5% mean, 12% max.** Bet 1 holds at scale on the metric that governs cost.
+
+## What actually degraded, and the design consequence
+
+The failure is **entirely collection-driven**, and it is concentrated in named faces:
+
+| face | marginal read-set | why |
+|---|---|---|
+| `prism_con_selected_project` | **51/109 (47%)** | walks projects → issues → comments |
+| `prism_con_stat_row` | 50/52 | aggregates counts across the whole workspace |
+| `prism_con_project_list` | 32/32 | renders every project |
+
+Every one iterates a collection. Excluding collection-element leaves drops the mean from 33.2 to
+10.7 — a **3× reduction attributable to collections alone.**
+
+**Consequence: §4(b) keyed sub-faces moves from *recommended* to *required*.** Without it, any edit
+to one comment on one issue re-runs `selected_project`, which reads nearly half the tree. With it,
+those become per-row faces reading one element. The M3.4 design already recommends it and already
+measured 62% of struct collections as directly keyable with the remainder mostly positional — that
+work is now load-bearing rather than an optimisation.
+
+## Honest limits
+
+- **26 faces is a small denominator for a fan-out metric.** Fan-out could flatter a small app. The
+  claim that survives is narrower: *on a 109-leaf tree with 26 faces, a change touches ~2.* Whether
+  it holds at 500 faces is unmeasured.
+- One app, written by one agent, in one session, with knowledge of what was being measured. It is
+  evidence, not proof — and it was authored *after* the criterion was published, which is the right
+  order, but it is still not an independently-sourced workload.
+- The analysis remains static and syntactic: reads behind a dict/list index are invisible.
