@@ -1,7 +1,7 @@
 # M1.7 — THE BET-1 FALSIFIER: RESULT
 
 **Date:** 2026-09-04
-**Reproduce:** `python NOVA_DESIGN/tools/m17_readset.py`
+**Reproduce:** `python NOVA_DESIGN/tools/m17_readset.py` then `python NOVA_DESIGN/tools/m17_slicing.py`
 **Corpus:** all 130 `prism/**/*.nova` modules — 113 state types, 55k lines
 **Gates:** M3.4 (reactivity) was gated on this. T16 (GO/NO-GO) consumes it.
 
@@ -81,7 +81,7 @@ can fix this by being cleverer — the dependency is real. M3.4 must therefore e
 Option (a) is strictly better and is the recommendation: it makes the framework robust to a design
 mistake the developer will inevitably make, rather than relying on them not making it.
 
-### 2. Delegation inherits whole read-sets — this is the genuine technical risk
+### 2. Delegation inherits whole read-sets — MEASURED, AND RECOVERABLE
 
 `prism_ss_is_usable(PrismSession)` reads **11/11 with direct = 0**. It touches no field itself; it
 calls a helper and inherits that helper's entire read-set. Same for
@@ -89,14 +89,38 @@ calls a helper and inherits that helper's entire read-set. Same for
 
 This is **not a measurement artifact.** The fixed point unions a callee's whole read-set for the
 matching parameter because it cannot slice by which part of the callee's result the caller actually
-observes — and **an implementable inference pass without value-level slicing has exactly the same
-imprecision.** So this over-approximation is representative of what M3.4 would really compute.
+observes — and an implementable inference pass without value-level slicing has exactly the same
+imprecision. So the over-approximation is representative of what M3.4 would really compute.
 
-**Consequence for M3.4:** inference precision is governed by *slicing through callees*, not by
-field-read tracking. Field tracking is the easy half and it is already known to work. The open
-question is whether a helper that builds a wide intermediate value, from which the caller reads one
-field, can be sliced back down. If it cannot, real read-sets inflate toward the reducer numbers
-(80%+) and Bet 1 does die — just not for the reason M1.7 anticipated.
+**This was originally recorded as M3.4's open risk. It has now been measured, and the answer is
+that the cheapest available slicing technique recovers it** (`tools/m17_slicing.py`).
+
+The helpers causing the inflation are **field-wise reconstructors** — `f(p: T, ...) -> T` whose body
+is `T(p.f0, p.f1, …, expr, …)`, i.e. a functional "with"-style update. `_ss_advance` passes **10 of
+11 fields through unchanged** and rewrites one. That is not a hard dataflow problem: result field
+*i* flows from whatever arg *i* mentions — a direct field-to-field map. Across the corpus there are
+**90 such reconstructors, with a mean 49% of fields passing through identically** (median 50%).
+
+| | unsliced | sliced |
+|---|---|---|
+| `prism_ss_is_usable` | 11/11 | **4/11** |
+| `prism_sy_flush_ready` | 9/9 | **2/9** |
+| `prism_app_dashboard` | 16/16 | **9/16** |
+| scaling slope | 0.255 (r²=0.11) | **0.146 (r²=0.07)** |
+
+**Validation:** the slicer independently returns exactly the four fields derivable by hand from
+`prism_ss_is_usable`'s source — `ss_access_sec`, `ss_status`, `ss_seen_ms`, `ss_expires_at`.
+
+The aggregate mean barely moves (1.77 → 1.58 leaves) because most faces were already narrow —
+**the tail is what matters.** A face reading 100% of state re-runs on every change, which is exactly
+what destroys reactivity; those are the cases that collapse to 18–36%. And the scaling slope halves,
+flattening further: slicing removes most of what little size-correlation remained.
+
+**Consequence for M3.4:** the two required techniques are now both known-tractable — leaf-granular
+tracking, and field-to-field flow through a reconstructor. Neither is research. The slicer here is
+deliberately the simplest possible version (one level, syntactic, matching only
+`let v = recon(p, …)`), so its numbers are an **upper bound** on the read-set: a real pass iterating
+to a fixed point can only do better.
 
 ---
 
@@ -140,10 +164,11 @@ tree — not more library modules.
 
 ## STATUS
 
-- **T15 / M1.7:** evidence delivered, criterion revised, M3.4 unblocked with two named constraints.
-  Not closed as "compiler pass built" — see above.
-- **M3.4:** may proceed on the design constraints above (leaf-granular tracking; slicing through
-  callees is the risk to prove out first, not field tracking).
+- **T15 / M1.7:** evidence delivered, criterion revised, M3.4 unblocked with two named constraints —
+  **both now measured as tractable.** Not closed as "compiler pass built" — see above.
+- **M3.4:** may proceed. Required techniques: leaf-granular tracking + field-to-field flow through
+  reconstructors. Both measured on the real corpus; neither is research. The remaining unknown is
+  scale (>100-leaf state tree), not mechanism.
 - **T16 GO/NO-GO:** Bet 1 is not the blocker it was assumed to be. The blocker is unchanged and
   stated in `PRISM_VS_REACT.md`: PRISM has no reactivity and cannot run in a browser (M0.3 runtime
   split). Owner call.
