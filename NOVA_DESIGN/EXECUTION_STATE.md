@@ -1224,21 +1224,49 @@ job that could not resolve its imports, and GNU `timeout` — which does not exi
 faking results twice). Every diagnostic now carries a NEGATIVE CONTROL, and an empty result is
 annotated as instrument failure rather than read as clean.
 
-### Track 2 — Prism Phase C: the SUPPORTING layers (`ui/` was never the gap)
+### Track 2 — Prism: the LIBRARY IS COMPLETE, and the M1.7 gate is CLEARED
 
-`ui/` is over-delivered (67 components vs ~50 planned) while the layers beneath it were near-empty.
-**`core/` 7/7 ✅** (node, event, face, secret, caps, key, journal) and **`text/` 4/4 ✅**
-(text, textmodel, select, find) are now COMPLETE; `obs/` 3/4, `dev/` 2/8, `intl/` 1/4, `render/` 1/4.
+**130 modules · 127 KATs · 55.1k lines.** Every library layer matches its README **by name**
+(`core/ text/ obs/ dev/ intl/ render/ style/ widget/ layout/ a11y/ ui/ backend/ embed/`) and
+`app/` (Tier 2) is 10/10: route, form, wire, guard, session, sync, wizard, shortcut, clipboard,
+download. Three residual README entries are documented naming discrepancies
+(`prism_tokens_dev` — lib-flattening collision; `prism_interact`; `prism_node` lives in `core/`),
+not gaps. ⛔ **Audit by NAME, never by count** — a count matched while `text/` was 3/4 by content.
 
-★ The finding that reordered the work: **`core/prism_event.nova` did not exist, so 67 UI
+★ The finding that reordered the earlier work: **`core/prism_event.nova` did not exist, so 67 UI
 components existed and NOT ONE could respond to anything.** Prism rendered; it was not
-interactive. Two defects were found by the KATs themselves: a **protocol-relative open redirect**
-(`//evil.example` satisfies "starts with /" and navigates off-site), and `prism_key` emitting a
-name (`"ShiftTab"`) it could not parse back — which would have lost Shift+Tab across any
+interactive. The KATs themselves found a **protocol-relative open redirect**
+(`//evil.example` satisfies "starts with /" and navigates off-site) and `prism_key` emitting a name
+(`"ShiftTab"`) it could not parse back — which would have lost Shift+Tab across any
 serialise/restore boundary. Both fixed.
 
-**Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — the gate
-for everything browser-side. Phase C needs no compiler work and proceeds without it.
+**✅ M1.7 — THE BET-1 FALSIFIER RAN (2026-09-04). Bet 1 is NOT dead; M3.4 is unblocked.**
+Canonical: [`M1_7_FALSIFIER_RESULT.md`](M1_7_FALSIFIER_RESULT.md); reproduce with
+`tools/m17_readset.py` then `tools/m17_slicing.py`. Two results that changed the plan:
+
+* ⛔ **The milestone's OWN kill criterion was invalid.** It tested a *ratio* against 20–30%, but
+  PRISM's state types average 5 reachable leaves — so a face reading **ONE field scores 20%** and
+  trips the line. It measured type size, not inference quality. Building the pass first (the
+  budgeted 3–4 weeks) would have reported 35.9%, compared it to 30%, and **killed Bet 1 on a
+  denominator artifact.** Absolutely: median read-set **1 leaf**, mean **1.87**, slope flat
+  (r²=0.15). Replacement criterion: median ≤3 / mean ≤6 leaves on a >100-leaf tree, no face >25%.
+* **The one genuine risk was measured and RECOVERED.** A face inheriting a helper's whole read-set
+  (`prism_ss_is_usable` = 11/11 leaves with direct=0 — it touches no field itself) is undone by
+  constructor slicing: **11/11 → 4/11**, matching the answer derivable by hand. The inflating
+  helpers are field-wise reconstructors (90 of them, 49% of fields identical pass-through), so the
+  map is a direct field-to-field flow, not hard dataflow. M3.4's two techniques — leaf-granular
+  tracking + reconstructor flow — are both tractable; neither is research.
+
+Also caught: 4 corrections each of which flipped the answer, incl. **renderer plumbing is not app
+state** (`PrismCanvasCtx` alone drove the slope 0.13→0.46, enough to fake a "Bet 1 dead" verdict).
+
+**What remains open is SCALE, not mechanism.** The corpus is a library; its deepest app-state type
+is `PrismAppState` at **16 FLAT leaves**, which structurally cannot answer the question. A real app
+with a NESTED tree (>100 reachable leaves) is in progress as `prism/app/prism_app_console.nova`.
+
+**Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
+SINGLE blocker on the browser path, M1.7 having cleared. See
+[`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
 
 ## Current focus — UPDATED 2026-08-20 (WEAPON PARITY Phase 1: cross-module soundness)
 
