@@ -103,6 +103,38 @@ collections.
 explicitly rejected** — a hybrid means two dependency systems, two failure modes, and two mental
 models, which violates "one obvious way" and is how frameworks become C++.
 
+### §4b measured against the corpus (2026-09-04)
+
+Before designing key inference, I measured whether the pattern it depends on actually occurs.
+
+**Getting the population right mattered, exactly as it did in M1.7.** A first pass found 132
+"per-element faces" of which only **8%** read a key-ish field — apparently fatal. But that
+population included `for sep in ["/", "\\"]` and loops over characters, where a key is meaningless.
+Restricted to loops whose element is a **struct** (the body reads a declared field of it), the real
+population is **43 faces**, and:
+
+| | count | |
+|---|---|---|
+| element type resolvable from the read-set alone | **42/43** | key inference has something to work with |
+| ...whose type carries an identity field (`id`/`key`/`name`/`slug`/`code`/`label`/`title`) | **26** | **62% directly keyable** |
+| ...lacking any identity field | 16 | falls back to §4(a) |
+
+**The 38% without an identity field are mostly POSITIONAL collections, where the index genuinely
+*is* the identity** — `rt_seg_*` (route segments: segment 0, 1, 2 — the order *is* the meaning),
+`a11y_*` findings, `gd_issue_*` audit issues. React's index-key trap is specifically about
+**reordering and insertion**; a positional list that is rebuilt wholesale from a parse is not
+subject to it, so index-keying those is correct rather than a compromise.
+
+So key inference has three tiers, and only the third is a real loss:
+1. **natural key present** — 62% of struct collections;
+2. **positional, rebuilt wholesale** — index-keyed soundly, covering most of the remainder;
+3. **genuinely unkeyable and reorderable** — falls back to §4(a) whole-collection invalidation,
+   and must emit a diagnostic naming the collection, because this is the case where PRISM would
+   silently re-render a large table.
+
+**This does not settle §4** — it shows the pattern is present and mostly keyable in a *library*.
+The load-bearing test is still a real table over a large collection, which is step 3 of §8.
+
 ## 5. Failure hunt — where this breaks
 
 | Case | Static read-set | Consequence | Verdict |
