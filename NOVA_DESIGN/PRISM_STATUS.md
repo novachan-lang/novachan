@@ -451,6 +451,7 @@ criterion passes. Never "done" without the measurement. Killed items stay, with 
 | T13 | M0.5 — dead-code elimination | ⬜ TODO | — | — | 2-3wk YELLOW. Target: hello-world 459KB → <50KB raw |
 | T14 | **P1 — vertical slice (DOM backend)** | ⬜ TODO | — | — | 6 sub-milestones M1.1-M1.6 → **a NOVA counter drawing through the DOM backend, clickable, 60fps** |
 | T15 | **M1.7 — THE BET-1 FALSIFIER** | ✅ EVIDENCE DELIVERED | 2026-09-04 | `NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md` | **Bet 1 NOT falsified. M1.7's own >20-30% ratio criterion was INVALID** (on 5-leaf types a face reading ONE field scores 20%). Real measure: **median read-set = 1 leaf, mean 1.87**, slope flat (r²=0.15). Two failure modes located, **both measured tractable**: god-object state (100%) and delegation inheriting whole read-sets — the latter RECOVERED by constructor slicing (`prism_ss_is_usable` 11/11→**4/11**, slope 0.255→0.146), validated against a hand-derived answer. M3.4 needs leaf-granular tracking + field-to-field reconstructor flow; neither is research. Remaining unknown is SCALE (>100-leaf tree), not mechanism. Proxy analyser, NOT the compiler pass |
+| T15b | **M3.4 reactivity — DESIGN + face-purity gate** | ✅ DESIGN DONE | 2026-09-04 | `NOVA_DESIGN/PRISM_M3_4_REACTIVITY_DESIGN.md` | Static read-sets are possible for PRISM and not for React/Solid/Svelte/Vue **because of the host language**, not because they missed it (dynamic property access, mutable closure scope, `eval`, `any`). Payoff: **zero runtime tracking cost** where Solid pays a getter per read. ⛔ **§4 collections are where this earns or loses** — a `list` is one leaf to the analysis but N rows at runtime; recommends **inferred keyed sub-faces**, rejects a static/runtime hybrid (two dependency systems = two failure modes). Failure hunt: 5 cases cost perf, **1 costs correctness silently** (a face reading module-level state) ⇒ must be a compile-time REJECTION. ✅ Detection half BUILT + gated (`tools/m34_face_purity.py`): **0 mutating / 0 computed initialisers across all 130 modules**, so the library is already compatible and enforcement needs no violation backlog cleared. Enforcement + the pass need GO |
 | T16 | ★ **GO/NO-GO decision point** | ⬜ TODO | — | — | After T14+T15. ~6-7 months in. Owner call |
 
 **Owner decision currently pending:** go-ahead on T10 (half a week, protects existing capability) and
@@ -783,9 +784,21 @@ drove Svelte's retreat (predictability) than any missed update. Required: `nova 
 measurement demands it — a `fine`/`coarse` **granularity hint that cannot change semantics**, so a
 wrong one can never cause stale UI (strictly safer than `@Stable`, which can).
 
-**7. NEW MILESTONE M1.7 — THE FALSIFIER.** Build *only* the dependency-inference pass and measure the
-average inferred read-set per face as a fraction of reachable program state. **>20-30% ⇒ granularity
-collapsed ⇒ zero-annotation reactivity is not survivable.** 3-4 weeks, and **M3.4 is now gated on it.**
+**7. MILESTONE M1.7 — THE FALSIFIER. ✅ RAN 2026-09-04. Bet 1 NOT falsified; M3.4 UNBLOCKED.**
+Canonical result: [`M1_7_FALSIFIER_RESULT.md`](M1_7_FALSIFIER_RESULT.md).
+
+⛔ **The criterion recorded here was INVALID and must NOT be re-adopted.** It read: *"measure the
+average inferred read-set per face as a fraction of reachable program state; >20-30% ⇒ granularity
+collapsed."* That is a **RATIO**, and PRISM's state types average **5 reachable leaves** — so a face
+reading **ONE SINGLE FIELD scores 20%** and trips the line. It measures type size, not inference
+quality. Building the pass first (the budgeted 3-4 weeks) would have reported **35.9%**, compared it
+to the 30% threshold, and killed Bet 1 on a denominator artifact.
+
+Measured in units that generalise: **median read-set = 1 leaf, mean 1.87**, scaling slope flat
+(r²=0.15). Replacement criterion: **median ≤3 / mean ≤6 leaves on a >100-leaf state tree, no face
+over 25%** — absolute, not fractional. Remaining unknown is **SCALE, not mechanism**; and note that
+a collection counts as ONE leaf (14% of leaves), so collection invalidation is **not** measured by
+this experiment — see [`PRISM_M3_4_REACTIVITY_DESIGN.md`](PRISM_M3_4_REACTIVITY_DESIGN.md) §4.
 | Q2 | Does `fillText`→atlas reach native text quality? Metric fidelity limits? | M2.3 | Prototype in Phase 1 |
 | Q3 | Is compiler-decided client/server placement achievable, or must it be annotated? | M4.3 | Design spike; annotated form is the accepted fallback |
 | Q4 | Closure-across-WASM lifetime under FULLRC — does function-table + RC-root hold? | M0.4 | Phase 0, deliberately first |
