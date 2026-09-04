@@ -1,0 +1,1033 @@
+// prism_app_console (app/, Tier 2) -- milestone M1.7's next evidence step: a REALISTIC operations
+// console with a DEEPLY NESTED state tree, built to answer the open measurement question left by
+// NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md -- "does a face's inferred dependency read-set stay small
+// when application state is a deep TREE rather than a flat struct?" `prism_app_dashboard.nova`'s
+// `PrismAppState` has 16 FLAT leaves (all scalars/lists, no nesting) and cannot answer that; this
+// file's `PrismConState` reaches >100 leaves through GENUINE nesting: a workspace containing
+// projects, a project containing issues, an issue containing comments AND an activity-event log,
+// a workspace roster and audit log, a multi-part viewer slice (pane/selection/sort/filter/page),
+// and six REUSED app/-tier state machines wired in as real sub-state (not reimplemented).
+//
+// ── ⛔ WHY THIS ANSWERS THE QUESTION THE MEASUREMENT TOOL COULD NOT ─────────────────────────
+// `NOVA_DESIGN/tools/m17_readset.py`'s `reach()` walks a field's TYPE annotation to decide whether
+// to recurse: `Result<PrismX>` / `list<PrismX>` strip to `PrismX` and recurse if `PrismX` is a
+// known struct type; a BARE `list`/`dict` field has no element type to recurse into and counts as
+// ONE leaf regardless of what is inside it (see M1_7_FALSIFIER_RESULT.md's "the one caveat that
+// bounds this verdict"). Every collection field below whose elements are one of THIS file's own
+// struct types is therefore typed `list<PrismConX>`, not bare `list` -- e.g.
+// `conws_projects: list<PrismConProject>`, `conprj_issues: list<PrismConIssue>`,
+// `coniss_comments: list<PrismConComment>`. This is not decoration: it is what lets the existing
+// static analyser recurse THROUGH a collection into its element type for the first time in the
+// corpus, directly testing the "collections are exactly what a UI renders most expensively" risk
+// the falsifier result flagged as unmeasured. Fields whose elements are plain strings
+// (`convw_expanded_project_ids`, `convw_expanded_issue_ids`) stay bare `list` -- there is no struct
+// type to recurse into and typing them `list<string>` would not change `reach()`'s behaviour.
+// Measured against `NOVA_DESIGN/tools/m17_readset.py` itself: `PrismConState` reaches **109
+// leaves** (verified by running the tool, not hand-counted -- see the report for the one place a
+// hand count was wrong: a `PrismSecret<string>` field's generic strips to its type PARAMETER
+// ("string"), not the wrapper, so it does NOT recurse and counts as one leaf, not two).
+//
+// ── FIELD PREFIX: EVERY NEW TYPE GETS ITS OWN TAG, GREPPED PROJECT-WIDE FIRST ────────────────
+// `con_` (top state), `conws_`, `conprj_`, `coniss_`, `concmt_`, `conevt_`, `conmem_`, `conaud_`,
+// `convw_`, `consrt_`, `conflt_`, `conpg_`, `conpref_`, `coninv_` -- all checked against every
+// `^\s+TAG\w*\s*:` in prism/**/*.nova before use (NOVA's field->slot map is GLOBAL). All clear.
+// Reused external types (`PrismSession`, `RtRouter`, `RtMatch`, `PrismShortcuts`, `PrismSync`,
+// `PrismWizard`, `PrismFmState`, `PrismNoticeQueue`) keep THEIR OWN modules' prefixes untouched.
+//
+// ── THE STATE TREE IS A GENUINE DECOMPOSITION, NOT A LEAF-COUNT PADDING EXERCISE ─────────────
+// Every type here is one a real admin/ops console has: a workspace with a member roster, a plan
+// and seat count, and an audit log (Linear/GitHub-org/Vercel-team-settings-shaped); projects that
+// own issues; issues that own a comment thread AND a separate activity-event timeline (GitHub
+// Issues' own two-stream shape); a viewer slice with the pane, selection, sort, filter and
+// pagination a real screen actually needs to render itself; and SIX reused app/-tier modules wired
+// in as real sub-state rather than re-derived: `prism_session` (auth), `prism_route` (routing +
+// derived breadcrumbs), `prism_form` (a reflection-derived "invite teammate" form), `prism_sync`
+// (cross-tab presence -- "who else is viewing this"), `prism_shortcut` (the command palette's
+// bindings) and `prism_wizard` (a "new project" setup flow, whose four generic steps -- account,
+// profile, payment, review -- map onto a real paid-plan project-creation flow).
+//
+// ── FACES vs REDUCERS (M1.7's correction #1: conflating the two is a category error) ─────────
+// Every `prism_con_*_view`/`prism_con_header`/`prism_con_console`/etc. function below is a FACE:
+// state in, a view out (`PrismNode`, a string, or a `PrismTable`/list), NEVER the state type
+// itself. A small, clearly-separated REDUCERS section (`prism_con_select_project`,
+// `prism_con_set_filter`, ...) returns `PrismConState` because that is what a state transition
+// legitimately does -- these are not faces and are not what this milestone measures.
+//
+// PUBLIC API (grouped; see body for the rest -- constructors for every leaf type, `_all()`/`_name()`
+// exhaustiveness helpers per enum, and per-variant constructors mirroring prism_wizard's own
+// `prism_wz_step_account()`-style pattern)
+//   Construction: prism_con_comment/_reaction/_label/_issue_event/_member/_audit_entry/_milestone/
+//     _integration/_issue/_project/_workspace/_sort/_filter/_pagination/_viewer/_prefs/_invite/
+//     _state(...)
+//   Pure derivation: prism_con_find_project/_find_issue/_selected_project/_selected_issue(state)
+//     prism_con_all_issues/_open_issue_count/_urgent_issue_count(ws)
+//     prism_con_filtered_issues(issues, flt) -> Result<list>   prism_con_paginate(rows, page) -> list
+//     prism_con_issue_table_data(state) -> Result<PrismTable>  (filtered + sorted, unrendered)
+//     prism_con_session_active(state) -> bool   prism_con_unread_notification_count(state) -> int
+//   Reducers (state -> state): prism_con_select_project/_select_issue/_select_comment/_set_sort/
+//     _set_filter/_set_page/_set_pane/_set_palette_query/_tick(state, ...) -> Result<PrismConState>
+//   Faces (state -> view): prism_con_header/_breadcrumb/_notification_badge/_stat_row/
+//     _project_list/_issue_table/_issue_detail/_comment_thread/_members_view/_audit_log_view/
+//     _project_milestones_view/_integrations_view/_command_palette/_preferences_pane/
+//     _invite_form_view/_new_project_wizard_view/_presence_view/_pane/_console(state) -> Result<PrismNode>
+//     prism_con_console_html(state) -> Result<string>   prism_con_console_ansi(state) -> Result<string>
+//   Demo: prism_con_demo_state() -> Result<PrismConState>   prism_con_console_route()
+
+import prism_node
+import prism_arrange
+import prism_content
+import prism_interact
+import prism_ui_kit
+import prism_ui_layout
+import prism_ui_nav
+import prism_ui_data
+import prism_ui_table
+import prism_ui_form
+import prism_ui_overlay
+import prism_render_html
+import prism_render_ansi
+import forge
+import prism_forge as pf
+import prism_session
+import prism_route
+import prism_form
+import prism_sync
+import prism_shortcut
+import prism_wizard
+import prism_notice
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Enums (closed, `Con`-prefixed variants -- enum constructors resolve in NOVA's flat
+// cross-module symbol space, so a bare `Active()`/`Open()` would be a landmine for any other
+// module) -- each gets an exhaustiveness pair (`_all()`/`_name()`) and per-variant constructors,
+// mirroring prism_wizard.nova's `prism_wz_step_account()` pattern so an external caller (the KAT)
+// never has to name a bare enum constructor directly.
+
+enum PrismConProjectStatus
+    ConPrjActive()
+    ConPrjPaused()
+    ConPrjArchived()
+
+fn prism_con_project_status_active() -> PrismConProjectStatus
+    ConPrjActive()
+fn prism_con_project_status_paused() -> PrismConProjectStatus
+    ConPrjPaused()
+fn prism_con_project_status_archived() -> PrismConProjectStatus
+    ConPrjArchived()
+
+fn prism_con_project_status_all() -> list
+    [ConPrjActive(), ConPrjPaused(), ConPrjArchived()]
+
+fn prism_con_project_status_name(s: PrismConProjectStatus) -> string
+    match s
+        ConPrjActive() => "active"
+        ConPrjPaused() => "paused"
+        ConPrjArchived() => "archived"
+
+enum PrismConIssueStatus
+    ConIssOpen()
+    ConIssInProgress()
+    ConIssBlocked()
+    ConIssDone()
+
+fn prism_con_issue_status_open() -> PrismConIssueStatus
+    ConIssOpen()
+fn prism_con_issue_status_in_progress() -> PrismConIssueStatus
+    ConIssInProgress()
+fn prism_con_issue_status_blocked() -> PrismConIssueStatus
+    ConIssBlocked()
+fn prism_con_issue_status_done() -> PrismConIssueStatus
+    ConIssDone()
+
+fn prism_con_issue_status_all() -> list
+    [ConIssOpen(), ConIssInProgress(), ConIssBlocked(), ConIssDone()]
+
+fn prism_con_issue_status_name(s: PrismConIssueStatus) -> string
+    match s
+        ConIssOpen() => "open"
+        ConIssInProgress() => "in_progress"
+        ConIssBlocked() => "blocked"
+        ConIssDone() => "done"
+
+enum PrismConPriority
+    ConPrioLow()
+    ConPrioMedium()
+    ConPrioHigh()
+    ConPrioUrgent()
+
+fn prism_con_priority_low() -> PrismConPriority
+    ConPrioLow()
+fn prism_con_priority_medium() -> PrismConPriority
+    ConPrioMedium()
+fn prism_con_priority_high() -> PrismConPriority
+    ConPrioHigh()
+fn prism_con_priority_urgent() -> PrismConPriority
+    ConPrioUrgent()
+
+fn prism_con_priority_all() -> list
+    [ConPrioLow(), ConPrioMedium(), ConPrioHigh(), ConPrioUrgent()]
+
+fn prism_con_priority_name(p: PrismConPriority) -> string
+    match p
+        ConPrioLow() => "low"
+        ConPrioMedium() => "medium"
+        ConPrioHigh() => "high"
+        ConPrioUrgent() => "urgent"
+
+enum PrismConPane
+    ConPaneOverview()
+    ConPaneProjects()
+    ConPaneProjectDetail()
+    ConPaneIssueDetail()
+    ConPaneNotifications()
+    ConPanePreferences()
+    ConPaneCommandPalette()
+
+fn prism_con_pane_overview() -> PrismConPane
+    ConPaneOverview()
+fn prism_con_pane_projects() -> PrismConPane
+    ConPaneProjects()
+fn prism_con_pane_project_detail() -> PrismConPane
+    ConPaneProjectDetail()
+fn prism_con_pane_issue_detail() -> PrismConPane
+    ConPaneIssueDetail()
+fn prism_con_pane_notifications() -> PrismConPane
+    ConPaneNotifications()
+fn prism_con_pane_preferences() -> PrismConPane
+    ConPanePreferences()
+fn prism_con_pane_command_palette() -> PrismConPane
+    ConPaneCommandPalette()
+
+fn prism_con_pane_all() -> list
+    [ConPaneOverview(), ConPaneProjects(), ConPaneProjectDetail(), ConPaneIssueDetail(), ConPaneNotifications(), ConPanePreferences(), ConPaneCommandPalette()]
+
+fn prism_con_pane_name(p: PrismConPane) -> string
+    match p
+        ConPaneOverview() => "overview"
+        ConPaneProjects() => "projects"
+        ConPaneProjectDetail() => "project_detail"
+        ConPaneIssueDetail() => "issue_detail"
+        ConPaneNotifications() => "notifications"
+        ConPanePreferences() => "preferences"
+        ConPaneCommandPalette() => "command_palette"
+
+enum PrismConTheme
+    ConThemeLight()
+    ConThemeDark()
+    ConThemeSystem()
+
+fn prism_con_theme_light() -> PrismConTheme
+    ConThemeLight()
+fn prism_con_theme_dark() -> PrismConTheme
+    ConThemeDark()
+fn prism_con_theme_system() -> PrismConTheme
+    ConThemeSystem()
+
+fn prism_con_theme_all() -> list
+    [ConThemeLight(), ConThemeDark(), ConThemeSystem()]
+
+fn prism_con_theme_name(t: PrismConTheme) -> string
+    match t
+        ConThemeLight() => "light"
+        ConThemeDark() => "dark"
+        ConThemeSystem() => "system"
+
+enum PrismConDensity
+    ConDensityComfortable()
+    ConDensityCompact()
+
+fn prism_con_density_comfortable() -> PrismConDensity
+    ConDensityComfortable()
+fn prism_con_density_compact() -> PrismConDensity
+    ConDensityCompact()
+
+fn prism_con_density_all() -> list
+    [ConDensityComfortable(), ConDensityCompact()]
+
+fn prism_con_density_name(d: PrismConDensity) -> string
+    match d
+        ConDensityComfortable() => "comfortable"
+        ConDensityCompact() => "compact"
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Leaf value types (workspace roster + audit log, issue comments + activity events). No
+// validation here -- these are plain value bags, matching prism_app_dashboard's own `PrismAppStat`
+// precedent (its one new type has a bare, unvalidated constructor).
+
+type PrismConReaction
+    conrxn_emoji: string
+    conrxn_by: string
+
+fn prism_con_reaction(emoji: string, by: string) -> PrismConReaction
+    PrismConReaction(emoji, by)
+
+type PrismConComment
+    concmt_id: string
+    concmt_issue_id: string
+    concmt_author: string
+    concmt_body: string
+    concmt_created_ms: int
+    concmt_edited: int          // 0/1, never a bool -- see CLAUDE.md
+    concmt_reactions: list<PrismConReaction>
+
+fn prism_con_comment(id: string, issue_id: string, author: string, body: string, created_ms: int, edited: int, reactions: list<PrismConReaction>) -> PrismConComment
+    PrismConComment(id, issue_id, author, body, created_ms, edited, reactions)
+
+type PrismConLabel
+    conlbl_name: string
+    conlbl_color: string
+
+fn prism_con_label(name: string, color: string) -> PrismConLabel
+    PrismConLabel(name, color)
+
+type PrismConMilestone
+    conmil_id: string
+    conmil_title: string
+    conmil_due_ms: int
+
+fn prism_con_milestone(id: string, title: string, due_ms: int) -> PrismConMilestone
+    PrismConMilestone(id, title, due_ms)
+
+type PrismConIntegration
+    conintg_id: string
+    conintg_kind: string
+    conintg_enabled: int         // 0/1
+
+fn prism_con_integration(id: string, kind: string, enabled: int) -> PrismConIntegration
+    PrismConIntegration(id, kind, enabled)
+
+type PrismConIssueEvent
+    conevt_id: string
+    conevt_kind: string
+    conevt_actor: string
+    conevt_at_ms: int
+    conevt_detail: string
+
+fn prism_con_issue_event(id: string, kind: string, actor: string, at_ms: int, detail: string) -> PrismConIssueEvent
+    PrismConIssueEvent(id, kind, actor, at_ms, detail)
+
+type PrismConMember
+    conmem_id: string
+    conmem_name: string
+    conmem_email: string
+    conmem_role: string
+    conmem_active: int           // 0/1
+
+fn prism_con_member(id: string, name: string, email: string, role: string, active: int) -> PrismConMember
+    PrismConMember(id, name, email, role, active)
+
+type PrismConAuditEntry
+    conaud_id: string
+    conaud_actor: string
+    conaud_action: string
+    conaud_target: string
+    conaud_at_ms: int
+
+fn prism_con_audit_entry(id: string, actor: string, action: string, target: string, at_ms: int) -> PrismConAuditEntry
+    PrismConAuditEntry(id, actor, action, target, at_ms)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Issue / Project / Workspace -- the workspace -> project -> issue -> {comment, event} spine.
+// `list<PrismConX>` typing throughout (not bare `list`) -- see the header note on why this matters
+// for the static read-set analyser.
+
+type PrismConIssue
+    coniss_id: string
+    coniss_project_id: string
+    coniss_title: string
+    coniss_status: PrismConIssueStatus
+    coniss_priority: PrismConPriority
+    coniss_assignee: string
+    coniss_labels: list<PrismConLabel>
+    coniss_created_ms: int
+    coniss_updated_ms: int
+    coniss_comments: list<PrismConComment>
+    coniss_events: list<PrismConIssueEvent>
+
+fn prism_con_issue(id: string, project_id: string, title: string, status: PrismConIssueStatus, priority: PrismConPriority, assignee: string, labels: list<PrismConLabel>, created_ms: int, updated_ms: int, comments: list<PrismConComment>, events: list<PrismConIssueEvent>) -> Result<PrismConIssue>
+    if len(id) == 0
+        return err("prism_app_console: issue id must not be empty")
+    if trim(title) == ""
+        return err("prism_app_console: issue title must not be empty (or all whitespace)")
+    ok(PrismConIssue(id, project_id, title, status, priority, assignee, labels, created_ms, updated_ms, comments, events))
+
+type PrismConProject
+    conprj_id: string
+    conprj_name: string
+    conprj_owner: string
+    conprj_status: PrismConProjectStatus
+    conprj_created_ms: int
+    conprj_archived: int            // 0/1
+    conprj_issues: list<PrismConIssue>
+    conprj_milestones: list<PrismConMilestone>
+
+fn prism_con_project(id: string, name: string, owner: string, status: PrismConProjectStatus, created_ms: int, archived: int, issues: list<PrismConIssue>, milestones: list<PrismConMilestone>) -> Result<PrismConProject>
+    if len(id) == 0
+        return err("prism_app_console: project id must not be empty")
+    if trim(name) == ""
+        return err("prism_app_console: project name must not be empty (or all whitespace)")
+    ok(PrismConProject(id, name, owner, status, created_ms, archived, issues, milestones))
+
+type PrismConWorkspace
+    conws_name: string
+    conws_slug: string
+    conws_plan: string
+    conws_seats_used: int
+    conws_seats_total: int
+    conws_projects: list<PrismConProject>
+    conws_members: list<PrismConMember>
+    conws_audit_log: list<PrismConAuditEntry>
+    conws_integrations: list<PrismConIntegration>
+
+fn prism_con_workspace(name: string, slug: string, plan: string, seats_used: int, seats_total: int, projects: list<PrismConProject>, members: list<PrismConMember>, audit_log: list<PrismConAuditEntry>, integrations: list<PrismConIntegration>) -> Result<PrismConWorkspace>
+    if trim(name) == ""
+        return err("prism_app_console: workspace name must not be empty (or all whitespace)")
+    if seats_used < 0 or seats_total < 0
+        return err("prism_app_console: seat counts must not be negative (got " + str(seats_used) + "/" + str(seats_total) + ")")
+    ok(PrismConWorkspace(name, slug, plan, seats_used, seats_total, projects, members, audit_log, integrations))
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Viewer slice: pane, selection, sort, filter, pagination -- exactly what a real screen needs
+// to render itself and nothing it does not. `consrt_dir`/`conflt_status`/`conflt_priority` are
+// plain strings (HTTP-boundary-shaped, mirroring prism_app_dashboard's own
+// `app_table_sort_dir` convention) validated where they are USED, not where they are stored.
+
+type PrismConSort
+    consrt_field: string
+    consrt_dir: string              // "ascending" | "descending" | "none"
+
+fn prism_con_sort(field: string, dir: string) -> PrismConSort
+    PrismConSort(field, dir)
+
+type PrismConFilter
+    conflt_status: string           // "" = all
+    conflt_priority: string
+    conflt_query: string
+    conflt_assignee: string
+
+fn prism_con_filter(status: string, priority: string, query: string, assignee: string) -> PrismConFilter
+    PrismConFilter(status, priority, query, assignee)
+
+type PrismConPagination
+    conpg_index: int                // 0-based
+    conpg_size: int
+
+fn prism_con_pagination(index: int, size: int) -> PrismConPagination
+    PrismConPagination(index, size)
+
+type PrismConViewer
+    convw_pane: PrismConPane
+    convw_selected_project_id: string    // "" = none
+    convw_selected_issue_id: string
+    convw_selected_comment_id: string
+    convw_expanded_project_ids: list
+    convw_expanded_issue_ids: list
+    convw_sort: PrismConSort
+    convw_filter: PrismConFilter
+    convw_page: PrismConPagination
+    convw_palette_query: string
+    convw_palette_open: int              // 0/1
+
+fn prism_con_viewer(pane: PrismConPane, selected_project_id: string, selected_issue_id: string, selected_comment_id: string, expanded_project_ids: list, expanded_issue_ids: list, sort: PrismConSort, flt: PrismConFilter, page: PrismConPagination, palette_query: string, palette_open: int) -> PrismConViewer
+    PrismConViewer(pane, selected_project_id, selected_issue_id, selected_comment_id, expanded_project_ids, expanded_issue_ids, sort, flt, page, palette_query, palette_open)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Preferences and the invite-form entity (the latter exists only to be reflected over by
+// `prism_form.prism_fm_form_of` -- it is never itself a stored field of `PrismConState`).
+
+type PrismConPrefs
+    conpref_theme: PrismConTheme
+    conpref_density: PrismConDensity
+    conpref_locale: string
+    conpref_reduce_motion: int      // 0/1
+    conpref_notif_sound: int        // 0/1
+
+fn prism_con_prefs(theme: PrismConTheme, density: PrismConDensity, locale: string, reduce_motion: int, notif_sound: int) -> PrismConPrefs
+    PrismConPrefs(theme, density, locale, reduce_motion, notif_sound)
+
+// int/string fields only (never bool -- see CLAUDE.md), so `prism_fm_form_of` derives text/email/
+// number fields for all four; no field name here has "email" as a substring except `coninv_email`
+// itself, which derives the "email" kind exactly as intended.
+type PrismConInvite
+    coninv_name: string
+    coninv_email: string
+    coninv_role: string
+    coninv_seats: int
+
+fn prism_con_invite(name: string, email: string, role: string, seats: int) -> PrismConInvite
+    PrismConInvite(name, email, role, seats)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Top-level state: the workspace tree, the viewer slice, and SIX reused app/-tier state
+// machines wired in as real sub-state. Bare constructor (no validation) -- deep validation already
+// happened in the sub-constructors above; `prism_con_console` validates render-time invariants
+// (non-empty workspace name), matching prism_app_dashboard's own validate-at-render-time split.
+
+type PrismConState
+    con_workspace: PrismConWorkspace
+    con_viewer: PrismConViewer
+    con_session: PrismSession
+    con_notify: PrismNoticeQueue
+    con_router: RtRouter
+    con_route_match: RtMatch
+    con_shortcuts: PrismShortcuts
+    con_sync: PrismSync
+    con_new_project_wizard: PrismWizard
+    con_invite_form: PrismFmState
+    con_prefs: PrismConPrefs
+    con_now_ms: int
+
+fn prism_con_state(workspace: PrismConWorkspace, viewer: PrismConViewer, session: PrismSession, notify: PrismNoticeQueue, router: RtRouter, route_match: RtMatch, shortcuts: PrismShortcuts, sync: PrismSync, new_project_wizard: PrismWizard, invite_form: PrismFmState, prefs: PrismConPrefs, now_ms: int) -> PrismConState
+    PrismConState(workspace, viewer, session, notify, router, route_match, shortcuts, sync, new_project_wizard, invite_form, prefs, now_ms)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Pure derivation (state -> data, never state -> state). These are FACES: a real screen or a
+// real reducer computes exactly these before doing anything else.
+
+fn prism_con_find_project(ws: PrismConWorkspace, id: string) -> Result<PrismConProject>
+    for p in ws.conws_projects
+        if p.conprj_id == id
+            return ok(p)
+    err("prism_app_console: no project with id '" + id + "'")
+
+fn prism_con_find_issue(project: PrismConProject, id: string) -> Result<PrismConIssue>
+    for i in project.conprj_issues
+        if i.coniss_id == id
+            return ok(i)
+    err("prism_app_console: no issue with id '" + id + "' in project '" + project.conprj_id + "'")
+
+fn prism_con_selected_project(state: PrismConState) -> Result<PrismConProject>
+    if state.con_viewer.convw_selected_project_id == ""
+        return err("prism_app_console: no project is selected")
+    prism_con_find_project(state.con_workspace, state.con_viewer.convw_selected_project_id)
+
+fn prism_con_selected_issue(state: PrismConState) -> Result<PrismConIssue>
+    let p = prism_con_selected_project(state)?
+    if state.con_viewer.convw_selected_issue_id == ""
+        return err("prism_app_console: no issue is selected")
+    prism_con_find_issue(p, state.con_viewer.convw_selected_issue_id)
+
+fn prism_con_all_issues(ws: PrismConWorkspace) -> list
+    let out = []
+    for p in ws.conws_projects
+        for i in p.conprj_issues
+            push(out, i)
+    out
+
+fn prism_con_open_issue_count(ws: PrismConWorkspace) -> int
+    len(prism_con_all_issues(ws).filter(fn(i) prism_con_issue_status_name(i.coniss_status) == "open"))
+
+fn prism_con_urgent_issue_count(ws: PrismConWorkspace) -> int
+    len(prism_con_all_issues(ws).filter(fn(i) prism_con_priority_name(i.coniss_priority) == "urgent"))
+
+fn _prism_con_valid_status_str(s: string) -> bool
+    if s == ""
+        return true
+    for v in prism_con_issue_status_all()
+        if prism_con_issue_status_name(v) == s
+            return true
+    false
+
+fn _prism_con_valid_priority_str(s: string) -> bool
+    if s == ""
+        return true
+    for v in prism_con_priority_all()
+        if prism_con_priority_name(v) == s
+            return true
+    false
+
+// An unrecognized status/priority is REJECTED, never silently treated as "no filter" -- mirrors
+// prism_app_dashboard's `_prism_app_sort_dir` discipline.
+fn _prism_con_validate_filter(flt: PrismConFilter) -> Result<int>
+    if not _prism_con_valid_status_str(flt.conflt_status)
+        return err("prism_app_console: filter status '" + flt.conflt_status + "' is not a recognized issue status")
+    if not _prism_con_valid_priority_str(flt.conflt_priority)
+        return err("prism_app_console: filter priority '" + flt.conflt_priority + "' is not a recognized priority")
+    ok(0)
+
+fn prism_con_filtered_issues(issues: list, flt: PrismConFilter) -> Result<list>
+    _prism_con_validate_filter(flt)?
+    let by_status = issues.filter(fn(i) flt.conflt_status == "" or prism_con_issue_status_name(i.coniss_status) == flt.conflt_status)
+    let by_priority = by_status.filter(fn(i) flt.conflt_priority == "" or prism_con_priority_name(i.coniss_priority) == flt.conflt_priority)
+    let by_assignee = by_priority.filter(fn(i) flt.conflt_assignee == "" or i.coniss_assignee == flt.conflt_assignee)
+    let q = lower(trim(flt.conflt_query))
+    if q == ""
+        return ok(by_assignee)
+    ok(by_assignee.filter(fn(i) contains(lower(i.coniss_title), q)))
+
+// Exact-boundary slicing: an out-of-range page (or a non-positive size) yields an EMPTY list, not
+// a crash and not an error -- the honest rendering of "nothing here", same ethos as
+// prism_download's -1-for-unknown-progress.
+//
+// ⛔ LIBRARY NAME COLLISION WORKED AROUND HERE: `forge.nova:4006-4007` declares its OWN 1-arity
+// `fn min(n: int)` / `fn max(n: int)` (validation-rule builders: `forge.min(13)` ->
+// `["min", "13", "too_small"]`). Those are bare, unqualified names, and NOVA's module namespace is
+// FLAT -- so in any program that imports `forge` (this file does, for `prism_con_console_route`)
+// they shadow the 2-arity arithmetic builtins `min(a, b)` / `max(a, b)`, which then cannot be
+// called at all.
+//
+// ★ THE FAILURE IS LOUD, NOT SILENT -- verified, because an earlier draft of this comment claimed
+// otherwise. `import forge` plus `fn pick(a, b) min(a, b)` yields a clean compile error:
+//     error[E1003]: function expects 1 arguments, but got 2:
+//                   expected (int) -> any, found (?T1, ?T2) -> ?T8
+// Same for typed params and for a direct call in `main`. There is NO silent argument-dropping, no
+// rule-list-as-int, and no segfault: arity checking catches it every time. That makes this an
+// ERGONOMICS defect (a stdlib module has squatted two builtin names), not a soundness hole.
+//
+// The real fix is upstream -- rename forge's rule builders to `min_rule`/`max_rule`, consistent
+// with its own neighbouring `min_len`/`max_len`. Until then this helper avoids the shadowed name.
+// NOTE `prism_ui_color_pick`, `prism_ui_pager`, `prism_ui_rating` and `prism_render_canvas` call
+// the bare builtins and would FAIL TO COMPILE (not corrupt) in a program that also imports forge.
+fn _prism_con_min_int(a: int, b: int) -> int
+    if a < b
+        return a
+    b
+
+fn prism_con_paginate(rows: list, page: PrismConPagination) -> list
+    if page.conpg_size <= 0
+        return []
+    let total = len(rows)
+    let start = page.conpg_index * page.conpg_size
+    if start < 0 or start >= total
+        return []
+    let stop = _prism_con_min_int(start + page.conpg_size, total)
+    [rows[i] for i in start..stop]
+
+fn prism_con_session_active(state: PrismConState) -> bool
+    prism_session.prism_ss_is_usable(state.con_session, state.con_now_ms)
+
+fn prism_con_unread_notification_count(state: PrismConState) -> int
+    prism_notice.prism_nt_pending_ack(state.con_notify)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Reducers (state -> state). NOT faces -- a reducer legitimately reads/returns the whole state
+// by construction (M1.7 correction #1). Kept small and separate on purpose.
+
+fn _prism_con_with_viewer(state: PrismConState, v: PrismConViewer) -> PrismConState
+    prism_con_state(state.con_workspace, v, state.con_session, state.con_notify, state.con_router, state.con_route_match, state.con_shortcuts, state.con_sync, state.con_new_project_wizard, state.con_invite_form, state.con_prefs, state.con_now_ms)
+
+fn prism_con_select_project(state: PrismConState, project_id: string) -> Result<PrismConState>
+    prism_con_find_project(state.con_workspace, project_id)?
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, project_id, "", "", v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, v.convw_page, v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_select_issue(state: PrismConState, issue_id: string) -> Result<PrismConState>
+    let p = prism_con_selected_project(state)?
+    prism_con_find_issue(p, issue_id)?
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, issue_id, "", v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, v.convw_page, v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_select_comment(state: PrismConState, comment_id: string) -> Result<PrismConState>
+    let issue = prism_con_selected_issue(state)?
+    if comment_id != ""
+        let mut found = false
+        for c in issue.coniss_comments
+            if c.concmt_id == comment_id
+                found = true
+        if not found
+            return err("prism_app_console: no comment with id '" + comment_id + "' on the selected issue")
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, v.convw_selected_issue_id, comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, v.convw_page, v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_set_sort(state: PrismConState, field: string, dir: string) -> Result<PrismConState>
+    if dir != "ascending" and dir != "descending" and dir != "none"
+        return err("prism_app_console: sort dir must be 'ascending', 'descending', or 'none', got '" + dir + "'")
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, v.convw_selected_issue_id, v.convw_selected_comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, prism_con_sort(field, dir), v.convw_filter, v.convw_page, v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_set_filter(state: PrismConState, flt: PrismConFilter) -> Result<PrismConState>
+    _prism_con_validate_filter(flt)?
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, v.convw_selected_issue_id, v.convw_selected_comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, flt, v.convw_page, v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_set_page(state: PrismConState, index: int, size: int) -> Result<PrismConState>
+    if index < 0
+        return err("prism_app_console: page index must be >= 0, got " + str(index))
+    if size <= 0
+        return err("prism_app_console: page size must be > 0, got " + str(size))
+    let v = state.con_viewer
+    ok(_prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, v.convw_selected_issue_id, v.convw_selected_comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, prism_con_pagination(index, size), v.convw_palette_query, v.convw_palette_open)))
+
+fn prism_con_set_pane(state: PrismConState, pane: PrismConPane) -> PrismConState
+    let v = state.con_viewer
+    _prism_con_with_viewer(state, prism_con_viewer(pane, v.convw_selected_project_id, v.convw_selected_issue_id, v.convw_selected_comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, v.convw_page, v.convw_palette_query, v.convw_palette_open))
+
+fn prism_con_set_palette_query(state: PrismConState, query: string, open: int) -> PrismConState
+    let v = state.con_viewer
+    _prism_con_with_viewer(state, prism_con_viewer(v.convw_pane, v.convw_selected_project_id, v.convw_selected_issue_id, v.convw_selected_comment_id, v.convw_expanded_project_ids, v.convw_expanded_issue_ids, v.convw_sort, v.convw_filter, v.convw_page, query, open))
+
+// Advances the reused session clock alongside the console's own. A real app calls this on every
+// tick/poll so `con_session`'s high-water mark never falls behind `con_now_ms`.
+fn prism_con_tick(state: PrismConState, now_ms: int) -> PrismConState
+    let session2 = prism_session.prism_ss_tick(state.con_session, now_ms)
+    prism_con_state(state.con_workspace, state.con_viewer, session2, state.con_notify, state.con_router, state.con_route_match, state.con_shortcuts, state.con_sync, state.con_new_project_wizard, state.con_invite_form, state.con_prefs, now_ms)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Faces: state -> view. A realistic screen's worth -- header, breadcrumb, project list, issue
+// table (sort+filter applied), issue detail, comment thread, notification badge, command palette,
+// preferences pane, plus the members/audit/presence/wizard/invite views a real ops console has.
+
+fn _prism_con_session_summary(s: PrismSession, now_ms: int) -> string
+    if prism_session.prism_ss_is_usable(s, now_ms)
+        return "signed in"
+    "signed out"
+
+fn prism_con_header(state: PrismConState) -> Result<PrismNode>
+    let brand = prism_ui_kit.prism_ui_icon_text(prism_content.prism_icon_menu(), state.con_workspace.conws_name)?
+    let session_node = prism_content.prism_label(_prism_con_session_summary(state.con_session, state.con_now_ms))?
+    prism_arrange.prism_band([brand, session_node])
+
+fn _prism_con_crumb_to_nav(c) -> Result<PrismBreadcrumbItem>
+    ok(prism_ui_nav.prism_breadcrumb_item(prism_route.rt_crumb_title(c), prism_route.rt_crumb_url(c)))
+
+fn prism_con_breadcrumb(state: PrismConState) -> Result<PrismNode>
+    let crumbs = prism_route.rt_router_breadcrumbs(state.con_router, state.con_route_match)?
+    let mk = fn(c) _prism_con_crumb_to_nav(c)
+    let nav_items = prism_ui_kit.prism_ui_collect(crumbs, mk)?
+    prism_ui_nav.prism_nav_breadcrumb(nav_items)
+
+fn prism_con_notification_badge(state: PrismConState) -> Result<PrismNode>
+    let n = prism_notice.prism_nt_count(state.con_notify)
+    let pending = prism_con_unread_notification_count(state)
+    let text = str(n) + " notification(s), " + str(pending) + " need attention"
+    prism_ui_kit.prism_ui_icon_text(prism_content.prism_icon_info(), text)
+
+fn prism_con_stat_row(state: PrismConState) -> Result<PrismNode>
+    let ws = state.con_workspace
+    let s1 = prism_ui_data.prism_ui_stat("Projects", str(len(ws.conws_projects)), none(), prism_ui_data.prism_stat_trend_flat())?
+    let s2 = prism_ui_data.prism_ui_stat("Open issues", str(prism_con_open_issue_count(ws)), none(), prism_ui_data.prism_stat_trend_flat())?
+    let s3 = prism_ui_data.prism_ui_stat("Urgent", str(prism_con_urgent_issue_count(ws)), none(), prism_ui_data.prism_stat_trend_flat())?
+    let s4 = prism_ui_data.prism_ui_stat("Unread", str(prism_con_unread_notification_count(state)), none(), prism_ui_data.prism_stat_trend_flat())?
+    prism_arrange.prism_band([s1, s2, s3, s4])
+
+fn _prism_con_project_columns() -> Result<list>
+    let name_col = prism_ui_table.prism_table_column("name", "Project", fn(r) r.conprj_name)?
+    let owner_col = prism_ui_table.prism_table_column("owner", "Owner", fn(r) r.conprj_owner)?
+    let status_col = prism_ui_table.prism_table_column("status", "Status", fn(r) prism_con_project_status_name(r.conprj_status))?
+    let count_col = prism_ui_table.prism_table_column("issues", "Issues", fn(r) str(len(r.conprj_issues)))?
+    ok([name_col, owner_col, status_col, count_col])
+
+fn prism_con_project_list(state: PrismConState) -> Result<PrismNode>
+    let cols = _prism_con_project_columns()?
+    let table = prism_ui_table.prism_table(cols, state.con_workspace.conws_projects, fn(r) r.conprj_id)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No projects yet -- create one to get started")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_issue_columns() -> Result<list>
+    let title_col = prism_ui_table.prism_table_column("title", "Title", fn(r) r.coniss_title)?
+    let status_col = prism_ui_table.prism_table_column("status", "Status", fn(r) prism_con_issue_status_name(r.coniss_status))?
+    let priority_col = prism_ui_table.prism_table_column("priority", "Priority", fn(r) prism_con_priority_name(r.coniss_priority))?
+    let assignee_col = prism_ui_table.prism_table_column("assignee", "Assignee", fn(r) r.coniss_assignee)?
+    ok([title_col, status_col, priority_col, assignee_col])
+
+fn _prism_con_table_sort_dir(s: string) -> Result<PrismSortDirection>
+    if s == "ascending"
+        return ok(prism_ui_table.prism_sort_ascending())
+    if s == "descending"
+        return ok(prism_ui_table.prism_sort_descending())
+    if s == "none"
+        return ok(prism_ui_table.prism_sort_unsorted())
+    err("prism_app_console: sort dir must be 'ascending', 'descending', or 'none', got '" + s + "'")
+
+// Filtered + sorted, UNRENDERED -- the face a caller wants when it needs to assert exact row order
+// or exact row count rather than parse rendered text.
+fn prism_con_issue_table_data(state: PrismConState) -> Result<PrismTable>
+    let project = prism_con_selected_project(state)?
+    let filtered = prism_con_filtered_issues(project.conprj_issues, state.con_viewer.convw_filter)?
+    let cols = _prism_con_issue_columns()?
+    let table = prism_ui_table.prism_table(cols, filtered, fn(r) r.coniss_id)?
+    let sort = state.con_viewer.convw_sort
+    if sort.consrt_field == ""
+        return ok(table)
+    let dir = _prism_con_table_sort_dir(sort.consrt_dir)?
+    prism_ui_table.prism_table_sorted(table, sort.consrt_field, dir)
+
+fn prism_con_issue_table(state: PrismConState) -> Result<PrismNode>
+    let table = prism_con_issue_table_data(state)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No issues match the current filter")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_label_names(labels: list<PrismConLabel>) -> list
+    labels.map(fn(l) l.conlbl_name)
+
+fn prism_con_issue_detail(state: PrismConState) -> Result<PrismNode>
+    let issue = prism_con_selected_issue(state)?
+    let pairs = [["Title", issue.coniss_title], ["Status", prism_con_issue_status_name(issue.coniss_status)], ["Priority", prism_con_priority_name(issue.coniss_priority)], ["Assignee", issue.coniss_assignee], ["Labels", join(_prism_con_label_names(issue.coniss_labels), ", ")]]
+    prism_ui_kit.prism_ui_kv(pairs)
+
+fn _prism_con_edited_suffix(edited: int) -> string
+    if edited == 1
+        return " (edited)"
+    ""
+
+fn _prism_con_reaction_summary(reactions: list<PrismConReaction>) -> string
+    if len(reactions) == 0
+        return ""
+    str(len(reactions)) + " reaction(s)"
+
+fn _prism_con_comment_node(c: PrismConComment) -> Result<PrismNode>
+    let author_line = prism_content.prism_label(c.concmt_author + _prism_con_edited_suffix(c.concmt_edited))?
+    let body_line = prism_content.prism_label(c.concmt_body)?
+    let rx = _prism_con_reaction_summary(c.concmt_reactions)
+    if rx == ""
+        return prism_arrange.prism_stack([author_line, body_line])
+    let rx_line = prism_content.prism_label(rx)?
+    prism_arrange.prism_stack([author_line, body_line, rx_line])
+
+fn prism_con_comment_thread(state: PrismConState) -> Result<PrismNode>
+    let issue = prism_con_selected_issue(state)?
+    if len(issue.coniss_comments) == 0
+        return prism_ui_kit.prism_ui_empty("No comments yet -- be the first to weigh in")
+    let mk = fn(c) _prism_con_comment_node(c)
+    let nodes = prism_ui_kit.prism_ui_collect(issue.coniss_comments, mk)?
+    prism_arrange.prism_stack(nodes)
+
+fn _prism_con_member_status_str(active: int) -> string
+    if active == 1
+        return "active"
+    "inactive"
+
+fn _prism_con_member_columns() -> Result<list>
+    let name_col = prism_ui_table.prism_table_column("name", "Name", fn(r) r.conmem_name)?
+    let email_col = prism_ui_table.prism_table_column("email", "Email", fn(r) r.conmem_email)?
+    let role_col = prism_ui_table.prism_table_column("role", "Role", fn(r) r.conmem_role)?
+    let status_col = prism_ui_table.prism_table_column("status", "Status", fn(r) _prism_con_member_status_str(r.conmem_active))?
+    ok([name_col, email_col, role_col, status_col])
+
+fn prism_con_members_view(state: PrismConState) -> Result<PrismNode>
+    let cols = _prism_con_member_columns()?
+    let table = prism_ui_table.prism_table(cols, state.con_workspace.conws_members, fn(r) r.conmem_id)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No members yet")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_audit_columns() -> Result<list>
+    let actor_col = prism_ui_table.prism_table_column("actor", "Actor", fn(r) r.conaud_actor)?
+    let action_col = prism_ui_table.prism_table_column("action", "Action", fn(r) r.conaud_action)?
+    let target_col = prism_ui_table.prism_table_column("target", "Target", fn(r) r.conaud_target)?
+    ok([actor_col, action_col, target_col])
+
+fn prism_con_audit_log_view(state: PrismConState) -> Result<PrismNode>
+    let cols = _prism_con_audit_columns()?
+    let table = prism_ui_table.prism_table(cols, state.con_workspace.conws_audit_log, fn(r) r.conaud_id)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No activity recorded yet")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_milestone_columns() -> Result<list>
+    let title_col = prism_ui_table.prism_table_column("title", "Milestone", fn(r) r.conmil_title)?
+    let due_col = prism_ui_table.prism_table_column("due", "Due", fn(r) str(r.conmil_due_ms))?
+    ok([title_col, due_col])
+
+fn prism_con_project_milestones_view(state: PrismConState) -> Result<PrismNode>
+    let project = prism_con_selected_project(state)?
+    let cols = _prism_con_milestone_columns()?
+    let table = prism_ui_table.prism_table(cols, project.conprj_milestones, fn(r) r.conmil_id)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No milestones yet")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_integration_status_str(enabled: int) -> string
+    if enabled == 1
+        return "enabled"
+    "disabled"
+
+fn _prism_con_integration_columns() -> Result<list>
+    let kind_col = prism_ui_table.prism_table_column("kind", "Integration", fn(r) r.conintg_kind)?
+    let status_col = prism_ui_table.prism_table_column("status", "Status", fn(r) _prism_con_integration_status_str(r.conintg_enabled))?
+    ok([kind_col, status_col])
+
+fn prism_con_integrations_view(state: PrismConState) -> Result<PrismNode>
+    let cols = _prism_con_integration_columns()?
+    let table = prism_ui_table.prism_table(cols, state.con_workspace.conws_integrations, fn(r) r.conintg_id)?
+    if prism_ui_table.prism_table_row_count(table) == 0
+        return prism_ui_table.prism_table_empty_message(table, "No integrations connected")
+    prism_ui_table.prism_table_render(table)
+
+fn _prism_con_command_titles(cmds: list) -> list
+    let out = []
+    for c in cmds
+        push(out, prism_shortcut.prism_sc_cmd_title(c) + "  (" + prism_shortcut.prism_sc_cmd_chord(c) + ")")
+    out
+
+// Reuses BOTH prism_shortcut (the actual query filtering, via prism_sc_search) and
+// prism_ui_overlay's purpose-built command-palette widget for rendering -- `matches` is always-true
+// here because the narrowing already happened in prism_sc_search.
+fn prism_con_command_palette(state: PrismConState) -> Result<PrismNode>
+    let query = state.con_viewer.convw_palette_query
+    let matched = prism_shortcut.prism_sc_search(state.con_shortcuts, query)
+    let titles = _prism_con_command_titles(matched)
+    prism_ui_overlay.prism_ov_command_palette("Search commands", query, titles, fn(s) true, "No commands match")
+
+fn prism_con_preferences_pane(state: PrismConState) -> Result<PrismNode>
+    let prefs = state.con_prefs
+    let theme_opts = [prism_interact.prism_pick_option("light", "Light"), prism_interact.prism_pick_option("dark", "Dark"), prism_interact.prism_pick_option("system", "System")]
+    let theme_pick = prism_interact.prism_pick(theme_opts, prism_con_theme_name(prefs.conpref_theme))?
+    let density_opts = [prism_interact.prism_pick_option("comfortable", "Comfortable"), prism_interact.prism_pick_option("compact", "Compact")]
+    let density_pick = prism_interact.prism_pick(density_opts, prism_con_density_name(prefs.conpref_density))?
+    let locale_label = prism_content.prism_label("Locale: " + prefs.conpref_locale)?
+    let motion_flag = prism_interact.prism_flag("Reduce motion", prefs.conpref_reduce_motion == 1)?
+    let sound_flag = prism_interact.prism_flag("Notification sound", prefs.conpref_notif_sound == 1)?
+    prism_arrange.prism_stack([theme_pick, density_pick, locale_label, motion_flag, sound_flag])
+
+fn prism_con_invite_form_view(state: PrismConState) -> Result<PrismNode>
+    let form = prism_form.prism_fm_current_form(state.con_invite_form)
+    prism_ui_form.prism_form_render(form)
+
+fn prism_con_new_project_wizard_view(state: PrismConState) -> Result<PrismNode>
+    let w = state.con_new_project_wizard
+    let step_label = prism_content.prism_label("Step: " + prism_wizard.prism_wz_current_name(w) + " (" + str(prism_wizard.prism_wz_progress_pct(w)) + "%)")?
+    let missing = prism_wizard.prism_wz_missing(w)
+    if len(missing) == 0
+        return prism_arrange.prism_stack([step_label])
+    let missing_label = prism_content.prism_label("Missing: " + join(missing, ", "))?
+    prism_arrange.prism_stack([step_label, missing_label])
+
+fn prism_con_presence_view(state: PrismConState) -> Result<PrismNode>
+    let present = prism_sync.prism_sy_present(state.con_sync, state.con_now_ms)
+    if len(present) == 0
+        return prism_ui_kit.prism_ui_empty("No one else is here right now")
+    let mk = fn(who) prism_content.prism_label(who)
+    let nodes = prism_ui_kit.prism_ui_collect(present, mk)?
+    prism_arrange.prism_band(nodes)
+
+// Sub-panes roll up to their parent SECTION so the 4-entry sidebar always has exactly one active
+// entry -- prism_nav_menu requires exactly one, same constraint prism_app_dashboard's own nav
+// already lives under.
+fn _prism_con_nav_section(pane: PrismConPane) -> string
+    match pane
+        ConPaneOverview() => "overview"
+        ConPaneProjects() => "projects"
+        ConPaneProjectDetail() => "projects"
+        ConPaneIssueDetail() => "projects"
+        ConPaneNotifications() => "notifications"
+        ConPanePreferences() => "preferences"
+        ConPaneCommandPalette() => "overview"
+
+fn _prism_con_nav_entries(pane: PrismConPane) -> Result<PrismNode>
+    let active = _prism_con_nav_section(pane)
+    let e1 = prism_ui_nav.prism_menu_entry("Overview", some(prism_content.prism_icon_menu()), "/", active == "overview")
+    let e2 = prism_ui_nav.prism_menu_entry("Projects", some(prism_content.prism_icon_search()), "/projects", active == "projects")
+    let e3 = prism_ui_nav.prism_menu_entry("Notifications", some(prism_content.prism_icon_info()), "/notifications", active == "notifications")
+    let e4 = prism_ui_nav.prism_menu_entry("Preferences", some(prism_content.prism_icon_plus()), "/preferences", active == "preferences")
+    prism_ui_nav.prism_nav_menu([e1, e2, e3, e4])
+
+fn prism_con_pane(state: PrismConState) -> Result<PrismNode>
+    match state.con_viewer.convw_pane
+        ConPaneOverview() => prism_con_stat_row(state)
+        ConPaneProjects() => prism_con_project_list(state)
+        ConPaneProjectDetail() => prism_con_issue_table(state)
+        ConPaneIssueDetail() => prism_con_issue_detail(state)
+        ConPaneNotifications() => prism_con_notification_badge(state)
+        ConPanePreferences() => prism_con_preferences_pane(state)
+        ConPaneCommandPalette() => prism_con_command_palette(state)
+
+fn prism_con_console(state: PrismConState) -> Result<PrismNode>
+    if trim(state.con_workspace.conws_name) == ""
+        return err("prism_app_console: workspace name must not be empty")
+    let header = prism_con_header(state)?
+    let sidebar = _prism_con_nav_entries(state.con_viewer.convw_pane)?
+    let crumbs = prism_con_breadcrumb(state)?
+    let stat_row = prism_con_stat_row(state)?
+    let pane_content = prism_con_pane(state)?
+    let content = prism_arrange.prism_stack([crumbs, stat_row, pane_content])?
+    let footer = prism_content.prism_label("NOVA Ops Console")?
+    prism_ui_layout.prism_shell(header, some(sidebar), content, some(footer))
+
+fn prism_con_console_html(state: PrismConState) -> Result<string>
+    let node = prism_con_console(state)?
+    prism_render_html.prism_html_render_page(node, state.con_workspace.conws_name + " -- NOVA Ops Console")
+
+fn prism_con_console_ansi(state: PrismConState) -> Result<string>
+    let node = prism_con_console(state)?
+    prism_render_ansi.prism_ansi_render(node)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Demo state: a realistic 3-project, multi-issue, multi-comment workspace, EXPORTED (not
+// `_`-private) so the KAT and any future caller audit/render the exact same state the route serves
+// -- mirrors prism_app_dashboard's own `prism_app_demo_state` precedent.
+
+fn prism_con_demo_state() -> Result<PrismConState>
+    let rx1 = prism_con_reaction("+1", "Dev Patel")
+    let rx2 = prism_con_reaction("eyes", "Farid Novak")
+    let c1 = prism_con_comment("cmt-1", "iss-101", "Priya Shah", "Repro'd on staging, looking into the query planner.", 1000, 0, [rx1])
+    let c2 = prism_con_comment("cmt-2", "iss-101", "Jordan Lee", "Same here, seeing 500s under load -- 対応中です.", 1500, 1, [rx1, rx2])
+    let e1 = prism_con_issue_event("evt-1", "created", "Priya Shah", 900, "Issue opened")
+    let e2 = prism_con_issue_event("evt-2", "status_changed", "Priya Shah", 1200, "open -> in_progress")
+    let lbl_backend = prism_con_label("backend", "blue")
+    let lbl_perf = prism_con_label("perf", "red")
+    let lbl_testing = prism_con_label("testing", "yellow")
+    let lbl_ci = prism_con_label("ci", "yellow")
+    let lbl_mobile = prism_con_label("mobile", "green")
+    let lbl_crash = prism_con_label("crash", "red")
+    let lbl_i18n = prism_con_label("i18n", "purple")
+    let iss1 = prism_con_issue("iss-101", "prj-core", "API latency spikes under load", ConIssInProgress(), ConPrioUrgent(), "Priya Shah", [lbl_backend, lbl_perf], 900, 1500, [c1, c2], [e1, e2])?
+    let iss2 = prism_con_issue("iss-102", "prj-core", "Add rate limiting to /v1/search", ConIssOpen(), ConPrioMedium(), "Jordan Lee", [lbl_backend], 950, 950, [], [])?
+    let iss3 = prism_con_issue("iss-103", "prj-core", "Flaky integration test: checkout flow", ConIssBlocked(), ConPrioHigh(), "Dev Patel", [lbl_testing, lbl_ci], 800, 1400, [], [])?
+    let mile1 = prism_con_milestone("mil-1", "v2.4 stability", 5000)
+    let prj1 = prism_con_project("prj-core", "Core Platform", "Priya Shah", ConPrjActive(), 500, 0, [iss1, iss2, iss3], [mile1])?
+
+    let iss4 = prism_con_issue("iss-201", "prj-mobile", "Crash on iOS 18 launch", ConIssOpen(), ConPrioUrgent(), "Elin Osei", [lbl_mobile, lbl_crash], 1600, 1600, [], [])?
+    let iss5 = prism_con_issue("iss-202", "prj-mobile", "Localize onboarding screens", ConIssDone(), ConPrioLow(), "Farid Novak", [lbl_mobile, lbl_i18n], 700, 1300, [], [])?
+    let prj2 = prism_con_project("prj-mobile", "Mobile Apps", "Elin Osei", ConPrjActive(), 600, 0, [iss4, iss5], [])?
+
+    let prj3 = prism_con_project("prj-legacy", "Legacy Billing", "Carla Diaz", ConPrjArchived(), 100, 1, [], [])?
+
+    let m1 = prism_con_member("mem-1", "Priya Shah", "priya@example.com", "Admin", 1)
+    let m2 = prism_con_member("mem-2", "Jordan Lee", "jordan@example.com", "Editor", 1)
+    let m3 = prism_con_member("mem-3", "Dev Patel", "dev@example.com", "Editor", 1)
+    let m4 = prism_con_member("mem-4", "Elin Osei", "elin@example.com", "Viewer", 0)
+
+    let a1 = prism_con_audit_entry("aud-1", "Priya Shah", "created project", "prj-core", 500)
+    let a2 = prism_con_audit_entry("aud-2", "Carla Diaz", "archived project", "prj-legacy", 1700)
+    let a3 = prism_con_audit_entry("aud-3", "陈静", "invited member", "elin@example.com", 1800)
+
+    let intg1 = prism_con_integration("intg-1", "slack", 1)
+    let intg2 = prism_con_integration("intg-2", "github", 1)
+    let intg3 = prism_con_integration("intg-3", "pagerduty", 0)
+
+    let ws = prism_con_workspace("NOVA Ops", "nova-ops", "pro", 4, 10, [prj1, prj2, prj3], [m1, m2, m3, m4], [a1, a2, a3], [intg1, intg2, intg3])?
+
+    let sort0 = prism_con_sort("", "none")
+    let flt0 = prism_con_filter("", "", "", "")
+    let page0 = prism_con_pagination(0, 10)
+    let viewer = prism_con_viewer(ConPaneOverview(), "", "", "", [], [], sort0, flt0, page0, "", 0)
+
+    let session = prism_session.prism_ss_login("access-tok-abc", "refresh-tok-xyz", 100000, 1)?
+
+    let r0 = prism_route.rt_router_new()
+    let r1 = prism_route.rt_router_register(r0, "/", "overview", "Overview")?
+    let r2 = prism_route.rt_router_register(r1, "/projects", "projects", "Projects")?
+    let r3 = prism_route.rt_router_register(r2, "/projects/:id", "project_detail", "Project \{id\}")?
+    let r4 = prism_route.rt_router_register(r3, "/projects/:id/issues/:issue_id", "issue_detail", "Issue \{issue_id\}")?
+    let router = prism_route.rt_router_register(r4, "/preferences", "preferences", "Preferences")?
+    let route_match = prism_route.rt_router_resolve(router, "/")?
+
+    let sc0 = prism_shortcut.prism_sc_registry()
+    let sc1 = prism_shortcut.prism_sc_bind(sc0, "ctrl+k", "open_palette", "Open command palette")?
+    let sc2 = prism_shortcut.prism_sc_bind(sc1, "ctrl+j", "goto_projects", "Go to projects")?
+    let shortcuts = prism_shortcut.prism_sc_bind(sc2, "ctrl+shift+p", "new_project", "New project")?
+
+    let sy0 = prism_sync.prism_sy_new("tab-1")?
+    let sync = prism_sync.prism_sy_presence_seen(sy0, "Jordan Lee", 0)?
+
+    let wz0 = prism_wizard.prism_wz_new()
+    let new_project_wizard = prism_wizard.prism_wz_complete(wz0, prism_wizard.prism_wz_step_account())
+
+    let invite_entity = prism_con_invite("Sam Rivera", "sam@example.com", "editor", 2)
+    let invite_form = prism_form.prism_fm_form_of(invite_entity)?
+
+    let prefs = prism_con_prefs(ConThemeSystem(), ConDensityComfortable(), "en-US", 0, 1)
+
+    let nq0 = prism_notice.prism_nt_queue(20)?
+    let n1 = prism_notice.prism_nt_warning("2 issues are overdue")?
+    let notify = prism_notice.prism_nt_post(nq0, n1)?
+
+    ok(prism_con_state(ws, viewer, session, notify, router, route_match, shortcuts, sync, new_project_wizard, invite_form, prefs, 0))
+
+fn prism_con_console_route()
+    let build_fn = fn(req) prism_con_console(unwrap(prism_con_demo_state()))
+    let h = pf.prism_forge_handler(build_fn, "NOVA Ops Console")
+    h

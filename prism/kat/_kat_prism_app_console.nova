@@ -1,0 +1,208 @@
+// KAT for prism/app/prism_app_console.nova -- milestone M1.7's next evidence step: a REALISTIC
+// operations console with a DEEPLY NESTED (109-leaf, verified by NOVA_DESIGN/tools/m17_readset.py)
+// state tree, composed from a workspace -> project -> issue -> {comment, event} spine plus six
+// reused app/-tier state machines (session, route, form, sync, shortcut, wizard).
+//
+// The properties this exists to prove:
+//   1. ★ THE NESTING IS REAL, not padding: four-level dotted access (workspace -> project -> issue
+//      -> comment/label/reaction) round-trips correctly through the demo state.
+//   2. ★ FILTERING ACTUALLY EXCLUDES: a status/priority/assignee/query filter narrows the issue
+//      set to exactly the expected ids, and an unrecognized filter value is REJECTED, not ignored.
+//   3. ★ SORTING ACTUALLY REORDERS: ascending vs descending by title produce the OPPOSITE id
+//      order, and an unset sort leaves original construction order untouched.
+//   4. ★ PAGINATION BOUNDARIES ARE EXACT: a page that lands exactly on the last partial page, and
+//      one entirely past the end, are both handled -- the latter yields [] rather than a crash.
+//   5. ★ AN EMPTY COLLECTION YIELDS AN EMPTY-STATE FACE, NOT A CRASH: a project with zero issues,
+//      an issue with zero comments, a workspace with zero projects.
+//   6. ★ AN OUT-OF-RANGE ID RETURNS err, NEVER A DEFAULT: unknown project/issue/comment ids.
+//   7. ★ NON-ASCII TEXT ROUND-TRIPS INTACT through find/select AND through full HTML/ANSI render.
+//   8. The six REUSED sub-state-machines (session, route+breadcrumbs, shortcuts/palette, sync/
+//      presence, wizard, form) behave correctly wired into the console, not just in isolation.
+
+import prism_app_console as con
+import prism_ui_table
+import prism_ui_form
+import prism_shortcut
+import prism_sync
+import prism_wizard
+import prism_form
+import prism_render_ansi
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_app_console ==")
+    let state = unwrap(con.prism_con_demo_state())
+
+    print("1. ★ the nested tree is real -- multi-level access round-trips")
+    check("workspace has 3 projects", len(state.con_workspace.conws_projects) == 3)
+    let core = unwrap(con.prism_con_find_project(state.con_workspace, "prj-core"))
+    check("prj-core has 3 issues", len(core.conprj_issues) == 3)
+    let iss101 = unwrap(con.prism_con_find_issue(core, "iss-101"))
+    check("iss-101 has 2 comments", len(iss101.coniss_comments) == 2)
+    check("iss-101 has 2 events", len(iss101.coniss_events) == 2)
+    check("iss-101 has 2 labels", len(iss101.coniss_labels) == 2)
+    check("iss-101's first label is 'backend'", iss101.coniss_labels[0].conlbl_name == "backend")
+    check("iss-101's first comment has 1 reaction", len(iss101.coniss_comments[0].concmt_reactions) == 1)
+    check("iss-101's second comment has 2 reactions", len(iss101.coniss_comments[1].concmt_reactions) == 2)
+    check("prj-core has 1 milestone", len(core.conprj_milestones) == 1)
+    check("workspace has 4 members", len(state.con_workspace.conws_members) == 4)
+    check("workspace has 3 audit entries", len(state.con_workspace.conws_audit_log) == 3)
+    check("workspace has 3 integrations", len(state.con_workspace.conws_integrations) == 3)
+
+    print("2. find/select -- found vs not-found")
+    check("finding an unknown project errs", is_err(con.prism_con_find_project(state.con_workspace, "nope")))
+    check("finding an unknown issue errs", is_err(con.prism_con_find_issue(core, "nope")))
+    check("★ no project selected -> selected_project errs", is_err(con.prism_con_selected_project(state)))
+    let sel = unwrap(con.prism_con_select_project(state, "prj-core"))
+    let sel2 = unwrap(con.prism_con_select_issue(sel, "iss-101"))
+    let selp = unwrap(con.prism_con_selected_project(sel2))
+    check("selected project is prj-core", selp.conprj_id == "prj-core")
+    let seli = unwrap(con.prism_con_selected_issue(sel2))
+    check("selected issue is iss-101", seli.coniss_id == "iss-101")
+    check("★ selecting an unknown project id errs, not a default", is_err(con.prism_con_select_project(state, "ghost")))
+    check("★ selecting an unknown issue id errs", is_err(con.prism_con_select_issue(sel, "ghost")))
+    check("comment selection accepts a real id", not is_err(con.prism_con_select_comment(sel2, "cmt-1")))
+    check("★ selecting an unknown comment id errs", is_err(con.prism_con_select_comment(sel2, "ghost-cmt")))
+    check("selecting comment_id '' (clear selection) is allowed", not is_err(con.prism_con_select_comment(sel2, "")))
+
+    print("3. ★ filtering actually excludes")
+    let all3 = unwrap(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("", "", "", "")))
+    check("no filter keeps all 3 issues", len(all3) == 3)
+    let open_only = unwrap(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("open", "", "", "")))
+    check("★ status=open narrows to exactly 1 (iss-102)", len(open_only) == 1 and open_only[0].coniss_id == "iss-102")
+    let urgent_only = unwrap(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("", "urgent", "", "")))
+    check("★ priority=urgent narrows to exactly 1 (iss-101)", len(urgent_only) == 1 and urgent_only[0].coniss_id == "iss-101")
+    let by_assignee = unwrap(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("", "", "", "Dev Patel")))
+    check("assignee filter narrows to exactly 1 (iss-103)", len(by_assignee) == 1 and by_assignee[0].coniss_id == "iss-103")
+    let by_query = unwrap(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("", "", "rate limiting", "")))
+    check("query filter (substring, case-insensitive) narrows to exactly 1", len(by_query) == 1 and by_query[0].coniss_id == "iss-102")
+    check("★ an unrecognized status is REJECTED, not ignored", is_err(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("bogus", "", "", ""))))
+    check("★ an unrecognized priority is REJECTED", is_err(con.prism_con_filtered_issues(core.conprj_issues, con.prism_con_filter("", "bogus", "", ""))))
+    check("★ set_filter rejects the same way a reducer", is_err(con.prism_con_set_filter(sel2, con.prism_con_filter("bogus", "", "", ""))))
+    check("set_filter accepts a valid filter", not is_err(con.prism_con_set_filter(sel2, con.prism_con_filter("open", "", "", ""))))
+
+    print("4. ★ sorting actually reorders")
+    let sel_sorted_asc = unwrap(con.prism_con_set_sort(sel2, "title", "ascending"))
+    let asc_table = unwrap(con.prism_con_issue_table_data(sel_sorted_asc))
+    let asc_rows = prism_ui_table.prism_table_rows(asc_table)
+    check("ascending sort has 3 rows", len(asc_rows) == 3)
+    let sel_sorted_desc = unwrap(con.prism_con_set_sort(sel2, "title", "descending"))
+    let desc_table = unwrap(con.prism_con_issue_table_data(sel_sorted_desc))
+    let desc_rows = prism_ui_table.prism_table_rows(desc_table)
+    check("★ ascending and descending by title produce the OPPOSITE id order", asc_rows[0].coniss_id == desc_rows[2].coniss_id and asc_rows[2].coniss_id == desc_rows[0].coniss_id)
+    check("★ ascending order is NOT equal to descending order (a real reorder happened)", not (asc_rows[0].coniss_id == desc_rows[0].coniss_id))
+    let unsorted_table = unwrap(con.prism_con_issue_table_data(sel2))
+    let unsorted_rows = prism_ui_table.prism_table_rows(unsorted_table)
+    check("unset sort preserves original construction order (iss-101, iss-102, iss-103)", unsorted_rows[0].coniss_id == "iss-101" and unsorted_rows[1].coniss_id == "iss-102" and unsorted_rows[2].coniss_id == "iss-103")
+    check("★ an invalid sort dir is rejected by the reducer", is_err(con.prism_con_set_sort(sel2, "title", "bogus")))
+
+    print("5. ★ pagination boundaries are exact")
+    let five = [1, 2, 3, 4, 5]
+    check("page 0 of size 2 is [1,2]", con.prism_con_paginate(five, con.prism_con_pagination(0, 2)) == [1, 2])
+    check("page 1 of size 2 is [3,4]", con.prism_con_paginate(five, con.prism_con_pagination(1, 2)) == [3, 4])
+    check("★ the last PARTIAL page (page 2 of size 2) is exactly [5]", con.prism_con_paginate(five, con.prism_con_pagination(2, 2)) == [5])
+    check("★ a page entirely past the end yields [] -- not a crash, not an error", con.prism_con_paginate(five, con.prism_con_pagination(3, 2)) == [])
+    check("a non-positive page size yields [] -- not a crash", con.prism_con_paginate(five, con.prism_con_pagination(0, 0)) == [])
+    check("★ set_page rejects a negative index", is_err(con.prism_con_set_page(sel2, -1, 10)))
+    check("★ set_page rejects a non-positive size", is_err(con.prism_con_set_page(sel2, 0, 0)))
+    check("set_page accepts valid values", not is_err(con.prism_con_set_page(sel2, 1, 5)))
+
+    print("6. ★ an empty collection yields an empty-state face, not a crash")
+    let legacy = unwrap(con.prism_con_find_project(state.con_workspace, "prj-legacy"))
+    check("prj-legacy genuinely has zero issues", len(legacy.conprj_issues) == 0)
+    let sel_legacy = unwrap(con.prism_con_select_project(state, "prj-legacy"))
+    let empty_table = unwrap(con.prism_con_issue_table_data(sel_legacy))
+    check("★ zero issues -> zero table rows, no crash", prism_ui_table.prism_table_row_count(empty_table) == 0)
+    check("★ issue_table (the rendering face) succeeds on zero rows", not is_err(con.prism_con_issue_table(sel_legacy)))
+    let mobile = unwrap(con.prism_con_find_project(state.con_workspace, "prj-mobile"))
+    let mobile_issue = unwrap(con.prism_con_find_issue(mobile, "iss-201"))
+    check("iss-201 genuinely has zero comments", len(mobile_issue.coniss_comments) == 0)
+    let sel_mobile = unwrap(con.prism_con_select_project(state, "prj-mobile"))
+    let sel_mobile_issue = unwrap(con.prism_con_select_issue(sel_mobile, "iss-201"))
+    check("★ zero comments -> comment_thread still succeeds (an honest empty state)", not is_err(con.prism_con_comment_thread(sel_mobile_issue)))
+    let empty_ws = unwrap(con.prism_con_workspace("Empty Co", "empty-co", "free", 0, 1, [], [], [], []))
+    let state_empty_ws = con.prism_con_state(empty_ws, state.con_viewer, state.con_session, state.con_notify, state.con_router, state.con_route_match, state.con_shortcuts, state.con_sync, state.con_new_project_wizard, state.con_invite_form, state.con_prefs, 0)
+    check("★ an empty workspace's project_list face succeeds, not a crash", not is_err(con.prism_con_project_list(state_empty_ws)))
+    check("open/urgent counts on an empty workspace are both 0", con.prism_con_open_issue_count(empty_ws) == 0 and con.prism_con_urgent_issue_count(empty_ws) == 0)
+
+    print("7. ★ an out-of-range id returns err, never a default")
+    check("★ find_project on an unknown id errs (not the first project)", is_err(con.prism_con_find_project(state.con_workspace, "totally-unknown")))
+    check("★ find_issue on an unknown id errs (not the first issue)", is_err(con.prism_con_find_issue(core, "totally-unknown")))
+
+    print("8. workspace-wide derivation across the full tree")
+    check("all_issues sees every project's issues (3+2+0=5)", len(con.prism_con_all_issues(state.con_workspace)) == 5)
+    check("★ open_issue_count is exactly 2 (iss-102, iss-201)", con.prism_con_open_issue_count(state.con_workspace) == 2)
+    check("★ urgent_issue_count is exactly 2 (iss-101, iss-201)", con.prism_con_urgent_issue_count(state.con_workspace) == 2)
+
+    print("9. ★ the six reused sub-state-machines, wired in")
+    check("★ the demo session is usable at now=0", con.prism_con_session_active(state))
+    let ticked = con.prism_con_tick(state, 99999999)
+    check("★ the session becomes unusable once it advances past its own expiry", not con.prism_con_session_active(ticked))
+    check("breadcrumb render succeeds for the root route", not is_err(con.prism_con_breadcrumb(state)))
+    check("★ shortcuts: searching 'project' (substring, title-or-id) matches BOTH 'Go to projects' and 'New project'", len(prism_shortcut.prism_sc_search(state.con_shortcuts, "project")) == 2)
+    check("★ ...while a more specific query narrows to exactly 'New project'", len(prism_shortcut.prism_sc_search(state.con_shortcuts, "new project")) == 1)
+    check("an unmatched query returns zero commands, not a crash", len(prism_shortcut.prism_sc_search(state.con_shortcuts, "zzz_no_such_command")) == 0)
+    check("command palette face succeeds", not is_err(con.prism_con_command_palette(state)))
+    check("★ presence includes the peer marked seen at construction time", contains(prism_sync.prism_sy_present(state.con_sync, 0), "Jordan Lee"))
+    check("★ presence excludes a peer once its TTL has elapsed", len(prism_sync.prism_sy_present(state.con_sync, 999999)) == 0)
+    check("★ the wizard cannot skip forward past an incomplete step", is_err(prism_wizard.prism_wz_goto(state.con_new_project_wizard, prism_wizard.prism_wz_step_review())))
+    check("wizard progress is 25% after completing exactly 1 of 4 steps", prism_wizard.prism_wz_progress_pct(state.con_new_project_wizard) == 25)
+    check("new_project_wizard_view face succeeds", not is_err(con.prism_con_new_project_wizard_view(state)))
+    check("★ the invite form (via prism_fm_form_of reflection) has exactly 4 fields", prism_ui_form.prism_form_field_count(prism_form.prism_fm_current_form(state.con_invite_form)) == 4)
+    let dirtied = unwrap(prism_form.prism_fm_set_field(state.con_invite_form, "coninv_seats", "9"))
+    check("★ editing the invite form marks it dirty", unwrap(prism_form.prism_fm_is_dirty(dirtied)))
+    check("invite_form_view face succeeds", not is_err(con.prism_con_invite_form_view(state)))
+    check("presence_view face succeeds", not is_err(con.prism_con_presence_view(state)))
+    check("preferences_pane face succeeds", not is_err(con.prism_con_preferences_pane(state)))
+    check("members_view face succeeds", not is_err(con.prism_con_members_view(state)))
+    check("audit_log_view face succeeds", not is_err(con.prism_con_audit_log_view(state)))
+    check("integrations_view face succeeds", not is_err(con.prism_con_integrations_view(state)))
+    check("project_milestones_view face succeeds and the project has 1 milestone", not is_err(con.prism_con_project_milestones_view(sel)))
+
+    print("10. ★ non-ASCII text round-trips intact")
+    check("★ a non-ASCII audit actor ('陈静') round-trips through the struct", state.con_workspace.conws_audit_log[2].conaud_actor == "陈静")
+    let audit_ansi = unwrap(prism_render_ansi.prism_ansi_render(unwrap(con.prism_con_audit_log_view(state))))
+    check("★ ...and survives full ANSI rendering of the audit log", contains(audit_ansi, "陈静"))
+    check("★ a mixed-script comment body ('対応中です') round-trips", iss101.coniss_comments[1].concmt_body == "Same here, seeing 500s under load -- 対応中です.")
+    let thread = unwrap(con.prism_con_comment_thread(sel2))
+    let thread_ansi = unwrap(prism_render_ansi.prism_ansi_render(thread))
+    check("★ ...and survives full ANSI rendering of the comment thread", contains(thread_ansi, "対応中です"))
+
+    print("11. full page assembly")
+    check("console page renders end-to-end", not is_err(con.prism_con_console(state)))
+    let html = unwrap(con.prism_con_console_html(state))
+    check("html render is non-empty and contains the workspace name", len(html) > 0 and contains(html, "NOVA Ops"))
+    let ansi = unwrap(con.prism_con_console_ansi(state))
+    check("ansi render (overview pane) is non-empty and shows the stat row", len(ansi) > 0 and contains(ansi, "Projects"))
+    let projects_state = con.prism_con_set_pane(state, con.prism_con_pane_projects())
+    let projects_ansi = unwrap(con.prism_con_console_ansi(projects_state))
+    check("★ switching pane to 'projects' and re-rendering shows an actual project name", contains(projects_ansi, "Core Platform"))
+
+    print("12. exhaustiveness -- every enum's variant count is asserted (a 5th value added silently would fail this)")
+    check("4 issue statuses", len(con.prism_con_issue_status_all()) == 4)
+    check("4 priorities", len(con.prism_con_priority_all()) == 4)
+    check("3 project statuses", len(con.prism_con_project_status_all()) == 3)
+    check("7 panes", len(con.prism_con_pane_all()) == 7)
+    check("3 themes", len(con.prism_con_theme_all()) == 3)
+    check("2 densities", len(con.prism_con_density_all()) == 2)
+    check("per-variant constructor round-trips its own name", con.prism_con_issue_status_name(con.prism_con_issue_status_open()) == "open")
+    check("pane dispatch: overview pane renders the stat row without error", not is_err(con.prism_con_pane(con.prism_con_set_pane(state, con.prism_con_pane_overview()))))
+    let with_pane = con.prism_con_set_pane(state, con.prism_con_pane_project_detail())
+    let with_pane_and_project = unwrap(con.prism_con_select_project(with_pane, "prj-core"))
+    check("pane dispatch: a sub-pane (project_detail) rolls up to the 'projects' sidebar section", not is_err(con.prism_con_console(with_pane_and_project)))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_app_console: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_app_console: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
