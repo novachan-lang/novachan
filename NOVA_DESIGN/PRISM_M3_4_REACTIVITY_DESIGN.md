@@ -99,6 +99,8 @@ collection elements. Hybrid, and honest about the fact that the static approach'
 exactly the dynamic one's strong point. Falls back to Solid's per-read cost, but only for
 collections.
 
+★ **UPGRADED TO REQUIRED 2026-09-05.** The 109-leaf scale measurement (`M1_7_FALSIFIER_RESULT.md` §SCALE) found the read-set degradation is **entirely collection-driven**: excluding collection-element leaves drops the mean from 33.2 to 10.7 leaves, a 3× reduction from collections alone, and the three worst faces (`selected_project` 51/109, `stat_row` 50/52, `project_list` 32/32) all iterate a collection. Without keyed sub-faces, editing one comment on one issue re-runs a face that reads nearly half the tree. §4(b) is therefore **load-bearing, not an optimisation.**
+
 **Recommendation: (b), with (a) as the sound fallback when a key cannot be inferred, and (c)
 explicitly rejected** — a hybrid means two dependency systems, two failure modes, and two mental
 models, which violates "one obvious way" and is how frameworks become C++.
