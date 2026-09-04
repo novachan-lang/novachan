@@ -1,0 +1,186 @@
+// prism_wizard (app/, Tier 2) -- stepper state machine, typed ADT + exhaustive match (#88).
+//
+// ── ⛔ THE STEP IS AN ENUM, WHICH IS THE ENTIRE POINT OF #88 ─────────────────────────────────
+// A wizard whose current step is a STRING or an INT ("step 3") has a whole class of bug that a
+// closed enum simply does not have: a typo'd step name, a step that no longer exists after a
+// refactor, and an off-by-one that lands between steps. Worse, a `switch (step)` over strings has
+// no exhaustiveness check, so ADDING a step compiles fine and silently falls through the default
+// on every screen that forgot it.
+// Here `PrismWizStep` is a closed enum and `prism_wz_step_all()` enumerates it, so a KAT can
+// assert the count -- which converts "someone added a 5th step and forgot a screen" from a silent
+// production gap into a failing test. That is the strongest exhaustiveness available without
+// compiler support for enumerating an enum's variants, and it is the same technique
+// prism_node_kind_all() uses for the 22 primitives.
+//
+// ── ⛔ YOU CANNOT SKIP FORWARD PAST AN INCOMPLETE STEP ──────────────────────────────────────
+// The bug every wizard ships: deep-linking or a stale "next" click lands the user on the payment
+// step with no shipping address, and the submit handler then fails in a way that blames the user.
+// `prism_wz_goto` therefore REFUSES a forward jump over an unsatisfied step and names the step
+// that blocks it. Going BACKWARD is always allowed -- revisiting a completed step is exactly what
+// a wizard is for, and forbidding it is how users get trapped.
+//
+// ── COMPLETION IS DATA, NOT A FLAG PER SCREEN ───────────────────────────────────────────────
+// Each step's satisfaction is recorded in one place (`wz_done`), so "can I advance?" and "can I
+// submit?" are the same question asked of the same data. A per-screen boolean would let the two
+// disagree, which is how a submit button enables on an incomplete form.
+//
+// ── SUBMIT IS TOTAL ─────────────────────────────────────────────────────────────────────────
+// `prism_wz_submit` either yields the ordered, complete step list or the list of steps still
+// missing -- never a bare false. "Cannot submit" without saying WHY is the error message users
+// screenshot and send to support.
+//
+// PUBLIC API
+//   prism_wz_step_account() / _profile() / _payment() / _review()  -> PrismWizStep
+//   prism_wz_step_name(s) / _step_index(s) / _step_all()
+//   prism_wz_new()                                 -> PrismWizard
+//   prism_wz_current(w) / _current_name(w)
+//   prism_wz_complete(w, step)                     -> PrismWizard
+//   prism_wz_uncomplete(w, step)                   -> PrismWizard
+//   prism_wz_is_done(w, step)                      -> int
+//   prism_wz_can_advance(w)                        -> int
+//   prism_wz_next(w) / _back(w)                    -> Result<PrismWizard>
+//   prism_wz_goto(w, step)                         -> Result<PrismWizard>
+//   prism_wz_missing(w)                            -> list
+//   prism_wz_submit(w)                             -> Result<list>
+//   prism_wz_progress_pct(w)                       -> int
+//   prism_wz_describe(w)                           -> string
+
+// `Wz`-prefixed variants: enum constructors resolve across modules in NOVA's one flat symbol
+// space, so bare `Account()`/`Review()` would be a landmine for any other module.
+enum PrismWizStep
+    WzAccount()
+    WzProfile()
+    WzPayment()
+    WzReview()
+
+// `wz_` prefix: the struct field->slot map is GLOBAL. `wz_done` is a list of step NAMES rather
+// than a list of enum values, because comparing enum values for membership is not something this
+// codebase has verified cross-module, and a name comparison is total and obvious.
+type PrismWizard
+    wz_at: int              // index into the canonical order
+    wz_done: list           // step names satisfied so far
+
+fn prism_wz_step_account() -> PrismWizStep
+    WzAccount()
+
+fn prism_wz_step_profile() -> PrismWizStep
+    WzProfile()
+
+fn prism_wz_step_payment() -> PrismWizStep
+    WzPayment()
+
+fn prism_wz_step_review() -> PrismWizStep
+    WzReview()
+
+fn prism_wz_step_name(s: PrismWizStep) -> string
+    match s
+        WzAccount() => "account"
+        WzProfile() => "profile"
+        WzPayment() => "payment"
+        WzReview() => "review"
+
+// The canonical order, and the enumeration that makes exhaustiveness checkable. A KAT asserting
+// len == 4 turns "a 5th step was added and a screen forgot it" into a failing test.
+fn prism_wz_step_all() -> list
+    [WzAccount(), WzProfile(), WzPayment(), WzReview()]
+
+fn prism_wz_step_index(s: PrismWizStep) -> int
+    match s
+        WzAccount() => 0
+        WzProfile() => 1
+        WzPayment() => 2
+        WzReview() => 3
+
+fn prism_wz_new() -> PrismWizard
+    PrismWizard(0, [])
+
+fn prism_wz_current(w: PrismWizard) -> PrismWizStep
+    prism_wz_step_all()[w.wz_at]
+
+fn prism_wz_current_name(w: PrismWizard) -> string
+    prism_wz_step_name(prism_wz_current(w))
+
+fn prism_wz_at(w: PrismWizard) -> int
+    w.wz_at
+
+fn prism_wz_is_done(w: PrismWizard, step: PrismWizStep) -> int
+    if contains(w.wz_done, prism_wz_step_name(step))
+        return 1
+    0
+
+fn prism_wz_complete(w: PrismWizard, step: PrismWizStep) -> PrismWizard
+    let n = prism_wz_step_name(step)
+    if contains(w.wz_done, n)
+        return w
+    let d = []
+    for x in w.wz_done
+        push(d, x)
+    push(d, n)
+    PrismWizard(w.wz_at, d)
+
+// Un-completing exists because a user editing an earlier step can INVALIDATE it (clearing a
+// required field). Without this, a wizard remembers a step as satisfied after the data that
+// satisfied it is gone -- and submit then ships an incomplete record.
+fn prism_wz_uncomplete(w: PrismWizard, step: PrismWizStep) -> PrismWizard
+    let n = prism_wz_step_name(step)
+    let d = []
+    for x in w.wz_done
+        if x != n
+            push(d, x)
+    PrismWizard(w.wz_at, d)
+
+fn prism_wz_can_advance(w: PrismWizard) -> int
+    prism_wz_is_done(w, prism_wz_current(w))
+
+fn prism_wz_next(w: PrismWizard) -> Result<PrismWizard>
+    let cur = prism_wz_current(w)
+    if prism_wz_is_done(w, cur) == 0
+        return err("prism_wizard: cannot advance -- step '{prism_wz_step_name(cur)}' is not complete. Advancing past it would land the user on a later step whose submit depends on data that was never collected")
+    if w.wz_at + 1 >= len(prism_wz_step_all())
+        return err("prism_wizard: already on the last step ('{prism_wz_current_name(w)}') -- there is nothing after it; call submit")
+    ok(PrismWizard(w.wz_at + 1, w.wz_done))
+
+// Backward is ALWAYS allowed: revisiting a completed step is what a wizard is for, and forbidding
+// it is how users get trapped on a step they cannot correct.
+fn prism_wz_back(w: PrismWizard) -> Result<PrismWizard>
+    if w.wz_at == 0
+        return err("prism_wizard: already on the first step ('{prism_wz_current_name(w)}')")
+    ok(PrismWizard(w.wz_at - 1, w.wz_done))
+
+// ⛔ A forward jump may not skip an unsatisfied step, and the error NAMES the blocker -- "you
+// cannot go there" without saying which step is missing is the message users screenshot.
+fn prism_wz_goto(w: PrismWizard, step: PrismWizStep) -> Result<PrismWizard>
+    let target = prism_wz_step_index(step)
+    if target <= w.wz_at
+        return ok(PrismWizard(target, w.wz_done))
+    let all = prism_wz_step_all()
+    let blocker = [""]
+    let i = [0]
+    for st in all
+        let idx = i[0]
+        i[0] = idx + 1
+        if idx < target and blocker[0] == "" and prism_wz_is_done(w, st) == 0
+            blocker[0] = prism_wz_step_name(st)
+    if blocker[0] != ""
+        return err("prism_wizard: cannot jump to '{prism_wz_step_name(step)}' -- step '{blocker[0]}' is still incomplete. A deep link or a stale next-click landing on a later step is how a submit handler ends up failing on data that was never collected")
+    ok(PrismWizard(target, w.wz_done))
+
+fn prism_wz_missing(w: PrismWizard) -> list
+    let out = []
+    for st in prism_wz_step_all()
+        if prism_wz_is_done(w, st) == 0
+            push(out, prism_wz_step_name(st))
+    out
+
+// ⛔ Total: the ordered complete list, or the reasons it cannot submit. Never a bare false.
+fn prism_wz_submit(w: PrismWizard) -> Result<list>
+    let missing = prism_wz_missing(w)
+    if len(missing) > 0
+        return err("prism_wizard: cannot submit -- {len(missing)} step(s) incomplete: " + join(missing, ", "))
+    ok(prism_wz_step_all().map(fn(s) prism_wz_step_name(s)))
+
+fn prism_wz_progress_pct(w: PrismWizard) -> int
+    (len(w.wz_done) * 100) / len(prism_wz_step_all())
+
+fn prism_wz_describe(w: PrismWizard) -> string
+    "wizard: at={prism_wz_current_name(w)} ({w.wz_at}/{len(prism_wz_step_all())}) done={len(w.wz_done)} pct={prism_wz_progress_pct(w)}"

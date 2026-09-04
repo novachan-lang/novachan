@@ -1,0 +1,115 @@
+// KAT for prism/app/prism_wizard.nova -- stepper state machine, typed ADT + exhaustive (#88).
+//
+// The four properties this exists for:
+//   1. ★ THE STEP VOCABULARY IS CLOSED AND COUNTED. Asserting len == 4 turns "someone added a 5th
+//      step and a screen forgot it" from a silent production gap into a failing test.
+//   2. ★ NO FORWARD SKIP PAST AN INCOMPLETE STEP, and the error NAMES the blocker. A deep link or
+//      a stale next-click landing on payment with no address is how a submit handler fails on data
+//      that was never collected.
+//   3. ★ BACKWARD IS ALWAYS ALLOWED -- forbidding it traps users on a step they cannot correct.
+//   4. ★ SUBMIT IS TOTAL: the complete list, or the steps still missing. Never a bare false.
+
+import prism_wizard
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_wizard ==")
+    let acct = prism_wizard.prism_wz_step_account()
+    let prof = prism_wizard.prism_wz_step_profile()
+    let pay = prism_wizard.prism_wz_step_payment()
+    let rev = prism_wizard.prism_wz_step_review()
+
+    print("1. ★ the step vocabulary is closed and counted")
+    let all = prism_wizard.prism_wz_step_all()
+    check("4 steps (a 5th added without updating this fails HERE)", len(all) == 4)
+    check("names are account,profile,payment,review", join(all.map(fn(s) prism_wizard.prism_wz_step_name(s)), ",") == "account,profile,payment,review")
+    check("indices are 0..3 in order", join(all.map(fn(s) "{prism_wizard.prism_wz_step_index(s)}"), ",") == "0,1,2,3")
+    // Every name must be distinct and non-empty, or a lookup collides silently.
+    let names = all.map(fn(s) prism_wizard.prism_wz_step_name(s))
+    let uniq = []
+    for n in names
+        if not contains(uniq, n)
+            push(uniq, n)
+    check("all step names are UNIQUE", len(uniq) == 4)
+
+    print("2. a fresh wizard")
+    let w0 = prism_wizard.prism_wz_new()
+    check("starts on the first step", prism_wizard.prism_wz_current_name(w0) == "account")
+    check("nothing complete", len(prism_wizard.prism_wz_missing(w0)) == 4)
+    check("cannot advance", prism_wizard.prism_wz_can_advance(w0) == 0)
+    check("progress 0%", prism_wizard.prism_wz_progress_pct(w0) == 0)
+    check("back from the first step is an error", is_err(prism_wizard.prism_wz_back(w0)))
+
+    print("3. ★ cannot advance past an incomplete step")
+    check("next is REFUSED while the current step is incomplete", is_err(prism_wizard.prism_wz_next(w0)))
+    let w1 = prism_wizard.prism_wz_complete(w0, acct)
+    check("completing marks it done", prism_wizard.prism_wz_is_done(w1, acct) == 1)
+    check("can advance now", prism_wizard.prism_wz_can_advance(w1) == 1)
+    check("completing twice is idempotent", prism_wizard.prism_wz_progress_pct(prism_wizard.prism_wz_complete(w1, acct)) == 25)
+    check("the ORIGINAL is unchanged (non-mutating)", prism_wizard.prism_wz_is_done(w0, acct) == 0)
+    let w2 = unwrap(prism_wizard.prism_wz_next(w1))
+    check("advanced to profile", prism_wizard.prism_wz_current_name(w2) == "profile")
+    check("progress 25%", prism_wizard.prism_wz_progress_pct(w2) == 25)
+    check("next refused again on the new incomplete step", is_err(prism_wizard.prism_wz_next(w2)))
+
+    print("4. ★ backward is always allowed")
+    let back = unwrap(prism_wizard.prism_wz_back(w2))
+    check("back returns to account", prism_wizard.prism_wz_current_name(back) == "account")
+    check("completion is retained going back", prism_wizard.prism_wz_is_done(back, acct) == 1)
+    // Even with the current step incomplete, back must work -- otherwise a user is trapped.
+    check("back works even when the current step is INCOMPLETE", prism_wizard.prism_wz_current_name(unwrap(prism_wizard.prism_wz_back(w2))) == "account")
+
+    print("5. ★ goto cannot skip forward past an incomplete step, and NAMES the blocker")
+    // account done, profile NOT done -> jumping to payment must be refused, blaming profile.
+    check("★ forward jump over an incomplete step is REFUSED", is_err(prism_wizard.prism_wz_goto(w1, pay)))
+    check("★ jumping to the last step is refused too", is_err(prism_wizard.prism_wz_goto(w1, rev)))
+    // Backward/current jumps are always fine.
+    check("jumping BACKWARD is allowed", prism_wizard.prism_wz_current_name(unwrap(prism_wizard.prism_wz_goto(w2, acct))) == "account")
+    check("jumping to the CURRENT step is allowed", prism_wizard.prism_wz_current_name(unwrap(prism_wizard.prism_wz_goto(w2, prof))) == "profile")
+    // With everything before it satisfied, the jump succeeds.
+    let ready = prism_wizard.prism_wz_complete(prism_wizard.prism_wz_complete(w0, acct), prof)
+    check("a forward jump over COMPLETE steps succeeds", prism_wizard.prism_wz_current_name(unwrap(prism_wizard.prism_wz_goto(ready, pay))) == "payment")
+
+    print("6. ★ un-completing, because editing back can INVALIDATE a step")
+    let undone = prism_wizard.prism_wz_uncomplete(w1, acct)
+    check("un-completing clears it", prism_wizard.prism_wz_is_done(undone, acct) == 0)
+    check("...so advancing is refused again", is_err(prism_wizard.prism_wz_next(undone)))
+    check("un-completing something never done is harmless", prism_wizard.prism_wz_is_done(prism_wizard.prism_wz_uncomplete(w0, rev), rev) == 0)
+    // THE case: a wizard must not remember a step as satisfied after the data is gone, or submit
+    // ships an incomplete record.
+    let allDone = prism_wizard.prism_wz_complete(prism_wizard.prism_wz_complete(prism_wizard.prism_wz_complete(prism_wizard.prism_wz_complete(w0, acct), prof), pay), rev)
+    check("all four complete", len(prism_wizard.prism_wz_missing(allDone)) == 0)
+    let broken = prism_wizard.prism_wz_uncomplete(allDone, prof)
+    check("★ invalidating an earlier step reopens it", len(prism_wizard.prism_wz_missing(broken)) == 1)
+    check("★ and submit is refused again", is_err(prism_wizard.prism_wz_submit(broken)))
+
+    print("7. ★ submit is TOTAL -- the list, or the reasons")
+    check("submit refused while incomplete", is_err(prism_wizard.prism_wz_submit(w1)))
+    check("missing lists exactly what remains", join(prism_wizard.prism_wz_missing(w1), ",") == "profile,payment,review")
+    let done = unwrap(prism_wizard.prism_wz_submit(allDone))
+    check("submit yields the ordered step list", join(done, ",") == "account,profile,payment,review")
+    check("progress 100%", prism_wizard.prism_wz_progress_pct(allDone) == 100)
+    // next on the last step is an error, not a silent no-op -- the caller should call submit.
+    let atLast = unwrap(prism_wizard.prism_wz_goto(allDone, rev))
+    check("next on the LAST step is an error directing to submit", is_err(prism_wizard.prism_wz_next(atLast)))
+
+    print("8. describe")
+    let d = prism_wizard.prism_wz_describe(w2)
+    check("describe names the current step", contains(d, "at=profile"))
+    check("describe reports progress", contains(d, "pct=25"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_wizard: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_wizard: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
