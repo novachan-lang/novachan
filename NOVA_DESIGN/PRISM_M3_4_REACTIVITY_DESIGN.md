@@ -158,7 +158,15 @@ Falsifiable, in order of cost:
    the numbers hold on a real app.
 3. **Design keyed sub-face inference** (§4b) against a real table before writing any of it.
 4. **Reject faces reading module state** — smallest, highest-value correctness gate; independently
-   useful even if reactivity is deferred.
+   useful even if reactivity is deferred. Split in two, because only the second half touches the
+   compiler:
+   - ✅ **detection — DONE**, `tools/m34_face_purity.py`, exit-code gated. Result over all 130
+     modules: 21 declare a module-level `let`, 41 function-to-binding references, **0 mutating** —
+     every one is a read-only constant — and **0 computed initialisers** (the separate known
+     import-zero defect class). **The library is structurally compatible with this design today**,
+     which also means the enforcement gate can be added without first fixing violations.
+   - ⬜ enforcement in the compiler — a rejection, not a warning. Needs GO.
 5. Only then: compiler pass, RED tier, full arc (reconverge + both memory modes).
 
-Steps 1–4 need no compiler change and no GO. **Step 5 does.**
+Steps 1–3 and 4(detection) need no compiler change and no GO. **Step 4(enforcement) and step 5
+do.**
