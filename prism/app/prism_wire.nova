@@ -1,0 +1,512 @@
+// prism_wire (app/, Tier 2) -- a typed channel with request dedup/retry/backoff (#92) and
+// wire-version negotiation (#125). Third module in app/, following the shape prism_route.nova
+// established: pure data/logic over `Result`, no sockets, no rendering.
+//
+// ── DESIGN DECISION: a PURE STATE MACHINE over an explicit clock, not `sleep` ──────────────────
+// Every other retry helper in this codebase (forge_retry_policy.nova, forge_retry_budget.nova)
+// assumes the caller loops and actually sleeps between attempts -- which means the only way to
+// test the hour-long tail of an exponential schedule is to either wait an hour or mock a clock
+// library. Nobody does either, so the tail path is the least-tested code in most retry
+// implementations and the most likely to be wrong when it finally fires in production (the exact
+// failure mode this module exists to avoid). Here there is no `sleep` anywhere in this file: the
+// caller advances time explicitly with `prism_wr_tick(state, now_ms)`, which is a pure function
+// from (state, a clock reading) to (new state, the list of sends that are due). A KAT can walk a
+// simulated week of backoff in microseconds by calling tick with successively larger integers --
+// see _kat_prism_wire.nova section 6, which exercises every attempt up to the retry budget's cap
+// without a single real millisecond elapsing. This is also why the module never calls a real
+// transport: `submit`/`tick`/`report` only ever decide WHAT to send and WHEN -- the caller's own
+// HTTP/WebSocket code (e.g. forge_http_client -- see CLAUDE.md on why the built-in http_get/post
+// must never be used from inside a live process) performs the actual I/O and reports the outcome
+// back in.
+//
+// ── DESIGN DECISION: identity is an explicit (channel, key) idempotency pair, not a content hash
+// "Decide what identity a request carries" -- the brief's own framing. Hashing the payload was
+// considered and rejected: two requests that are semantically DIFFERENT operations can have
+// byte-identical bodies (a user clicking "add $5" twice on purpose sends the same JSON twice, on
+// purpose, and both must go through), so content alone can never tell "retry of the same op" apart
+// from "two different ops that happen to look the same". Only the CALLER's business logic knows
+// that distinction, so the caller supplies the key explicitly -- the same discipline Stripe/PayPal
+// style idempotency keys use, chosen because it is the one design every major payments API has
+// independently converged on for this exact problem. `channel` names WHICH typed operation this
+// is (PRISM_SPEC.md's `wire ident(...) -> type` declares one such operation per name; this module
+// is the runtime machinery a compiled `wire` block will eventually drive, the same relationship
+// prism_route.nova has to a future `route` block) and `key` names WHICH occurrence of it. Dedup
+// and retry are the same mechanism seen from two ends: `prism_wr_submit` is idempotent on
+// (channel, key) -- calling it again with the SAME payload, at ANY point in the request's life
+// (still scheduled, in flight, or long since resolved) returns the tracked state completely
+// unchanged rather than creating a second attempt. That is what makes retry safe -- a caller that
+// is not sure whether its last submit landed can always just submit again. Calling it again with a
+// DIFFERENT payload under the same key is instead rejected outright: silently keeping the old
+// payload would mean the caller's new data quietly never gets sent, and silently swapping it would
+// mean a request already in flight could resolve against content the caller never intended for
+// that key. Neither is safe, so a payload mismatch is a loud `Result` error, not a judgment call
+// made on the caller's behalf.
+//
+// ── DESIGN DECISION: exponential backoff with a hard cap, jitter as a PURE function ────────────
+// `prism_wr_backoff_envelope_ms` is the classic doubling schedule (base * 2^attempt, capped),
+// computed iteratively with an early exit the moment the running value reaches the cap -- never
+// `1 << attempt` (NOVA's `<<` is unsound for a shift count >= 64; see CLAUDE.md), and never
+// allowed to keep doubling past the cap where it could otherwise overflow on a very large attempt
+// count. This envelope alone is what "monotonic up to the cap and never exceeds it" means, and it
+// is exposed publicly so a KAT can assert that property directly as a tight loop over attempt
+// numbers rather than by stepping the whole state machine (TESTING BAR: prefer invariants).
+// Jitter matters -- an un-jittered schedule means every client that dropped in the same outage
+// retries in lockstep and re-creates the outage the moment the cap is reached -- but a jittered
+// value must still be a REPRODUCIBLE function of its inputs or the retry path becomes untestable
+// again, defeating the whole point of this file. `prism_wr_jittered_backoff_ms` is therefore pure:
+// it derives a seed purely from `policy`'s own caller-supplied seed XORed with a hash of
+// (channel, key, attempt) -- same inputs, same delay, always -- and feeds that through
+// std/util/prng's xorshift64 generator (chosen over hand-rolling a second PRNG in this file: it
+// already exists, is already deterministic/state-threaded, and re-deriving one here would be
+// exactly the duplication CLAUDE.md's review checklist forbids). The formula is AWS's "Equal
+// Jitter" (Brooker, "Exponential Backoff And Jitter", 2015): half the envelope is guaranteed, and a
+// random 0..half is added on top, so the realized delay is always in [envelope/2, envelope] --
+// bounded below (so the cap is never approached by a fluke near-zero jitter that would look
+// exactly like no backoff at all) and bounded above by the same cap the envelope itself respects.
+// "Full jitter" (0..envelope) was considered and rejected for exactly that lower-bound reason.
+//
+// ── DESIGN DECISION: attempts are counted at SEND time, and exhaustion is an OBSERVABLE status ──
+// `prism_wr_tick` increments `wr_req_attempts` the moment a request is handed to the caller as due
+// to send -- attempt N is the Nth physical transmission, not the Nth failure, so a policy's
+// `max_attempts` reads as "this operation will be tried at most N times total", the number an
+// application developer actually wants to reason about. Once attempts reaches that cap AND the
+// caller reports another retryable failure, the request moves to `WrExhausted()` and is never
+// scheduled again -- infinite retry is a self-inflicted denial of service against whatever is on
+// the other end, and this module refuses to be the mechanism for it. Exhaustion is a distinct,
+// named terminal status (not a silent stop, not folded into `WrFailed()`) precisely so a caller can
+// tell "the server said no" apart from "we gave up asking" -- `prism_wr_is_exhausted` makes it a
+// one-line check instead of a magic attempt-count comparison the caller would have to reinvent.
+//
+// ── DESIGN DECISION: retryable-vs-fatal is a swappable POLICY, decoupled from the machine core ──
+// "Not everything is retryable" -- a 400-class client error retried forever is a bug (the request
+// will never succeed no matter how many times it is resent), while a 500-class server error is
+// exactly the case retry exists for. `prism_wr_report` takes an already-classified `WrOutcomeKind`
+// rather than a raw status code, and `prism_wr_classify_status` is offered as the DEFAULT policy
+// (2xx -> ok; 408 Request Timeout and 429 Too Many Requests -> retryable despite being 4xx, because
+// both are explicitly transient-by-design in HTTP; any other 5xx -> retryable; everything else,
+// including other 4xx and any 3xx that reached this layer un-followed, -> fatal) rather than being
+// baked into the state machine. A caller with a genuinely different policy (treat 409 Conflict as
+// retryable for one particular endpoint, say) classifies it themselves and calls `prism_wr_report`
+// directly -- the core machine never has to be forked to change what counts as retryable.
+//
+// ── DESIGN DECISION: version negotiation is asymmetric, and structurally cannot see a payload ───
+// "Consider whether newer-server-vs-older-client is the same case as the reverse -- usually it is
+// not." It is not, and the asymmetry is exactly where wire-format additive evolution lives: a
+// MAJOR version is a breaking change, so ANY major mismatch is rejected in both directions -- there
+// is no assumption of compatibility to fall back on once the shape itself has changed. Within one
+// major version, MINOR bumps are additive-only by convention (new optional fields), which is what
+// makes the two minor directions genuinely different: a server newer in minor than the client
+// (server_minor > client_minor) is SAFE -- the server may have added fields the client's decoder
+// has never heard of, and an unknown-fields-ignored decoder simply does not read them. A server
+// OLDER in minor than the client (server_minor < client_minor) is UNSAFE -- the client's decoder
+// was built expecting fields a server this old was never taught to send, and there is no way to
+// decode "presence of a field that was never in the response" as anything but wrong. That is the
+// asymmetry: forward is fine, backward is not. `prism_wr_negotiate_version`'s signature takes only
+// the two `WrVersion` values -- it cannot decode a payload because it is never given one, which is
+// what "fail loudly before any payload is decoded" means as a structural guarantee rather than a
+// discipline the caller has to remember to uphold. It is deliberately decoupled from
+// submit/tick/report: a real client calls it once, against a version learned from a handshake or
+// health check, before it ever starts submitting requests on the channel -- folding it into every
+// `report()` call would make a version incompatibility consume a retry attempt and a dedup slot
+// for no reason, when it is not a request failure at all but a reason to stop talking to this
+// server altogether.
+//
+// ── MEASURED NOVA HAZARDS THIS FILE IS WRITTEN AROUND ───────────────────────────────────────────
+// (1) String concatenation truncates at the first `chr(0)` (NUL) -- `"A" + chr(0) + "B"` has
+//     `len == 2`, confirmed against `nova_runtime.c`'s `bytes_to_str`. The composite dict key this
+//     module builds from (channel, key) therefore uses `chr(1)` as its delimiter, never `chr(0)` --
+//     `chr(1)` is not the NUL byte, so concatenation cannot silently drop the second half, and it
+//     is already excluded from both halves by `_prism_wr_valid_token`'s own control-byte rejection
+//     (which is why the delimiter is provably absent from either half, not merely assumed to be).
+// (2) `let x = if ...` whose branches build DIFFERENT enum PAYLOAD shapes corrupts the value later,
+//     at an unrelated field read. Every enum in this file (`WrStatus`, `WrOutcomeKind`) is,
+//     following prism_route.nova/prism_form.nova's own convention, a zero-argument tag with no
+//     payload at all, which makes that corruption class structurally inapplicable here -- but the
+//     mitigation is still applied on principle everywhere a branch would otherwise build a value:
+//     `_prism_wr_outcome_retryable_next` and `_prism_wr_apply_outcome` use early return per branch
+//     with the shared tail factored into a helper, never a `let` assigned from a multi-line `if`.
+// (3) `"{undefined_name}"` compiles clean and silently interpolates `0` for a name not in scope.
+//     Every interpolation below names a real parameter or a `.`-accessed field of one.
+// (4) A `bool` changes representation across a call boundary and cannot be type-validated. No
+//     struct field, function parameter, or list/dict value in this file is ever a `bool` -- status
+//     and outcome are closed enums, and every 0/1-shaped flag that exists only stays local to one
+//     function (matching the same locally-scoped list-cell idiom prism_route.nova's own
+//     `_rt_first_control_char` already uses for its loop position, which never crosses a call).
+//
+// PUBLIC API
+//   WrStatus                          WrScheduled | WrInFlight | WrSucceeded | WrFailed | WrExhausted
+//   WrOutcomeKind                     WrOutcomeOk | WrOutcomeRetryable | WrOutcomeFatal
+//   WrVersion, WrPolicy, WrState, WrRequest, WrTickResult      opaque value types callers hold and pass back
+//
+//   prism_wr_version(major, minor)                              -> Result<WrVersion>
+//   prism_wr_version_str(v)                                     -> string
+//   prism_wr_version_major(v) / prism_wr_version_minor(v)       -> int
+//   prism_wr_negotiate_version(client, server)                  -> Result<string>   #125, never sees a payload
+//
+//   prism_wr_outcome_ok() / prism_wr_outcome_retryable() / prism_wr_outcome_fatal() -> WrOutcomeKind
+//   prism_wr_outcome_str(outcome)                               -> string
+//   prism_wr_classify_status(http_status)                       -> WrOutcomeKind    default retry policy
+//
+//   prism_wr_policy(client_version, base_ms, cap_ms, max_attempts, seed) -> Result<WrPolicy>
+//   prism_wr_state_new(policy)                                  -> WrState
+//
+//   prism_wr_submit(state, channel, key, payload, now_ms)       -> Result<WrState>       #92 dedup
+//   prism_wr_tick(state, now_ms)                                -> Result<WrTickResult>  explicit clock
+//   prism_wr_report(state, channel, key, outcome, now_ms)       -> Result<WrState>       backoff/budget
+//   prism_wr_find(state, channel, key)                          -> Result<WrRequest>
+//
+//   prism_wr_status_str(status)                                 -> string
+//   prism_wr_is_exhausted(status) / prism_wr_is_terminal(status) -> bool
+//
+//   prism_wr_backoff_envelope_ms(policy, attempt)                -> int   pure, unjittered, capped
+//   prism_wr_jittered_backoff_ms(policy, channel, key, attempt)  -> int   pure fn of (seed,channel,key,attempt)
+//
+//   prism_wr_tick_state(t) / prism_wr_tick_ready(t)              -> WrState / list<WrRequest>
+//   prism_wr_req_channel(r) / _key(r) / _payload(r)              -> string
+//   prism_wr_req_status(r)                                       -> WrStatus
+//   prism_wr_req_attempts(r) / _due_at_ms(r) / _submitted_at_ms(r) -> int
+
+import std/util/prng as prng
+
+// ── WrStatus: closed, 5-outcome. No public constructor -- like prism_form.nova's
+// PrismFmDraftStatus, a caller only ever RECEIVES one (from prism_wr_req_status /
+// prism_wr_find) and matches on it; there is no legitimate call site outside this file that
+// needs to build one.
+enum WrStatus
+    WrScheduled()
+    WrInFlight()
+    WrSucceeded()
+    WrFailed()
+    WrExhausted()
+
+// ── WrOutcomeKind: what a caller reports back after actually performing a send. Unlike WrStatus,
+// a caller MUST be able to construct one (to pass into prism_wr_report), so -- matching
+// prism_route.nova's RtParamKind/RtNavKind convention -- every variant gets a wrapper.
+enum WrOutcomeKind
+    WrOutcomeOk()
+    WrOutcomeRetryable()
+    WrOutcomeFatal()
+
+fn prism_wr_outcome_ok() -> WrOutcomeKind
+    WrOutcomeOk()
+
+fn prism_wr_outcome_retryable() -> WrOutcomeKind
+    WrOutcomeRetryable()
+
+fn prism_wr_outcome_fatal() -> WrOutcomeKind
+    WrOutcomeFatal()
+
+// String form of a WrOutcomeKind -- the same reason prism_wr_status_str exists below: a caller
+// (or a KAT) compares outcomes by name rather than relying on structural equality over an enum
+// value, matching prism_form.nova's own prism_fm_draft_status_str convention.
+fn prism_wr_outcome_str(outcome: WrOutcomeKind) -> string
+    match outcome
+        WrOutcomeOk() => "ok"
+        WrOutcomeRetryable() => "retryable"
+        WrOutcomeFatal() => "fatal"
+
+// The default retry policy for a raw HTTP-style status code -- see header DESIGN DECISION on why
+// this is offered as a swappable default rather than baked into prism_wr_report itself.
+fn prism_wr_classify_status(http_status: int) -> WrOutcomeKind
+    if http_status >= 200 and http_status <= 299
+        return WrOutcomeOk()
+    if http_status == 408 or http_status == 429
+        return WrOutcomeRetryable()
+    if http_status >= 500 and http_status <= 599
+        return WrOutcomeRetryable()
+    WrOutcomeFatal()
+
+// ── Value types. Every field is `wr_`-prefixed with a per-struct sub-tag (`wr_ver_`, `wr_pol_`,
+// `wr_req_`, `wr_st_`, `wr_tr_`) -- NOVA's struct field->slot map is GLOBAL, so a bare
+// `major`/`status`/`attempts` here would risk silently sharing a slot with an unrelated field of
+// that name declared anywhere else in the whole program.
+
+type WrVersion
+    wr_ver_major: int
+    wr_ver_minor: int
+
+// The retry/backoff/dedup POLICY for one channel connection. `wr_pol_seed` is the caller-supplied
+// seed that makes jitter reproducible (see header) -- pass a fixed value in tests, a per-client
+// random value (or a stable per-install id) in production so different clients decorrelate.
+type WrPolicy
+    wr_pol_client_version: WrVersion
+    wr_pol_base_ms: int
+    wr_pol_cap_ms: int
+    wr_pol_max_attempts: int
+    wr_pol_seed: int
+
+// One tracked logical request. `wr_req_payload` is opaque to this module -- it is whatever the
+// caller already hand-built (per CLAUDE.md, `to_json()` on an imported struct is untrustworthy, so
+// callers hand-build their own request bodies) and this module never inspects or re-encodes it, it
+// only ever resends the SAME bytes on every attempt. `wr_req_due_at_ms` is meaningful only while
+// `wr_req_status` is `WrScheduled()`; it holds the last-used value afterward.
+type WrRequest
+    wr_req_channel: string
+    wr_req_key: string
+    wr_req_payload: string
+    wr_req_status: WrStatus
+    wr_req_attempts: int
+    wr_req_due_at_ms: int
+    wr_req_submitted_at_ms: int
+
+// The whole machine's live state: the policy plus every tracked request, keyed by a composite of
+// (channel, key) -- see `_prism_wr_composite_key`. Threaded non-mutating (every operation returns a
+// NEW WrState), matching prism_route.nova's RtRouter convention -- a caller holding an older state
+// value never sees a later submit/tick/report reach through it.
+type WrState
+    wr_st_policy: WrPolicy
+    wr_st_requests: dict          // composite key -> WrRequest
+
+// The result of advancing the clock: the new state, plus every request that just became due to
+// send (already marked WrInFlight, with wr_req_attempts already incremented for this send).
+type WrTickResult
+    wr_tr_state: WrState
+    wr_tr_ready: list             // list<WrRequest>
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Version (#125) ──────────────────────────────────────────────────────────────────────────
+
+fn prism_wr_version(major: int, minor: int) -> Result<WrVersion>
+    if major < 0
+        return err("prism_wire: version major must be >= 0, got {major}")
+    if minor < 0
+        return err("prism_wire: version minor must be >= 0, got {minor}")
+    ok(WrVersion(major, minor))
+
+fn prism_wr_version_str(v: WrVersion) -> string
+    "v{v.wr_ver_major}.{v.wr_ver_minor}"
+
+fn prism_wr_version_major(v: WrVersion) -> int
+    v.wr_ver_major
+
+fn prism_wr_version_minor(v: WrVersion) -> int
+    v.wr_ver_minor
+
+// See header DESIGN DECISION on the asymmetry. Ok carries a human-readable reason (mirroring
+// prism_route.nova's own habit of a reason string on the success path of a check function, not
+// just the failure path) so a caller can log WHY a connection was accepted, not just that it was.
+fn prism_wr_negotiate_version(client: WrVersion, server: WrVersion) -> Result<string>
+    if server.wr_ver_major > client.wr_ver_major
+        return err("prism_wire: version mismatch -- server is on wire major v{server.wr_ver_major} but this client was built against v{client.wr_ver_major}; the client's decoder does not understand this wire shape at all -- upgrade the client before decoding any payload from this server")
+    if server.wr_ver_major < client.wr_ver_major
+        return err("prism_wire: version mismatch -- server is still on wire major v{server.wr_ver_major} but this client expects v{client.wr_ver_major}; an older or rolled-back server may be running -- the client cannot assume fields such a server may never send, so no payload from it should be decoded")
+    if server.wr_ver_minor < client.wr_ver_minor
+        return err("prism_wire: version mismatch -- server is on v{client.wr_ver_major}.{server.wr_ver_minor} but this client expects at least v{client.wr_ver_major}.{client.wr_ver_minor}; the server has not yet deployed fields this client's decoder relies on -- do not decode any payload from it until the server catches up")
+    ok("compatible: server v{server.wr_ver_major}.{server.wr_ver_minor} satisfies client v{client.wr_ver_major}.{client.wr_ver_minor}")
+
+// ── Policy / state construction ─────────────────────────────────────────────────────────────
+
+fn prism_wr_policy(client_version: WrVersion, base_ms: int, cap_ms: int, max_attempts: int, seed: int) -> Result<WrPolicy>
+    if base_ms <= 0
+        return err("prism_wire: base_ms must be > 0, got {base_ms}")
+    if cap_ms < base_ms
+        return err("prism_wire: cap_ms ({cap_ms}) must be >= base_ms ({base_ms})")
+    if max_attempts < 1
+        return err("prism_wire: max_attempts must be >= 1, got {max_attempts}")
+    ok(WrPolicy(client_version, base_ms, cap_ms, max_attempts, seed))
+
+fn prism_wr_state_new(policy: WrPolicy) -> WrState
+    WrState(policy, {})
+
+// ── Identity: composite (channel, key) key + token validation ──────────────────────────────
+
+// Byte-wise scan for a control byte (<0x20 or ==0x7F), reusing str_chars' BYTE-wise semantics
+// (see CLAUDE.md) the same way prism_route.nova's `_rt_first_control_char` does. Unlike that
+// function, the offending byte's ordinal is captured DIRECTLY from the byte-wise iteration
+// (`ord(b)`) rather than re-indexed out of the original string afterward -- re-indexing a BYTE
+// position into NOVA's CODEPOINT-indexed `s[i]` misaligns the moment any multi-byte character
+// precedes the control byte, so the value used in the message here is read once, at the point
+// it is already known to be correct, and never re-derived.
+fn _prism_wr_valid_token(label: string, s: string) -> Result<string>
+    if len(s) == 0
+        return err("prism_wire: {label} is required (empty string)")
+    let idx = [0]
+    for b in str_chars(s)
+        let i = idx[0]
+        idx[0] = i + 1
+        let code = ord(b)
+        if code < 32 or code == 127
+            return err("prism_wire: {label} '{s}' has a control character (code {code}) at byte {i}")
+    ok(s)
+
+// chr(1) (not chr(0) -- see header hazard note (1)) joins the two validated halves. Because both
+// halves are already proven free of any byte < 32, chr(1) can never appear inside either half, so
+// two DIFFERENT (channel, key) pairs can never produce the same composite string.
+fn _prism_wr_composite_key(channel: string, key: string) -> Result<string>
+    let c = _prism_wr_valid_token("channel name", channel)?
+    let k = _prism_wr_valid_token("dedup key", key)?
+    ok(c + chr(1) + k)
+
+// ── Submit (#92 dedup) ──────────────────────────────────────────────────────────────────────
+
+fn prism_wr_submit(state: WrState, channel: string, key: string, payload: string, now_ms: int) -> Result<WrState>
+    let ck = _prism_wr_composite_key(channel, key)?
+    if ck in state.wr_st_requests
+        let existing = state.wr_st_requests[ck]
+        if existing.wr_req_payload != payload
+            return err("prism_wire: channel '{channel}' key '{key}' was already submitted with a different payload -- reusing a dedup key for a different request body is not allowed; use a new key for a genuinely different operation")
+        return ok(state)
+    let fresh = WrRequest(channel, key, payload, WrScheduled(), 0, now_ms, now_ms)
+    let reqs = dict_copy(state.wr_st_requests)
+    reqs[ck] = fresh
+    ok(WrState(state.wr_st_policy, reqs))
+
+// ── Tick: the explicit clock (#92 retry scheduling) ─────────────────────────────────────────
+
+fn _prism_wr_is_scheduled(status: WrStatus) -> bool
+    match status
+        WrScheduled() => true
+        WrInFlight() => false
+        WrSucceeded() => false
+        WrFailed() => false
+        WrExhausted() => false
+
+// Advances the clock to `now_ms`. Every request whose status is WrScheduled() and whose due time
+// has arrived moves to WrInFlight() (attempts incremented -- see header on why attempts count
+// sends, not failures) and is collected into `wr_tr_ready` for the caller to actually transmit.
+// Iterates the ORIGINAL dict while writing into a fresh copy, so mutation never observes its own
+// writes mid-scan.
+fn prism_wr_tick(state: WrState, now_ms: int) -> Result<WrTickResult>
+    let reqs = dict_copy(state.wr_st_requests)
+    let ready = []
+    for ck, req in state.wr_st_requests
+        if _prism_wr_is_scheduled(req.wr_req_status) and req.wr_req_due_at_ms <= now_ms
+            let sent = WrRequest(req.wr_req_channel, req.wr_req_key, req.wr_req_payload, WrInFlight(), req.wr_req_attempts + 1, req.wr_req_due_at_ms, req.wr_req_submitted_at_ms)
+            reqs[ck] = sent
+            push(ready, sent)
+    ok(WrTickResult(WrState(state.wr_st_policy, reqs), ready))
+
+// ── Backoff schedule -- pure functions of (policy, attempt) / (policy, channel, key, attempt) ──
+
+// The unjittered envelope: base_ms * 2^attempt, capped at cap_ms, computed by iterative doubling
+// with an early exit the instant the cap is reached (never `1 << attempt` -- see header). `attempt`
+// is 0-based (0 = the delay before the FIRST retry). Monotonic non-decreasing in attempt, and never
+// exceeds cap_ms, by construction -- these are exactly the property a KAT can assert as a loop.
+fn prism_wr_backoff_envelope_ms(policy: WrPolicy, attempt: int) -> int
+    if attempt <= 0
+        return policy.wr_pol_base_ms if policy.wr_pol_base_ms < policy.wr_pol_cap_ms else policy.wr_pol_cap_ms
+    let d = policy.wr_pol_base_ms
+    for i in 0..attempt
+        if d >= policy.wr_pol_cap_ms
+            return policy.wr_pol_cap_ms
+        d = d * 2
+    d if d < policy.wr_pol_cap_ms else policy.wr_pol_cap_ms
+
+// A permille (0..999) derived purely from the policy's seed and this specific (channel, key,
+// attempt) -- same inputs always produce the same value. str_hash (FNV-1a, already a builtin --
+// see header on not re-deriving a second hash function) folds the two strings into the seed;
+// prng_seed's own stirring absorbs the XOR combination cleanly regardless of sign.
+fn _prism_wr_jitter_permille(policy: WrPolicy, channel: string, key: string, attempt: int) -> int
+    let seed0 = prng.prng_seed(policy.wr_pol_seed ^ str_hash(channel) ^ str_hash(key) ^ attempt)
+    let step = prng.prng_next(seed0)
+    step[0] % 1000
+
+// AWS "Equal Jitter" (Brooker 2015) -- see header. Result is always in [envelope/2, envelope],
+// which is itself always in [0, cap_ms].
+fn prism_wr_jittered_backoff_ms(policy: WrPolicy, channel: string, key: string, attempt: int) -> int
+    let envelope = prism_wr_backoff_envelope_ms(policy, attempt)
+    let half = envelope / 2
+    let frac = _prism_wr_jitter_permille(policy, channel, key, attempt)
+    half + (half * frac) / 1000
+
+// ── Report: apply an outcome, schedule the next retry or resolve terminally ─────────────────
+
+// Early-return-per-branch, shared tail factored out -- see header hazard note (2). Called only
+// once wr_req_attempts >= 1 is already guaranteed (report() only proceeds past
+// _prism_wr_require_in_flight when status is WrInFlight(), which is only ever reached via tick()
+// incrementing attempts), so `wr_req_attempts - 1` below is always >= 0.
+fn _prism_wr_outcome_retryable_next(policy: WrPolicy, req: WrRequest, now_ms: int) -> WrRequest
+    if req.wr_req_attempts >= policy.wr_pol_max_attempts
+        return WrRequest(req.wr_req_channel, req.wr_req_key, req.wr_req_payload, WrExhausted(), req.wr_req_attempts, req.wr_req_due_at_ms, req.wr_req_submitted_at_ms)
+    let delay = prism_wr_jittered_backoff_ms(policy, req.wr_req_channel, req.wr_req_key, req.wr_req_attempts - 1)
+    WrRequest(req.wr_req_channel, req.wr_req_key, req.wr_req_payload, WrScheduled(), req.wr_req_attempts, now_ms + delay, req.wr_req_submitted_at_ms)
+
+fn _prism_wr_apply_outcome(policy: WrPolicy, req: WrRequest, outcome: WrOutcomeKind, now_ms: int) -> WrRequest
+    match outcome
+        WrOutcomeOk() => WrRequest(req.wr_req_channel, req.wr_req_key, req.wr_req_payload, WrSucceeded(), req.wr_req_attempts, req.wr_req_due_at_ms, req.wr_req_submitted_at_ms)
+        WrOutcomeFatal() => WrRequest(req.wr_req_channel, req.wr_req_key, req.wr_req_payload, WrFailed(), req.wr_req_attempts, req.wr_req_due_at_ms, req.wr_req_submitted_at_ms)
+        WrOutcomeRetryable() => _prism_wr_outcome_retryable_next(policy, req, now_ms)
+
+fn _prism_wr_require_in_flight(channel: string, key: string, status: WrStatus) -> Result<int>
+    match status
+        WrInFlight() => ok(1)
+        WrScheduled() => err("prism_wire: channel '{channel}' key '{key}' is not in flight yet (still scheduled) -- report() must follow a send handed out by tick()")
+        WrSucceeded() => err("prism_wire: channel '{channel}' key '{key}' already succeeded -- report() called twice for the same attempt?")
+        WrFailed() => err("prism_wire: channel '{channel}' key '{key}' already failed terminally -- report() called twice for the same attempt?")
+        WrExhausted() => err("prism_wire: channel '{channel}' key '{key}' already exhausted its retry budget -- report() called twice for the same attempt?")
+
+// Applies the outcome of an in-flight attempt: WrOutcomeOk() resolves it WrSucceeded(); a
+// WrOutcomeFatal() resolves it WrFailed() immediately, with NO further scheduling regardless of
+// remaining budget (a 400-class error retried forever is a bug, per header); a
+// WrOutcomeRetryable() either schedules the next backoff-delayed attempt or, once the attempt
+// budget is spent, resolves it WrExhausted() -- see header on both.
+fn prism_wr_report(state: WrState, channel: string, key: string, outcome: WrOutcomeKind, now_ms: int) -> Result<WrState>
+    let ck = _prism_wr_composite_key(channel, key)?
+    if not (ck in state.wr_st_requests)
+        return err("prism_wire: no request tracked for channel '{channel}' key '{key}' -- call prism_wr_submit before prism_wr_report")
+    let req = state.wr_st_requests[ck]
+    _prism_wr_require_in_flight(channel, key, req.wr_req_status)?
+    let next = _prism_wr_apply_outcome(state.wr_st_policy, req, outcome, now_ms)
+    let reqs = dict_copy(state.wr_st_requests)
+    reqs[ck] = next
+    ok(WrState(state.wr_st_policy, reqs))
+
+// ── Lookup / accessors ──────────────────────────────────────────────────────────────────────
+
+fn prism_wr_find(state: WrState, channel: string, key: string) -> Result<WrRequest>
+    let ck = _prism_wr_composite_key(channel, key)?
+    if ck in state.wr_st_requests
+        return ok(state.wr_st_requests[ck])
+    err("prism_wire: no request tracked for channel '{channel}' key '{key}'")
+
+fn prism_wr_status_str(status: WrStatus) -> string
+    match status
+        WrScheduled() => "scheduled"
+        WrInFlight() => "in_flight"
+        WrSucceeded() => "succeeded"
+        WrFailed() => "failed"
+        WrExhausted() => "exhausted"
+
+// The exhaustion observability the header's retry-budget DESIGN DECISION requires.
+fn prism_wr_is_exhausted(status: WrStatus) -> bool
+    match status
+        WrExhausted() => true
+        WrScheduled() => false
+        WrInFlight() => false
+        WrSucceeded() => false
+        WrFailed() => false
+
+fn prism_wr_is_terminal(status: WrStatus) -> bool
+    match status
+        WrSucceeded() => true
+        WrFailed() => true
+        WrExhausted() => true
+        WrScheduled() => false
+        WrInFlight() => false
+
+fn prism_wr_tick_state(t: WrTickResult) -> WrState
+    t.wr_tr_state
+
+fn prism_wr_tick_ready(t: WrTickResult) -> list
+    t.wr_tr_ready
+
+fn prism_wr_req_channel(r: WrRequest) -> string
+    r.wr_req_channel
+
+fn prism_wr_req_key(r: WrRequest) -> string
+    r.wr_req_key
+
+fn prism_wr_req_payload(r: WrRequest) -> string
+    r.wr_req_payload
+
+fn prism_wr_req_status(r: WrRequest) -> WrStatus
+    r.wr_req_status
+
+fn prism_wr_req_attempts(r: WrRequest) -> int
+    r.wr_req_attempts
+
+fn prism_wr_req_due_at_ms(r: WrRequest) -> int
+    r.wr_req_due_at_ms
+
+fn prism_wr_req_submitted_at_ms(r: WrRequest) -> int
+    r.wr_req_submitted_at_ms

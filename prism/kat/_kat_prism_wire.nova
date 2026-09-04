@@ -1,0 +1,276 @@
+// KAT for prism/app/prism_wire.nova -- typed channel with dedup/retry/backoff (#92) and
+// wire-version negotiation (#125).
+//
+// The properties this exists to prove, in order of importance:
+//   1. ★ A DUPLICATE REQUEST APPLIES ONCE, however many times it is retried or resubmitted --
+//      the dedup identity (channel, key) is stable across every physical attempt, submit() is
+//      idempotent at every point in a request's life (scheduled, in flight, or long resolved),
+//      and a payload mismatch under a reused key is a loud rejection, never a silent swap.
+//   2. ★ BACKOFF IS MONOTONIC UP TO THE CAP AND NEVER EXCEEDS IT -- proven as a property over a
+//      wide attempt range on the pure envelope function, then tied to the real state machine.
+//   3. ★ AN EXHAUSTED RETRY BUDGET IS OBSERVABLE, not silent -- a distinct WrExhausted() status,
+//      reached deterministically after exactly max_attempts sends, never retried past it.
+//   4. ★ A VERSION MISMATCH IS REJECTED BEFORE ANY PAYLOAD IS DECODED -- structurally true by
+//      signature (negotiate takes two versions, nothing else) and behaviorally true in both
+//      the major-mismatch (both directions, distinct messages) and the minor-regression case,
+//      while a minor ADVANCE on the server is accepted (the newer-vs-older asymmetry).
+//   5. A 400-class (fatal) outcome is never retried, however long the caller keeps ticking; a
+//      500-class (retryable) outcome always is, until the budget is spent.
+//   6. A non-ASCII payload survives byte-identical across submit -> tick -> retry -> tick.
+
+import prism_wire as w
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn _v(major: int, minor: int) -> WrVersion
+    unwrap(w.prism_wr_version(major, minor))
+
+fn _policy(base_ms: int, cap_ms: int, max_attempts: int, seed: int) -> WrPolicy
+    unwrap(w.prism_wr_policy(_v(1, 2), base_ms, cap_ms, max_attempts, seed))
+
+fn main()
+    print("== _kat_prism_wire ==")
+
+    // ── 0. policy construction is validated ─────────────────────────────────────────────────
+    print("0. policy construction rejects nonsensical config")
+    check("base_ms <= 0 is rejected", is_err(w.prism_wr_policy(_v(1, 0), 0, 100, 3, 1)))
+    check("negative base_ms is rejected", is_err(w.prism_wr_policy(_v(1, 0), -5, 100, 3, 1)))
+    check("cap_ms < base_ms is rejected", is_err(w.prism_wr_policy(_v(1, 0), 200, 100, 3, 1)))
+    check("max_attempts < 1 is rejected", is_err(w.prism_wr_policy(_v(1, 0), 100, 200, 0, 1)))
+    check("a sane policy is accepted", not is_err(w.prism_wr_policy(_v(1, 0), 100, 200, 3, 1)))
+    check("negative version major is rejected", is_err(w.prism_wr_version(-1, 0)))
+    check("negative version minor is rejected", is_err(w.prism_wr_version(1, -1)))
+
+    // ── 1. ★ versioning (#125): asymmetric, and structurally payload-blind ─────────────────────
+    print("1. ★ version negotiation (#125) -- asymmetric major/minor, never sees a payload")
+    // prism_wr_negotiate_version(client, server) -- its signature is exactly two WrVersion
+    // values, nothing else; there is no parameter through which a payload could ever reach it,
+    // which is the structural half of "before any payload is decoded".
+    let c12 = _v(1, 2)
+    check("exact version match is compatible", not is_err(w.prism_wr_negotiate_version(c12, _v(1, 2))))
+    check("server AHEAD in minor (same major) is compatible -- forward-compatible additive fields", not is_err(w.prism_wr_negotiate_version(c12, _v(1, 5))))
+    let behind_minor = w.prism_wr_negotiate_version(c12, _v(1, 0))
+    check("★ server BEHIND in minor (same major) is REJECTED -- the asymmetric case", is_err(behind_minor))
+    check("...with a message naming the server-catch-up direction", contains(unwrap_err(behind_minor), "has not yet deployed"))
+    let server_ahead_major = w.prism_wr_negotiate_version(c12, _v(2, 0))
+    check("server AHEAD in major is REJECTED (breaking change, not additive)", is_err(server_ahead_major))
+    check("...with a message telling the CLIENT to upgrade", contains(unwrap_err(server_ahead_major), "upgrade the client"))
+    let server_behind_major = w.prism_wr_negotiate_version(c12, _v(0, 9))
+    check("server BEHIND in major is ALSO rejected", is_err(server_behind_major))
+    check("★ ...but with a DIFFERENT message -- newer-server-vs-older-client is not the same case as the reverse", contains(unwrap_err(server_behind_major), "rolled-back"))
+    check("the two major-mismatch directions produce genuinely different text", unwrap_err(server_ahead_major) != unwrap_err(server_behind_major))
+    check("version accessors round-trip", w.prism_wr_version_major(c12) == 1 and w.prism_wr_version_minor(c12) == 2)
+    check("version_str formats as vMAJOR.MINOR", w.prism_wr_version_str(c12) == "v1.2")
+
+    // ── 2. ★ dedup (#92): idempotent submit, payload-mismatch guard ────────────────────────────
+    print("2. ★ dedup (#92): submit is idempotent on (channel, key)")
+    let p0 = _policy(100, 800, 4, 777)
+    let s0 = w.prism_wr_state_new(p0)
+    let s1 = unwrap(w.prism_wr_submit(s0, "checkout", "cart-42", "\{\"total\":19.99\}", 1000))
+    let r1 = unwrap(w.prism_wr_find(s1, "checkout", "cart-42"))
+    check("a fresh submit is WrScheduled", w.prism_wr_status_str(w.prism_wr_req_status(r1)) == "scheduled")
+    check("a fresh submit has 0 attempts", w.prism_wr_req_attempts(r1) == 0)
+    check("a fresh submit is due at its own submit time", w.prism_wr_req_due_at_ms(r1) == 1000)
+    // Resubmitting the identical (channel, key, payload) later must be a pure no-op: not just
+    // "still scheduled" but the EXACT same tracked record (due time unmoved by the later call).
+    let s2 = unwrap(w.prism_wr_submit(s1, "checkout", "cart-42", "\{\"total\":19.99\}", 9999))
+    let r2 = unwrap(w.prism_wr_find(s2, "checkout", "cart-42"))
+    check("★ resubmitting the SAME payload leaves due_at_ms untouched (true no-op, not a reschedule)", w.prism_wr_req_due_at_ms(r2) == 1000)
+    check("...and attempts untouched", w.prism_wr_req_attempts(r2) == 0)
+    let mismatch = w.prism_wr_submit(s1, "checkout", "cart-42", "\{\"total\":999.00\}", 1000)
+    check("★ resubmitting a DIFFERENT payload under the same key is REJECTED, not silently applied", is_err(mismatch))
+    check("...with a message calling out the reused key", contains(unwrap_err(mismatch), "different payload"))
+
+    // ── 3. the explicit clock: nothing is sent before it is due ────────────────────────────────
+    print("3. prism_wr_tick only returns work that is actually due")
+    let t_early = unwrap(w.prism_wr_tick(s1, 999))
+    check("ticking BEFORE the due time returns nothing ready", len(w.prism_wr_tick_ready(t_early)) == 0)
+    let early_lookup = unwrap(w.prism_wr_find(w.prism_wr_tick_state(t_early), "checkout", "cart-42"))
+    check("...and the request is untouched (still 0 attempts)", w.prism_wr_req_attempts(early_lookup) == 0)
+    let t_due = unwrap(w.prism_wr_tick(s1, 1000))
+    let ready0 = w.prism_wr_tick_ready(t_due)
+    check("ticking AT the due time returns exactly one ready send", len(ready0) == 1)
+    check("...marked WrInFlight", w.prism_wr_status_str(w.prism_wr_req_status(ready0[0])) == "in_flight")
+    check("...with attempts incremented to 1 (attempt N = Nth SEND, not Nth failure)", w.prism_wr_req_attempts(ready0[0]) == 1)
+    let s_inflight = w.prism_wr_tick_state(t_due)
+    let t_again = unwrap(w.prism_wr_tick(s_inflight, 5000))
+    check("ticking again while in flight returns nothing (no duplicate concurrent send of the same key)", len(w.prism_wr_tick_ready(t_again)) == 0)
+
+    // ── 4. success resolves terminally; post-success resubmit stays a no-op ────────────────────
+    print("4. a successful report resolves WrSucceeded, and dedup holds even after resolution")
+    let s_ok = unwrap(w.prism_wr_report(s_inflight, "checkout", "cart-42", w.prism_wr_outcome_ok(), 1050))
+    let r_ok = unwrap(w.prism_wr_find(s_ok, "checkout", "cart-42"))
+    check("status is now succeeded", w.prism_wr_status_str(w.prism_wr_req_status(r_ok)) == "succeeded")
+    check("is_terminal is true", w.prism_wr_is_terminal(w.prism_wr_req_status(r_ok)))
+    check("is_exhausted is false (it succeeded, it did not run out)", not w.prism_wr_is_exhausted(w.prism_wr_req_status(r_ok)))
+    let s_ok2 = unwrap(w.prism_wr_submit(s_ok, "checkout", "cart-42", "\{\"total\":19.99\}", 999999))
+    check("★ resubmitting the SAME op after it already succeeded is still a no-op (never re-sent)", w.prism_wr_status_str(w.prism_wr_req_status(unwrap(w.prism_wr_find(s_ok2, "checkout", "cart-42")))) == "succeeded")
+    let t_after_ok = unwrap(w.prism_wr_tick(s_ok, 999999999))
+    check("...and it is never returned as ready again, no matter how far the clock runs", len(w.prism_wr_tick_ready(t_after_ok)) == 0)
+
+    // ── 5. ★ backoff envelope: monotonic, capped -- pure property over a wide attempt range ────
+    print("5. ★ prism_wr_backoff_envelope_ms is monotonic non-decreasing and never exceeds the cap")
+    let p5 = _policy(100, 800, 50, 42)
+    let prev = [0]
+    let mono_ok = [1]
+    let cap_ok = [1]
+    for a in 0..40
+        let env = w.prism_wr_backoff_envelope_ms(p5, a)
+        if env < prev[0]
+            mono_ok[0] = 0
+        if env > 800
+            cap_ok[0] = 0
+        prev[0] = env
+    check("★ envelope(attempt) is monotonic non-decreasing across attempts 0..39", mono_ok[0] == 1)
+    check("★ envelope(attempt) never exceeds cap_ms=800 across attempts 0..39", cap_ok[0] == 1)
+    check("envelope(0) == base_ms", w.prism_wr_backoff_envelope_ms(p5, 0) == 100)
+    check("envelope eventually saturates AT the cap (not above it)", w.prism_wr_backoff_envelope_ms(p5, 30) == 800)
+    check("a negative attempt is clamped to the base case, not treated as a crash", w.prism_wr_backoff_envelope_ms(p5, -3) == 100)
+
+    // ── 6. ★ jitter: pure, reproducible, always within [envelope/2, envelope] ──────────────────
+    print("6. ★ prism_wr_jittered_backoff_ms is a pure fn of (seed, channel, key, attempt), bounded")
+    let bounds_ok = [1]
+    for a in 0..40
+        let env = w.prism_wr_backoff_envelope_ms(p5, a)
+        let half = env / 2
+        let jit = w.prism_wr_jittered_backoff_ms(p5, "ch", "k", a)
+        if jit < half or jit > env
+            bounds_ok[0] = 0
+    check("★ jittered delay stays within [envelope/2, envelope] across attempts 0..39", bounds_ok[0] == 1)
+    let jit_a = w.prism_wr_jittered_backoff_ms(p5, "checkout", "cart-42", 3)
+    let jit_b = w.prism_wr_jittered_backoff_ms(p5, "checkout", "cart-42", 3)
+    check("same (policy, channel, key, attempt) always yields the SAME delay (reproducible, testable)", jit_a == jit_b)
+    let jit_c = w.prism_wr_jittered_backoff_ms(p5, "checkout", "cart-99", 3)
+    check("a DIFFERENT key perturbs the delay (decorrelates a thundering herd)", jit_a != jit_c)
+
+    // ── 7. ★ end-to-end retry cycle over the explicit clock: retryable -> exhausted ────────────
+    print("7. ★ full retry cycle: retryable failures reschedule with growing backoff, then exhaust")
+    let p7 = _policy(100, 800, 4, 555)
+    let seen_channels = []
+    let seen_keys = []
+    let st = w.prism_wr_state_new(p7)
+    st = unwrap(w.prism_wr_submit(st, "sync", "op-9", "payload-v1", 0))
+    let clock = [0]
+    let attempt_count = [0]
+    let final_status = [""]
+    for round in 0..8
+        let tr = unwrap(w.prism_wr_tick(st, clock[0]))
+        st = w.prism_wr_tick_state(tr)
+        let ready = w.prism_wr_tick_ready(tr)
+        if len(ready) > 0
+            let sent = ready[0]
+            push(seen_channels, w.prism_wr_req_channel(sent))
+            push(seen_keys, w.prism_wr_req_key(sent))
+            attempt_count[0] = attempt_count[0] + 1
+            let rep = unwrap(w.prism_wr_report(st, "sync", "op-9", w.prism_wr_outcome_retryable(), clock[0]))
+            st = rep
+            let after = unwrap(w.prism_wr_find(st, "sync", "op-9"))
+            final_status[0] = w.prism_wr_status_str(w.prism_wr_req_status(after))
+            if w.prism_wr_is_terminal(w.prism_wr_req_status(after))
+                clock[0] = clock[0] + 1
+            else
+                clock[0] = w.prism_wr_req_due_at_ms(after)
+    check("exactly 4 physical sends happened (the policy's max_attempts)", attempt_count[0] == 4)
+    check("★ the retry budget is EXHAUSTED, not retried forever", final_status[0] == "exhausted")
+    let t_post_exhaust = unwrap(w.prism_wr_tick(st, 999999999))
+    check("...and an exhausted request is never scheduled again, at any future clock reading", len(w.prism_wr_tick_ready(t_post_exhaust)) == 0)
+    check("★ every one of the 4 physical attempts carried the IDENTICAL dedup channel", len(seen_channels) == 4 and seen_channels[0] == "sync" and seen_channels[1] == "sync" and seen_channels[2] == "sync" and seen_channels[3] == "sync")
+    check("★ ...and the IDENTICAL dedup key -- a retried request never gets a new identity", len(seen_keys) == 4 and seen_keys[0] == "op-9" and seen_keys[1] == "op-9" and seen_keys[2] == "op-9" and seen_keys[3] == "op-9")
+
+    // ── 8. fatal outcomes never retry, however long the caller keeps ticking ───────────────────
+    print("8. a fatal (400-class) outcome resolves WrFailed and is NEVER retried")
+    let p8 = _policy(50, 400, 5, 3)
+    let s8 = w.prism_wr_state_new(p8)
+    let s8b = unwrap(w.prism_wr_submit(s8, "profile", "user-7", "\{\"name\":\"a\"\}", 0))
+    let t8 = unwrap(w.prism_wr_tick(s8b, 0))
+    let s8c = w.prism_wr_tick_state(t8)
+    let s8d = unwrap(w.prism_wr_report(s8c, "profile", "user-7", w.prism_wr_outcome_fatal(), 0))
+    let r8 = unwrap(w.prism_wr_find(s8d, "profile", "user-7"))
+    check("status is failed (not exhausted -- these are different terminal reasons)", w.prism_wr_status_str(w.prism_wr_req_status(r8)) == "failed")
+    check("attempts stayed at 1 -- a fatal error costs exactly one attempt, never more", w.prism_wr_req_attempts(r8) == 1)
+    let t8_later = unwrap(w.prism_wr_tick(s8d, 999999999))
+    check("★ ticking far into the future NEVER resurrects a fatally-failed request", len(w.prism_wr_tick_ready(t8_later)) == 0)
+
+    // ── 9. classify_status: the default retry policy ────────────────────────────────────────────
+    print("9. prism_wr_classify_status: 2xx ok, 408/429/5xx retryable, everything else fatal")
+    check("200 -> ok", w.prism_wr_outcome_str(w.prism_wr_classify_status(200)) == "ok")
+    check("204 -> ok", w.prism_wr_outcome_str(w.prism_wr_classify_status(204)) == "ok")
+    check("404 -> fatal", w.prism_wr_outcome_str(w.prism_wr_classify_status(404)) == "fatal")
+    check("400 -> fatal", w.prism_wr_outcome_str(w.prism_wr_classify_status(400)) == "fatal")
+    check("408 (Request Timeout) -> retryable despite being 4xx", w.prism_wr_outcome_str(w.prism_wr_classify_status(408)) == "retryable")
+    check("429 (Too Many Requests) -> retryable despite being 4xx", w.prism_wr_outcome_str(w.prism_wr_classify_status(429)) == "retryable")
+    check("500 -> retryable", w.prism_wr_outcome_str(w.prism_wr_classify_status(500)) == "retryable")
+    check("503 -> retryable", w.prism_wr_outcome_str(w.prism_wr_classify_status(503)) == "retryable")
+    check("301 (redirect reaching this layer) -> fatal, not retried blindly", w.prism_wr_outcome_str(w.prism_wr_classify_status(301)) == "fatal")
+    let total_ok = [1]
+    for code in 100..599
+        let k = w.prism_wr_outcome_str(w.prism_wr_classify_status(code))
+        let is_2xx = code >= 200 and code <= 299
+        let is_special_retry = code == 408 or code == 429 or (code >= 500 and code <= 599)
+        if is_2xx and k != "ok"
+            total_ok[0] = 0
+        if is_special_retry and k != "retryable"
+            total_ok[0] = 0
+        if (not is_2xx) and (not is_special_retry) and k != "fatal"
+            total_ok[0] = 0
+    check("classify_status is total and consistent across the full 100..598 status range", total_ok[0] == 1)
+
+    // ── 10. report() misuse is rejected, never silently accepted ───────────────────────────────
+    print("10. prism_wr_report refuses to corrupt state on misuse")
+    let s10 = w.prism_wr_state_new(_policy(100, 400, 3, 1))
+    check("report() on a channel/key that was never submitted is rejected", is_err(w.prism_wr_report(s10, "nope", "nope", w.prism_wr_outcome_ok(), 0)))
+    let s10b = unwrap(w.prism_wr_submit(s10, "x", "y", "p", 0))
+    let still_scheduled = w.prism_wr_report(s10b, "x", "y", w.prism_wr_outcome_ok(), 0)
+    check("★ report() on a request that is still only SCHEDULED (never ticked) is rejected", is_err(still_scheduled))
+    let t10 = unwrap(w.prism_wr_tick(s10b, 0))
+    let s10c = unwrap(w.prism_wr_report(w.prism_wr_tick_state(t10), "x", "y", w.prism_wr_outcome_ok(), 0))
+    let double_report = w.prism_wr_report(s10c, "x", "y", w.prism_wr_outcome_ok(), 0)
+    check("★ a SECOND report() on an already-terminal request is rejected, not silently reapplied", is_err(double_report))
+
+    // ── 11. composite identity: (channel, key) pairs never collide ─────────────────────────────
+    print("11. distinct (channel, key) pairs never collide, even when concatenation naively would")
+    let s11 = w.prism_wr_state_new(_policy(100, 400, 3, 1))
+    let s11b = unwrap(w.prism_wr_submit(s11, "ab", "c", "payload-ONE", 0))
+    let s11c = unwrap(w.prism_wr_submit(s11b, "a", "bc", "payload-TWO", 0))
+    let f1 = unwrap(w.prism_wr_find(s11c, "ab", "c"))
+    let f2 = unwrap(w.prism_wr_find(s11c, "a", "bc"))
+    check("★ ('ab','c') and ('a','bc') are tracked as TWO separate requests", w.prism_wr_req_payload(f1) == "payload-ONE" and w.prism_wr_req_payload(f2) == "payload-TWO")
+
+    // ── 12. token validation ────────────────────────────────────────────────────────────────────
+    print("12. channel/key validation rejects what would corrupt identity")
+    let s12 = w.prism_wr_state_new(_policy(100, 400, 3, 1))
+    check("empty channel is rejected", is_err(w.prism_wr_submit(s12, "", "k", "p", 0)))
+    check("empty key is rejected", is_err(w.prism_wr_submit(s12, "ch", "", "p", 0)))
+    let ctrl = "ba" + chr(1) + "d"
+    check("a channel containing a control byte is rejected", is_err(w.prism_wr_submit(s12, ctrl, "k", "p", 0)))
+    check("a key containing a control byte is rejected", is_err(w.prism_wr_submit(s12, "ch", ctrl, "p", 0)))
+
+    // ── 13. ★ non-ASCII payload survives byte-identical across submit/retry ────────────────────
+    print("13. ★ a non-ASCII payload round-trips byte-identical through retries")
+    let payload_nonascii = "\{\"note\":\"日本語 — café 🚀\"\}"
+    let s13 = w.prism_wr_state_new(_policy(50, 400, 4, 9))
+    let s13b = unwrap(w.prism_wr_submit(s13, "notes", "n-1", payload_nonascii, 0))
+    let t13a = unwrap(w.prism_wr_tick(s13b, 0))
+    let sent13a = w.prism_wr_tick_ready(t13a)[0]
+    check("★ the FIRST send carries the non-ASCII payload byte-identical", w.prism_wr_req_payload(sent13a) == payload_nonascii)
+    let s13c = unwrap(w.prism_wr_report(w.prism_wr_tick_state(t13a), "notes", "n-1", w.prism_wr_outcome_retryable(), 0))
+    let due13 = w.prism_wr_req_due_at_ms(unwrap(w.prism_wr_find(s13c, "notes", "n-1")))
+    let t13b = unwrap(w.prism_wr_tick(s13c, due13))
+    let sent13b = w.prism_wr_tick_ready(t13b)[0]
+    check("★ the RETRY resends the SAME non-ASCII payload byte-identical (retry never mutates content)", w.prism_wr_req_payload(sent13b) == payload_nonascii)
+    check("...and its length in bytes is unchanged too", len(w.prism_wr_req_payload(sent13b)) == len(payload_nonascii))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_wire: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_wire: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
