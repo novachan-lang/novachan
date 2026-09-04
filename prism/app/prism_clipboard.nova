@@ -1,0 +1,201 @@
+// prism_clipboard (app/, Tier 2) -- clipboard, e.g. pasting a range from Excel into a grid (#63).
+//
+// ── ⛔ PASTED DATA IS UNTRUSTED INPUT. THIS IS THE WHOLE MODULE. ─────────────────────────────
+// A clipboard paste is data from outside the program, exactly like a URL or a request body, and it
+// is the one people forget. Two concrete consequences that are handled here:
+//   * **CSV/TSV FORMULA INJECTION.** A cell beginning `=`, `+`, `-`, `@`, TAB or CR is executed as
+//     a FORMULA when the grid is later exported and reopened in Excel/Sheets -- `=cmd|'/c calc'!A`
+//     is the classic. So `prism_cb_paste` marks such cells and `prism_cb_sanitise_cell` prefixes
+//     them with `'`, which is the format's own escape. Rejecting the paste outright would be
+//     hostile (the data is usually legitimate); silently keeping it is a code-execution path in
+//     someone else's spreadsheet.
+//   * **RAGGED AND ENORMOUS RANGES.** A paste is user-shaped, so the row lengths need not match
+//     the grid's columns and the size is unbounded. Both are reported, never guessed at.
+//
+// ── ⛔ A RAGGED PASTE IS REPORTED, NOT PADDED ────────────────────────────────────────────────
+// Padding a short row puts every later value under the wrong header -- the identical failure mode
+// prism_render_sheet refuses on the way OUT. Producing plausible-but-wrong data is worse than
+// refusing, because nothing downstream can detect it.
+//
+// ── THE DELIMITER IS DETECTED, AND THE CHOICE IS EXPLAINED ──────────────────────────────────
+// Excel and Sheets put TAB-separated text on the clipboard, not CSV -- so TSV is tried first, and
+// only text with no tab at all is treated as CSV. Guessing the other way round mangles every cell
+// containing a comma, which is most currency and most prose.
+//
+// ── QUOTED FIELDS ARE HONOURED ON THE WAY IN ────────────────────────────────────────────────
+// RFC 4180 quoting is not optional on input either: a quoted field may CONTAIN the delimiter and a
+// doubled quote is one literal quote. Splitting naively on the delimiter corrupts exactly the rows
+// a user is most likely to notice.
+//
+// PUBLIC API
+//   prism_cb_detect_delimiter(text)        -> string      "\t" or ","
+//   prism_cb_paste(text)                   -> Result<PrismPaste>
+//   prism_cb_rows(p) / _row_count(p) / _col_count(p) / _is_ragged(p)
+//   prism_cb_cell(p, row, col)             -> Result<string>
+//   prism_cb_risky_cells(p)                -> list        "row,col" of formula-risk cells
+//   prism_cb_is_risky(value)               -> int
+//   prism_cb_sanitise_cell(value)          -> string
+//   prism_cb_sanitised_rows(p)             -> list
+//   prism_cb_fit(p, columns)               -> Result<PrismPaste>
+//   prism_cb_describe(p)                   -> string
+
+// `cb_` prefix: the struct field->slot map is GLOBAL, so a bare `rows`/`cols` would share a slot
+// with any other module's field of that name.
+type PrismPaste
+    cb_rows: list       // list of list of string
+    cb_cols: int        // the WIDEST row -- see is_ragged
+    cb_ragged: int      // 0/1, never a bool
+
+// The characters Excel/Sheets treat as starting a formula. TAB and CR are included because a
+// leading control character can be used to shift a value out of the escape.
+fn prism_cb_is_risky(value) -> int
+    if type_of(value) != "string" or len(value) == 0
+        return 0
+    let cps = code_points(value)
+    let first = cps[0]
+    // = + - @ TAB CR
+    if first == 61 or first == 43 or first == 45 or first == 64 or first == 9 or first == 13
+        return 1
+    0
+
+// The format's OWN escape: a leading apostrophe makes Excel/Sheets treat the cell as text. Chosen
+// over stripping the character (which silently changes a legitimate "-5") and over rejecting the
+// paste (hostile, since the data is usually fine).
+fn prism_cb_sanitise_cell(value) -> string
+    if type_of(value) != "string"
+        return ""
+    if prism_cb_is_risky(value) == 0
+        return value
+    "'" + value
+
+// TSV first: Excel and Sheets put TAB-separated text on the clipboard. Guessing CSV first mangles
+// every cell containing a comma, which is most currency and most prose.
+fn prism_cb_detect_delimiter(text) -> string
+    if type_of(text) != "string"
+        return ","
+    if contains(text, "\t")
+        return "\t"
+    ","
+
+// RFC 4180 aware split of ONE line. A quoted field may contain the delimiter; a doubled quote
+// inside a quoted field is one literal quote.
+fn _cb_split_line(line: string, delim: string) -> list
+    let out = []
+    let cur = []
+    let inq = [0]
+    let i = [0]
+    let cps = code_points(line)
+    let dcp = code_points(delim)[0]
+    while i[0] < len(cps)
+        let c = cps[i[0]]
+        if inq[0] == 1
+            if c == 34
+                // A doubled quote inside a quoted field is one literal quote.
+                if i[0] + 1 < len(cps) and cps[i[0] + 1] == 34
+                    push(cur, "\"")
+                    i[0] = i[0] + 2
+                else
+                    inq[0] = 0
+                    i[0] = i[0] + 1
+            else
+                push(cur, from_codepoint(c))
+                i[0] = i[0] + 1
+        else if c == 34
+            inq[0] = 1
+            i[0] = i[0] + 1
+        else if c == dcp
+            push(out, join(cur, ""))
+            let fresh = []
+            for _x in cur
+                push(fresh, "")
+            cur = fresh
+            i[0] = i[0] + 1
+        else
+            push(cur, from_codepoint(c))
+            i[0] = i[0] + 1
+    push(out, join(cur, ""))
+    out
+
+fn prism_cb_paste(text) -> Result<PrismPaste>
+    if type_of(text) != "string"
+        return err("prism_clipboard: pasted text must be a string, got {type_of(text)}")
+    if len(text) == 0
+        return err("prism_clipboard: nothing to paste (empty clipboard)")
+    let delim = prism_cb_detect_delimiter(text)
+    // Normalise line endings first: a clipboard from Windows carries CRLF, and a stray CR left at
+    // the end of every row would make each last cell formula-risky and compare unequal.
+    let lines = replace(replace(text, "\r\n", "\n"), "\r", "\n").split("\n")
+    let rows = []
+    let widest = [0]
+    for ln in lines
+        // A trailing newline is normal in clipboard text and must not produce a phantom row.
+        if len(ln) > 0
+            let cells = _cb_split_line(ln, delim)
+            if len(cells) > widest[0]
+                widest[0] = len(cells)
+            push(rows, cells)
+    if len(rows) == 0
+        return err("prism_clipboard: pasted text contained no rows")
+    let ragged = [0]
+    for r in rows
+        if len(r) != widest[0]
+            ragged[0] = 1
+    ok(PrismPaste(rows, widest[0], ragged[0]))
+
+fn prism_cb_rows(p: PrismPaste) -> list
+    p.cb_rows
+
+fn prism_cb_row_count(p: PrismPaste) -> int
+    len(p.cb_rows)
+
+fn prism_cb_col_count(p: PrismPaste) -> int
+    p.cb_cols
+
+fn prism_cb_is_ragged(p: PrismPaste) -> int
+    p.cb_ragged
+
+fn prism_cb_cell(p: PrismPaste, row, col) -> Result<string>
+    if type_of(row) != "int" or type_of(col) != "int"
+        return err("prism_clipboard: row and col must be ints, got {type_of(row)}/{type_of(col)}")
+    if row < 0 or row >= len(p.cb_rows)
+        return err("prism_clipboard: row {row} is outside the paste ({len(p.cb_rows)} rows)")
+    let r = p.cb_rows[row]
+    if col < 0 or col >= len(r)
+        return err("prism_clipboard: col {col} is outside row {row} ({len(r)} cells) -- this paste is ragged, so a column present in one row may be absent in another")
+    ok(r[col])
+
+// "row,col" for every cell that would execute as a formula. Returned as coordinates so a UI can
+// highlight exactly those cells rather than warning about the paste as a whole.
+fn prism_cb_risky_cells(p: PrismPaste) -> list
+    let out = []
+    let ri = [0]
+    for r in p.cb_rows
+        let rown = ri[0]
+        ri[0] = rown + 1
+        let ci = [0]
+        for c in r
+            let coln = ci[0]
+            ci[0] = coln + 1
+            if prism_cb_is_risky(c) == 1
+                push(out, "{rown},{coln}")
+    out
+
+fn prism_cb_sanitised_rows(p: PrismPaste) -> list
+    p.cb_rows.map(fn(r) r.map(fn(c) prism_cb_sanitise_cell(c)))
+
+// ⛔ Fits the paste to a grid of `columns`, REFUSING a ragged paste rather than padding it --
+// padding puts every later value under the wrong header, the identical failure prism_render_sheet
+// refuses on the way out.
+fn prism_cb_fit(p: PrismPaste, columns) -> Result<PrismPaste>
+    if type_of(columns) != "int"
+        return err("prism_clipboard: column count must be an int, got {type_of(columns)}")
+    if columns < 1
+        return err("prism_clipboard: column count must be >= 1, got {columns}")
+    if p.cb_ragged == 1
+        return err("prism_clipboard: this paste is RAGGED (rows of differing width, widest {p.cb_cols}) -- padding it would put every later value under the wrong header, producing data that looks plausible and is wrong. Fix the source range or map the columns explicitly")
+    if p.cb_cols != columns
+        return err("prism_clipboard: pasted range is {p.cb_cols} columns wide but the grid has {columns} -- refusing rather than truncating or padding, either of which silently misaligns every row")
+    ok(p)
+
+fn prism_cb_describe(p: PrismPaste) -> string
+    "paste: {len(p.cb_rows)} rows x {p.cb_cols} cols ragged={p.cb_ragged} risky={len(prism_cb_risky_cells(p))}"

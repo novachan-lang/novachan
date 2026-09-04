@@ -1,0 +1,188 @@
+// prism_download (app/, Tier 2) -- streaming download (#80).
+//
+// A PURE STATE MACHINE over an explicit clock, like prism_wire/prism_session/prism_sync: the caller
+// owns the transport and feeds chunks in. Nothing here opens a socket or writes a file.
+//
+// ── ⛔ THE FILENAME IS THE ATTACK SURFACE, AND IT COMES FROM THE SERVER ─────────────────────
+// A download's filename usually arrives in a `Content-Disposition` header — i.e. from outside the
+// program. Three concrete things that must not be possible, all handled by `prism_dl_safe_name`:
+//   * **PATH TRAVERSAL.** `../../.ssh/authorized_keys` must not escape the download directory. Any
+//     path separator or `..` segment is stripped, not "resolved" — resolving invites a
+//     double-encoding bypass.
+//   * **ABSOLUTE PATHS AND WINDOWS DRIVE LETTERS.** `/etc/passwd` and `C:\Windows\x` are both
+//     absolute; a leading separator or `X:` prefix is removed.
+//   * **WINDOWS RESERVED DEVICE NAMES.** `CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9` are
+//     devices, not files, on every Windows host — and the check must be case-insensitive AND
+//     extension-insensitive, because `con.txt` is still the console. Writing to one can hang the
+//     process rather than fail cleanly.
+// A name that sanitises to nothing yields a safe default rather than an empty filename, because an
+// empty name is where "write to the directory itself" bugs live.
+//
+// ── ⛔ A DECLARED SIZE IS A CLAIM, NOT A FACT ────────────────────────────────────────────────
+// `Content-Length` is server-supplied. If more bytes arrive than were declared, that is either a
+// broken server or an attempt to overrun a caller's pre-allocated buffer — so `prism_dl_chunk`
+// REFUSES the overflowing chunk instead of accepting it. Fewer bytes than declared is equally a
+// failure, but it is only detectable at the END, so `prism_dl_finish` checks it: a truncated file
+// that reports success is the worst outcome, because the corruption is discovered later by whoever
+// opens it.
+//
+// ── PROGRESS IS UNAVAILABLE WITHOUT A DECLARED SIZE, AND SAYS SO ────────────────────────────
+// Chunked transfers have no length. A progress bar that invents a percentage for them either
+// crawls to 99% and stalls or jumps backwards. `prism_dl_progress_pct` returns -1 for "unknown",
+// which a UI must handle by showing an indeterminate spinner — the honest rendering.
+//
+// PUBLIC API
+//   prism_dl_safe_name(raw)                    -> string
+//   prism_dl_start(name, declared_size, now_ms) -> Result<PrismDownload>
+//   prism_dl_chunk(d, bytes, now_ms)           -> Result<PrismDownload>
+//   prism_dl_finish(d)                         -> Result<PrismDownload>
+//   prism_dl_cancel(d)                         -> PrismDownload
+//   prism_dl_fail(d, reason)                   -> Result<PrismDownload>
+//   prism_dl_status(d) / _status_name(d) / _received(d) / _declared(d) / _name(d)
+//   prism_dl_progress_pct(d)                   -> int    -1 when unknown
+//   prism_dl_rate_bps(d, now_ms)               -> int    -1 when not measurable
+//   prism_dl_describe(d)                       -> string
+
+// `Dl`-prefixed variants: enum constructors resolve across modules in NOVA's flat symbol space.
+enum PrismDownloadStatus
+    DlPending()
+    DlStreaming()
+    DlComplete()
+    DlCancelled()
+    DlFailed()
+
+// `dl_` prefix: the struct field->slot map is GLOBAL. Every flag is an int, never a bool.
+type PrismDownload
+    dl_name: string
+    dl_declared: int        // -1 when the server declared no length
+    dl_received: int
+    dl_status: PrismDownloadStatus
+    dl_started: int
+    dl_updated: int
+    dl_reason: string
+
+fn prism_dl_status_name(s: PrismDownloadStatus) -> string
+    match s
+        DlPending() => "pending"
+        DlStreaming() => "streaming"
+        DlComplete() => "complete"
+        DlCancelled() => "cancelled"
+        DlFailed() => "failed"
+
+fn prism_dl_status_all() -> list
+    [DlPending(), DlStreaming(), DlComplete(), DlCancelled(), DlFailed()]
+
+fn _dl_reserved() -> list
+    ["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]
+
+// ⛔ Strips rather than resolves. Resolving `..` invites a double-encoding bypass; removing the
+// separators outright leaves nothing to resolve.
+fn prism_dl_safe_name(raw) -> string
+    if type_of(raw) != "string" or len(raw) == 0
+        return "download"
+    // Drop everything up to and including the last separator of either flavour, which also
+    // disposes of an absolute path and every `..` segment above the basename.
+    let cut = [raw]
+    for sep in ["/", "\\"]
+        let parts = cut[0].split(sep)
+        cut[0] = parts[len(parts) - 1]
+    let base = cut[0]
+    // A Windows drive prefix survives the split when no separator followed it ("C:file").
+    let nodrive = [base]
+    if contains(base, ":")
+        let cp = base.split(":")
+        nodrive[0] = cp[len(cp) - 1]
+    // Any remaining dot-only name is a directory reference, not a file.
+    let cleaned = [nodrive[0]]
+    if cleaned[0] == ".." or cleaned[0] == "."
+        cleaned[0] = ""
+    // Control bytes are removed: a NUL or CR in a filename truncates it at the OS boundary.
+    let out = []
+    for cp2 in code_points(cleaned[0])
+        if cp2 >= 32 and cp2 != 127
+            push(out, from_codepoint(cp2))
+    let name = join(out, "")
+    if len(name) == 0
+        return "download"
+    // Reserved DEVICE names, case- AND extension-insensitive: `con.txt` is still the console.
+    let stem = str_to_lower(name).split(".")[0]
+    if contains(_dl_reserved(), stem)
+        return "download-" + name
+    name
+
+fn prism_dl_start(name, declared_size, now_ms) -> Result<PrismDownload>
+    if type_of(declared_size) != "int" or type_of(now_ms) != "int"
+        return err("prism_download: declared size and now_ms must be ints, got {type_of(declared_size)}/{type_of(now_ms)}")
+    if declared_size < -1
+        return err("prism_download: declared size {declared_size} is invalid -- use -1 for 'the server declared no length', never a negative size")
+    ok(PrismDownload(prism_dl_safe_name(name), declared_size, 0, DlPending(), now_ms, now_ms, ""))
+
+fn prism_dl_name(d: PrismDownload) -> string
+    d.dl_name
+
+fn prism_dl_declared(d: PrismDownload) -> int
+    d.dl_declared
+
+fn prism_dl_received(d: PrismDownload) -> int
+    d.dl_received
+
+fn prism_dl_status(d: PrismDownload) -> PrismDownloadStatus
+    d.dl_status
+
+fn prism_dl_reason(d: PrismDownload) -> string
+    d.dl_reason
+
+// ⛔ Refuses a chunk that would exceed the DECLARED size -- either a broken server or an attempt to
+// overrun a caller's pre-allocated buffer.
+fn prism_dl_chunk(d: PrismDownload, bytes, now_ms) -> Result<PrismDownload>
+    if type_of(bytes) != "int" or type_of(now_ms) != "int"
+        return err("prism_download: byte count and now_ms must be ints, got {type_of(bytes)}/{type_of(now_ms)}")
+    if bytes < 0
+        return err("prism_download: a chunk of {bytes} bytes is impossible")
+    let stn = prism_dl_status_name(d.dl_status)
+    if stn == "complete" or stn == "cancelled" or stn == "failed"
+        return err("prism_download: '{d.dl_name}' is already {stn} -- a late chunk after a terminal state means the caller's transport is still running and must be stopped, not appended to")
+    let total = d.dl_received + bytes
+    if d.dl_declared >= 0 and total > d.dl_declared
+        return err("prism_download: '{d.dl_name}' would exceed its DECLARED size ({total} > {d.dl_declared}) -- Content-Length is a server CLAIM, and accepting the overflow would overrun a buffer sized from it")
+    ok(PrismDownload(d.dl_name, d.dl_declared, total, DlStreaming(), d.dl_started, now_ms, d.dl_reason))
+
+// ⛔ A SHORT download is a failure, detectable only here. A truncated file reported as success is
+// the worst outcome: the corruption is found later, by whoever opens it.
+fn prism_dl_finish(d: PrismDownload) -> Result<PrismDownload>
+    let stn = prism_dl_status_name(d.dl_status)
+    if stn == "complete" or stn == "cancelled" or stn == "failed"
+        return err("prism_download: '{d.dl_name}' is already {stn}")
+    if d.dl_declared >= 0 and d.dl_received != d.dl_declared
+        return err("prism_download: '{d.dl_name}' is TRUNCATED -- received {d.dl_received} of {d.dl_declared} declared bytes. Reporting success here would hand the caller a corrupt file whose damage is discovered later by whoever opens it")
+    ok(PrismDownload(d.dl_name, d.dl_declared, d.dl_received, DlComplete(), d.dl_started, d.dl_updated, d.dl_reason))
+
+fn prism_dl_cancel(d: PrismDownload) -> PrismDownload
+    PrismDownload(d.dl_name, d.dl_declared, d.dl_received, DlCancelled(), d.dl_started, d.dl_updated, "cancelled by caller")
+
+fn prism_dl_fail(d: PrismDownload, reason) -> Result<PrismDownload>
+    if type_of(reason) != "string" or len(reason) == 0
+        return err("prism_download: a failure reason is required -- a failed download with no stated cause cannot be reported to a user or retried intelligently")
+    ok(PrismDownload(d.dl_name, d.dl_declared, d.dl_received, DlFailed(), d.dl_started, d.dl_updated, reason))
+
+// ⛔ -1 means UNKNOWN, not 0. A chunked transfer has no length, and inventing a percentage makes a
+// bar that crawls to 99% and stalls; a UI must show an indeterminate spinner instead.
+fn prism_dl_progress_pct(d: PrismDownload) -> int
+    if d.dl_declared < 0
+        return 0 - 1
+    if d.dl_declared == 0
+        return 100
+    (d.dl_received * 100) / d.dl_declared
+
+// Bytes per second over the whole transfer. -1 when no time has elapsed, because dividing by zero
+// elapsed time is where "17 GB/s" progress readouts come from.
+fn prism_dl_rate_bps(d: PrismDownload, now_ms) -> int
+    if type_of(now_ms) != "int"
+        return 0 - 1
+    let elapsed = now_ms - d.dl_started
+    if elapsed <= 0
+        return 0 - 1
+    (d.dl_received * 1000) / elapsed
+
+fn prism_dl_describe(d: PrismDownload) -> string
+    "download: name={d.dl_name} status={prism_dl_status_name(d.dl_status)} got={d.dl_received} declared={d.dl_declared} pct={prism_dl_progress_pct(d)}"

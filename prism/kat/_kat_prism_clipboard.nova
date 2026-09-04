@@ -1,0 +1,116 @@
+// KAT for prism/app/prism_clipboard.nova -- paste a range into a grid (#63).
+//
+// The four properties this exists for:
+//   1. ★ FORMULA INJECTION. A cell starting `=`,`+`,`-`,`@` executes as a FORMULA when the grid is
+//      exported and reopened in Excel/Sheets. Detected per-cell and escaped with the format's own
+//      `'` prefix -- not stripped (which changes a legitimate "-5") and not rejected (hostile,
+//      since the data is usually fine).
+//   2. ★ A RAGGED PASTE IS REPORTED, NEVER PADDED -- padding puts every later value under the
+//      wrong header, exactly what prism_render_sheet refuses on the way out.
+//   3. ★ TSV IS TRIED FIRST, because Excel and Sheets put TAB-separated text on the clipboard.
+//      Guessing CSV first mangles every cell containing a comma.
+//   4. ★ QUOTED FIELDS ARE HONOURED ON INPUT -- a quoted field may contain the delimiter, and a
+//      doubled quote is one literal quote.
+
+import prism_clipboard
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_clipboard ==")
+
+    print("1. ★ delimiter detection prefers TSV")
+    check("★ text with a TAB is TSV", prism_clipboard.prism_cb_detect_delimiter("a\tb") == "\t")
+    check("text with no tab is CSV", prism_clipboard.prism_cb_detect_delimiter("a,b") == ",")
+    // THE case: a comma-containing TSV must stay TSV, or every such cell is mangled.
+    check("★ a TSV whose cells contain commas stays TSV", prism_clipboard.prism_cb_detect_delimiter("1,50\t2,75") == "\t")
+    check("a non-string yields a safe default", prism_clipboard.prism_cb_detect_delimiter(7) == ",")
+
+    print("2. parsing a rectangular paste")
+    check("empty clipboard rejected", is_err(prism_clipboard.prism_cb_paste("")))
+    check("non-string rejected", is_err(prism_clipboard.prism_cb_paste(7)))
+    let p = unwrap(prism_clipboard.prism_cb_paste("a\tb\nc\td"))
+    check("2 rows", prism_clipboard.prism_cb_row_count(p) == 2)
+    check("2 cols", prism_clipboard.prism_cb_col_count(p) == 2)
+    check("not ragged", prism_clipboard.prism_cb_is_ragged(p) == 0)
+    check("cell(0,0)", unwrap(prism_clipboard.prism_cb_cell(p, 0, 0)) == "a")
+    check("cell(1,1)", unwrap(prism_clipboard.prism_cb_cell(p, 1, 1)) == "d")
+    check("out-of-range row is an err", is_err(prism_clipboard.prism_cb_cell(p, 5, 0)))
+    check("out-of-range col is an err", is_err(prism_clipboard.prism_cb_cell(p, 0, 5)))
+    check("non-int coords rejected", is_err(prism_clipboard.prism_cb_cell(p, "0", 0)))
+    // A trailing newline is normal in clipboard text and must not produce a phantom row.
+    check("★ a trailing newline does NOT add a phantom row", prism_clipboard.prism_cb_row_count(unwrap(prism_clipboard.prism_cb_paste("a\tb\n"))) == 1)
+    // Windows clipboards carry CRLF; a stray CR would make every last cell formula-risky.
+    let crlf = unwrap(prism_clipboard.prism_cb_paste("a\tb\r\nc\td"))
+    check("★ CRLF is normalised (no stray CR in the last cell)", unwrap(prism_clipboard.prism_cb_cell(crlf, 0, 1)) == "b")
+    check("★ ...and a CR does not make it look risky", len(prism_clipboard.prism_cb_risky_cells(crlf)) == 0)
+
+    print("3. ★ quoted fields are honoured on input")
+    let q = unwrap(prism_clipboard.prism_cb_paste("\"a,b\",c"))
+    check("★ a quoted field may CONTAIN the delimiter", unwrap(prism_clipboard.prism_cb_cell(q, 0, 0)) == "a,b")
+    check("...and the next field is intact", unwrap(prism_clipboard.prism_cb_cell(q, 0, 1)) == "c")
+    check("★ it is TWO fields, not three", prism_clipboard.prism_cb_col_count(q) == 2)
+    let dq = unwrap(prism_clipboard.prism_cb_paste("\"say \"\"hi\"\"\",x"))
+    check("★ a DOUBLED quote is one literal quote", unwrap(prism_clipboard.prism_cb_cell(dq, 0, 0)) == "say \"hi\"")
+
+    print("4. ★ formula injection is detected per cell")
+    check("★ '=' is risky", prism_clipboard.prism_cb_is_risky("=1+1") == 1)
+    check("★ '+' is risky", prism_clipboard.prism_cb_is_risky("+1") == 1)
+    check("★ '-' is risky", prism_clipboard.prism_cb_is_risky("-1") == 1)
+    check("★ '@' is risky", prism_clipboard.prism_cb_is_risky("@SUM(A1)") == 1)
+    check("plain text is not risky", prism_clipboard.prism_cb_is_risky("hello") == 0)
+    check("a number is not risky", prism_clipboard.prism_cb_is_risky("42") == 0)
+    check("empty is not risky", prism_clipboard.prism_cb_is_risky("") == 0)
+    check("a non-string is not risky", prism_clipboard.prism_cb_is_risky(7) == 0)
+    // The classic payload.
+    let evil = unwrap(prism_clipboard.prism_cb_paste("name\tformula\nada\t=cmd|'/c calc'!A1"))
+    check("★ the injection cell is located by coordinate", join(prism_clipboard.prism_cb_risky_cells(evil), ";") == "1,1")
+    check("the safe cells are NOT flagged", len(prism_clipboard.prism_cb_risky_cells(evil)) == 1)
+
+    print("5. ★ sanitising uses the format's own escape")
+    check("★ a risky cell gains a leading apostrophe", prism_clipboard.prism_cb_sanitise_cell("=1+1") == "'=1+1")
+    check("★ a legitimate negative number is PRESERVED, not stripped", prism_clipboard.prism_cb_sanitise_cell("-5") == "'-5")
+    check("plain text is untouched", prism_clipboard.prism_cb_sanitise_cell("hello") == "hello")
+    let clean = prism_clipboard.prism_cb_sanitised_rows(evil)
+    check("★ the sanitised grid escapes the payload", clean[1][1] == "'=cmd|'/c calc'!A1")
+    check("...and leaves the rest alone", clean[1][0] == "ada")
+    check("shape is preserved by sanitising", len(clean) == 2 and len(clean[0]) == 2)
+
+    print("6. ★ a ragged paste is reported, never padded")
+    let ragged = unwrap(prism_clipboard.prism_cb_paste("a\tb\tc\nd\te"))
+    check("★ ragged is detected", prism_clipboard.prism_cb_is_ragged(ragged) == 1)
+    check("col count is the WIDEST row", prism_clipboard.prism_cb_col_count(ragged) == 3)
+    check("the short row keeps its real width", is_err(prism_clipboard.prism_cb_cell(ragged, 1, 2)))
+    check("★ fitting a ragged paste is REFUSED", is_err(prism_clipboard.prism_cb_fit(ragged, 3)))
+    check("a rectangular paste fits its exact width", not is_err(prism_clipboard.prism_cb_fit(p, 2)))
+    check("★ a width MISMATCH is refused, not truncated", is_err(prism_clipboard.prism_cb_fit(p, 3)))
+    check("★ ...nor padded", is_err(prism_clipboard.prism_cb_fit(p, 1)))
+    check("zero columns rejected", is_err(prism_clipboard.prism_cb_fit(p, 0)))
+    check("non-int columns rejected", is_err(prism_clipboard.prism_cb_fit(p, "2")))
+
+    print("7. non-ASCII cells survive")
+    let jp = unwrap(prism_clipboard.prism_cb_paste("名前\t備考\n日本語\théllo"))
+    check("non-ASCII headers parse", unwrap(prism_clipboard.prism_cb_cell(jp, 0, 0)) == "名前")
+    check("non-ASCII values parse", unwrap(prism_clipboard.prism_cb_cell(jp, 1, 1)) == "héllo")
+    check("...and are not flagged risky", len(prism_clipboard.prism_cb_risky_cells(jp)) == 0)
+    check("...and survive sanitising unchanged", prism_clipboard.prism_cb_sanitised_rows(jp)[1][0] == "日本語")
+
+    print("8. describe")
+    let d = prism_clipboard.prism_cb_describe(evil)
+    check("describe reports the shape", contains(d, "2 rows x 2 cols"))
+    check("describe reports the risky count", contains(d, "risky=1"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_clipboard: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_clipboard: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

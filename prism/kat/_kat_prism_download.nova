@@ -1,0 +1,123 @@
+// KAT for prism/app/prism_download.nova -- streaming download (#80).
+//
+// The four properties this exists for:
+//   1. ★ THE FILENAME COMES FROM THE SERVER, so path traversal, absolute paths, Windows drive
+//      prefixes and RESERVED DEVICE NAMES must all be neutralised. `con.txt` is still the console.
+//   2. ★ A DECLARED SIZE IS A CLAIM: more bytes than declared is REFUSED (buffer overrun), and
+//      FEWER is a truncation failure detectable only at finish.
+//   3. ★ PROGRESS IS -1 (UNKNOWN) WITHOUT A DECLARED LENGTH -- inventing a percentage produces a
+//      bar that crawls to 99% and stalls.
+//   4. ★ A TERMINAL STATE IS TERMINAL: a late chunk after complete/cancel/fail is an error, not an
+//      append.
+
+import prism_download
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_download ==")
+
+    print("1. ★ filename sanitisation -- the server supplies this")
+    check("★ path traversal is stripped", prism_download.prism_dl_safe_name("../../.ssh/authorized_keys") == "authorized_keys")
+    check("★ a backslash path is stripped too", prism_download.prism_dl_safe_name("..\\..\\windows\\system32\\x.dll") == "x.dll")
+    check("★ an absolute POSIX path keeps only the basename", prism_download.prism_dl_safe_name("/etc/passwd") == "passwd")
+    check("★ a Windows drive path keeps only the basename", prism_download.prism_dl_safe_name("C:\\Windows\\evil.exe") == "evil.exe")
+    check("★ a bare drive prefix is removed", prism_download.prism_dl_safe_name("C:report.pdf") == "report.pdf")
+    check("an ordinary name is untouched", prism_download.prism_dl_safe_name("invoice-2026.pdf") == "invoice-2026.pdf")
+    // A name that sanitises to nothing must not yield an empty filename -- that is where
+    // "write to the directory itself" bugs live.
+    check("★ '..' alone yields a safe default", prism_download.prism_dl_safe_name("..") == "download")
+    check("★ '/' alone yields a safe default", prism_download.prism_dl_safe_name("/") == "download")
+    check("an empty name yields a safe default", prism_download.prism_dl_safe_name("") == "download")
+    check("a non-string yields a safe default", prism_download.prism_dl_safe_name(7) == "download")
+    // Control bytes truncate a filename at the OS boundary.
+    check("★ a control byte is removed", prism_download.prism_dl_safe_name("re\nport.pdf") == "report.pdf")
+
+    print("2. ★ Windows reserved DEVICE names")
+    check("★ CON is neutralised", prism_download.prism_dl_safe_name("CON") == "download-CON")
+    check("★ ...case-insensitively", prism_download.prism_dl_safe_name("con") == "download-con")
+    // THE subtle half: an extension does NOT make it safe.
+    check("★ con.txt is STILL the console", prism_download.prism_dl_safe_name("con.txt") == "download-con.txt")
+    check("★ NUL is neutralised", prism_download.prism_dl_safe_name("nul.dat") == "download-nul.dat")
+    check("★ COM1 is neutralised", prism_download.prism_dl_safe_name("COM1.log") == "download-COM1.log")
+    check("★ LPT9 is neutralised", prism_download.prism_dl_safe_name("lpt9") == "download-lpt9")
+    check("a name merely CONTAINING 'con' is fine", prism_download.prism_dl_safe_name("contract.pdf") == "contract.pdf")
+    check("...and one ending in it too", prism_download.prism_dl_safe_name("bacon.txt") == "bacon.txt")
+
+    print("3. start and stream")
+    check("a negative declared size is rejected", is_err(prism_download.prism_dl_start("a", -2, 0)))
+    check("non-int size rejected", is_err(prism_download.prism_dl_start("a", "100", 0)))
+    let d0 = unwrap(prism_download.prism_dl_start("report.pdf", 1000, 0))
+    check("starts pending", prism_download.prism_dl_status_name(prism_download.prism_dl_status(d0)) == "pending")
+    check("nothing received", prism_download.prism_dl_received(d0) == 0)
+    check("the name is sanitised on the way in", prism_download.prism_dl_name(unwrap(prism_download.prism_dl_start("../x.pdf", 10, 0))) == "x.pdf")
+    check("5 status values", len(prism_download.prism_dl_status_all()) == 5)
+    let d1 = unwrap(prism_download.prism_dl_chunk(d0, 400, 1000))
+    check("a chunk advances it to streaming", prism_download.prism_dl_status_name(prism_download.prism_dl_status(d1)) == "streaming")
+    check("bytes accumulate", prism_download.prism_dl_received(d1) == 400)
+    check("progress is 40%", prism_download.prism_dl_progress_pct(d1) == 40)
+    check("the ORIGINAL is unchanged (non-mutating)", prism_download.prism_dl_received(d0) == 0)
+    check("a negative chunk is rejected", is_err(prism_download.prism_dl_chunk(d0, -1, 1000)))
+    check("a zero-byte chunk is allowed (a real transport sends them)", not is_err(prism_download.prism_dl_chunk(d1, 0, 1100)))
+
+    print("4. ★ a declared size is a CLAIM, enforced in both directions")
+    // Over: refuse, because a caller's buffer was sized from that claim.
+    check("★ a chunk exceeding the declared size is REFUSED", is_err(prism_download.prism_dl_chunk(d1, 601, 2000)))
+    check("a chunk reaching it exactly is accepted", not is_err(prism_download.prism_dl_chunk(d1, 600, 2000)))
+    // Under: only detectable at finish, and reporting success would hand back a corrupt file.
+    check("★ finishing SHORT is a TRUNCATION error", is_err(prism_download.prism_dl_finish(d1)))
+    let full = unwrap(prism_download.prism_dl_chunk(d1, 600, 2000))
+    let done = unwrap(prism_download.prism_dl_finish(full))
+    check("finishing complete works", prism_download.prism_dl_status_name(prism_download.prism_dl_status(done)) == "complete")
+    check("all bytes accounted for", prism_download.prism_dl_received(done) == 1000)
+    check("progress is 100%", prism_download.prism_dl_progress_pct(done) == 100)
+
+    print("5. ★ progress is UNKNOWN without a declared length")
+    let chunked = unwrap(prism_download.prism_dl_start("stream.bin", -1, 0))
+    check("★ progress is -1, not 0", prism_download.prism_dl_progress_pct(chunked) == -1)
+    let cs = unwrap(prism_download.prism_dl_chunk(chunked, 5000, 1000))
+    check("★ still -1 after receiving data", prism_download.prism_dl_progress_pct(cs) == -1)
+    check("bytes are still counted", prism_download.prism_dl_received(cs) == 5000)
+    check("★ an unbounded stream can never overflow", not is_err(prism_download.prism_dl_chunk(cs, 999999, 2000)))
+    check("★ and finishing is allowed at any size", prism_download.prism_dl_status_name(prism_download.prism_dl_status(unwrap(prism_download.prism_dl_finish(cs)))) == "complete")
+    // A zero-length file is legitimately 100% complete, not unknown.
+    check("a zero-DECLARED download is 100%", prism_download.prism_dl_progress_pct(unwrap(prism_download.prism_dl_start("empty", 0, 0))) == 100)
+
+    print("6. ★ a terminal state is terminal")
+    check("★ a late chunk after complete is REFUSED", is_err(prism_download.prism_dl_chunk(done, 1, 3000)))
+    check("finishing twice is refused", is_err(prism_download.prism_dl_finish(done)))
+    let cancelled = prism_download.prism_dl_cancel(d1)
+    check("cancel is terminal", prism_download.prism_dl_status_name(prism_download.prism_dl_status(cancelled)) == "cancelled")
+    check("★ a chunk after cancel is REFUSED", is_err(prism_download.prism_dl_chunk(cancelled, 1, 3000)))
+    check("cancel records a reason", len(prism_download.prism_dl_reason(cancelled)) > 0)
+    check("a failure REQUIRES a stated reason", is_err(prism_download.prism_dl_fail(d1, "")))
+    let failed = unwrap(prism_download.prism_dl_fail(d1, "connection reset"))
+    check("failure records the reason", prism_download.prism_dl_reason(failed) == "connection reset")
+    check("★ a chunk after failure is REFUSED", is_err(prism_download.prism_dl_chunk(failed, 1, 3000)))
+
+    print("7. rate")
+    check("★ zero elapsed time yields -1, not a division by zero", prism_download.prism_dl_rate_bps(d1, 0) == -1)
+    check("rate over 1s of 400 bytes is 400 B/s", prism_download.prism_dl_rate_bps(d1, 1000) == 400)
+    check("rate over 2s halves", prism_download.prism_dl_rate_bps(d1, 2000) == 200)
+    check("a non-int now yields -1", prism_download.prism_dl_rate_bps(d1, "1000") == -1)
+
+    print("8. non-ASCII filenames survive")
+    check("a non-ASCII name is preserved", prism_download.prism_dl_safe_name("請求書-héllo.pdf") == "請求書-héllo.pdf")
+    check("...and traversal is still stripped from one", prism_download.prism_dl_safe_name("../../請求書.pdf") == "請求書.pdf")
+    let d = prism_download.prism_dl_describe(done)
+    check("describe reports the name and status", contains(d, "report.pdf") and contains(d, "status=complete"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_download: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_download: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
