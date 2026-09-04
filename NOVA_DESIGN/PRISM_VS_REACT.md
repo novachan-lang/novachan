@@ -33,7 +33,7 @@ element vocabulary is open by design.
 
 | Gap | Status | Blocking |
 |---|---|---|
-| **Reactivity — there is NONE** | `prism_exp_readsets_available()` returns **false** | **M3.4**, gated on **M1.7 (the Bet-1 falsifier)** |
+| **Reactivity — there is NONE** | `prism_exp_readsets_available()` returns **false** | **M3.4** — **M1.7 gate CLEARED 2026-09-04** |
 | **Cannot run in a browser** | no DOM backend, no WASM closures | **T11 / M0.3 runtime split** → T12, T14 |
 | **Ecosystem** | zero third-party components | decade-scale; explicitly out of scope |
 | **DevTools / Fast Refresh** | none | after M0.3 |
@@ -44,13 +44,25 @@ element vocabulary is open by design.
 **React's entire value proposition is "state changes → the right thing re-renders."** PRISM does
 not have that yet. It has a node tree, six output backends, an event model, a journal, and a
 testing story — all of which are *better* than React's equivalents — but the loop that makes a UI
-framework a UI framework is unbuilt and is gated on a **falsifier that has not been run**.
+framework a UI framework is still unbuilt.
 
-M1.7 exists precisely because zero-annotation reactivity may be impossible: if the measured
-read-set per face exceeds 20–30% of reachable state, Bet 1 is dead and the design must change.
-**Building more library modules does not move this.** `app/` (route, form, wire, guard, …) is
-genuinely useful Tier-2 work, but every one of those modules will sit on top of whatever
-reactivity model M1.7 permits — and none of them tests the bet.
+**M1.7 has now been run (2026-09-04) and Bet 1 is not dead** — see
+`M1_7_FALSIFIER_RESULT.md`. Two findings changed the plan:
+
+* **M1.7's own kill criterion was invalid.** It compared a *ratio* against 20–30%, but PRISM's
+  state types average 5 reachable leaves, so a face reading **one single field already scores
+  20%**. Measured absolutely, the median face reads **1 leaf** and the mean **1.87** — exactly the
+  granularity Bet 1 needs. Had the compiler pass been built first, it would have reported 35.9%
+  and killed Bet 1 on a denominator artifact.
+* **The one genuine risk — a face inheriting a helper's whole read-set — is recoverable.**
+  `prism_ss_is_usable` reads 11/11 leaves while touching no field itself; constructor slicing
+  brings it to **4/11**, the same answer derivable by hand. Both techniques M3.4 needs
+  (leaf-granular tracking, field-to-field flow through a reconstructor) are now measured
+  tractable. Neither is research.
+
+**What remains unknown is SCALE, not mechanism.** The corpus is a library; its deepest app-state
+type is 16 *flat* leaves. Whether read-sets stay ~1–2 leaves on a >100-leaf nested application
+tree is the open question, and it needs a real app — not more library modules.
 
 ---
 
@@ -58,15 +70,17 @@ reactivity model M1.7 permits — and none of them tests the bet.
 
 Three things, in dependency order. Nothing else is on the critical path.
 
-1. **M1.7 — run the falsifier.** 3–4 weeks. Build ONLY the dependency-inference pass and measure
-   the read-set. Cheapest experiment that can invalidate the most work: if Bet 1 is dead, we learn
-   it before writing the reactivity layer, not after.
+1. ~~**M1.7 — run the falsifier.**~~ ✅ **DONE 2026-09-04**, and not in 3–4 weeks: a static
+   read-set analyser over the existing 55k-line corpus answered it in one session, and caught that
+   the milestone's own pass/fail criterion was unusable. Bet 1 survives; the residual question is
+   scale, which needs an app with a nested state tree.
 2. **M0.3 — the runtime split.** 6–10 weeks, RED tier, full arc. Without it PRISM cannot execute in
    a browser, and "better than React" is not assessable by anyone who would compare them.
 3. **M3.4 — reactivity**, in whatever form M1.7 licenses.
 
-Everything currently green — six library layers, 120 modules, 117 KATs, ~49.5k lines — is real and
-is a genuine advantage on correctness. It is not a substitute for the three items above.
+Everything currently green — six library layers plus `app/`, **130 modules, 127 KATs, ~55.1k
+lines** — is real and is a genuine advantage on correctness. It is not a substitute for the items
+above.
 
 ---
 
@@ -75,4 +89,5 @@ is a genuine advantage on correctness. It is not a substitute for the three item
 > **PRISM is already better than React at every property React can only express as a convention.
 > React is better than PRISM at being a UI framework that runs in a browser today.**
 
-The second half is closed by M1.7 → M0.3 → M3.4, and by nothing else.
+The second half is closed by ~~M1.7~~ → **M0.3** → **M3.4**, and by nothing else. M1.7 is cleared;
+M0.3 (the runtime split, RED tier) is now the single blocker on the browser path.
