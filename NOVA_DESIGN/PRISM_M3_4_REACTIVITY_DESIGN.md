@@ -179,9 +179,22 @@ Falsifiable, in order of cost:
 3. **Higher-order faces force a conservative union that swamps the read-set.** If specialisation is
    not tractable, HOF-heavy code loses granularity — and HOFs are mandated project style, so this
    would be self-inflicted.
-4. **Changeset construction is not cheap.** The design assumes a functional update knows which
-   fields it replaced. If the compiler cannot derive that, the changeset needs a tree diff and the
-   runtime advantage over React narrows.
+4. ~~**Changeset construction is not cheap.**~~ ✅ **MEASURED 2026-09-04 — not a risk.** The design
+   assumes a functional update knows which fields it replaced. Over the 90 reconstructors in the
+   corpus, the changeset (fields *not* passed through identically) is **median 1 field, mean 1.99,
+   and ≤2 fields for 88% of them**:
+
+   | fields changed | 0 | 1 | 2 | 3 | ≥6 |
+   |---|---|---|---|---|---|
+   | reconstructors | 8 | **47** | 24 | 2 | 8 |
+
+   Two notes on reading this. The *fractional* form says "51% of fields change", which is the same
+   small-denominator artifact M1.7 exposed — a 2-field change on a 4-field type is 50%. Absolute is
+   the meaningful measure. And the 8 wide outliers are **detector artifacts, not wide updates**:
+   `prism_ss_begin_refresh` shows 11/11 because it constructs from `adv` (the result of
+   `_ss_advance(s, now_ms)`) rather than from `s`, so no argument matches `s.field`. Its true
+   changeset is 3 fields — `ss_status`, `ss_inflight_since`, `ss_seen_ms`. Composing reconstructors
+   transitively removes these, so **1.99 is an upper bound; the real mean is lower.**
 
 ## 8. Recommended sequence (if GO)
 
