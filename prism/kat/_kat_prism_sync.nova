@@ -1,0 +1,147 @@
+// KAT for prism/app/prism_sync.nova -- offline queue (#75), multi-tab (#74), presence (#77),
+// conflict resolution (#76).
+//
+// The four properties this exists for:
+//   1. ★ NO SILENT WINNER. A divergence becomes a conflict VALUE; there is no auto-resolve and no
+//      default strategy. Last-write-wins is data loss with a friendly name.
+//   2. ★ AN UNRESOLVED CONFLICT BLOCKS ITS KEY from flushing -- sending it would overwrite the
+//      very remote change under dispute.
+//   3. ★ EXACTLY ONE TAB FLUSHES, and an EXPIRED lease is claimable -- a crashed tab cannot
+//      release its lease, so without expiry the queue wedges forever.
+//   4. ★ A BACKWARDS CLOCK JUMP cannot revive an expired lease (two tabs flushing) or a departed
+//      peer.
+
+import prism_sync
+
+let STATS = [0, 0]
+let NON_ASCII = "メモ-héllo"
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_sync ==")
+
+    print("1. construction and enqueue")
+    check("empty tab id rejected", is_err(prism_sync.prism_sy_new("")))
+    check("non-string tab id rejected", is_err(prism_sync.prism_sy_new(7)))
+    let s0 = unwrap(prism_sync.prism_sy_new("tab-A"))
+    check("fresh queue is empty", prism_sync.prism_sy_pending(s0) == 0)
+    check("empty key rejected", is_err(prism_sync.prism_sy_enqueue(s0, "", "v", 1000)))
+    check("non-string payload rejected", is_err(prism_sync.prism_sy_enqueue(s0, "k", 7, 1000)))
+    check("non-int now rejected", is_err(prism_sync.prism_sy_enqueue(s0, "k", "v", "1000")))
+    let s1 = unwrap(prism_sync.prism_sy_enqueue(s0, "doc1", "v1", 1000))
+    let s2 = unwrap(prism_sync.prism_sy_enqueue(s1, "doc2", NON_ASCII, 1100))
+    check("two queued", prism_sync.prism_sy_pending(s2) == 2)
+    check("ORDER is preserved", join(prism_sync.prism_sy_pending_keys(s2), ",") == "doc1,doc2")
+    check("the ORIGINAL is unchanged (non-mutating)", prism_sync.prism_sy_pending(s0) == 0)
+    check("a non-ASCII payload survives", prism_sync.prism_sy_op_payload(prism_sync.prism_sy_flush_ready(unwrap(prism_sync.prism_sy_claim_lease(s2, 1200, 5000)), 1200)?[1]) == NON_ASCII)
+
+    print("2. ★ exactly one tab flushes")
+    check("no lease held initially", prism_sync.prism_sy_holds_lease(s2, 1200) == 0)
+    check("flushing without the lease is REFUSED", is_err(prism_sync.prism_sy_flush_ready(s2, 1200)))
+    check("zero-length ttl rejected", is_err(prism_sync.prism_sy_claim_lease(s2, 1200, 0)))
+    let leased = unwrap(prism_sync.prism_sy_claim_lease(s2, 1200, 5000))
+    check("lease claimed", prism_sync.prism_sy_holds_lease(leased, 1200) == 1)
+    check("the holder is recorded", prism_sync.prism_sy_lease_holder(leased) == "tab-A")
+    check("flushing now works", len(unwrap(prism_sync.prism_sy_flush_ready(leased, 1200))) == 2)
+    // A DIFFERENT tab sharing the same state must be refused while the lease is live.
+    let tabB = unwrap(prism_sync.prism_sy_new("tab-B"))
+    let sharedB = unwrap(prism_sync.prism_sy_claim_lease(tabB, 1200, 5000))
+    check("a second tab can claim when the first has not (separate state)", prism_sync.prism_sy_holds_lease(sharedB, 1200) == 1)
+    check("renewing without holding is refused", is_err(prism_sync.prism_sy_renew_lease(s2, 1200, 5000)))
+    check("renewing while holding extends it", prism_sync.prism_sy_holds_lease(unwrap(prism_sync.prism_sy_renew_lease(leased, 5000, 5000)), 9000) == 1)
+    check("the lease EXPIRES on its own", prism_sync.prism_sy_holds_lease(leased, 6201) == 0)
+    check("release drops it immediately", prism_sync.prism_sy_holds_lease(prism_sync.prism_sy_release_lease(leased), 1201) == 0)
+
+    print("3. ack removes exactly one pending op")
+    check("acking an unqueued key is an error", is_err(prism_sync.prism_sy_ack(leased, "nope")))
+    let acked = unwrap(prism_sync.prism_sy_ack(leased, "doc1"))
+    check("one remains", prism_sync.prism_sy_pending(acked) == 1)
+    check("and it is the right one", join(prism_sync.prism_sy_pending_keys(acked), ",") == "doc2")
+    // Two edits to the same key: acking removes the OLDEST, preserving the later one.
+    let twice = unwrap(prism_sync.prism_sy_enqueue(unwrap(prism_sync.prism_sy_enqueue(s0, "k", "first", 1000)), "k", "second", 1100))
+    check("two edits to one key both queue (NOT collapsed)", prism_sync.prism_sy_pending(twice) == 2)
+    let once = unwrap(prism_sync.prism_sy_ack(twice, "k"))
+    check("acking removes only one", prism_sync.prism_sy_pending(once) == 1)
+
+    print("4. ★ conflicts become VALUES -- no silent winner")
+    check("a remote value matching local is NOT a conflict", prism_sync.prism_sy_conflict_count(unwrap(prism_sync.prism_sy_observe_remote(s1, "doc1", "v1"))) == 0)
+    check("a remote value for an unqueued key is NOT a conflict", prism_sync.prism_sy_conflict_count(unwrap(prism_sync.prism_sy_observe_remote(s1, "other", "x"))) == 0)
+    let conf = unwrap(prism_sync.prism_sy_observe_remote(s1, "doc1", "REMOTE-EDIT"))
+    check("a DIVERGENT remote value creates a conflict", prism_sync.prism_sy_conflict_count(conf) == 1)
+    check("the key is in conflict", prism_sync.prism_sy_in_conflict(conf, "doc1"))
+    let c0 = prism_sync.prism_sy_conflicts(conf)[0]
+    check("the conflict carries BOTH sides", prism_sync.prism_sy_conflict_local(c0) == "v1" and prism_sync.prism_sy_conflict_remote(c0) == "REMOTE-EDIT")
+    check("the conflict names its key", prism_sync.prism_sy_conflict_key(c0) == "doc1")
+    // Neither value was applied -- the queue still holds the local edit untouched.
+    check("★ neither side was auto-applied (local op still pending)", prism_sync.prism_sy_pending(conf) == 1)
+    check("observing the same conflict twice does not duplicate it", prism_sync.prism_sy_conflict_count(unwrap(prism_sync.prism_sy_observe_remote(conf, "doc1", "OTHER"))) == 1)
+
+    print("5. ★ an unresolved conflict BLOCKS its key from flushing")
+    let confLeased = unwrap(prism_sync.prism_sy_claim_lease(conf, 2000, 5000))
+    check("★ the conflicted key is NOT flushed", len(unwrap(prism_sync.prism_sy_flush_ready(confLeased, 2000))) == 0)
+    // A second, unconflicted key must still flush -- the block is per-key, not global.
+    let mixed = unwrap(prism_sync.prism_sy_claim_lease(unwrap(prism_sync.prism_sy_enqueue(conf, "clean", "ok", 2000)), 2000, 5000))
+    let ready = unwrap(prism_sync.prism_sy_flush_ready(mixed, 2000))
+    check("an UNconflicted key still flushes (per-key, not global)", len(ready) == 1)
+    check("...and it is the clean one", prism_sync.prism_sy_op_key(ready[0]) == "clean")
+
+    print("6. resolution is explicit, in all three directions")
+    check("resolving a key with no conflict is an error", is_err(prism_sync.prism_sy_resolve_local(s1, "doc1")))
+    let keepLocal = unwrap(prism_sync.prism_sy_resolve_local(conf, "doc1"))
+    check("resolve_local clears the conflict", prism_sync.prism_sy_conflict_count(keepLocal) == 0)
+    check("...and KEEPS the pending local op so it ships", prism_sync.prism_sy_pending(keepLocal) == 1)
+    check("...so it flushes again", len(unwrap(prism_sync.prism_sy_flush_ready(unwrap(prism_sync.prism_sy_claim_lease(keepLocal, 2000, 5000)), 2000))) == 1)
+    let takeRemote = unwrap(prism_sync.prism_sy_resolve_remote(conf, "doc1"))
+    check("resolve_remote clears the conflict", prism_sync.prism_sy_conflict_count(takeRemote) == 0)
+    // ★ The subtle half: the local op must be DROPPED, or the next flush re-overwrites the remote
+    // value -- the same data loss, delayed by one round trip.
+    check("★ resolve_remote DROPS the local op (or it would re-overwrite)", prism_sync.prism_sy_pending(takeRemote) == 0)
+    let merged = unwrap(prism_sync.prism_sy_resolve_merged(conf, "doc1", "MERGED-{NON_ASCII}"))
+    check("resolve_merged clears the conflict", prism_sync.prism_sy_conflict_count(merged) == 0)
+    check("...and the MERGED value is what ships", prism_sync.prism_sy_op_payload(unwrap(prism_sync.prism_sy_flush_ready(unwrap(prism_sync.prism_sy_claim_lease(merged, 2000, 5000)), 2000))[0]) == "MERGED-{NON_ASCII}")
+    check("non-string merged value rejected", is_err(prism_sync.prism_sy_resolve_merged(conf, "doc1", 7)))
+    check("resolutions are counted for observability", prism_sync.prism_sy_resolved_count(merged) == 1)
+
+    print("7. presence")
+    let p1 = unwrap(prism_sync.prism_sy_presence_seen(s0, "alice", 1000))
+    let p2 = unwrap(prism_sync.prism_sy_presence_seen(p1, "bob", 1000))
+    check("empty presence id rejected", is_err(prism_sync.prism_sy_presence_seen(s0, "", 1000)))
+    check("both present", len(prism_sync.prism_sy_present(p2, 1000)) == 2)
+    check("still present within the TTL", len(prism_sync.prism_sy_present(p2, 30999)) == 2)
+    check("gone past the TTL", len(prism_sync.prism_sy_present(p2, 31001)) == 0)
+    let p3 = unwrap(prism_sync.prism_sy_presence_seen(p2, "alice", 31000))
+    check("a heartbeat keeps just that peer", len(prism_sync.prism_sy_present(p3, 31001)) == 1)
+
+    print("8. ★ a backwards clock jump cannot revive a lease or a peer")
+    // NOTE the times: `s2`'s high-water mark is already 1100 from the enqueues above, so a lease
+    // claimed at now=1000 would correctly start from 1100 -- the skew protection working. The
+    // first version of this test used 1000/2001 and failed for exactly that reason: the MODULE was
+    // right and the TEST was wrong. Times here are chosen above the existing mark.
+    let late = unwrap(prism_sync.prism_sy_claim_lease(s2, 3000, 1000))
+    check("held at t=3000", prism_sync.prism_sy_holds_lease(late, 3000) == 1)
+    check("expired at t=4001", prism_sync.prism_sy_holds_lease(late, 4001) == 0)
+    // Advance the high-water mark past expiry, then jump back.
+    let advanced = unwrap(prism_sync.prism_sy_presence_seen(late, "x", 4001))
+    check("★ a backwards jump does NOT revive the lease", prism_sync.prism_sy_holds_lease(advanced, 3000) == 0)
+    check("the high-water mark is not lowered", prism_sync.prism_sy_seen_ms(advanced) == 4001)
+    check("the skew is OBSERVABLE", prism_sync.prism_sy_skew_events(unwrap(prism_sync.prism_sy_presence_seen(advanced, "y", 5))) >= 1)
+
+    print("9. describe carries no payload values")
+    let d = prism_sync.prism_sy_describe(unwrap(prism_sync.prism_sy_enqueue(s0, "secretkey", "PAYLOAD-MARKER", 1000)))
+    check("describe reports counts", contains(d, "pending=1"))
+    check("★ describe does NOT print user payloads", not contains(d, "PAYLOAD-MARKER"))
+    check("describe names the tab", contains(d, "tab=tab-A"))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_sync: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_sync: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)

@@ -1,0 +1,320 @@
+// prism_sync (app/, Tier 2) -- offline queue (#75), multi-tab (#74), presence (#77),
+// conflict resolution (#76).
+//
+// A PURE STATE MACHINE over an explicit clock, like prism_wire and prism_session: `now_ms` is an
+// argument, the caller owns the transport and the storage. Nothing here sleeps or opens a socket.
+//
+// ── ⛔ CONFLICT RESOLUTION NEVER PICKS A WINNER SILENTLY ─────────────────────────────────────
+// Last-write-wins is the default everywhere and it is DATA LOSS with a friendly name: the loser's
+// edit is destroyed, nobody is told, and the only trace is a user insisting they typed something.
+// So a divergence produces a `PrismSyncConflict` VALUE that must be resolved explicitly --
+// `prism_sy_resolve_local`, `_resolve_remote`, or `_resolve_merged` with the merged value. There
+// is deliberately NO auto-resolve and NO default strategy. If a caller wants LWW they must write
+// it, at which point it is a visible choice rather than an invisible one.
+// An unresolved conflict BLOCKS its key: `prism_sy_flush_ready` will not send an operation whose
+// key is in conflict, because sending it would overwrite the very remote change under dispute.
+//
+// ── ⛔ EXACTLY ONE TAB FLUSHES — MULTI-TAB IS A CORRECTNESS PROBLEM (#74) ────────────────────
+// Every tab of an app has the same offline queue in the same shared storage. If two flush at once
+// the server sees each operation twice; with prism_wire's dedup that is survivable, without it it
+// is duplicate writes. Worse, two tabs both retrying a rotated credential can invalidate the
+// session (see prism_session). So a tab must HOLD THE LEASE to flush.
+// The lease is time-bounded and must be renewed: a tab that is closed, crashed or suspended cannot
+// release it, so an unrenewable lock would wedge the queue permanently. `prism_sy_claim_lease`
+// therefore succeeds when the existing lease has EXPIRED against the high-water clock -- expiry is
+// the recovery mechanism, not a fallback.
+//
+// ── THE CLOCK IS A HIGH-WATER MARK, for the same reason as prism_session ─────────────────────
+// A backwards clock jump must not make an expired lease look live (two tabs flushing) nor an
+// expired presence entry look present. `max(seen, now)` throughout.
+//
+// ── ORDER IS PRESERVED, AND THAT IS WHY THE QUEUE IS NOT A SET ───────────────────────────────
+// Two edits to the same key must apply in the order the user made them, so the queue is an ordered
+// list and dedup happens at the WIRE layer (by (channel, key), see prism_wire) rather than by
+// collapsing the queue here. Collapsing "set A then set B" into "set B" is only valid if nothing
+// observes the intermediate state -- and an offline queue cannot know that.
+//
+// PUBLIC API
+//   prism_sy_new(tab_id)                            -> Result<PrismSync>
+//   prism_sy_enqueue(s, key, payload, now_ms)       -> Result<PrismSync>
+//   prism_sy_pending(s) / _pending_keys(s)          -> int / list
+//   prism_sy_claim_lease(s, now_ms, ttl_ms)         -> Result<PrismSync>
+//   prism_sy_renew_lease(s, now_ms, ttl_ms)         -> Result<PrismSync>
+//   prism_sy_release_lease(s)                       -> PrismSync
+//   prism_sy_holds_lease(s, now_ms)                 -> int
+//   prism_sy_flush_ready(s, now_ms)                 -> Result<list>
+//   prism_sy_ack(s, key)                            -> Result<PrismSync>
+//   prism_sy_observe_remote(s, key, remote_payload) -> Result<PrismSync>
+//   prism_sy_conflicts(s) / _conflict_count(s) / _in_conflict(s, key)
+//   prism_sy_resolve_local(s, key) / _resolve_remote(s, key) / _resolve_merged(s, key, value)
+//   prism_sy_presence_seen(s, who, now_ms)          -> Result<PrismSync>
+//   prism_sy_present(s, now_ms)                     -> list
+//   prism_sy_describe(s)                            -> string
+
+// `Sy`-prefixed variants: enum constructors resolve across modules in NOVA's flat symbol space.
+enum PrismSyncOrigin
+    SyLocal()
+    SyRemote()
+    SyMerged()
+
+// `sy_`/`so_`/`sc_` prefixes: the struct field->slot map is GLOBAL, so a bare `key`/`payload`/
+// `origin` would share a slot with another module's field of that name.
+type PrismSyncOp
+    so_key: string
+    so_payload: string
+    so_queued_at: int
+
+type PrismSyncConflict
+    sc_key: string
+    sc_local: string
+    sc_remote: string
+
+type PrismSync
+    sy_tab: string
+    sy_ops: list            // ordered: user order is preserved -- see header
+    sy_conflicts: list
+    sy_lease_tab: string    // "" = unheld
+    sy_lease_until: int
+    sy_seen_ms: int
+    sy_skew_events: int
+    sy_presence: dict       // who -> last-seen ms
+    sy_resolved: int        // count of resolutions, for observability
+
+// Presence entries older than this are not "present". 30s is two missed 15s heartbeats -- long
+// enough to survive one dropped beat, short enough that a closed tab disappears promptly.
+let PRISM_SY_PRESENCE_TTL_MS = 30000
+
+fn prism_sy_origin_name(o: PrismSyncOrigin) -> string
+    match o
+        SyLocal() => "local"
+        SyRemote() => "remote"
+        SyMerged() => "merged"
+
+fn prism_sy_new(tab_id) -> Result<PrismSync>
+    if type_of(tab_id) != "string" or len(tab_id) == 0
+        return err("prism_sync: a tab id is required and must be a string, got {type_of(tab_id)} -- the lease is per-tab, so an unidentified tab cannot hold one")
+    ok(PrismSync(tab_id, [], [], "", 0, 0, 0, {}, 0))
+
+fn _sy_advance(s: PrismSync, now_ms: int) -> PrismSync
+    if now_ms >= s.sy_seen_ms
+        return PrismSync(s.sy_tab, s.sy_ops, s.sy_conflicts, s.sy_lease_tab, s.sy_lease_until, now_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved)
+    PrismSync(s.sy_tab, s.sy_ops, s.sy_conflicts, s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events + 1, s.sy_presence, s.sy_resolved)
+
+fn prism_sy_seen_ms(s: PrismSync) -> int
+    s.sy_seen_ms
+
+fn prism_sy_skew_events(s: PrismSync) -> int
+    s.sy_skew_events
+
+fn prism_sy_resolved_count(s: PrismSync) -> int
+    s.sy_resolved
+
+// ── queue ───────────────────────────────────────────────────────────────────────────────────
+fn prism_sy_enqueue(s: PrismSync, key, payload, now_ms) -> Result<PrismSync>
+    if type_of(key) != "string" or len(key) == 0
+        return err("prism_sync: an operation key is required and must be a string, got {type_of(key)}")
+    if type_of(payload) != "string"
+        return err("prism_sync: payload must be a string, got {type_of(payload)}")
+    if type_of(now_ms) != "int"
+        return err("prism_sync: now_ms must be an int, got {type_of(now_ms)}")
+    let adv = _sy_advance(s, now_ms)
+    let ops = []
+    for o in adv.sy_ops
+        push(ops, o)
+    push(ops, PrismSyncOp(key, payload, adv.sy_seen_ms))
+    ok(PrismSync(adv.sy_tab, ops, adv.sy_conflicts, adv.sy_lease_tab, adv.sy_lease_until, adv.sy_seen_ms, adv.sy_skew_events, adv.sy_presence, adv.sy_resolved))
+
+fn prism_sy_pending(s: PrismSync) -> int
+    len(s.sy_ops)
+
+fn prism_sy_pending_keys(s: PrismSync) -> list
+    s.sy_ops.map(fn(o) o.so_key)
+
+fn prism_sy_op_payload(o: PrismSyncOp) -> string
+    o.so_payload
+
+fn prism_sy_op_key(o: PrismSyncOp) -> string
+    o.so_key
+
+// ── lease (multi-tab) ───────────────────────────────────────────────────────────────────────
+fn prism_sy_holds_lease(s: PrismSync, now_ms) -> int
+    if type_of(now_ms) != "int"
+        return 0
+    let adv = _sy_advance(s, now_ms)
+    if adv.sy_lease_tab != adv.sy_tab
+        return 0
+    if adv.sy_seen_ms >= adv.sy_lease_until
+        return 0
+    1
+
+// Succeeds when the lease is unheld OR has EXPIRED. Expiry is the recovery mechanism: a tab that
+// was closed or crashed cannot release its lease, so without expiry the queue would wedge forever.
+fn prism_sy_claim_lease(s: PrismSync, now_ms, ttl_ms) -> Result<PrismSync>
+    if type_of(now_ms) != "int" or type_of(ttl_ms) != "int"
+        return err("prism_sync: now_ms and ttl_ms must be ints, got {type_of(now_ms)}/{type_of(ttl_ms)}")
+    if ttl_ms < 1
+        return err("prism_sync: lease ttl must be >= 1ms, got {ttl_ms} -- a zero-length lease is never held, so every tab would flush")
+    let adv = _sy_advance(s, now_ms)
+    if adv.sy_lease_tab != "" and adv.sy_lease_tab != adv.sy_tab and adv.sy_seen_ms < adv.sy_lease_until
+        return err("prism_sync: tab '{adv.sy_lease_tab}' holds the flush lease until {adv.sy_lease_until} -- exactly one tab may flush, or the server sees every operation twice and two tabs retrying a rotated credential can invalidate the session")
+    ok(PrismSync(adv.sy_tab, adv.sy_ops, adv.sy_conflicts, adv.sy_tab, adv.sy_seen_ms + ttl_ms, adv.sy_seen_ms, adv.sy_skew_events, adv.sy_presence, adv.sy_resolved))
+
+fn prism_sy_renew_lease(s: PrismSync, now_ms, ttl_ms) -> Result<PrismSync>
+    if prism_sy_holds_lease(s, now_ms) == 0
+        return err("prism_sync: tab '{s.sy_tab}' does not hold the lease, so it cannot renew it -- claim it instead")
+    prism_sy_claim_lease(s, now_ms, ttl_ms)
+
+fn prism_sy_release_lease(s: PrismSync) -> PrismSync
+    PrismSync(s.sy_tab, s.sy_ops, s.sy_conflicts, "", 0, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved)
+
+fn prism_sy_lease_holder(s: PrismSync) -> string
+    s.sy_lease_tab
+
+// ⛔ Requires the lease, and SKIPS any key in conflict -- sending an operation whose key is under
+// dispute would overwrite the very remote change the conflict is about.
+fn prism_sy_flush_ready(s: PrismSync, now_ms) -> Result<list>
+    if prism_sy_holds_lease(s, now_ms) == 0
+        return err("prism_sync: tab '{s.sy_tab}' does not hold the flush lease -- claim it first. Exactly one tab may flush")
+    let out = []
+    for o in s.sy_ops
+        if not prism_sy_in_conflict(s, o.so_key)
+            push(out, o)
+    ok(out)
+
+fn prism_sy_ack(s: PrismSync, key) -> Result<PrismSync>
+    if type_of(key) != "string"
+        return err("prism_sync: key must be a string, got {type_of(key)}")
+    let kept = []
+    let hit = [0]
+    for o in s.sy_ops
+        if o.so_key == key and hit[0] == 0
+            hit[0] = 1
+        else
+            push(kept, o)
+    if hit[0] == 0
+        return err("prism_sync: no pending operation for key '{key}' -- acking something that was never queued means the caller's state and this module's have diverged")
+    // Acks the OLDEST op for that key, preserving order for any later edits to the same key.
+    ok(PrismSync(s.sy_tab, kept, s.sy_conflicts, s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved))
+
+// ── conflicts (#76) ─────────────────────────────────────────────────────────────────────────
+fn prism_sy_in_conflict(s: PrismSync, key) -> bool
+    if type_of(key) != "string"
+        return false
+    let hit = [0]
+    for c in s.sy_conflicts
+        if c.sc_key == key
+            hit[0] = 1
+    hit[0] == 1
+
+fn prism_sy_conflicts(s: PrismSync) -> list
+    s.sy_conflicts
+
+fn prism_sy_conflict_count(s: PrismSync) -> int
+    len(s.sy_conflicts)
+
+fn prism_sy_conflict_key(c: PrismSyncConflict) -> string
+    c.sc_key
+
+fn prism_sy_conflict_local(c: PrismSyncConflict) -> string
+    c.sc_local
+
+fn prism_sy_conflict_remote(c: PrismSyncConflict) -> string
+    c.sc_remote
+
+// A remote value arrives for a key. If we hold a DIFFERENT pending local value, that is a
+// divergence and becomes a conflict VALUE -- never an automatic overwrite in either direction.
+fn prism_sy_observe_remote(s: PrismSync, key, remote_payload) -> Result<PrismSync>
+    if type_of(key) != "string" or len(key) == 0
+        return err("prism_sync: key is required and must be a string, got {type_of(key)}")
+    if type_of(remote_payload) != "string"
+        return err("prism_sync: remote payload must be a string, got {type_of(remote_payload)}")
+    if prism_sy_in_conflict(s, key)
+        return ok(s)
+    let local = [""]
+    let found = [0]
+    for o in s.sy_ops
+        if o.so_key == key
+            local[0] = o.so_payload
+            found[0] = 1
+    if found[0] == 0
+        return ok(s)
+    if local[0] == remote_payload
+        return ok(s)
+    let cs = []
+    for c in s.sy_conflicts
+        push(cs, c)
+    push(cs, PrismSyncConflict(key, local[0], remote_payload))
+    ok(PrismSync(s.sy_tab, s.sy_ops, cs, s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved))
+
+fn _sy_drop_conflict(s: PrismSync, key: string) -> list
+    let kept = []
+    for c in s.sy_conflicts
+        if c.sc_key != key
+            push(kept, c)
+    kept
+
+fn _sy_set_payload(s: PrismSync, key: string, value: string) -> list
+    let out = []
+    for o in s.sy_ops
+        if o.so_key == key
+            push(out, PrismSyncOp(o.so_key, value, o.so_queued_at))
+        else
+            push(out, o)
+    out
+
+// Keep the local edit: the conflict clears and the queued operation stands, so the next flush
+// sends it and overwrites the remote value. A deliberate choice by the caller.
+fn prism_sy_resolve_local(s: PrismSync, key) -> Result<PrismSync>
+    if not prism_sy_in_conflict(s, key)
+        return err("prism_sync: no conflict on key '{key}' to resolve")
+    ok(PrismSync(s.sy_tab, s.sy_ops, _sy_drop_conflict(s, key), s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved + 1))
+
+// Accept the remote value: the conflict clears AND the pending local operation is DROPPED, because
+// keeping it would re-overwrite the remote value on the next flush -- which is exactly the data
+// loss this module exists to prevent, just delayed by one round trip.
+fn prism_sy_resolve_remote(s: PrismSync, key) -> Result<PrismSync>
+    if not prism_sy_in_conflict(s, key)
+        return err("prism_sync: no conflict on key '{key}' to resolve")
+    let kept = []
+    for o in s.sy_ops
+        if o.so_key != key
+            push(kept, o)
+    ok(PrismSync(s.sy_tab, kept, _sy_drop_conflict(s, key), s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved + 1))
+
+// A merged value the caller computed. Replaces the queued payload, so the merge is what ships.
+fn prism_sy_resolve_merged(s: PrismSync, key, value) -> Result<PrismSync>
+    if type_of(value) != "string"
+        return err("prism_sync: merged value must be a string, got {type_of(value)}")
+    if not prism_sy_in_conflict(s, key)
+        return err("prism_sync: no conflict on key '{key}' to resolve")
+    ok(PrismSync(s.sy_tab, _sy_set_payload(s, key, value), _sy_drop_conflict(s, key), s.sy_lease_tab, s.sy_lease_until, s.sy_seen_ms, s.sy_skew_events, s.sy_presence, s.sy_resolved + 1))
+
+// ── presence (#77) ──────────────────────────────────────────────────────────────────────────
+fn prism_sy_presence_seen(s: PrismSync, who, now_ms) -> Result<PrismSync>
+    if type_of(who) != "string" or len(who) == 0
+        return err("prism_sync: presence id is required and must be a string, got {type_of(who)}")
+    if type_of(now_ms) != "int"
+        return err("prism_sync: now_ms must be an int, got {type_of(now_ms)}")
+    let adv = _sy_advance(s, now_ms)
+    let p = {}
+    for k in keys(adv.sy_presence)
+        p[k] = adv.sy_presence[k]
+    p[who] = adv.sy_seen_ms
+    ok(PrismSync(adv.sy_tab, adv.sy_ops, adv.sy_conflicts, adv.sy_lease_tab, adv.sy_lease_until, adv.sy_seen_ms, adv.sy_skew_events, p, adv.sy_resolved))
+
+// Present = seen within the TTL, judged against the HIGH-WATER clock so a backwards jump cannot
+// make a departed peer look present again.
+fn prism_sy_present(s: PrismSync, now_ms) -> list
+    if type_of(now_ms) != "int"
+        return []
+    let adv = _sy_advance(s, now_ms)
+    let out = []
+    for k in keys(adv.sy_presence)
+        if adv.sy_seen_ms - adv.sy_presence[k] < PRISM_SY_PRESENCE_TTL_MS
+            push(out, k)
+    out
+
+// Hand-built; never the generic to_json(), which mis-dispatches on an imported struct and reads
+// out of bounds. Carries no payload values -- a sync diagnostic should not print user data.
+fn prism_sy_describe(s: PrismSync) -> string
+    "sync: tab={s.sy_tab} pending={len(s.sy_ops)} conflicts={len(s.sy_conflicts)} lease={s.sy_lease_tab} until={s.sy_lease_until} seen={s.sy_seen_ms} skew={s.sy_skew_events} resolved={s.sy_resolved}"
