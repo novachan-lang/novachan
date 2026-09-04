@@ -1,0 +1,493 @@
+// prism_guard (app/, Tier 2) -- RBAC-conditional UI, "unreachable UI is a COMPILE ERROR" (#90).
+// Same layering stance as prism_route.nova (the module the app/ README names as the shape every
+// other file here copies): pure data/logic over `Result`, no rendering, own decoupled value types
+// -- this file does not know about prism/core/prism_node.nova's real render tree any more than
+// prism_route knows about a browser DOM. A `GdNode` is the minimal shape an audit needs (an id, a
+// guard, children); a real app maps its actual widget tree into that shape once, at the call site.
+//
+// ── ⛔ WHAT "COMPILE ERROR" CAN ACTUALLY MEAN HERE -- READ BEFORE TRUSTING THE HEADLINE CLAIM ────
+// prism_route's header and prism_form's header both hit this exact wall and both said so plainly:
+// NOVA has no `face`/`wire` DSL the compiler lowers (PRISM_STATUS.md: "T11/M0.3, the runtime split"
+// is still awaiting owner GO/NO-GO). There is no mechanism in this language today by which the
+// COMPILER itself can look at a UI tree and a role table and refuse to build the program. So the
+// literal sentence "unreachable UI is a compile error" is NOT achievable as a library, full stop --
+// stating otherwise would be exactly the kind of overclaim CLAUDE.md forbids.
+//
+// What IS achievable, and is the actual substance of this module: a guard is an ordinary VALUE
+// (`GdGuard`), a UI element is an ordinary VALUE that carries the guard it requires (`GdNode`), and
+// `gd_audit` is an ordinary FUNCTION that WALKS a role table and a node tree and returns
+// `Result::Err`-shaped diagnostics for exactly the two bug classes RBAC-gated UI actually suffers
+// from in practice (see the AUDIT DIRECTIONS section below). That function can be, and is meant to
+// be, called from the SAME place `nova_ci.ps1`-style regression gates already run -- i.e. wired into
+// a project's own test suite so a build that introduces dead UI or an orphaned grant fails its own
+// CI, the same way `rt_router_register`'s ambiguity check fails an app at router-construction time
+// rather than at a random request later. That is a real, load-bearing gate -- but it is a TEST GATE
+// a project chooses to wire in, not a property the NOVA compiler itself enforces on every program
+// that merely imports this file. A caller who builds a `GdNode` tree and never calls `gd_audit` gets
+// no protection at all, exactly as a caller who never runs `nova check` gets no type checking.
+// STATED PLAINLY, mirroring prism_caps' own honesty split:
+//   STRUCTURAL (true regardless of whether anyone remembers to audit): a `GdNode` cannot be built
+//   without SOME `GdGuard` value in hand (guard is a required constructor argument, not an optional
+//   one -- see the NO DEFAULT PARAMETER note below) -- so "silently public because a field was left
+//   at its zero value" is unrepresentable. `gd_guard_none()` (deny-by-default) is a real, explicit
+//   value a caller must have deliberately reached for, same as `gd_guard_public()`.
+//   NOT STRUCTURAL (needs a human, or a CI wire, to actually happen): that `gd_audit` is ever
+//   CALLED, and that its `Result::Err` is treated as a build failure rather than printed and
+//   ignored. Exactly the compiler-vs-library gap prism_route's and prism_form's headers document.
+//
+// ── DESIGN DECISION: deny-by-default is the ONLY zero-permission state, and it is inert ──────────
+// The brief: "an element with no declared permission should be UNREACHABLE, not public." This
+// module has exactly THREE guard modes (`GdGuardMode`): `GdGuardModeNone` (no permission -- always
+// unreachable, by every role, unconditionally), `GdGuardModePublic` (explicitly, deliberately
+// reachable by anyone, INCLUDING before any role is known -- see the short-circuit note below), and
+// `GdGuardModeRequire` (reachable only by a role whose effective permission set contains the named
+// permission). There is no fourth "not yet decided" state and no implicit conversion between them --
+// omitting a permission does not fall back to public, and a typo in a permission name does not fall
+// back to public either, it falls to UNREACHABLE (see AUDIT DIRECTIONS #1). Every ambiguous input
+// this module can observe (an empty permission string, an unregistered role, a self-referential
+// parent) is REJECTED with `Result::Err` rather than resolved by a guess -- fail CLOSED throughout,
+// per this being a security module.
+//
+// ── DESIGN DECISION: no NOVA default-parameter value relied on for `guard` ───────────────────────
+// Default parameter VALUES now survive a module boundary in NOVA (fixed 2026-08-20), but every
+// verified case is a LITERAL default (`b: int = 5`). This module's "the caller must supply a guard"
+// guarantee is security-relevant, so it does not lean on an unverified combination (a STRUCT-VALUED,
+// FUNCTION-CALL default expression, exported cross-module, for the first time in this codebase) --
+// `gd_node(id, guard, children)` takes `guard` as a plain required positional argument. Nothing is
+// lost: "no permission declared" is still expressible and still the deny-by-default OUTCOME, it is
+// just spelled `gd_guard_none()` explicitly rather than reached by omission. A future module that
+// has already independently verified struct-returning cross-module defaults is free to wrap this
+// with a defaulted convenience constructor; this file does not gamble the security property on it.
+//
+// ── DESIGN DECISION: a PUBLIC guard short-circuits BEFORE any role lookup, on purpose ────────────
+// "An unknown role must be an ERROR, not an empty permission set" (see next section) governs
+// PERMISSION-gated content, where a role name is actually consulted to decide reachability. A
+// PUBLIC-guarded element is, by definition, reachable with NO role at all -- a login screen must
+// render before authentication has established any role, "anonymous" not being a role this module
+// tracks. `gd_role_can_reach` therefore checks the guard's mode FIRST: a `GdGuardModePublic` node
+// returns `Ok(true)` even if the `role_name` argument names a role that does not exist in the set --
+// this is NOT the same silent-empty-grant failure mode the brief warns against, because no grant was
+// ever consulted; it is proven distinct from that failure mode directly in the KAT (a bogus role
+// name against a public node -> `Ok(true)`; the identical bogus role name against a
+// permission-gated node on the same tree -> `Err`, one call apart).
+//
+// ── DESIGN DECISION: an unknown role is an ERROR everywhere a role's grants ARE consulted ────────
+// `_gd_role_all_perms` is the SOLE place this module ever resolves "what can role X do", and its
+// very first step is `_gd_find_role(rs, cur)?` -- a role name that is not registered returns
+// `Result::Err` immediately, before any permission set is computed. Every public function that asks
+// "can this role do X" (`gd_role_grants`, `gd_role_effective_permissions`, and `gd_role_can_reach`
+// for its one Require-guarded path) is a thin wrapper over that same call, so the error propagates
+// uniformly: a renamed or typo'd role name is a LOUD `Result::Err` naming the missing role, never a
+// silent "this role can do nothing", which is exactly the failure mode that lets a renamed role
+// disable a feature with no diagnostic (the brief's own words for the bug class this closes).
+//
+// ── DESIGN DECISION: hierarchy is real, and a cycle is not merely REJECTED, it is UNREPRESENTABLE ─
+// `gd_role_set_register_extends(rs, name, perms, parent)` requires `parent` to already be a
+// registered role in `rs` -- reusing the exact "already-registered background" discipline
+// prism_route.nova's sheet registration established for the identical reason (see that file's own
+// header). `GdRoleSet` is append-only (every registration returns a NEW `GdRoleSet`; there is no
+// "change an existing role's parent" operation anywhere in this module's public API) and a role's
+// parent is fixed the instant it is registered. Put those two facts together: to register role B
+// extending A, A must ALREADY exist; so by the time B exists, A's own parent (if any) was ALREADY
+// fixed, and can never later be changed to point at B. A cycle of ANY length would require at least
+// one role in the cycle to extend a role that is registered AFTER it -- which this API has no way to
+// express. This is a stronger claim than "rejected at registration": it is that the registration
+// table can only ever encode a DAG (in fact a forest of trees, since a role has at most one parent),
+// by construction, the same way prism_route's registration-order-only-matters-never argument is
+// stronger than "conflicts are checked". `_gd_role_all_perms` still walks the parent chain with a
+// bounded step counter and a visited-set as a DEFENSIVE check (not an expected path) -- belt and
+// suspenders against a future code change to this file accidentally reintroducing mutation, per
+// this being security code where "structurally impossible today" is not trusted to stay true
+// forever without a runtime backstop. The KAT proves the DIRECT case (a role attempting to extend
+// itself, the simplest cycle) is rejected, and this section explains why every longer cycle is
+// equally unreachable through this API, not merely untested.
+//
+// ── AUDIT DIRECTIONS: `gd_audit` finds two DIFFERENT bug classes, and a single typo trips BOTH ───
+// Given a role set and a forest of `GdNode` trees, `gd_audit` reports two kinds of finding:
+//   FORWARD (per element): is this element reachable by AT LEAST ONE registered role's effective
+//   permission set? Two ways to fail: `GdIssueDeadNoGuard` (the element declares no permission at
+//   all -- deny-by-default made it dead on arrival) and `GdIssueDeadUnknownPerm` (the element
+//   requires a permission that literally no role, after inheritance, grants -- "usually a typo'd
+//   permission name", per the brief).
+//   REVERSE (per permission): for every permission some role's OWN, DIRECTLY-declared grant list
+//   contains, is it required by AT LEAST ONE element anywhere in the audited forest?
+//   `GdIssueOrphanPermission` if not -- either a stale grant left behind after the UI that used it
+//   was removed, or literally the OTHER HALF of a typo reported elsewhere in the SAME report as a
+//   `GdIssueDeadUnknownPerm` (role grants "orders.delete", an element requires "orders.delet" -- the
+//   element is dead AND "orders.delete" is orphaned, one misspelling, two report lines that point at
+//   each other). Both directions are computed from the same two data structures (role grants,
+//   element requirements) with no separate "registry of expected permissions" to maintain or drift.
+//
+// PUBLIC API
+//   GdGuardMode + GdGuard                                                opaque value types
+//   gd_guard_none() / gd_guard_public()                                  -> GdGuard
+//   gd_guard_require(permission)                                         -> Result<GdGuard>
+//   gd_guard_is_none(g) / _is_public(g) / _is_require(g)                 -> bool
+//   gd_guard_permission(g)                                                -> string
+//   GdRole, GdRoleSet                                                    opaque value types
+//   gd_role_set_new()                                                     -> GdRoleSet
+//   gd_role_set_register(rs, name, perms)                                 -> Result<GdRoleSet>
+//   gd_role_set_register_extends(rs, name, perms, parent)                 -> Result<GdRoleSet>
+//   gd_role_set_roles(rs) / _role_count(rs)                               -> list / int
+//   gd_role_name(r) / _direct_permissions(r) / _parent(r)
+//   gd_role_effective_permissions(rs, role_name)                          -> Result<list>
+//   gd_role_grants(rs, role_name, permission)                             -> Result<bool>
+//   GdNode                                                                opaque value type
+//   gd_node(id, guard, children) / gd_leaf(id, guard)                     -> Result<GdNode>
+//   gd_node_id(n) / _guard(n) / _children(n)
+//   gd_role_can_reach(rs, role_name, node)                                -> Result<bool>
+//   GdIssueKind, GdIssue, GdAuditReport                                   opaque value types
+//   gd_issue_kind(i) / _kind_name(k) / _node_path(i) / _permission(i) / _detail(i)
+//   gd_audit(rs, roots)                                                   -> Result<GdAuditReport>
+//   gd_ar_issues(rep) / _issue_count(rep) / _node_count(rep) / _role_count(rep)
+//   gd_audit_is_clean(rep)                                                -> bool
+//   gd_audit_render(rep)                                                  -> string
+
+// ── Value types. Every field is `gd_`-prefixed -- NOVA's struct field->slot map is GLOBAL (see
+// prism_route.nova and prism_caps.nova for the same note); an unprefixed `name`/`kind`/`children`
+// would silently share a slot with an unrelated field of the same bare name declared anywhere else
+// in the program.
+
+enum GdGuardMode
+    GdGuardModeNone()
+    GdGuardModePublic()
+    GdGuardModeRequire()
+
+type GdGuard
+    gd_guard_mode: GdGuardMode
+    gd_guard_perm: string        // meaningful only when gd_guard_mode == GdGuardModeRequire
+
+type GdRole
+    gd_role_name: string
+    gd_role_perms: list          // list<string>, DIRECTLY-granted permissions (before inheritance)
+    gd_role_parent: string       // "" = no parent; else an ALREADY-registered role name
+
+type GdRoleSet
+    gd_rs_roles: list            // list<GdRole>, append-only -- see header on why that closes cycles
+
+type GdNode
+    gd_node_id: string
+    gd_node_guard: GdGuard
+    gd_node_children: list       // list<GdNode>
+
+enum GdIssueKind
+    GdIssueDeadNoGuard()
+    GdIssueDeadUnknownPerm()
+    GdIssueOrphanPermission()
+
+type GdIssue
+    gd_issue_kind: GdIssueKind
+    gd_issue_node_path: string   // "/"-joined ancestry; "" for GdIssueOrphanPermission
+    gd_issue_permission: string  // "" for GdIssueDeadNoGuard (there is no permission name to give)
+    gd_issue_detail: string      // hand-built human message -- never str()/to_json() on a struct
+                                  // (measured NOVA defect: mis-dispatch + OOB read on an imported
+                                  // struct once the caller's file declares any struct of its own)
+
+type GdAuditReport
+    gd_ar_issues: list           // list<GdIssue>
+    gd_ar_node_count: int
+    gd_ar_role_count: int
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ── Name validation (roles, permissions, node ids all share this one check) ─────────────────────
+
+// Byte-wise scan for a control character (<0x20 or ==0x7F), same technique and same safety argument
+// as prism_route.nova's `_rt_first_control_char`: a UTF-8 continuation/lead byte is always >= 0x80,
+// so a multi-byte (non-ASCII) character can never be misread as a control byte here.
+fn _gd_first_control_char(s: string) -> int
+    let idx = [0]
+    for b in str_chars(s)
+        let i = idx[0]
+        idx[0] = i + 1
+        if ord(b) < 32 or ord(b) == 127
+            return i
+    -1
+
+// Shared by role names, permission names, and node ids. `s` is deliberately left UNTYPED (not
+// `s: string`) even though most call sites already hold a statically-typed string, because this
+// helper is ALSO reached from a genuinely untyped-list-sourced call site (each element of a
+// caller-supplied `perms` list) -- same reasoning prism_route.nova's `_rt_valid_path_shape` gives
+// for keeping its own type_of check despite most callers being statically typed.
+// Rejects: non-string, empty, any control byte, and leading/trailing ASCII space -- the last one
+// specifically because "orders.delete" and "orders.delete " are invisible-different and would
+// silently fail every comparison a human reading the source could never explain.
+fn _gd_valid_name(label: string, s) -> Result<string>
+    if type_of(s) != "string"
+        return err("prism_guard: {label} must be a string, got {type_of(s)}")
+    let n = len(s)
+    if n == 0
+        return err("prism_guard: {label} cannot be empty")
+    let bad = _gd_first_control_char(s)
+    if bad >= 0
+        return err("prism_guard: {label} '{s}' has a control character (code {ord(s[bad])}) at byte {bad} -- rejected")
+    if s[0] == " " or s[n - 1] == " "
+        return err("prism_guard: {label} '{s}' has leading or trailing whitespace -- rejected (an invisible difference that would silently break every comparison against it)")
+    ok(s)
+
+// ── GdGuard: the value a UI element carries to declare what it needs ────────────────────────────
+
+fn gd_guard_none() -> GdGuard
+    GdGuard(GdGuardModeNone(), "")
+
+fn gd_guard_public() -> GdGuard
+    GdGuard(GdGuardModePublic(), "")
+
+fn gd_guard_require(permission: string) -> Result<GdGuard>
+    let vp = _gd_valid_name("required permission", permission)?
+    ok(GdGuard(GdGuardModeRequire(), vp))
+
+fn gd_guard_is_none(g: GdGuard) -> bool
+    match g.gd_guard_mode
+        GdGuardModeNone() => true
+        GdGuardModePublic() => false
+        GdGuardModeRequire() => false
+
+fn gd_guard_is_public(g: GdGuard) -> bool
+    match g.gd_guard_mode
+        GdGuardModePublic() => true
+        GdGuardModeNone() => false
+        GdGuardModeRequire() => false
+
+fn gd_guard_is_require(g: GdGuard) -> bool
+    match g.gd_guard_mode
+        GdGuardModeRequire() => true
+        GdGuardModeNone() => false
+        GdGuardModePublic() => false
+
+fn gd_guard_permission(g: GdGuard) -> string
+    g.gd_guard_perm
+
+// ── GdRoleSet: registration ─────────────────────────────────────────────────────────────────────
+
+fn gd_role_set_new() -> GdRoleSet
+    GdRoleSet([])
+
+fn _gd_find_role(rs: GdRoleSet, name: string) -> Result<GdRole>
+    for r in rs.gd_rs_roles
+        if r.gd_role_name == name
+            return ok(r)
+    err("prism_guard: no role named '{name}' is registered")
+
+// Shared core behind both public registration entry points. `parent` is "" for a root role.
+fn _gd_register_role(rs: GdRoleSet, name: string, perms: list, parent: string) -> Result<GdRoleSet>
+    let valid_name = _gd_valid_name("role name", name)?
+    let existing = _gd_find_role(rs, valid_name)
+    if not is_err(existing)
+        return err("prism_guard: role '{valid_name}' is already registered -- role names must be unique, and this API is append-only (there is no way to re-register or mutate an existing role, which is also what makes an inheritance cycle unrepresentable -- see the file header)")
+    let clean_perms = []
+    let seen_perms = {}
+    for p in perms
+        let vp = _gd_valid_name("permission name", p)?
+        if vp in seen_perms
+            return err("prism_guard: role '{valid_name}' lists permission '{vp}' more than once")
+        seen_perms[vp] = true
+        push(clean_perms, vp)
+    let clean_parent = ""
+    if len(parent) > 0
+        let vparent = _gd_valid_name("parent role name", parent)?
+        let pr = _gd_find_role(rs, vparent)
+        if is_err(pr)
+            return err("prism_guard: role '{valid_name}' declares parent '{vparent}', which is not registered -- a parent must be registered BEFORE a role that extends it; this is also exactly what makes an inheritance CYCLE unrepresentable through this API (nothing can extend a role that does not exist yet)")
+        clean_parent = vparent
+    let new_role = GdRole(valid_name, clean_perms, clean_parent)
+    let roles = copy(rs.gd_rs_roles)
+    push(roles, new_role)
+    ok(GdRoleSet(roles))
+
+fn gd_role_set_register(rs: GdRoleSet, name: string, perms: list) -> Result<GdRoleSet>
+    _gd_register_role(rs, name, perms, "")
+
+fn gd_role_set_register_extends(rs: GdRoleSet, name: string, perms: list, parent: string) -> Result<GdRoleSet>
+    if len(parent) == 0
+        return err("prism_guard: gd_role_set_register_extends requires a non-empty parent role name -- use gd_role_set_register for a role with no parent")
+    _gd_register_role(rs, name, perms, parent)
+
+fn gd_role_set_roles(rs: GdRoleSet) -> list
+    rs.gd_rs_roles
+
+fn gd_role_set_role_count(rs: GdRoleSet) -> int
+    len(rs.gd_rs_roles)
+
+fn gd_role_name(r: GdRole) -> string
+    r.gd_role_name
+
+fn gd_role_direct_permissions(r: GdRole) -> list
+    r.gd_role_perms
+
+fn gd_role_parent(r: GdRole) -> string
+    r.gd_role_parent
+
+// ── Effective (with-inheritance) permission resolution ──────────────────────────────────────────
+
+// The ONE place this module ever resolves "what can role X actually do". `_gd_find_role(rs, cur)?`
+// on the FIRST iteration is what makes an unknown role name a loud Result::Err everywhere this is
+// reached from, rather than a silent empty grant -- see the file header. The step-bound + visited
+// set are a DEFENSIVE backstop, not an expected path: registration-time forward-reference-only
+// parents already make a cycle unrepresentable (see header) -- this still checks, because trusting
+// "should be impossible" alone in security code is exactly what CLAUDE.md's failure-hunt rule warns
+// against.
+fn _gd_role_all_perms(rs: GdRoleSet, name: string) -> Result<list>
+    let seen_roles = {}
+    let out = {}
+    let bound = len(rs.gd_rs_roles) + 1
+    let steps = [0]
+    let cur = name
+    while len(cur) > 0
+        if steps[0] > bound
+            return err("prism_guard: role '{name}' inheritance chain exceeds {bound} steps -- this should be structurally impossible via gd_role_set_register_extends (a parent must already be registered), so this is a defensive guard tripping, not a real cycle a caller built; treat as a bug report against this module")
+        steps[0] = steps[0] + 1
+        if cur in seen_roles
+            return err("prism_guard: role '{name}' inheritance chain revisits '{cur}' -- cycle detected. This should be structurally unreachable via gd_role_set_register_extends; treat as a bug report against this module")
+        seen_roles[cur] = true
+        let r = _gd_find_role(rs, cur)?
+        for p in r.gd_role_perms
+            out[p] = true
+        cur = r.gd_role_parent
+    ok(keys(out))
+
+fn gd_role_effective_permissions(rs: GdRoleSet, role_name: string) -> Result<list>
+    _gd_role_all_perms(rs, role_name)
+
+fn gd_role_grants(rs: GdRoleSet, role_name: string, permission: string) -> Result<bool>
+    let perms = _gd_role_all_perms(rs, role_name)?
+    ok(contains(perms, permission))
+
+// ── GdNode: a UI element carrying the guard it requires ─────────────────────────────────────────
+// `guard` is a REQUIRED positional argument, not defaulted -- see the file header's "no default
+// parameter relied on" design decision. `children` stays an untyped `list` (documented `list<GdNode>`
+// by comment, matching prism_route.nova's own `list<RtRoute>` convention) -- this module trusts the
+// documented shape rather than re-validating every element's type at construction, the same
+// established posture the rest of this codebase's registration functions take for list params.
+
+fn gd_node(id: string, guard: GdGuard, children: list) -> Result<GdNode>
+    let valid_id = _gd_valid_name("node id", id)?
+    ok(GdNode(valid_id, guard, children))
+
+fn gd_leaf(id: string, guard: GdGuard) -> Result<GdNode>
+    gd_node(id, guard, [])
+
+fn gd_node_id(n: GdNode) -> string
+    n.gd_node_id
+
+fn gd_node_guard(n: GdNode) -> GdGuard
+    n.gd_node_guard
+
+fn gd_node_children(n: GdNode) -> list
+    n.gd_node_children
+
+// The single-node, single-role reachability check. See the file header's "PUBLIC guard
+// short-circuits" design decision for exactly why a bogus `role_name` against a PUBLIC node is
+// `Ok(true)` rather than `Err` -- public content needs no role at all, so none is looked up.
+fn gd_role_can_reach(rs: GdRoleSet, role_name: string, node: GdNode) -> Result<bool>
+    match node.gd_node_guard.gd_guard_mode
+        GdGuardModePublic() => ok(true)
+        GdGuardModeNone() => ok(false)
+        GdGuardModeRequire() => gd_role_grants(rs, role_name, node.gd_node_guard.gd_guard_perm)
+
+// ── Issue / report accessors ─────────────────────────────────────────────────────────────────────
+
+fn gd_issue_kind(i: GdIssue) -> GdIssueKind
+    i.gd_issue_kind
+
+fn gd_issue_kind_name(k: GdIssueKind) -> string
+    match k
+        GdIssueDeadNoGuard() => "dead_no_guard"
+        GdIssueDeadUnknownPerm() => "dead_unknown_permission"
+        GdIssueOrphanPermission() => "orphan_permission"
+
+fn gd_issue_node_path(i: GdIssue) -> string
+    i.gd_issue_node_path
+
+fn gd_issue_permission(i: GdIssue) -> string
+    i.gd_issue_permission
+
+fn gd_issue_detail(i: GdIssue) -> string
+    i.gd_issue_detail
+
+fn gd_ar_issues(report: GdAuditReport) -> list
+    report.gd_ar_issues
+
+fn gd_ar_issue_count(report: GdAuditReport) -> int
+    len(report.gd_ar_issues)
+
+fn gd_ar_node_count(report: GdAuditReport) -> int
+    report.gd_ar_node_count
+
+fn gd_ar_role_count(report: GdAuditReport) -> int
+    report.gd_ar_role_count
+
+fn gd_audit_is_clean(report: GdAuditReport) -> bool
+    len(report.gd_ar_issues) == 0
+
+// ── The audit ────────────────────────────────────────────────────────────────────────────────────
+
+// Pre-order walk accumulating into shared, caller-owned mutable state -- `issues`/`node_count` are
+// lists, which are reference types in NOVA (see prism_caps.nova's own header on why: copying a
+// struct copies the list HANDLE, not its contents), so `push`/index-assignment through them here is
+// visible to the caller without threading a return value back up through every recursive call, the
+// same pattern prism_core/prism_node.nova's own `prism_node_walk` uses for its pre-order traversal.
+fn _gd_walk(node: GdNode, path: string, all_reachable_perms: list, required_perms_seen: dict, issues: list, node_count: list)
+    node_count[0] = node_count[0] + 1
+    let full_path = if len(path) == 0
+        node.gd_node_id
+    else
+        path + "/" + node.gd_node_id
+    match node.gd_node_guard.gd_guard_mode
+        GdGuardModeNone() =>
+            push(issues, GdIssue(GdIssueDeadNoGuard(), full_path, "", "prism_guard: element '{full_path}' has no declared permission -- deny-by-default means it is UNREACHABLE by any role; call gd_guard_require(...) or gd_guard_public() explicitly"))
+        GdGuardModePublic() =>
+            0
+        GdGuardModeRequire() =>
+            let perm = node.gd_node_guard.gd_guard_perm
+            required_perms_seen[perm] = true
+            if not contains(all_reachable_perms, perm)
+                push(issues, GdIssue(GdIssueDeadUnknownPerm(), full_path, perm, "prism_guard: element '{full_path}' requires permission '{perm}', which NO registered role grants (check for a typo) -- unreachable"))
+    for c in node.gd_node_children
+        _gd_walk(c, full_path, all_reachable_perms, required_perms_seen, issues, node_count)
+
+// Given a role set and a FOREST of `GdNode` trees (a real app has more than one page/route), finds:
+//   (1) FORWARD -- every element unreachable by any role (`GdIssueDeadNoGuard`, `GdIssueDeadUnknownPerm`)
+//   (2) REVERSE -- every permission a role directly grants that no element anywhere requires
+//       (`GdIssueOrphanPermission`)
+// See the file header's AUDIT DIRECTIONS section for why these are the valuable, buildable half of
+// #90, and why a single typo shows up as one line of each kind, pointing at each other.
+fn gd_audit(rs: GdRoleSet, roots: list) -> Result<GdAuditReport>
+    if len(rs.gd_rs_roles) == 0
+        return err("prism_guard: cannot audit against an empty role set -- register at least one role first (an empty role set would trivially report every guarded element as dead, which is not a useful diagnostic)")
+    if len(roots) == 0
+        return err("prism_guard: cannot audit an empty UI forest (no root elements given)")
+    let all_reachable = {}
+    for r in rs.gd_rs_roles
+        let eff = _gd_role_all_perms(rs, r.gd_role_name)?
+        for p in eff
+            all_reachable[p] = true
+    let all_reachable_list = keys(all_reachable)
+    let required_seen = {}
+    let issues = []
+    let node_count = [0]
+    for root in roots
+        _gd_walk(root, "", all_reachable_list, required_seen, issues, node_count)
+    let granted_by = {}
+    for r in rs.gd_rs_roles
+        for p in r.gd_role_perms
+            if p in granted_by
+                push(granted_by[p], r.gd_role_name)
+            else
+                granted_by[p] = [r.gd_role_name]
+    for p in keys(granted_by)
+        if not (p in required_seen)
+            let roles_str = join(granted_by[p], ", ")
+            push(issues, GdIssue(GdIssueOrphanPermission(), "", p, "prism_guard: permission '{p}' is granted by role(s) [{roles_str}] but is required by NO element in the audited UI forest -- a stale grant, or the other half of a typo'd permission reported elsewhere in this report as dead UI"))
+    ok(GdAuditReport(issues, node_count[0], len(rs.gd_rs_roles)))
+
+// Hand-built rendering, deliberately not relying on str()/to_json() on a struct -- see
+// prism_caps.nova's `prism_cap_describe` for the same reasoning and the measured defect it avoids.
+fn gd_audit_render(report: GdAuditReport) -> string
+    let n_issues = len(report.gd_ar_issues)
+    if n_issues == 0
+        return "prism_guard audit: CLEAN -- {report.gd_ar_node_count} element(s), {report.gd_ar_role_count} role(s), 0 issues"
+    let lines = []
+    push(lines, "prism_guard audit: {n_issues} issue(s) across {report.gd_ar_node_count} element(s), {report.gd_ar_role_count} role(s)")
+    for i in report.gd_ar_issues
+        push(lines, "  [" + gd_issue_kind_name(i.gd_issue_kind) + "] " + i.gd_issue_detail)
+    join(lines, "\n")

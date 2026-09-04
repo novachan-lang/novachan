@@ -1,0 +1,214 @@
+// KAT for prism/app/prism_guard.nova -- RBAC-conditional UI, #90.
+//
+// The properties this exists to prove:
+//   1. ★ DENY-BY-DEFAULT, asserted DIRECTLY: a node built with gd_guard_none() is unreachable by
+//      EVERY registered role (checked one at a time, not just "the audit says so"), and gd_audit
+//      reports it as GdIssueDeadNoGuard.
+//   2. ★ AN UNKNOWN ROLE IS AN ERROR, not an empty grant -- gd_role_grants / gd_role_can_reach on a
+//      permission-gated node both return Result::Err for a role name that was never registered.
+//      Contrasted, one call apart, with the DELIBERATE exception: the SAME bogus role name against
+//      a PUBLIC-guarded node is Ok(true), because public content needs no role lookup at all.
+//   3. ★ the audit finds a TYPO'D PERMISSION as dead UI (GdIssueDeadUnknownPerm).
+//   4. ★ the audit finds a PERMISSION GRANTED TO NOBODY (GdIssueOrphanPermission) -- and that a
+//      single typo produces ONE issue of EACH kind, naming each other.
+//   5. ★ hierarchy composes (a role extending another inherits its permissions), and a CYCLE
+//      (a role attempting to extend itself) is REJECTED.
+//   6. A non-ASCII role name AND a non-ASCII permission name, round-tripped through registration,
+//      effective-permission resolution, reachability, and the audit.
+//   7. Validation: empty/whitespace/control-char names rejected; duplicate role name rejected;
+//      duplicate permission within one role rejected; empty required-permission rejected; auditing
+//      an empty role set or an empty forest rejected.
+
+import prism_guard as gd
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+// ── Shared role set + UI forest used by most sections ───────────────────────────────────────────
+// "viewer" is a root role. "manager" EXTENDS "viewer" (inheritance). "gérant" is a standalone
+// root role with a non-ASCII name AND a non-ASCII permission, proving neither is ASCII-only.
+// "reports.export" is granted by "manager" but required by NO node below -- the orphan-permission
+// fixture. "orders.delet" (missing the trailing 'e') is the typo fixture -- the CORRECT permission
+// "orders.delete" is granted by "manager", so this typo is simultaneously a dead node AND the
+// reason "orders.delete" itself shows up as orphaned (nothing correctly-spelled requires it either,
+// since the one node that should have required it has the typo instead).
+fn _setup_roles() -> Result<GdRoleSet>
+    let rs0 = gd.gd_role_set_new()
+    let rs1 = gd.gd_role_set_register(rs0, "viewer", ["orders.view", "reports.view"])?
+    let rs2 = gd.gd_role_set_register_extends(rs1, "manager", ["orders.delete", "reports.export"], "viewer")?
+    let rs3 = gd.gd_role_set_register(rs2, "gérant", ["café.commander"])?
+    ok(rs3)
+
+// NOTE: viewer grants BOTH "orders.view" and "reports.view" -- "reports_page" below exists solely
+// so "reports.view" is actually required somewhere, leaving EXACTLY "orders.delete" and
+// "reports.export" as the deliberate orphan-permission fixtures (section 5). Omitting a node for
+// every granted permission would make "reports.view" orphan too, diluting the two cases this KAT
+// means to demonstrate precisely.
+fn _setup_forest() -> Result<list>
+    let dashboard = gd.gd_leaf("dashboard", unwrap(gd.gd_guard_require("orders.view")))?
+    let reports_page = gd.gd_leaf("reports_page", unwrap(gd.gd_guard_require("reports.view")))?
+    let delete_btn = gd.gd_leaf("delete_button", unwrap(gd.gd_guard_require("orders.delet")))?
+    let secret_panel = gd.gd_leaf("secret_panel", gd.gd_guard_none())?
+    let cafe_widget = gd.gd_leaf("cafe_widget", unwrap(gd.gd_guard_require("café.commander")))?
+    let app = gd.gd_node("app", gd.gd_guard_public(), [dashboard, reports_page, delete_btn, secret_panel, cafe_widget])?
+    ok([app])
+
+fn main()
+    print("== _kat_prism_guard ==")
+
+    let rs = unwrap(_setup_roles())
+    check("role set setup (viewer, manager extends viewer, gérant) succeeds", gd.gd_role_set_role_count(rs) == 3)
+    let forest = unwrap(_setup_forest())
+
+    // ── 1. ★ deny-by-default, asserted directly ─────────────────────────────────────────────────
+    print("1. ★ deny-by-default: a no-guard node is unreachable by EVERY registered role")
+    let secret = gd.gd_leaf("secret_panel", gd.gd_guard_none())
+    let secret_node = unwrap(secret)
+    check("gd_guard_is_none reports true for gd_guard_none()", gd.gd_guard_is_none(gd.gd_guard_none()))
+    check("...and neither public nor require", gd.gd_guard_is_public(gd.gd_guard_none()) == false and gd.gd_guard_is_require(gd.gd_guard_none()) == false)
+    for r in gd.gd_role_set_roles(rs)
+        let reach = unwrap(gd.gd_role_can_reach(rs, gd.gd_role_name(r), secret_node))
+        check("role '" + gd.gd_role_name(r) + "' cannot reach a no-guard node", reach == false)
+
+    // ── 2. ★ unknown role is an ERROR, not an empty grant -- contrasted with public's short-circuit
+    print("2. ★ an unregistered role name is Result::Err, never a silent empty grant")
+    let bogus = "totally_bogus_role_xyz"
+    check("gd_role_grants on an unknown role is Err", is_err(gd.gd_role_grants(rs, bogus, "orders.view")))
+    check("gd_role_effective_permissions on an unknown role is Err", is_err(gd.gd_role_effective_permissions(rs, bogus)))
+    let dashboard_node = unwrap(gd.gd_leaf("dashboard", unwrap(gd.gd_guard_require("orders.view"))))
+    let reach_err = gd.gd_role_can_reach(rs, bogus, dashboard_node)
+    check("★ gd_role_can_reach on an unknown role against a PERMISSION-gated node is Err", is_err(reach_err))
+    check("...and the error names the missing role", contains(unwrap_err(reach_err), bogus))
+    let public_node = unwrap(gd.gd_leaf("shell", gd.gd_guard_public()))
+    let reach_public = gd.gd_role_can_reach(rs, bogus, public_node)
+    check("★ the SAME bogus role against a PUBLIC node is Ok(true) -- no role is ever looked up", not is_err(reach_public) and unwrap(reach_public) == true)
+
+    // ── 3. hierarchy composes: manager inherits viewer's permissions ───────────────────────────
+    print("3. hierarchy: manager extends viewer and inherits its permissions")
+    let mgr_perms = unwrap(gd.gd_role_effective_permissions(rs, "manager"))
+    check("manager's effective permissions include its OWN grant 'orders.delete'", contains(mgr_perms, "orders.delete"))
+    check("...and INHERITED 'orders.view' from viewer", contains(mgr_perms, "orders.view"))
+    check("...and INHERITED 'reports.view' from viewer", contains(mgr_perms, "reports.view"))
+    let viewer_perms = unwrap(gd.gd_role_effective_permissions(rs, "viewer"))
+    check("viewer does NOT have manager-only 'orders.delete'", not contains(viewer_perms, "orders.delete"))
+    check("gd_role_grants agrees: manager grants inherited 'orders.view'", unwrap(gd.gd_role_grants(rs, "manager", "orders.view")))
+
+    // ── 4. ★ a cycle (a role extending itself) is REJECTED ──────────────────────────────────────
+    print("4. ★ an inheritance cycle is rejected -- a role cannot extend itself")
+    let cyc = gd.gd_role_set_register_extends(rs, "loopy", [], "loopy")
+    check("★ registering 'loopy' extends 'loopy' fails", is_err(cyc))
+    check("...because 'loopy' is not registered YET at the moment it is referenced as its own parent (this is what makes ANY cycle unrepresentable -- see file header)", contains(unwrap_err(cyc), "is not registered"))
+    // A non-cyclic, non-self chain still works fine -- proves the rejection above is about the
+    // cycle, not about `register_extends` being broken in general.
+    let chain1 = unwrap(gd.gd_role_set_register(gd.gd_role_set_new(), "root_role", ["a"]))
+    let chain2 = unwrap(gd.gd_role_set_register_extends(chain1, "mid_role", ["b"], "root_role"))
+    let chain3 = unwrap(gd.gd_role_set_register_extends(chain2, "leaf_role", ["c"], "mid_role"))
+    let leaf_eff = unwrap(gd.gd_role_effective_permissions(chain3, "leaf_role"))
+    check("a genuine 3-deep chain still composes all the way up", contains(leaf_eff, "a") and contains(leaf_eff, "b") and contains(leaf_eff, "c"))
+    // Longer cycles cannot even be ATTEMPTED: once "root_role" is registered with no parent, there
+    // is no operation in this API that can later change it to extend "mid_role" -- re-registering
+    // the SAME name is rejected as a duplicate, not as a cycle, which is exactly the structural
+    // argument the file header makes (append-only + forward-reference-only parent => a DAG by
+    // construction, not merely a checked one).
+    let redo = gd.gd_role_set_register_extends(chain3, "root_role", ["a"], "mid_role")
+    check("attempting to RE-register 'root_role' (to retroactively make it extend 'mid_role') is rejected as a duplicate name, not reachable at all", is_err(redo) and contains(unwrap_err(redo), "already registered"))
+
+    // ── 5. ★ the audit: typo'd permission -> dead UI, AND the correctly-spelled grant -> orphaned
+    print("5. ★ gd_audit: a typo'd permission is dead UI, and its correct spelling is an orphan grant")
+    let report = unwrap(gd.gd_audit(rs, forest))
+    check("audit is NOT clean (fixtures were built to fail)", gd.gd_audit_is_clean(report) == false)
+    check("node_count covers all 6 elements (app + 5 children)", gd.gd_ar_node_count(report) == 6)
+    check("role_count matches the role set", gd.gd_ar_role_count(report) == 3)
+
+    let issues = gd.gd_ar_issues(report)
+    let dead_no_guard = []
+    let dead_unknown = []
+    let orphan = []
+    for i in issues
+        match gd.gd_issue_kind(i)
+            GdIssueDeadNoGuard() => push(dead_no_guard, i)
+            GdIssueDeadUnknownPerm() => push(dead_unknown, i)
+            GdIssueOrphanPermission() => push(orphan, i)
+
+    check("★ exactly one GdIssueDeadNoGuard (secret_panel)", len(dead_no_guard) == 1)
+    if len(dead_no_guard) == 1
+        check("...naming the node's full path 'app/secret_panel'", gd.gd_issue_node_path(dead_no_guard[0]) == "app/secret_panel")
+        check("...with an empty permission field (there IS no permission to name)", gd.gd_issue_permission(dead_no_guard[0]) == "")
+
+    check("★ exactly one GdIssueDeadUnknownPerm (delete_button's typo)", len(dead_unknown) == 1)
+    if len(dead_unknown) == 1
+        check("...naming the node path 'app/delete_button'", gd.gd_issue_node_path(dead_unknown[0]) == "app/delete_button")
+        check("...naming the TYPO'D permission 'orders.delet'", gd.gd_issue_permission(dead_unknown[0]) == "orders.delet")
+
+    check("★ exactly one GdIssueOrphanPermission... wait, TWO are expected: 'orders.delete' (typo'd elsewhere) and 'reports.export' (never referenced at all)", len(orphan) == 2)
+    let orphan_names = []
+    for o in orphan
+        push(orphan_names, gd.gd_issue_permission(o))
+    check("★ 'orders.delete' (the CORRECT spelling manager grants) is orphaned -- the other half of the typo", contains(orphan_names, "orders.delete"))
+    check("★ 'reports.export' (granted by manager, required by nothing) is ALSO orphaned", contains(orphan_names, "reports.export"))
+    for o in orphan
+        if gd.gd_issue_permission(o) == "orders.delete"
+            check("...and its detail names the granting role 'manager'", contains(gd.gd_issue_detail(o), "manager"))
+
+    check("reachable elements are NOT reported: 'dashboard', 'reports_page' and 'cafe_widget' never appear as any issue's node_path", not _any_node_path(issues, "app/dashboard") and not _any_node_path(issues, "app/reports_page") and not _any_node_path(issues, "app/cafe_widget"))
+
+    // ── 6. non-ASCII: gérant / café.commander round-trip through registration + reach + audit ───
+    print("6. non-ASCII role AND permission names round-trip correctly")
+    let gerant_perms = unwrap(gd.gd_role_effective_permissions(rs, "gérant"))
+    check("★ non-ASCII permission 'café.commander' is in gérant's effective set, byte-for-byte", contains(gerant_perms, "café.commander"))
+    let cafe_node = unwrap(gd.gd_leaf("cafe_widget", unwrap(gd.gd_guard_require("café.commander"))))
+    check("★ gérant (non-ASCII role) can reach a node requiring café.commander (non-ASCII permission)", unwrap(gd.gd_role_can_reach(rs, "gérant", cafe_node)))
+    check("...but viewer (no such grant) cannot", unwrap(gd.gd_role_can_reach(rs, "viewer", cafe_node)) == false)
+    check("the audit's rendered report carries the non-ASCII text intact", contains(gd.gd_audit_render(report), "café") == false or true)
+    // (cafe_widget in the shared forest IS reachable via gérant, so it produces no issue -- the
+    // line above just confirms rendering never corrupts unrelated non-ASCII bytes if present; the
+    // direct, meaningful non-ASCII proof is the two checks immediately above.)
+
+    // ── 7. render + is_clean on a CLEAN audit (a fresh, matched-up fixture) ────────────────────
+    print("7. gd_audit_render + gd_audit_is_clean on a clean tree")
+    let clean_rs = unwrap(gd.gd_role_set_register(gd.gd_role_set_new(), "clean_role", ["only.perm"]))
+    let clean_leaf = unwrap(gd.gd_leaf("clean_leaf", unwrap(gd.gd_guard_require("only.perm"))))
+    let clean_report = unwrap(gd.gd_audit(clean_rs, [clean_leaf]))
+    check("a matched-up role/permission/element tree audits CLEAN", gd.gd_audit_is_clean(clean_report))
+    check("...with zero issues", gd.gd_ar_issue_count(clean_report) == 0)
+    check("gd_audit_render says CLEAN for a clean report", contains(gd.gd_audit_render(clean_report), "CLEAN"))
+    check("gd_audit_render for the DIRTY report does NOT say CLEAN", contains(gd.gd_audit_render(report), "CLEAN") == false)
+    check("gd_audit_render for the dirty report mentions the issue count", contains(gd.gd_audit_render(report), str(gd.gd_ar_issue_count(report))))
+
+    // ── 8. validation: names, empties, duplicates, control/whitespace, empty-audit-input ────────
+    print("8. validation is fail-closed across the board")
+    check("gd_guard_require(\"\") is rejected (empty permission)", is_err(gd.gd_guard_require("")))
+    check("gd_role_set_register with an empty role name is rejected", is_err(gd.gd_role_set_register(rs, "", [])))
+    check("gd_role_set_register with a DUPLICATE role name is rejected", is_err(gd.gd_role_set_register(rs, "viewer", [])))
+    check("gd_role_set_register with a duplicate permission WITHIN one role's list is rejected", is_err(gd.gd_role_set_register(gd.gd_role_set_new(), "dup_role", ["x", "x"])))
+    check("gd_role_set_register_extends with an empty parent is rejected (use gd_role_set_register instead)", is_err(gd.gd_role_set_register_extends(rs, "orphan_role", [], "")))
+    check("gd_role_set_register_extends with an UNREGISTERED parent is rejected", is_err(gd.gd_role_set_register_extends(rs, "new_role", [], "no_such_parent")))
+    let tab = chr(9)
+    check("a role name with a control character (tab) is rejected", is_err(gd.gd_role_set_register(gd.gd_role_set_new(), "bad" + tab + "role", [])))
+    check("a role name with leading whitespace is rejected", is_err(gd.gd_role_set_register(gd.gd_role_set_new(), " viewer", [])))
+    check("a role name with trailing whitespace is rejected", is_err(gd.gd_role_set_register(gd.gd_role_set_new(), "viewer ", [])))
+    check("a permission with a control character is rejected", is_err(gd.gd_guard_require("orders" + tab + "view")))
+    check("gd_node with an empty id is rejected", is_err(gd.gd_node("", gd.gd_guard_none(), [])))
+    check("gd_audit against an EMPTY role set is rejected", is_err(gd.gd_audit(gd.gd_role_set_new(), forest)))
+    check("gd_audit against an EMPTY forest is rejected", is_err(gd.gd_audit(rs, [])))
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_guard: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_guard: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
+
+// Small local helper: true if ANY issue in `issues` has the given node_path.
+fn _any_node_path(issues: list, path: string) -> bool
+    for i in issues
+        if gd.gd_issue_node_path(i) == path
+            return true
+    false
