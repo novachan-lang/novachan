@@ -450,7 +450,7 @@ criterion passes. Never "done" without the measurement. Killed items stay, with 
 | T12 | **M0.4 — closures across the WASM boundary** | ⬜ TODO | — | — | 4-8wk **RED**. Function table + RC-rooted captured env. **CODE → needs go-ahead** |
 | T13 | M0.5 — dead-code elimination | ⬜ TODO | — | — | 2-3wk YELLOW. Target: hello-world 459KB → <50KB raw |
 | T14 | **P1 — vertical slice (DOM backend)** | ⬜ TODO | — | — | 6 sub-milestones M1.1-M1.6 → **a NOVA counter drawing through the DOM backend, clickable, 60fps** |
-| T15 | **M1.7 — THE BET-1 FALSIFIER** | ⬜ TODO | — | — | 3-4wk. Measure read-set per face as % of reachable state. **>20-30% ⇒ Bet 1 dead.** M3.4 is gated on this |
+| T15 | **M1.7 — THE BET-1 FALSIFIER** | ✅ EVIDENCE DELIVERED | 2026-09-04 | `NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md` | **Bet 1 NOT falsified. M1.7's own >20-30% ratio criterion was INVALID** (on 5-leaf types a face reading ONE field scores 20%). Real measure: **median read-set = 1 leaf, mean 1.87**, slope 0.334 r²=0.15 (flat, not proportional). Two failure modes located: god-object state (100%) + **delegation inherits whole read-sets** (36% of faces grew; `prism_ss_is_usable` = 11/11 with direct=0) — the latter is the genuine risk to M3.4. Proxy analyser over the 55k corpus, NOT the compiler pass. Criterion replaced |
 | T16 | ★ **GO/NO-GO decision point** | ⬜ TODO | — | — | After T14+T15. ~6-7 months in. Owner call |
 
 **Owner decision currently pending:** go-ahead on T10 (half a week, protects existing capability) and
