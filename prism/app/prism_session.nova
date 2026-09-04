@@ -1,0 +1,272 @@
+// prism_session (app/, Tier 2) -- silent token refresh and logout-everywhere (#91).
+//
+// ── A PURE STATE MACHINE OVER AN EXPLICIT CLOCK ──────────────────────────────────────────────
+// No sockets, no `sleep`, no real time, no crypto. `now_ms` is an ARGUMENT; the caller performs
+// the actual refresh call and reports the outcome back in. Same shape as prism_wire, and for the
+// same reason: a module that sleeps can only be tested by waiting, so nobody tests the
+// hour-from-now expiry path and it is wrong the first time it runs in production.
+//
+// ── ⛔ REFRESH STARTS EARLY, AND THE MARGIN IS THE WHOLE POINT ───────────────────────────────
+// Refreshing AT expiry guarantees a window in which already-dispatched requests carry a token that
+// died in flight. So refresh begins at `expires_at - PRISM_SS_REFRESH_MARGIN_MS` (60s). 60s is not
+// arbitrary: it must exceed one request round-trip plus one retry of that request, so a request
+// that starts just before the margin can still complete, fail, and be retried on a token that is
+// still valid. Shorter and the retry lands after death; much longer and the session churns tokens
+// it did not need to.
+//
+// ── ⛔ AT MOST ONE REFRESH IN FLIGHT — AND WHY THAT IS A CORRECTNESS RULE, NOT AN OPTIMISATION ─
+// If five requests notice staleness at once and five refreshes fire, four are wasted — but worse,
+// a server that ROTATES the refresh token (the standard hardening) will treat the later four as
+// replays of a consumed token and can invalidate the whole session. So concurrency here does not
+// cost latency, it costs the user their login. `prism_ss_begin_refresh` therefore REFUSES when one
+// is already in flight, and the caller waits on the existing one rather than starting a second.
+//
+// ── ⛔ CLOCK SKEW: EXPIRY IS EVALUATED AGAINST A MONOTONIC HIGH-WATER MARK ───────────────────
+// `expires_at` comes from the SERVER; `now` comes from the client, and a client clock moves
+// backwards routinely (suspend/resume, an NTP correction, a user changing the date). If expiry were
+// compared against the raw `now`, a backwards jump would RESURRECT an expired session — a
+// security hole reachable by changing the system clock. So every observation advances
+// `ss_seen_ms` = max(seen, now), and expiry is judged against THAT. A backwards jump is therefore
+// ignored for expiry purposes and can never extend a session. It is recorded (`ss_skew_events`) so
+// the condition is observable rather than silently swallowed.
+//
+// ── ⛔ TOKENS ARE SECRETS, STRUCTURALLY ──────────────────────────────────────────────────────
+// Both tokens are held as `PrismSecret` (core/prism_secret.nova). `prism_ss_describe` — the ONLY
+// diagnostic renderer here — never touches a token value; it reports status, epoch and timing.
+// A refresh token in a log, a crash report or a telemetry payload IS the breach, so the module
+// offers no path that renders one. Reading a token requires the deliberate, named
+// `prism_ss_access_token`, which is what an outgoing request calls and nothing else should.
+//
+// ── LOGOUT-EVERYWHERE IS A SERVER FACT; THE CLIENT HALF IS AN EPOCH ─────────────────────────
+// A client cannot revoke another device's token — only the server can. What a client CAN do is
+// carry a session EPOCH (generation) the server stamps on every response, and treat an increase as
+// a forced logout. That works mid-refresh too: an epoch bump observed while a refresh is in flight
+// revokes immediately and the refresh's later outcome is DISCARDED, because honouring it would
+// resurrect a session the server just killed.
+//
+// PUBLIC API
+//   prism_ss_anonymous()                                   -> PrismSession
+//   prism_ss_login(access, refresh, expires_at, epoch)     -> Result<PrismSession>
+//   prism_ss_status(s) / _status_name(s) / _epoch(s) / _expires_at(s) / _seen_ms(s)
+//   prism_ss_is_usable(s, now_ms)                          -> bool
+//   prism_ss_needs_refresh(s, now_ms)                      -> bool
+//   prism_ss_tick(s, now_ms)                               -> PrismSession
+//   prism_ss_begin_refresh(s, now_ms)                      -> Result<PrismSession>
+//   prism_ss_refresh_ok(s, access, refresh, expires_at, epoch, now_ms) -> Result<PrismSession>
+//   prism_ss_refresh_network_failure(s, now_ms)            -> Result<PrismSession>
+//   prism_ss_refresh_rejected(s)                           -> PrismSession        (401 -> dead)
+//   prism_ss_observe_epoch(s, server_epoch)                -> PrismSession
+//   prism_ss_logout(s)                                     -> PrismSession
+//   prism_ss_access_token(s)                               -> Result<string>      deliberate
+//   prism_ss_describe(s)                                   -> string              token-free
+//   prism_ss_refresh_in_flight(s) / _skew_events(s)        -> int
+
+import prism_secret
+
+// Margin ahead of expiry at which a silent refresh begins. See the header for why 60s.
+let PRISM_SS_REFRESH_MARGIN_MS = 60000
+
+// `Ss`-prefixed variants: enum constructors resolve across modules in NOVA's one flat symbol
+// space, so bare `Active()`/`Expired()` would be a landmine for every other module.
+enum PrismSessionStatus
+    SsAnonymous()
+    SsActive()
+    SsRefreshing()
+    SsExpired()
+    SsRevoked()
+    SsDead()
+
+// `ss_` prefix: the struct field->slot map is GLOBAL, so a bare `status`/`epoch`/`attempts` would
+// share a slot with any other module's field of that name and silently corrupt dot-access.
+// Every flag is an INT 0/1, never a bool: a NOVA bool cannot be type-validated and changes
+// representation across a call boundary, which faulted twice in prism_form.
+type PrismSession
+    ss_status: PrismSessionStatus
+    ss_access: string       // redacted-at-rest label only; the real value lives in ss_access_sec
+    ss_access_sec: int      // 1 when a real access secret is held, 0 when cleared
+    ss_refresh_sec: int     // 1 when a real refresh secret is held
+    ss_access_val: PrismSecret<string>
+    ss_refresh_val: PrismSecret<string>
+    ss_expires_at: int
+    ss_epoch: int
+    ss_inflight_since: int  // 0 = no refresh in flight
+    ss_seen_ms: int         // monotonic high-water clock -- see CLOCK SKEW
+    ss_skew_events: int
+
+fn prism_ss_status_name(st: PrismSessionStatus) -> string
+    match st
+        SsAnonymous() => "anonymous"
+        SsActive() => "active"
+        SsRefreshing() => "refreshing"
+        SsExpired() => "expired"
+        SsRevoked() => "revoked"
+        SsDead() => "dead"
+
+fn prism_ss_status_all() -> list
+    [SsAnonymous(), SsActive(), SsRefreshing(), SsExpired(), SsRevoked(), SsDead()]
+
+fn _ss_empty_secret() -> PrismSecret<string>
+    unwrap(prism_secret.sec_new("empty", ""))
+
+fn prism_ss_anonymous() -> PrismSession
+    PrismSession(SsAnonymous(), "none", 0, 0, _ss_empty_secret(), _ss_empty_secret(), 0, 0, 0, 0, 0)
+
+fn prism_ss_login(access, refresh, expires_at, epoch) -> Result<PrismSession>
+    if type_of(access) != "string" or len(access) == 0
+        return err("prism_session: access token must be a non-empty string, got {type_of(access)}")
+    if type_of(refresh) != "string" or len(refresh) == 0
+        return err("prism_session: refresh token must be a non-empty string, got {type_of(refresh)}")
+    if type_of(expires_at) != "int" or type_of(epoch) != "int"
+        return err("prism_session: expires_at and epoch must be ints, got {type_of(expires_at)}/{type_of(epoch)}")
+    if epoch < 0
+        return err("prism_session: epoch {epoch} is negative -- an epoch only ever increases, so a negative one is a decoding error")
+    let a = prism_secret.sec_new("access_token", access)?
+    let r = prism_secret.sec_new("refresh_token", refresh)?
+    ok(PrismSession(SsActive(), "held", 1, 1, a, r, expires_at, epoch, 0, 0, 0))
+
+fn prism_ss_status(s: PrismSession) -> PrismSessionStatus
+    s.ss_status
+
+fn prism_ss_epoch(s: PrismSession) -> int
+    s.ss_epoch
+
+fn prism_ss_expires_at(s: PrismSession) -> int
+    s.ss_expires_at
+
+fn prism_ss_seen_ms(s: PrismSession) -> int
+    s.ss_seen_ms
+
+fn prism_ss_refresh_in_flight(s: PrismSession) -> int
+    if s.ss_inflight_since == 0
+        return 0
+    1
+
+fn prism_ss_skew_events(s: PrismSession) -> int
+    s.ss_skew_events
+
+// The high-water clock. A backwards `now` NEVER lowers it, so it can never extend a session.
+fn _ss_advance(s: PrismSession, now_ms: int) -> PrismSession
+    if now_ms >= s.ss_seen_ms
+        return PrismSession(s.ss_status, s.ss_access, s.ss_access_sec, s.ss_refresh_sec, s.ss_access_val, s.ss_refresh_val, s.ss_expires_at, s.ss_epoch, s.ss_inflight_since, now_ms, s.ss_skew_events)
+    // Backwards jump: keep the high-water mark, and RECORD it so the condition is observable.
+    PrismSession(s.ss_status, s.ss_access, s.ss_access_sec, s.ss_refresh_sec, s.ss_access_val, s.ss_refresh_val, s.ss_expires_at, s.ss_epoch, s.ss_inflight_since, s.ss_seen_ms, s.ss_skew_events + 1)
+
+fn _ss_with_status(s: PrismSession, st: PrismSessionStatus) -> PrismSession
+    PrismSession(st, s.ss_access, s.ss_access_sec, s.ss_refresh_sec, s.ss_access_val, s.ss_refresh_val, s.ss_expires_at, s.ss_epoch, s.ss_inflight_since, s.ss_seen_ms, s.ss_skew_events)
+
+// Clears BOTH secrets. Used by every terminal transition, so a revoked/dead/logged-out session
+// cannot hand out a token afterwards even if a caller asks.
+fn _ss_cleared(s: PrismSession, st: PrismSessionStatus) -> PrismSession
+    PrismSession(st, "none", 0, 0, _ss_empty_secret(), _ss_empty_secret(), 0, s.ss_epoch, 0, s.ss_seen_ms, s.ss_skew_events)
+
+// Usable means a request may go out on this token RIGHT NOW. Judged against the high-water clock.
+fn prism_ss_is_usable(s: PrismSession, now_ms) -> bool
+    if type_of(now_ms) != "int"
+        return false
+    let adv = _ss_advance(s, now_ms)
+    if adv.ss_access_sec == 0
+        return false
+    let st = prism_ss_status_name(adv.ss_status)
+    if st != "active" and st != "refreshing"
+        return false
+    adv.ss_seen_ms < adv.ss_expires_at
+
+fn prism_ss_needs_refresh(s: PrismSession, now_ms) -> bool
+    if type_of(now_ms) != "int"
+        return false
+    if s.ss_refresh_sec == 0
+        return false
+    let st = prism_ss_status_name(s.ss_status)
+    if st != "active" and st != "expired"
+        return false
+    let adv = _ss_advance(s, now_ms)
+    adv.ss_seen_ms >= adv.ss_expires_at - PRISM_SS_REFRESH_MARGIN_MS
+
+// Advances the clock and settles status. Deliberately does NOT start a refresh -- starting one is
+// an explicit caller action, because only the caller can actually perform the network call.
+fn prism_ss_tick(s: PrismSession, now_ms) -> PrismSession
+    if type_of(now_ms) != "int"
+        return s
+    let adv = _ss_advance(s, now_ms)
+    let st = prism_ss_status_name(adv.ss_status)
+    // A terminal state is never revisited: revoked/dead/anonymous do not become active again by
+    // the clock moving, and a refresh in flight is left alone until its outcome is reported.
+    if st == "revoked" or st == "dead" or st == "anonymous" or st == "refreshing"
+        return adv
+    if adv.ss_seen_ms >= adv.ss_expires_at
+        return _ss_with_status(adv, SsExpired())
+    _ss_with_status(adv, SsActive())
+
+// ⛔ REFUSES when a refresh is already in flight -- see the header: a second concurrent refresh can
+// invalidate the session outright on a server that rotates refresh tokens.
+fn prism_ss_begin_refresh(s: PrismSession, now_ms) -> Result<PrismSession>
+    if type_of(now_ms) != "int"
+        return err("prism_session: now_ms must be an int, got {type_of(now_ms)}")
+    if s.ss_inflight_since != 0
+        return err("prism_session: a refresh is already in flight (since {s.ss_inflight_since}) -- wait on it rather than starting a second. A server that rotates refresh tokens treats the second as a replay of a consumed token and can invalidate the whole session")
+    if s.ss_refresh_sec == 0
+        return err("prism_session: no refresh token held (status {prism_ss_status_name(s.ss_status)}) -- nothing to refresh with")
+    let stn = prism_ss_status_name(s.ss_status)
+    if stn == "revoked" or stn == "dead"
+        return err("prism_session: session is {stn} -- refreshing a terminated session cannot succeed and must not be attempted")
+    let adv = _ss_advance(s, now_ms)
+    ok(PrismSession(SsRefreshing(), adv.ss_access, adv.ss_access_sec, adv.ss_refresh_sec, adv.ss_access_val, adv.ss_refresh_val, adv.ss_expires_at, adv.ss_epoch, adv.ss_seen_ms, adv.ss_seen_ms, adv.ss_skew_events))
+
+// The caller's refresh succeeded. ⛔ If the session was REVOKED while this was in flight, the
+// outcome is DISCARDED -- honouring it would resurrect a session the server has already killed.
+fn prism_ss_refresh_ok(s: PrismSession, access, refresh, expires_at, epoch, now_ms) -> Result<PrismSession>
+    let stn = prism_ss_status_name(s.ss_status)
+    if stn == "revoked" or stn == "dead"
+        return ok(s)
+    if s.ss_inflight_since == 0
+        return err("prism_session: no refresh was in flight -- reporting an outcome for a refresh that was never begun means the caller's state and this module's have diverged")
+    let fresh = prism_ss_login(access, refresh, expires_at, epoch)?
+    let adv = _ss_advance(s, now_ms)
+    // A refresh response carrying an OLDER epoch than we already know is a stale server or a
+    // replayed response; keep the higher epoch rather than regressing.
+    let keep_epoch = if epoch >= adv.ss_epoch
+        epoch
+    else
+        adv.ss_epoch
+    ok(PrismSession(SsActive(), fresh.ss_access, 1, 1, fresh.ss_access_val, fresh.ss_refresh_val, expires_at, keep_epoch, 0, adv.ss_seen_ms, adv.ss_skew_events))
+
+// A NETWORK failure is retryable: the tokens are untouched and the session returns to its
+// clock-determined state, so the caller may begin another refresh.
+fn prism_ss_refresh_network_failure(s: PrismSession, now_ms) -> Result<PrismSession>
+    if s.ss_inflight_since == 0
+        return err("prism_session: no refresh was in flight to fail")
+    let stn = prism_ss_status_name(s.ss_status)
+    if stn == "revoked" or stn == "dead"
+        return ok(s)
+    let cleared = PrismSession(SsActive(), s.ss_access, s.ss_access_sec, s.ss_refresh_sec, s.ss_access_val, s.ss_refresh_val, s.ss_expires_at, s.ss_epoch, 0, s.ss_seen_ms, s.ss_skew_events)
+    ok(prism_ss_tick(cleared, now_ms))
+
+// ⛔ A 401 on the REFRESH token is terminal. Retrying is pointless (the credential is rejected) and
+// harmful (it burns rate limit and can trip lockout). Tokens are cleared.
+fn prism_ss_refresh_rejected(s: PrismSession) -> PrismSession
+    _ss_cleared(s, SsDead())
+
+// The server's session generation. An INCREASE means logout-everywhere fired; it revokes
+// immediately, including mid-refresh.
+fn prism_ss_observe_epoch(s: PrismSession, server_epoch) -> PrismSession
+    if type_of(server_epoch) != "int"
+        return s
+    if server_epoch <= s.ss_epoch
+        return s
+    PrismSession(SsRevoked(), "none", 0, 0, _ss_empty_secret(), _ss_empty_secret(), 0, server_epoch, 0, s.ss_seen_ms, s.ss_skew_events)
+
+fn prism_ss_logout(s: PrismSession) -> PrismSession
+    _ss_cleared(s, SsAnonymous())
+
+// ⛔ The ONLY path that yields a token's plaintext, named so it is greppable and obvious in review.
+// An outgoing request calls this; nothing else should.
+fn prism_ss_access_token(s: PrismSession) -> Result<string>
+    if s.ss_access_sec == 0
+        return err("prism_session: no access token held (status {prism_ss_status_name(s.ss_status)})")
+    ok(prism_secret.sec_unwrap(s.ss_access_val))
+
+// ⛔ Token-free by construction: this function cannot leak a token because it never reads one.
+// Hand-built, never the generic to_json() -- that mis-dispatches on an imported struct and reads
+// out of bounds, and a session diagnostic is the last place that should happen.
+fn prism_ss_describe(s: PrismSession) -> string
+    "session: status={prism_ss_status_name(s.ss_status)} epoch={s.ss_epoch} expires_at={s.ss_expires_at} seen={s.ss_seen_ms} inflight={prism_ss_refresh_in_flight(s)} skew={s.ss_skew_events} access_held={s.ss_access_sec} refresh_held={s.ss_refresh_sec}"

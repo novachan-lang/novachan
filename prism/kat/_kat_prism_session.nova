@@ -1,0 +1,145 @@
+// KAT for prism/app/prism_session.nova -- silent refresh + logout-everywhere (#91).
+//
+// The five properties this exists for:
+//   1. ★ AT MOST ONE REFRESH IN FLIGHT. Not an optimisation -- a server that rotates refresh
+//      tokens treats a second concurrent refresh as a replay of a consumed token and can
+//      invalidate the whole session. So concurrency here costs the user their login.
+//   2. ★ A TOKEN'S PLAINTEXT NEVER APPEARS IN DIAGNOSTIC OUTPUT. Asserted against describe() with
+//      a distinctive marker -- a refresh token in a log IS the breach.
+//   3. ★ AN EPOCH BUMP REVOKES EVEN MID-REFRESH, and the in-flight outcome is DISCARDED --
+//      honouring it would resurrect a session the server just killed.
+//   4. ★ A 401 ON REFRESH IS TERMINAL. Retrying is pointless and harmful.
+//   5. ★ A BACKWARDS CLOCK JUMP CANNOT EXTEND A SESSION. Expiry is judged against a monotonic
+//      high-water mark, so changing the system clock is not an authentication bypass.
+
+import prism_secret
+import prism_session
+
+let STATS = [0, 0]
+let MARKER = "tok-SECRET-MARKER-7b2e"
+let NAME_NON_ASCII = "セッション-héllo"
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn _fresh() -> PrismSession
+    // expires at t=100000; margin is 60000, so refresh is due from t=40000.
+    unwrap(prism_session.prism_ss_login(MARKER, "refresh-{MARKER}", 100000, 7))
+
+fn main()
+    print("== _kat_prism_session ==")
+
+    print("1. construction and validation")
+    check("empty access token rejected", is_err(prism_session.prism_ss_login("", "r", 1000, 0)))
+    check("empty refresh token rejected", is_err(prism_session.prism_ss_login("a", "", 1000, 0)))
+    check("non-string token rejected", is_err(prism_session.prism_ss_login(7, "r", 1000, 0)))
+    check("non-int expiry rejected", is_err(prism_session.prism_ss_login("a", "r", "1000", 0)))
+    check("negative epoch rejected", is_err(prism_session.prism_ss_login("a", "r", 1000, -1)))
+    let anon = prism_session.prism_ss_anonymous()
+    check("anonymous starts anonymous", prism_session.prism_ss_status_name(prism_session.prism_ss_status(anon)) == "anonymous")
+    check("anonymous holds no token", is_err(prism_session.prism_ss_access_token(anon)))
+    let s = _fresh()
+    check("login is active", prism_session.prism_ss_status_name(prism_session.prism_ss_status(s)) == "active")
+    check("epoch stored", prism_session.prism_ss_epoch(s) == 7)
+    check("the token IS retrievable by the deliberate accessor", unwrap(prism_session.prism_ss_access_token(s)) == MARKER)
+    check("6 status values", len(prism_session.prism_ss_status_all()) == 6)
+
+    print("2. ★ a token's plaintext NEVER reaches diagnostic output")
+    let d = prism_session.prism_ss_describe(s)
+    check("describe does NOT contain the access token", not contains(d, MARKER))
+    check("describe does NOT contain the refresh token", not contains(d, "refresh-{MARKER}"))
+    check("describe still reports status", contains(d, "status=active"))
+    check("describe reports the epoch", contains(d, "epoch=7"))
+    check("describe reports whether tokens are held, without their values", contains(d, "access_held=1"))
+    // A non-ASCII token must be equally absent -- byte-wise handling must not leak a fragment.
+    let sj = unwrap(prism_session.prism_ss_login(NAME_NON_ASCII, "r-{NAME_NON_ASCII}", 100000, 1))
+    check("a NON-ASCII token is absent from describe too", not contains(prism_session.prism_ss_describe(sj), NAME_NON_ASCII))
+    check("...and still retrievable intact", unwrap(prism_session.prism_ss_access_token(sj)) == NAME_NON_ASCII)
+
+    print("3. usability and the refresh margin")
+    check("usable well before expiry", prism_session.prism_ss_is_usable(s, 10000))
+    check("NOT yet due for refresh at t=10000", not prism_session.prism_ss_needs_refresh(s, 10000))
+    // Margin is 60s and expiry is 100000, so refresh is due from exactly 40000.
+    check("refresh becomes due exactly at expiry - margin (40000)", prism_session.prism_ss_needs_refresh(s, 40000))
+    check("still USABLE while due for refresh (that is the point of the margin)", prism_session.prism_ss_is_usable(s, 40000))
+    check("not usable at expiry", not prism_session.prism_ss_is_usable(s, 100000))
+    check("tick past expiry marks expired", prism_session.prism_ss_status_name(prism_session.prism_ss_status(prism_session.prism_ss_tick(s, 100001))) == "expired")
+    check("an expired session is still due for refresh", prism_session.prism_ss_needs_refresh(prism_session.prism_ss_tick(s, 100001), 100001))
+    check("non-int now is rejected rather than coerced", not prism_session.prism_ss_is_usable(s, "10000"))
+
+    print("4. ★ at most ONE refresh in flight")
+    let r1 = unwrap(prism_session.prism_ss_begin_refresh(s, 40000))
+    check("begin_refresh sets refreshing", prism_session.prism_ss_status_name(prism_session.prism_ss_status(r1)) == "refreshing")
+    check("in-flight flag is set", prism_session.prism_ss_refresh_in_flight(r1) == 1)
+    // THE property: a second concurrent begin is REFUSED.
+    check("a SECOND concurrent refresh is REFUSED", is_err(prism_session.prism_ss_begin_refresh(r1, 40001)))
+    check("the original is unchanged (non-mutating)", prism_session.prism_ss_refresh_in_flight(s) == 0)
+    check("refreshing is still usable if not yet expired", prism_session.prism_ss_is_usable(r1, 40001))
+    check("reporting an outcome with nothing in flight is an error", is_err(prism_session.prism_ss_refresh_ok(s, "a2", "r2", 200000, 7, 41000)))
+    check("reporting a network failure with nothing in flight is an error", is_err(prism_session.prism_ss_refresh_network_failure(s, 41000)))
+    let done = unwrap(prism_session.prism_ss_refresh_ok(r1, "access2", "refresh2", 200000, 7, 41000))
+    check("a successful refresh returns to active", prism_session.prism_ss_status_name(prism_session.prism_ss_status(done)) == "active")
+    check("in-flight is cleared", prism_session.prism_ss_refresh_in_flight(done) == 0)
+    check("the NEW token is in place", unwrap(prism_session.prism_ss_access_token(done)) == "access2")
+    check("the new expiry is in place", prism_session.prism_ss_expires_at(done) == 200000)
+    check("a refresh may begin again after one completes", not is_err(prism_session.prism_ss_begin_refresh(done, 150000)))
+
+    print("5. failure classes are NOT the same")
+    // Network failure: retryable, tokens intact.
+    let netfail = unwrap(prism_session.prism_ss_refresh_network_failure(r1, 41000))
+    check("a network failure clears in-flight", prism_session.prism_ss_refresh_in_flight(netfail) == 0)
+    check("...keeps the token (retryable)", unwrap(prism_session.prism_ss_access_token(netfail)) == MARKER)
+    check("...and allows another attempt", not is_err(prism_session.prism_ss_begin_refresh(netfail, 41001)))
+    // 401 on the refresh token: terminal.
+    let dead = prism_session.prism_ss_refresh_rejected(r1)
+    check("a 401 on refresh is DEAD", prism_session.prism_ss_status_name(prism_session.prism_ss_status(dead)) == "dead")
+    check("...clears the token", is_err(prism_session.prism_ss_access_token(dead)))
+    check("...is NEVER retried", is_err(prism_session.prism_ss_begin_refresh(dead, 42000)))
+    check("...and the clock cannot revive it", prism_session.prism_ss_status_name(prism_session.prism_ss_status(prism_session.prism_ss_tick(dead, 1))) == "dead")
+
+    print("6. ★ logout-everywhere: an epoch bump revokes, even MID-REFRESH")
+    check("a lower epoch is ignored", prism_session.prism_ss_status_name(prism_session.prism_ss_status(prism_session.prism_ss_observe_epoch(s, 6))) == "active")
+    check("an EQUAL epoch is ignored", prism_session.prism_ss_status_name(prism_session.prism_ss_status(prism_session.prism_ss_observe_epoch(s, 7))) == "active")
+    let revoked = prism_session.prism_ss_observe_epoch(s, 8)
+    check("a HIGHER epoch revokes", prism_session.prism_ss_status_name(prism_session.prism_ss_status(revoked)) == "revoked")
+    check("revocation clears the token", is_err(prism_session.prism_ss_access_token(revoked)))
+    check("a revoked session is not usable", not prism_session.prism_ss_is_usable(revoked, 1))
+    check("a revoked session cannot refresh", is_err(prism_session.prism_ss_begin_refresh(revoked, 1)))
+    check("the clock cannot revive it", prism_session.prism_ss_status_name(prism_session.prism_ss_status(prism_session.prism_ss_tick(revoked, 1))) == "revoked")
+    // THE mid-refresh case: revoke while in flight, then the refresh "succeeds".
+    let revoked_mid = prism_session.prism_ss_observe_epoch(r1, 9)
+    check("revoking MID-REFRESH works", prism_session.prism_ss_status_name(prism_session.prism_ss_status(revoked_mid)) == "revoked")
+    let ignored = unwrap(prism_session.prism_ss_refresh_ok(revoked_mid, "zombie", "zombie-r", 999999, 9, 42000))
+    check("★ the in-flight outcome is DISCARDED, not honoured", prism_session.prism_ss_status_name(prism_session.prism_ss_status(ignored)) == "revoked")
+    check("...so no zombie token is installed", is_err(prism_session.prism_ss_access_token(ignored)))
+    check("logout is anonymous and token-free", is_err(prism_session.prism_ss_access_token(prism_session.prism_ss_logout(s))))
+
+    print("7. ★ a backwards clock jump cannot extend a session")
+    // Advance the high-water mark past expiry, then hand back an EARLIER now.
+    let late = prism_session.prism_ss_tick(s, 100001)
+    check("expired at the later time", prism_session.prism_ss_status_name(prism_session.prism_ss_status(late)) == "expired")
+    check("high-water mark recorded", prism_session.prism_ss_seen_ms(late) == 100001)
+    // A clock jump back to well before expiry must NOT make it usable again.
+    check("★ a backwards jump does NOT restore usability", not prism_session.prism_ss_is_usable(late, 10))
+    let jumped = prism_session.prism_ss_tick(late, 10)
+    check("★ nor does ticking backwards revive it", prism_session.prism_ss_status_name(prism_session.prism_ss_status(jumped)) == "expired")
+    check("the high-water mark is not lowered", prism_session.prism_ss_seen_ms(jumped) == 100001)
+    check("the skew is OBSERVABLE, not silently swallowed", prism_session.prism_ss_skew_events(jumped) >= 1)
+    check("a forward jump still advances normally", prism_session.prism_ss_seen_ms(prism_session.prism_ss_tick(late, 200000)) == 200000)
+
+    print("8. a stale/replayed refresh response cannot regress the epoch")
+    let r2 = unwrap(prism_session.prism_ss_begin_refresh(s, 40000))
+    let older = unwrap(prism_session.prism_ss_refresh_ok(r2, "a3", "r3", 200000, 3, 41000))
+    check("an older epoch in the response does not lower ours", prism_session.prism_ss_epoch(older) == 7)
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_session: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_session: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
