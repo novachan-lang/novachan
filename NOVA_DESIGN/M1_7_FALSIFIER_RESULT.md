@@ -30,6 +30,19 @@ same corpus says the opposite:
 leaves whether the type has 3 or 16. That is precisely the granularity Bet 1 requires. If it holds
 at app scale, a 500-leaf state tree yields read-sets of ~0.4%, not 33%.
 
+### ⛔ The caveat that bounds this verdict: a collection counts as ONE leaf
+
+`reach()` has no element type to recurse into for a bare `list`/`dict`, so a collection field is
+**one leaf**. Measured over the corpus: **61 of 448 reachable leaves (14%) are collection-backed.**
+
+So "this face reads 1 leaf" can mean "this face depends on a 10,000-row table." The *ratio* is
+unaffected — numerator and denominator both treat a list as one leaf — but **invalidation
+granularity over collections is not measured by this experiment at all**, and collections are
+exactly what a UI renders most expensively (tables, lists, trees). This is the one place where the
+M1.7 numbers are optimistic rather than conservative, and it is why M3.4's design must treat keyed
+collection granularity as a separate first-class problem rather than a special case. See
+`PRISM_M3_4_REACTIVITY_DESIGN.md` §4.
+
 **The honest limit: this corpus cannot prove it holds at app scale.** The largest app-state type
 here is `PrismAppState` at 16 leaves. Nothing in this data supports extrapolation to a 200- or
 500-leaf application state tree, and the two candidate models disagree wildly there (flat ⇒ 0.4%,
