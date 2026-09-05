@@ -485,6 +485,20 @@ PRISM_STATUS.md          ← YOU ARE HERE. Always start here. Live status, what'
 
 ## REPOSITORY STRUCTURE — ✅ BUILT (130 modules, 127 KATs, ~55.1k lines)
 
+**KAT coverage audit (2026-09-05), by NAME:** 131 modules, 128 KAT files. Every module is
+gated, though not all one-to-one — the naming is not uniform and a count alone would mislead:
+
+* **8 modules are covered by AGGREGATE KATs**, not same-named ones: `prism_arrange`,
+  `prism_content`, `prism_interact`, `prism_structure` (via `_kat_prism_widget_a`/`_b`/`_all`);
+  `prism_color`, `prism_palette`, `prism_look` (via `_kat_prism_style_a`/`_b`/`_all`);
+  `prism_tokens_dev` (via `_kat_prism_tokens_export`). Verified by reading those KATs' imports,
+  not inferred from names.
+* **2 modules have NO dedicated KAT** but are exercised transitively: `prism_ansi` (the ANSI
+  backend) by **13** KATs, and `prism_ui_kit` (the composition layer under all 67 `ui/`
+  components) by **40**. Not untested — but `prism_ui_kit`'s error-propagation semantics are
+  only tested *incidentally*, through components that happen to use them. A dedicated KAT is a
+  legitimate, non-urgent gap.
+
 **This is the authoritative map, and it now describes what EXISTS, not a proposal.** Layer counts: `core/` 7 · `text/` 5 · `widget/` 6 · `style/` 7 · `render/` 4 · `obs/` 5 · `dev/` 8 · `intl/` 4 · `a11y/` 1 · `ui/` 67 · `app/` 14. Each layer's own `README.md` is the by-name audit basis for that layer — ⛔ audit by NAME, never by count.
 
 **Learning from `forge/`:** it is **1,013 files completely flat**, with `.ll` and `.exe` build
