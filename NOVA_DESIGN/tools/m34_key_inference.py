@@ -37,6 +37,7 @@ m17 = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(m17)
 
 NOMINAL = re.compile(r'(^|_)(id|key|slug|uuid|code|name|title)$')
+REJECTED = []   # (elem_type, field, reason): Rule 1 candidates the discriminator threw out
 
 
 def corpus_text(root='prism'):
@@ -83,12 +84,30 @@ def keyability_by_elem_type(types, alltext):
     colls = collection_fields(types)
     elem_types = {c[2] for c in colls}
     cmp_fields = defaultdict(set)
+    del REJECTED[:]
+    # A TERM on the far side of an `==`: either a literal or a variable / field path.
+    _TERM = r'("(?:[^"\\]|\\.)*"|-?\d+|0x[0-9a-fA-F]+|[A-Za-z_]\w*(?:\.\w+)*(?:\s*\(\s*\))?)'
+    _LITERAL = re.compile(r'^(?:"(?:[^"\\]|\\.)*"|-?\d+|0x[0-9a-fA-F]+|true|false|'
+                          r'[A-Z]\w*\s*\(\s*\))$')
     for et in elem_types:
         for fld, _ in types[et]:
-            # x.fld == ...   or   ... == x.fld
-            if re.search(r'\.' + re.escape(fld) + r'\s*==', alltext) or \
-               re.search(r'==\s*\w+\.' + re.escape(fld) + r'\b', alltext):
+            others = []
+            for _m in re.finditer(r'\.' + re.escape(fld) + r'\s*==\s*' + _TERM, alltext):
+                others.append(_m.group(1).strip())
+            for _m in re.finditer(_TERM + r'\s*==\s*\w+\.' + re.escape(fld) + r'\b', alltext):
+                others.append(_m.group(1).strip())
+            if not others:
+                continue
+            # THE DISCRIMINATOR (design doc s10.12). An IDENTITY LOOKUP compares against a
+            # VARIABLE (x.id == target); a FILTER PREDICATE compares against a LITERAL
+            # (x.nn_auto == 0). A bare "is there an == on this field" cannot tell them apart,
+            # and that false positive would have keyed a notification queue by a 0/1 FLAG.
+            varcmp = [o for o in others if not _LITERAL.match(o)]
+            if varcmp:
                 cmp_fields[et].add(fld)
+            else:
+                REJECTED.append((et, fld,
+                                 'literal-only: ' + ', '.join(sorted(set(others))[:3])))
     out = {}
     for et in elem_types:
         lookup = cmp_fields.get(et, set())
@@ -150,6 +169,16 @@ def main():
           .format(pc(both + r1)))
     print("  any rule fires:                                                  {}".format(
         pc(both + r1 + r3)))
+    print()
+    print("=" * 78)
+    print("RULE 1 CANDIDATES REJECTED BY THE DISCRIMINATOR (s10.12)")
+    print("=" * 78)
+    if not REJECTED:
+        print("  none")
+    else:
+        print("  {} field(s) compared ONLY against literals -- filter predicates, not identity:".format(len(REJECTED)))
+        for _et, _fld, _why in sorted(REJECTED):
+            print("    {}.{}  <- {}".format(_et, _fld, _why))
     print()
     print("=" * 78)
     print("DISAGREEMENTS -- s10.4 says Rule 1 WINS.  How often does that matter?")

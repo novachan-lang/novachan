@@ -798,3 +798,45 @@ measurement artifact that made a number wrong. This one would have made the *shi
 wrong — a UI keyed by a boolean. It was caught only because an agent questioned a tool it was told
 to reuse rather than trust, and because a `nn_id` field added an hour earlier finally created the
 first disagreement for the policy to be tested against.
+
+### 10.13 DISCRIMINATOR BUILT AND RE-MEASURED (2026-09-05) — and §10.7 was right after all
+
+§10.12's literal/variable discriminator is implemented (`tools/m34_key_inference.py`): Rule 1 now
+admits a candidate **only when the far side of the `==` is a variable**, never a literal, and the
+rejections are printed rather than silently filtered.
+
+**It rejected three fields — all `0/1` flags, all compared only against constants:**
+
+| field | comparisons | |
+|---|---|---|
+| `PrismNotice.nn_auto` | `0`, `1` | the one that would have keyed a notification queue by a boolean |
+| `RtRoute.rt_route_is_sheet` | `0`, `1` | **same class, newly found** |
+| `RtSegment.rt_seg_lit` | `0`, `1` | **same class, newly found** |
+
+So it was not an isolated slip: **three of the corpus's Rule 1 candidates were filter predicates.**
+
+| | before | **after** |
+|---|---|---|
+| both rules fire | 12 | 11 |
+| **Rule 1 only** | 1 | **0** |
+| Rule 3 only | 7 | 8 |
+| neither | 4 | **5** |
+| **Rule 1 coverage** | 54.2% | **45.8%** |
+| any rule fires | 83.3% | **79.2%** |
+
+**⭐ This settles a back-and-forth in my own analysis.** §10.7 concluded *"Rule 1 is not
+load-bearing; Rule 3 is"* — Rule 1 never fired alone. §10.10 then **withdrew** that, arguing the
+low coverage was an artifact of the untyped corpus, since Rule 1 rose 30% → 47.6% → 54.2% as
+collections became visible.
+
+**§10.10's withdrawal was itself wrong.** That rise was inflated by filter predicates. With the
+discriminator, **Rule 1 fires alone 0% of the time** — exactly as §10.7 originally found. The naming
+heuristic I ranked *third and weakest* in §10.2 carries the coverage; the behavioural rule
+corroborates but never reaches a collection the nominal rule misses.
+
+**Final position on §10.2's rule ordering:** Rule 3 (nominal) proposes and covers. Rule 1
+(behavioural) **validates** — its value is confirming that a nominal `id` is the identity the
+program actually uses, and, now, *nothing else*. "Behaviour beats naming" is withdrawn for good.
+
+**Unchanged:** the simulator's six action rows are byte-identical (`attempted 6, completed 6`), since
+it asks only the boolean "is any key derivable" and Rule 3 independently supplies `nn_id`.
