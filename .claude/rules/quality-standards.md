@@ -105,11 +105,21 @@ Every **feature and design decision** must be compared in full against the best 
 
 If a feature CANNOT match the best existing implementation, document WHY and what the plan is. "We'll fix it later" is not acceptable — it's a tracked known limitation with a timeline.
 
-## DELEGATION — Opus orchestrates, Sonnet implements
+## DELEGATION — Opus 5 thinks, Sonnet 5 writes
 
-Mechanical/pure-NOVA/boilerplate work is delegated to Sonnet subagents. The SAME gates apply to delegated work: reconverge, full nova_ci both modes, KAT, adversarial verification. Opus REVIEWS all delegated output before commit.
+**Sonnet 5 = ALL writing and every small/light task. Opus 5 = thinking, architecture, complex design, hard debugging, and REVIEW.** Default when unsure: Sonnet. Opus must be justified, not assumed.
 
-Cheaper on the writing. ZERO compromise on verification — enforcement is by the model-agnostic GATES + review, not by the author's model.
+**Mechanical ⇒ Sonnet, and this list is not exhaustive but it IS binding:** every `.nova` module, every KAT/test, boilerplate registration, **doc/README sweeps**, **count refreshes across files**, find-and-replace, **build/KAT run loops**, and **analysis/tooling scripts**. "It is faster if I just do it" is the thought that ends in a nine-file sweep running on Opus. Batch mechanical work into ONE Sonnet task.
+
+**⛔ When Sonnet is rate-limited, the work QUEUES — it is NEVER promoted to Opus.** Idle is cheaper than Opus doing Sonnet's job. Say the queue is blocked and when it clears. (This is the loophole that silently inverted the rule: four subagents died on session limits in one day and each time the work got absorbed into Opus rather than waiting.)
+
+**Output tokens count.** Commit messages sized to the FINDING, not the diff. Do not re-run a measurement to polish a number that does not move a conclusion.
+
+### ★ 100% QUALITY, NO COMPROMISE — owner's standing clause
+
+Cheaper author, **IDENTICAL bar**. Save tokens on the WRITING; never on the VERIFICATION or the standard. Enforcement is by the **model-agnostic GATES + Opus review**, not by who authored it: reconverge `gen5 == gen6`; full `nova_ci` in BOTH memory modes, ASAN-clean; KAT-gated with a **negative control** wherever a check could pass vacuously; **`attempted == expected` on every batch** (a failure count alone cannot distinguish "all passed" from "nothing ran"); kill-on-timeout on every binary run; adversarial verification on anything non-trivial.
+
+**Opus REVIEWS every delegated output before commit** — load-bearing, not ceremony. In one session that review caught a subagent's fabricated "silent segfault with no compile error" defect claim (it fails LOUD with `E1003`) and a build loop reporting `failures: 0` having run nothing. Sloppy Sonnet output is rejected exactly as sloppy Opus output is. **Model routing is a COST decision and never a quality decision.**
 
 ## Thinking Quality
 
