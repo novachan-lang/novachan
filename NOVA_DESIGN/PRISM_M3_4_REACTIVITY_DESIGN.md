@@ -144,11 +144,38 @@ The load-bearing test is still a real table over a large collection, which is st
 | Conditional read `if s.a then s.b else s.c` | `{a,b,c}` | spurious re-run when `c` changes | **Acceptable** — over-approximation, still 3 leaves |
 | Dynamic index `s.items[i].x` | `items.*.x` | see §4 | **The real problem**; §4(b) is the answer |
 | Face takes `any` | undecidable | must assume "reads everything" ⇒ re-runs always | **Sound but useless.** This is a hard argument for the standing project law that `any` is only for genuinely dynamic data |
-| Higher-order face (takes a fn) | depends on the passed closure | conservative union over all call sites, or specialise per site | **Open.** Specialisation is the right answer and needs measuring |
+| Higher-order face (takes a fn) | depends on the passed closure | see below — the compiler already decides this | ✅ **RESOLVED 2026-09-05 against the compiler source** |
 | Face reads a module-level `let` | not a parameter, so invisible | stale UI — a **correctness** bug, not a perf bug | ⛔ **Must reject at compile time.** A face reading mutable module state is unsound and must be an error, not a warning |
 | Recursive state (tree of nodes) | cycle-safe closure gives finite paths | coarse over depth | Acceptable; same as §4 |
 
 ★ **A gap the original hunt missed: AGGREGATES.** `prism_con_stat_row` counts across every element of a collection (50 of 52 leaves). Keying cannot reduce it — an aggregate genuinely depends on every element, so any insert, delete or field change invalidates it. Keyed sub-faces solve *per-row rendering*; they do nothing for *fold over all rows*. Making that incremental needs a separate mechanism (maintain the aggregate as state and update it from the changeset, i.e. incremental view maintenance), which this design does **not** currently address. Every realistic dashboard has counts and totals, so this is not an edge case — it is the next design question after §4.
+
+### Higher-order faces — resolved from the compiler, not assumed
+
+This row was recorded as open, with "specialise per call site" guessed as the likely answer. The
+compiler already answers it, and the answer is **partly worse than guessed** — which is why it was
+worth reading rather than assuming:
+
+1. **Call-site specialisation is already the norm.** `nova_compiler.nova` specialises unannotated
+   parameters to the argument type seen at the call site — it is what "makes unannotated struct
+   params lower to `fmul` instead of `nova_rt_mul`", and *"in NOVA unannotated is the NORM"*. So an
+   ordinary face gets an **exact** read-set per specialisation. No conservative union needed.
+2. **An explicit `any` blocks it** — the compiler treats `any` as *"a declaration that the parameter
+   is polymorphic, so call-site specialization must not narrow it"* (`ir_any_params`). This
+   independently confirms §5's `any` row: an `any`-typed face genuinely cannot have a static
+   read-set, and the compiler already says so.
+3. ⛔ **An ADDRESS-TAKEN function cannot be specialised at all.** When a function is passed as a
+   value it is reachable through a `__fnref_` trampoline, so *"its call sites are NOT all visible
+   and it cannot be specialized"* — it is compiled generically and **reads its fields BY NAME**
+   through `nova_field_get_or`. That is precisely the higher-order case, and a by-name dynamic read
+   has no derivable static read-set.
+
+**Design consequence.** M3.4 does not need to invent this analysis: the compiler already computes
+the address-taken set. So the rule is — exact read-set for specialised faces (the common case);
+conservative "reads all of type `T`" plus a **diagnostic** for an address-taken face. The compiler's
+own note that *"address-taken functions are rare, so this costs approximately nothing"* is an
+existing claim about performance; whether it also holds for *faces specifically* is unmeasured, and
+is the one number to check before relying on it.
 
 **The one that must not be waved away is the module-level `let`.** Every other row costs
 performance; that row costs correctness, silently. PRISM already has the mechanism to catch it —
