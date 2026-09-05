@@ -932,3 +932,80 @@ piece.
 **Consequence for the M0.3-vs-M3.4 ordering:** unchanged. M3.4 step 1 still needs no browser and is
 still provable on the ANSI/HTML backends. But its first increment is bigger than the §8 sequence
 implied, which is worth knowing before committing weeks to it.
+
+## 15. IMPLEMENTATION SPEC — the general read-set pass (step 1)
+
+Written on receiving GO, before any compiler edit. This is the algorithm, precisely, so
+implementation is mechanical rather than exploratory.
+
+### 15.1 Hook point: the AST, not the IR
+
+`nova_compiler.nova:11501` notes that in some lowering paths (e.g. inside `.map(fn(x) x.price)`) a
+receiver type is erased to `any` in the **IR**. The AST, walked after type inference has run, does
+not have this problem — every `member` expression's base still carries whatever type information
+the checker assigned it. **The pass therefore runs on the typed AST, not on IR instructions.**
+
+Field access is `Expr("member", fieldName, 0, [baseExpr], [], line)` (`nova_compiler.nova:21-27`,
+construction sites e.g. line 1208). A chain `x.a.b` is nested: `Expr("member","b",0,[Expr("member",
+"a",0,[Expr("ident","x",...)],[],_)],[],_)`.
+
+### 15.2 The core function
+
+```
+fn readset_of(fn_name: string, param_name: string, param_type: string) -> dict
+    // returns {leaf_path: 1} -- a set, encoded as a dict for O(1) membership
+```
+
+**Algorithm**, matching `tools/m17_readset.py`'s prototype, now scope-correct instead of
+regex-matched:
+
+1. Build a local alias set `{param_name}`, seeded with the parameter itself.
+2. Walk the function body's statement list. On `let y = <expr containing only param/alias
+   references and non-branching field/index access>`, add `y` to the alias set — this is what lets
+   `let s = state; s.field` resolve.
+3. For every `member` expression whose base (after resolving through aliases) is a name in the alias
+   set: record the dotted path from the parameter, e.g. `member(base=member(base=ident("s"),
+   "workspace"), "projects")` with `s` aliasing `state` records `workspace.projects`.
+4. **Leaf vs. struct field**: if the field's declared type (from the struct's field table, already
+   built by the compiler for `__field_get`, see `nova_compiler.nova:4908`) is itself a known struct
+   type, do not stop — a subsequent `.sub_field` on the same chain extends the path. If the type is
+   not a struct (or is `list`/`dict` without a type parameter), the path terminates there: a leaf.
+5. **Calls**: when an alias (or the parameter itself) is passed as an argument to another
+   user-defined function `G` at parameter position `i`, recurse into `readset_of(G, G's i-th param
+   name, param_type)` and union the (path-prefixed) result. Memoize per `(fn_name, param_name)` to
+   handle recursion and to make the whole-program fixed point terminate.
+6. **Reconstructor slicing** (§10.11's technique, already proven in `m17_slicing.py`): if `G`'s
+   return type equals `param_type` and its body is `param_type(arg0, arg1, ...)` positionally
+   matching the struct's declared field order, do not union `G`'s whole read-set — instead, for each
+   result field the caller subsequently reads, resolve which of `arg0..argN` produced it and recurse
+   only into that argument's sub-expression.
+
+### 15.3 What step 1 does NOT do yet
+
+* No notion of a "face" — this computes a read-set for **any** function given a parameter, which is
+  the general capability §14 argued for. PRISM-specific consumption (marking a face, rejecting one
+  that reads module state) is step 3+.
+* No changeset, no keying, no invalidation. Step 1 is read-only analysis.
+* No codegen change. The pass computes a value; nothing yet consumes it to alter emitted output.
+  **This keeps early iterations reconverge-safe by construction** — if the pass's own code is
+  deterministic (no hash-map iteration leaking into output, no timestamps; see the LLVM-IR
+  determinism rule in `quality-standards.md`), self-compilation is unaffected.
+
+### 15.4 First deliverable, concretely
+
+An internal query, exercised by a KAT rather than by end-user syntax (there is no `face` keyword
+yet): a compiler-internal test harness that calls `readset_of` on known functions in a fixture
+`.nova` file and asserts the exact leaf-path set, including:
+* a direct read (`s.field`);
+* a chain through nesting (`s.a.b`);
+* an alias (`let t = s; t.field`);
+* a call-graph traversal (`f` calls `g(s)`, `g` reads `s.field`);
+* a reconstructor slice (matching `m17_slicing.py`'s `_ss_advance`-shaped case);
+* a negative: a field NOT read must NOT appear.
+
+### 15.5 Gate
+
+RED tier, full arc: reconverge (`gen5.ll == gen6.ll`), `nova_ci` both memory modes, the new KAT
+wired into the gate. No exception for "it's just an analysis pass" — §14 already found the general
+shortcut everyone reaches for (typing to `PrismNode`) is exactly the mistake to avoid, and the same
+discipline applies to verification.
