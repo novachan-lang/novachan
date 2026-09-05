@@ -584,3 +584,34 @@ look.props` iterates a dict's string keys, it "inferred" `PrismLook.props -> lis
 Sanity checks passed before trusting any of this: the tool reproduces the known 9/10 nominal
 keyability for the console app and independently identifies `PrismConReaction` as the single
 unkeyable element type, matching §4b.
+
+### 10.9 RE-MEASURED after typing the 11 fields — the population doubled, and both §10.7 claims shift
+
+Typing the 11 collection fields took the visible population from **10 collections to 21**, which is
+the first library-wide (rather than one-file) measurement of key inference:
+
+| | before typing (10 colls) | **after typing (21 colls)** |
+|---|---|---|
+| both rules fire | 3 (30%) | 9 (**42.9%**) |
+| **Rule 1 only** | **0 (0%)** | **1 (4.8%)** |
+| Rule 3 only | 6 (60%) | 7 (33.3%) |
+| neither | 1 (10%) | 4 (**19.0%**) |
+| **Rule 1 coverage** | 30% | **47.6%** |
+| **any rule fires** | 90% | **81.0%** |
+
+**Two corrections to §10.7, both against my earlier wording:**
+
+1. **"Rule 1 never fires alone" is no longer true.** It fires alone in one case (4.8%). So Rule 1 is
+   *not* purely redundant with the naming heuristic — it contributes coverage the nominal rule
+   cannot. Its coverage nearly doubled (30% → 47.6%) simply by making more collections visible. It
+   is still not load-bearing (Rule 3 remains the wider net), but "validator only" understates it.
+   **Revised: Rule 3 proposes and covers; Rule 1 both corroborates and extends.**
+
+2. **Overall coverage is 81%, not 90% — the console app flattered it.** `prism_app_console`'s
+   structs were written with explicit `_id`/`_name` fields, so it scored 9/10. Across real library
+   code the figure is 81%, and **19% of collections can be keyed by neither rule** — those fall to
+   §4(a) whole-collection invalidation plus a diagnostic. That is the honest number to design
+   against, and it is exactly the sort of flattering-sample error this campaign has hit repeatedly.
+
+**Still zero disagreements** where both rules fire, across a doubled population — so §10.4's
+"Rule 1 wins" tiebreak remains untested by real data, and remains low-stakes.
