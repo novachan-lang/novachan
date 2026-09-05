@@ -99,7 +99,7 @@ collection elements. Hybrid, and honest about the fact that the static approach'
 exactly the dynamic one's strong point. Falls back to Solid's per-read cost, but only for
 collections.
 
-★ **UPGRADED TO REQUIRED 2026-09-05.** The 109-leaf scale measurement (`M1_7_FALSIFIER_RESULT.md` §SCALE) found the read-set degradation is **entirely collection-driven**: excluding collection-element leaves drops the mean from 33.2 to 10.7 leaves, a 3× reduction from collections alone, and the three worst faces (`selected_project` 51/109, `stat_row` 50/52, `project_list` 32/32) all iterate a collection. Without keyed sub-faces, editing one comment on one issue re-runs a face that reads nearly half the tree. §4(b) is therefore **load-bearing, not an optimisation.**
+★ **UPGRADED TO REQUIRED 2026-09-05 — on COST, not read-set size.** Modelling this on the 109-leaf console app (`tools/m34_keyed_subfaces.py`) showed the reason first given here (read-set size) was the metric M1.7 had just retired, and that fan-out passes with or without keying. The real argument is **invalidated WORK** (`M1_7_FALSIFIER_RESULT.md` §CRITERION): without keying, editing one comment re-runs `prism_con_selected_project`, which walks every project × issue × comment — **O(rows), unbounded in collection size**. With keying it re-runs one comment face, O(1). Marginal read-set mean 8.15 → 2.85, max 51 → 13; `selected_project` 51 → 1, `project_list` 32 → 0. That is a categorical difference, not a constant factor, and it is the one place PRISM would otherwise lose outright to React — which at least diffs its output. §4(b) is **load-bearing.**
 
 **Recommendation: (b), with (a) as the sound fallback when a key cannot be inferred, and (c)
 explicitly rejected** — a hybrid means two dependency systems, two failure modes, and two mental
@@ -147,6 +147,8 @@ The load-bearing test is still a real table over a large collection, which is st
 | Higher-order face (takes a fn) | depends on the passed closure | conservative union over all call sites, or specialise per site | **Open.** Specialisation is the right answer and needs measuring |
 | Face reads a module-level `let` | not a parameter, so invisible | stale UI — a **correctness** bug, not a perf bug | ⛔ **Must reject at compile time.** A face reading mutable module state is unsound and must be an error, not a warning |
 | Recursive state (tree of nodes) | cycle-safe closure gives finite paths | coarse over depth | Acceptable; same as §4 |
+
+★ **A gap the original hunt missed: AGGREGATES.** `prism_con_stat_row` counts across every element of a collection (50 of 52 leaves). Keying cannot reduce it — an aggregate genuinely depends on every element, so any insert, delete or field change invalidates it. Keyed sub-faces solve *per-row rendering*; they do nothing for *fold over all rows*. Making that incremental needs a separate mechanism (maintain the aggregate as state and update it from the changeset, i.e. incremental view maintenance), which this design does **not** currently address. Every realistic dashboard has counts and totals, so this is not an edge case — it is the next design question after §4.
 
 **The one that must not be waved away is the module-level `let`.** Every other row costs
 performance; that row costs correctness, silently. PRISM already has the mechanism to catch it —
