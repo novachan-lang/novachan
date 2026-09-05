@@ -483,7 +483,9 @@ PRISM_STATUS.md          ← YOU ARE HERE. Always start here. Live status, what'
 | **7. ≤2 agents, never recursive, never `Workflow` fan-out** | Pro-plan constraint. Agents are told explicitly not to spawn children |
 | **8. Ask before writing code** | Design and structure are written freely. **No `.nova` implementation lands without an explicit go-ahead.** |
 
-## REPOSITORY STRUCTURE (proposed — not yet created)
+## REPOSITORY STRUCTURE — ✅ BUILT (130 modules, 127 KATs, ~55.1k lines)
+
+**This is the authoritative map, and it now describes what EXISTS, not a proposal.** Layer counts: `core/` 7 · `text/` 5 · `widget/` 6 · `style/` 7 · `render/` 4 · `obs/` 5 · `dev/` 8 · `intl/` 4 · `a11y/` 1 · `ui/` 67 · `app/` 14. Each layer's own `README.md` is the by-name audit basis for that layer — ⛔ audit by NAME, never by count.
 
 **Learning from `forge/`:** it is **1,013 files completely flat**, with `.ll` and `.exe` build
 artifacts interleaved among sources. Navigable only by prefix search. **Prism is foldered from day
