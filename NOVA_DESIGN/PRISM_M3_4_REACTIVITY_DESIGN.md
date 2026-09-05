@@ -258,8 +258,10 @@ Falsifiable, in order of cost:
 5. **Design the changeset format and keying TOGETHER** — §3's structural-delta hole means they are
    one design, not two. A keyed row cannot be invalidated, and an aggregate delta cannot be
    computed, from a changeset that only carries leaf values.
-6. **Aggregates (§9) — only if §9.5's measurement justifies them**, and strictly after keying,
-   since a delta needs element identity.
+6. **Aggregates (§9) — REQUIRED**, and strictly after keying since a delta needs element
+   identity. §9.6 measured them as 82% group-class with zero holistic, and §12 showed that
+   without them three of six realistic actions stay O(N) however well collections are keyed.
+   Build Tier 1 (`count`/`sum`) only; Tiers 2–3 remain out of scope.
 7. Only then: compiler pass, RED tier, full arc (reconverge + both memory modes).
 
 Steps 1–3 and 4(detection) need no compiler change and no GO. Steps 5–6 are design and also need
@@ -493,6 +495,8 @@ population trap as §CRITERION, third occurrence.)
 **What they actually fold over** is exactly what the design predicted: `nq_items` (unread
 notification badge), `conws_projects` (open- and urgent-issue counts), `rt_router_routes`,
 `sy_conflicts`, `gd_ar_issues`. Dashboard counters — the case every real application has.
+
+★ **UPGRADED BY §12: this is NECESSARY, not merely justified.** The invalidation simulation found that with keying fully applied, **three of six realistic user actions remain O(N)** and an aggregate is the cause in every case — `stat_row` folds over every issue on `add_new_issue`, and three aggregates fold on `dismiss_notification`, where keying therefore buys **1.0×**. Aggregates, not collections, are the dominant remaining cost.
 
 **Decision: implement group-class incremental aggregates only** (`count`, `sum`, and folds with a
 group inverse), strictly after §4(b) keying, since a delta needs element identity. `min`/`max` and
