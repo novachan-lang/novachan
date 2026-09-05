@@ -653,3 +653,22 @@ Three of four are rebuilt-wholesale lists, which is precisely the condition §10
 for index-keying to be *sound* rather than React's trap. So **effective coverage is ~100%**, and the
 single genuine gap is compound keys — already recorded in §10.4 as a v2 extension, and now known to
 affect exactly one collection in the corpus.
+
+### 10.11 Verification of the typing change
+
+The 14 field annotations touched 12 library modules, so the 13 KATs run initially were not a
+sufficient gate. Built the transitive dependency graph over `prism/`: 11 changed modules reach
+**18 modules**, exercised by **20 of the 128 KATs**. All 20 rebuilt and re-run under
+kill-on-timeout: **RAN=20, FAILURES=0**, with zero-length output counted as a failure so a silent
+pass cannot register as green.
+
+⛔ **The first attempt at this was a FALSE GREEN and is worth recording.** The work-list was written
+by Python (CRLF) and read by a bash loop, so every `$k` carried a trailing ``, every `cp` failed,
+and `|| continue` skipped all twenty **silently** — printing `build failures: 0`. The tell was that
+`0 failures` came with **one** artifact instead of twenty; the single success was the last line,
+which had no trailing newline and therefore no ``.
+
+**Rule adopted:** every batch reports an **attempted** count beside its failure count, and the
+caller asserts attempted == expected. A failure count alone cannot distinguish "all passed" from
+"nothing ran" — the same failure mode as the four instruments in the macOS campaign that reported
+success while measuring nothing.
