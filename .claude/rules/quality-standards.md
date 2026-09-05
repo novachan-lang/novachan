@@ -111,7 +111,17 @@ If a feature CANNOT match the best existing implementation, document WHY and wha
 
 **Mechanical ⇒ Sonnet, and this list is not exhaustive but it IS binding:** every `.nova` module, every KAT/test, boilerplate registration, **doc/README sweeps**, **count refreshes across files**, find-and-replace, **build/KAT run loops**, and **analysis/tooling scripts**. "It is faster if I just do it" is the thought that ends in a nine-file sweep running on Opus. Batch mechanical work into ONE Sonnet task.
 
-**⛔ When Sonnet is rate-limited, the work QUEUES — it is NEVER promoted to Opus.** Idle is cheaper than Opus doing Sonnet's job. Say the queue is blocked and when it clears. (This is the loophole that silently inverted the rule: four subagents died on session limits in one day and each time the work got absorbed into Opus rather than waiting.)
+**⛔ NEVER STALL. A rule that stops work is a broken rule.** (Corrected 2026-09-05: an earlier version of this said work must QUEUE when Sonnet is rate-limited. That was wrong — the owner's intent is COST CONTROL, not idleness, and a stalled project costs far more than the tokens saved.) If Sonnet is unavailable, **do the work**, preferring the cheapest path that keeps moving.
+
+**★ DELEGATION HAS A FIXED OVERHEAD — size the task to it.** Every dispatched agent starts COLD: it re-reads the design docs, re-explores the corpus, and re-derives context the main loop already holds. Measured on this project: **~100-150k subagent tokens of pure overhead per dispatch**, before any work happens. Eleven dispatches in one day cost **~1.9M subagent tokens**.
+
+| task | route |
+|---|---|
+| a few lines, one file, already fully specified | **do it inline** — delegating a 6-line fix cost ~150k tokens where inline costs ~2k |
+| many files, long generation, repetitive edits, a whole module or KAT | **Sonnet agent** — the overhead amortises |
+| genuinely large and Sonnet is unavailable | do it inline anyway, and say so |
+
+Delegating below that threshold does not save tokens — it spends 50x more of a shared budget, and it is what exhausted the session limit six times in one day.
 
 **Output tokens count.** Commit messages sized to the FINDING, not the diff. Do not re-run a measurement to polish a number that does not move a conclusion.
 
