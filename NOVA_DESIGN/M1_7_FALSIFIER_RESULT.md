@@ -268,3 +268,69 @@ work is now load-bearing rather than an optimisation.
   evidence, not proof — and it was authored *after* the criterion was published, which is the right
   order, but it is still not an independently-sourced workload.
 - The analysis remains static and syntactic: reads behind a dict/list index are invisible.
+
+---
+
+# §CRITERION — the fourth and final form (2026-09-05)
+
+Modelling keyed sub-faces on the console app (`tools/m34_keyed_subfaces.py`) exposed a
+**contradiction in this document**, and resolving it is the last thing M1.7 owes M3.4.
+
+§SCALE retired read-set size in favour of **fan-out**, arguing size is an intermediate variable.
+But keyed sub-faces were simultaneously upgraded to *required* on the basis of read-set size — the
+very metric just retired. And the model confirms the problem: **fan-out passes both before and
+after keying** (7.5% → 2.6% mean; max 11.5% *unchanged*). By the §SCALE criterion, keying is
+unnecessary. By the reasoning that demanded keying, §SCALE's criterion is wrong. Both cannot stand.
+
+**The error is the unit.** Fan-out counts invalidated **face definitions**, not face *instances*.
+Editing one comment was already charged to exactly one face definition before keying — the
+compositional model had already isolated it. What keying changes is not how many faces re-run but
+**what one re-run costs**: `prism_con_selected_project` walks projects → issues → comments, so its
+single re-run is O(rows), and a definition count cannot see that.
+
+So fan-out was the right *idea* — measure the outcome, not an intermediate — with the wrong *unit*.
+
+## The criterion, and why each earlier form failed
+
+| # | Form | Why it failed |
+|---|---|---|
+| 1 | read-set as % of reachable state | measures **type size**; a face reading one field of a 5-leaf type scores 20% |
+| 2 | absolute read-set size (median ≤3 / mean ≤6) | an **intermediate** variable, not the cost |
+| 3 | fan-out over face definitions (≤10% / ≤25%) | right idea, wrong **unit** — blind to O(N) work inside one face |
+| **4** | **invalidated WORK per state change** — Σ over re-run faces of their cost, where a collection-iterating face costs **O(rows)** | — |
+
+**This was available before the data.** §4 of the design doc already said, unprompted, that naive
+leaf invalidation "re-renders a 10,000-row table when one cell changes — worse than React, which at
+least diffs." The O(N) cost was identified as *the* collection problem from the start; the
+criterion simply failed to encode it. That is why this revision is a correction rather than a
+rescue — the third in this campaign, and each one is recorded above rather than quietly swapped.
+
+## Under criterion 4
+
+| | before keying | after keying |
+|---|---|---|
+| edit one comment | re-runs `selected_project` → walks **every** project × issue × comment | re-runs **one** comment face |
+| cost | **O(rows), unbounded** | **O(1), bounded** |
+| marginal read-set mean / median / max | 8.15 / 2.5 / **51** | 2.85 / 1.0 / **13** |
+| `selected_project` / `project_list` | 51 / 32 | **1 / 0** |
+
+**Keyed sub-faces are REQUIRED, and now for the correct reason:** without them the cost of a
+single-row edit is unbounded in collection size. That is a categorical difference, not a constant
+factor — and it is the one place PRISM would otherwise lose outright to React, which at least
+diffs the output.
+
+**Keyability on this app: 9 of 10 element types carry an identity field (90%)**, well above the
+62% corpus baseline — though that is partly because this app's structs were written with explicit
+`_id`/`_name` fields. Only `PrismConReaction` (`conrxn_emoji`, `conrxn_by`) is unkeyable, and it is
+positional.
+
+## Limits of the model — stated, not discovered later
+
+- **The element-face read-sets are a MODEL, not a measurement** — an upper bound on what real
+  per-element inference could achieve, same status as the slicer's numbers.
+- **`stat_row` (50 → 7) is a genuine limit of keying, not a tool gap.** It is an *aggregate*
+  (counts across every element), so keying one row cannot reduce it. Aggregates need incremental
+  recomputation, which is a separate mechanism this design does not yet address.
+- The reported 7 is itself conservative: the resolver misses relay calls nested inside `str(...)`,
+  leaving 5 spurious workspace scalars. The true figure is ≈2.
+- Static and syntactic throughout: a `len(x)`-only use is counted as a full read.
