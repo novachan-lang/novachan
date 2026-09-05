@@ -17,13 +17,13 @@ Three questions answered here:
 
 | # | Feature | Best today | Prism | Verdict |
 |---|---|---|---|---|
-| 1 | **Component model** | React function components | `view` declaration — a NOVA fn returning a widget tree. No JSX, no `return`, no wrapper element | **WIN** — 6 lines vs 10 for a counter |
+| 1 | **Component model** | React function components | `face` declaration — a NOVA fn returning a widget tree. No JSX, no `return`, no wrapper element | **WIN** — 6 lines vs 10 for a counter |
 | 2 | **Reactive state** | Solid `createSignal` / Svelte `$state` | **No API at all.** `let count = 0` — compiler infers dependencies | **WIN** — the only zero-API model |
 | 3 | **Derived/computed** | Solid `createMemo`, Vue `computed` | Plain function. Compiler caches it if it proves purity + dependency set | **WIN** — no API |
 | 4 | **Effects** | `useEffect` (React's own docs say it's overused) | Explicit `on mount` / `on change` blocks; the *common* cases (fetch on mount, sync on change) are derived | **WIN** — no dependency arrays, so no stale-closure bug class |
 | 5 | **Rendering strategy** | Solid fine-grained (no VDOM) | Compiled fine-grained → binary patch ops into a display list. No VDOM, no diff | **WIN** — no diff pass at all |
 | 6 | **Keyed lists / reconciliation** | React keys, Solid `<For>` | `list items key=.id as t` — key is part of the syntax, not a convention | **WIN** — a missing key is a compile error, not a runtime warning |
-| 7 | **Conditional rendering** | `{cond && <X/>}` | `if cond` as a normal NOVA statement inside `view` | **WIN** — no `&&` / ternary gymnastics |
+| 7 | **Conditional rendering** | `{cond && <X/>}` | `if cond` as a normal NOVA statement inside a `face` | **WIN** — no `&&` / ternary gymnastics |
 | 8 | **Fragments / portals** | React `<>` and `createPortal` | Fragments unnecessary (children aren't wrapped); `portal` primitive | **WIN** — one fewer concept to learn |
 | 9 | **Refs / imperative escape** | `useRef` + `forwardRef` | Widget handles are values; `focus(field)` just works. No forwarding ceremony | **WIN** |
 | 10 | **Context / DI** | React Context (re-render cascades) | Process-scoped state, read down the tree; no cascade because reactivity is fine-grained | **WIN** |
@@ -59,7 +59,7 @@ Three questions answered here:
 | # | Feature | Best today | Prism | Verdict |
 |---|---|---|---|---|
 | 27 | **Client routing** | react-router / TanStack Router | Typed route table; params typed | **WIN** — a bad route param is a compile error |
-| 28 | **Nested routes / layouts** | react-router outlets | Nested `view` composition — no special outlet concept | **WIN** |
+| 28 | **Nested routes / layouts** | react-router outlets | Nested `face` composition — no special outlet concept | **WIN** |
 | 29 | **Guards / auth** | Manual wrappers | Route guard is a typed fn; role gating derives from the session type | **WIN** — the 10-role RBAC becomes typed |
 | 30 | **Deep linking / back-forward** | History API | Same, via platform shim; state restoration is typed | **TIE** |
 
