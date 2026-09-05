@@ -96,6 +96,10 @@ It also tightens the fallback: if Bet 1 broke in implementation, we would learn 
 working server-rendered framework — rather than after having rebuilt the runtime for a browser
 target that had nothing worth running in it yet.
 
+## ✅ DECIDED 2026-09-05 — GO on both, M3.4 FIRST
+
+Owner gave explicit GO on both M0.3 and M3.4, and delegated the ordering: *"do everything by your correct way of thinking."* Deciding per the recommendation below — **M3.4 first.** Rationale unchanged from what follows: additive, provable on ANSI/HTML without a browser, and if Bet 1 breaks in implementation we learn it cheap rather than after 6–10 weeks of runtime surgery. M0.3 follows once M3.4's first slice is gated.
+
 ## Recommendation
 
 **Do M3.4 first, on the ANSI/HTML backends. Then M0.3.**
