@@ -1272,6 +1272,32 @@ with a NESTED tree (>100 reachable leaves) is in progress as `prism/app/prism_ap
 
 **✅ M3.4 PREREQUISITE CLOSED (2026-09-05).** §10.8's blocker — key inference needs `list<T>`-typed collections — is **done**: 14 fields typed across 12 modules, visible collections 10→24, coverage **83.3%** with the remainder falling soundly to positional keying. Gated on all 20 transitively-affected KATs (**RAN=20 FAILURES=0**). The first run was a **false green** — a CRLF work-list made every loop iteration skip silently while printing `failures: 0`; standing countermeasure now is that **every batch asserts attempted == expected**. Next, out-of-tree and needing no GO: simulate invalidated WORK per user action (§8 step 3) before any compiler pass.
 
+**✅ 2026-09-05 — M3.4 DESIGN COMPLETE (§1–§13), EVERY GATING QUESTION MEASURED.**
+`PRISM_M3_4_REACTIVITY_DESIGN.md` is finished as a design; what remains needs a GO, not more
+analysis. Today's results, each measured rather than argued:
+
+* **§12 invalidated WORK per user action** (`tools/m34_invalidation_sim.py`, 133-leaf tree):
+  editing one comment goes **11015 → 1 unit** with keying. But **keying reaches O(1) for only ONE
+  of six actions** — three stay O(N) because *aggregates* fold regardless. That upgraded §9's
+  Tier-1 aggregates from *justified* to **NECESSARY**.
+* **§10.13 the key-inference discriminator**: Rule 1 now admits a candidate only when the far side
+  of an `==` is a **variable**, never a literal. It rejected **three 0/1 flags**
+  (`nn_auto`, `rt_route_is_sheet`, `rt_seg_lit`) that the naive detector had treated as identity
+  keys — §10.4's "Rule 1 wins" would have **keyed a UI by a boolean**. Coverage 54.2% → 45.8%,
+  and §10.7's original conclusion (Rule 3 carries it) is vindicated after §10.10 wrongly withdrew it.
+
+**Library changes landed today, each KAT-gated:** 14 collection fields typed `list<T>` (the §10.8
+prerequisite — 85% of the corpus was invisible to key inference without them) · `PrismNotice` given
+an identity field · `prism_ansi_table` sized by **display width** not byte length ·
+`std/text/wcwidth.nova`'s `ww_string_width` fixed (it counted bytes; a CJK char reported width 3,
+not 2) · `_kat_prism_ui_kit` and `_kat_prism_ansi` added, so **every module now has KAT coverage**.
+
+⚠ **Verification was unreliable for part of today**: the disk sat at 99% and compile failures
+*moved between runs* while a build loop reported `failures=0` having produced 12 of 14 binaries.
+Root cause was Docker's `docker_data.vhdx` at 96 GB; after pruning 73 GB of build cache and a clean
+shutdown it compacted to 23.8 GB, taking C: from **8.5 GB free to 81 GB**. Results before that
+point were re-verified.
+
 **Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
 SINGLE blocker on the browser path, M1.7 having cleared. See
 [`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
