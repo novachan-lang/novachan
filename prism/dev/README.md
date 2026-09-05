@@ -1,6 +1,6 @@
 # prism/dev — developer tooling (MANDATORY per spec §12.7, not optional)
 
-Not started except as noted. The reactivity research (`PRISM_STATUS.md` Q1) concluded that shipping
+**COMPLETE — 8 modules, all KAT-gated.** The reactivity research (`PRISM_STATUS.md` Q1) concluded that shipping
 zero-annotation reactivity with no diagnostics and no escape hatch is a product failure on its own --
 every prior system that shipped inferred reactivity also shipped these.
 

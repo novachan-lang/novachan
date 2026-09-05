@@ -1,6 +1,6 @@
 # prism/widget — the primitives (PRISM_SPEC.md Part III)
 
-Planned for **MA.3**: all 26 primitives as plain functions returning a `PrismNode`
+**COMPLETE (MA.3)** — the primitives as plain functions returning a `PrismNode`
 (`prism/core/prism_node.nova`) -- no `face`/`->` syntax yet, exactly how `forge_html`'s
 `div()`/`p()`/`el()` are plain functions returning strings.
 

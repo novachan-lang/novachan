@@ -15,4 +15,4 @@ here (calendar math deserves its own falsification pass, not a bolt-on to this m
 | Module | Purpose | Status |
 |---|---|---|
 | `prism_intl.nova` | Catalogs, interpolation, plural, number grouping, locale, direction (#66 #120 #65, combined) | **DONE** |
-| `prism_datetime.nova` | `Instant` / `ZonedDateTime` / `PlainDate` (#64) | Not started |
+| `prism_datetime.nova` | `Instant` / `ZonedDateTime` / `PlainDate` (#64) | **BUILT** |

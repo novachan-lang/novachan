@@ -1,7 +1,11 @@
 # prism/ui — component library
 
-Not started. Fleet-delegable once `widget/` (MA.3) and `style/` (MA.4) interfaces are frozen --
-`PRISM_ROADMAP.md`'s sequencing rule: "fleet work only after its interface is frozen."
+**COMPLETE — 67 components, KAT-gated.** Over-delivered against the ~50 planned. Built after
+`widget/` (MA.3) and `style/` (MA.4) interfaces were frozen, per `PRISM_ROADMAP.md`'s sequencing
+rule: "fleet work only after its interface is frozen."
+
+⛔ Components here are COMPOSITIONS of the closed 22-primitive vocabulary (axiom A7), never new
+primitives. That is what keeps the vocabulary closed while the library grows.
 
 | Module | Purpose |
 |---|---|
