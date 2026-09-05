@@ -14,6 +14,27 @@
 // DOM backend (web) and the GPU backend (native desktop/mobile) -- not a stand-in for either.
 // The API shape stays consistent with those: build a frame string, write it to the screen.
 //
+// ── 2026-09-05: `prism_ansi_table` COLUMN SIZING FIXED TO USE DISPLAY WIDTH ─────────────────────
+// `prism_ansi_table` used to size/pad columns with `len()` -- a BYTE count, not a terminal column
+// count (see prism_text.nova's header for the proof that `len()` is byte-oriented in this runtime).
+// A 3-byte CJK character has `len() == 3` but renders as 2 terminal cells, so any table mixing
+// ASCII and CJK content came out misaligned in a real terminal even though the string itself was
+// byte-exact. `prism_text.nova` (Milestone MB.10) already exists as the one place in this codebase
+// that owns monospace-cell measurement (`prism_text_width`) and cell-aware padding
+// (`prism_text_pad_left/right/center`) -- this module now imports it rather than re-deriving a
+// second, inevitably-divergent width function. NOT `std/text/wcwidth.nova`'s `ww_string_width`:
+// that function is ALSO byte-wise (it walks bytes and charges every byte > 127 as width 1, so a
+// 3-byte CJK character reports width 3, not 2) -- using it here would just move the same bug to a
+// different file. `prism_text_pad_left/right/center` return `Result<string>` (a negative width is a
+// caller error), but every function in this module returns a plain `string` -- there is no `Result`
+// anywhere in `prism_ansi`'s public API, and widening `prism_ansi_table`'s signature to `Result`
+// would ripple to every caller for no benefit. `_prism_ansi_pad_right` below is the seam: it calls
+// `prism_text.prism_text_pad_right` and unwraps it, falling back to the unpadded string on `Err`.
+// That path is UNREACHABLE in practice -- `_prism_ansi_pad_right` is only ever called with
+// `widths[i] + 2`, and `widths[i]` is built by `_prism_ansi_max_int` starting from a `prism_text_width`
+// result, so it is always >= 0 and the padded width is always >= 2 -- but a defensive fallback costs
+// nothing and keeps a plain-string API from ever being able to crash on a `Result` it doesn't speak.
+//
 // Public API:
 //   prism_ansi_clear()              -> ANSI "clear screen + home" sequence
 //   prism_ansi_move(x, y)           -> ANSI cursor-to-position
@@ -28,6 +49,8 @@
 //   prism_ansi_spinner(i)           -> spinner frame at index i (|, /, -, \)
 //   prism_ansi_bold/italic/underline(s) -> ANSI SGR-wrapped text
 //   prism_ansi_link(url, label)     -> OSC 8 terminal hyperlink
+
+import prism_text
 
 fn _prism_ansi_esc() -> string
     chr(27) + "["
@@ -71,24 +94,34 @@ fn _prism_ansi_max_int(a: int, b: int) -> int
         return a
     b
 
+// Pad `s` on the right to `width` DISPLAY CELLS (not bytes) via prism_text's cell-aware padder.
+// `prism_ansi`'s whole public API is plain `string`, never `Result` -- this is the seam where that
+// meets `prism_text_pad_right`'s `Result<string>`. A negative width is the only `Err` case
+// `prism_text_pad_right` defines, and every caller here passes `widths[i] + 2` where `widths[i]`
+// comes from `prism_text_width` (always >= 0), so `Err` is unreachable in practice; falling back to
+// the unpadded string rather than propagating is the safe, crash-free default for that dead path.
+fn _prism_ansi_pad_right(s: string, width: int) -> string
+    let padded = prism_text.prism_text_pad_right(s, width)
+    if is_err(padded)
+        return s
+    unwrap(padded)
+
 fn prism_ansi_table(headers: list, rows: list) -> string
     let cols = len(headers)
     let widths = []
     let ci = 0
     while ci < cols
-        widths.push(len(headers[ci]))
+        widths.push(prism_text.prism_text_width(headers[ci]))
         ci = ci + 1
     for row in rows
         let i = 0
         while i < cols and i < len(row)
-            widths[i] = _prism_ansi_max_int(widths[i], len(row[i]))
+            widths[i] = _prism_ansi_max_int(widths[i], prism_text.prism_text_width(row[i]))
             i = i + 1
     let out = ""
     let i = 0
     while i < cols
-        out = out + headers[i]
-        let pad = widths[i] - len(headers[i]) + 2
-        out = out + _prism_ansi_repeat_char(" ", pad)
+        out = out + _prism_ansi_pad_right(headers[i], widths[i] + 2)
         i = i + 1
     out = out + "\n"
     let separator = ""
@@ -100,9 +133,7 @@ fn prism_ansi_table(headers: list, rows: list) -> string
     for row in rows
         let k = 0
         while k < cols and k < len(row)
-            out = out + row[k]
-            let pad = widths[k] - len(row[k]) + 2
-            out = out + _prism_ansi_repeat_char(" ", pad)
+            out = out + _prism_ansi_pad_right(row[k], widths[k] + 2)
             k = k + 1
         out = out + "\n"
     out

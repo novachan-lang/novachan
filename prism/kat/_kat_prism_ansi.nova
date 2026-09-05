@@ -12,13 +12,17 @@
 //      formatting into everything printed after it, the characteristic ANSI bug.
 //   3. Non-ASCII text (CJK, accented) passes through intact everywhere -- no corruption, no
 //      truncation, no silent byte-slicing.
-//   4. ★ `prism_ansi_table`'s column widths are computed from `len()`, which is BYTE length,
-//      not `char_count()` (codepoint count) or display width. For CJK content this makes the
-//      computed padding differ from both the character count AND the true terminal display
-//      width (CJK renders double-width) -- columns will not visually align in a real
-//      terminal when mixed with ASCII. This is a real, previously-untested limitation of this
-//      module; it is NOT data corruption (no bytes are lost, nothing crashes) -- see the KAT
-//      report for the minimal repro. This KAT asserts the CURRENT byte-based behavior exactly.
+//   4. ★ FIXED 2026-09-05: `prism_ansi_table`'s column widths used to be computed from `len()`,
+//      which is BYTE length, not `char_count()` (codepoint count) or display width. For CJK
+//      content this made the computed padding differ from both the character count AND the
+//      true terminal display width (CJK renders double-width), so columns did not visually
+//      align in a real terminal when mixed with ASCII -- exact bytes, wrong terminal columns.
+//      `prism_ansi_table` now sizes and pads columns via `prism_text.prism_text_width` /
+//      `prism_text_pad_right` (the existing cell-aware layer in `prism/text/prism_text.nova`),
+//      so a column's width is the true terminal cell count, not a byte count. Pure-ASCII output
+//      is byte-identical to before (bytes == display cells for ASCII, so nothing changes); the
+//      CJK assertions below now assert the FIXED (aligned) behavior, and one new assertion
+//      proves a mixed ASCII/CJK table's rows all land on the same rendered display width.
 //   5. Every function in this module returns a plain `string` unconditionally -- there is no
 //      Result/error path anywhere in the public API, so there are no is_err/unwrap checks here.
 //   6. Boundary cases: empty string, zero/negative width or height, a value exactly at a
@@ -26,6 +30,7 @@
 //      module does NOT validate or clamp -- it passes them straight into str()).
 
 import prism_ansi
+import prism_text as pt
 
 let STATS = [0, 0]
 
@@ -104,13 +109,33 @@ fn main()
     check("★ spinner(-4) wraps to the FIRST frame", prism_ansi.prism_ansi_spinner(-4) == "|")
     check("★ spinner(-5) wraps to the LAST frame again", prism_ansi.prism_ansi_spinner(-5) == "\\")
 
-    print("8. ★ table alignment + boundary + the CJK width caveat")
+    print("8. ★ table alignment + boundary + the CJK width fix")
     check("2 headers, 1 row, widths grow to fit the wider cell", prism_ansi.prism_ansi_table(["A", "B"], [["1", "22"]]) == "A  B   \n-  --  \n1  22  \n")
     check("an empty rows list still renders the header + separator", prism_ansi.prism_ansi_table(["A", "B"], []) == "A  B  \n-  -  \n")
     check("★ an empty headers list (0 columns) with one row emits 3 blank lines, not an error", prism_ansi.prism_ansi_table([], [["x"]]) == "\n\n\n")
     check("★ a row SHORTER than the header count silently drops its missing trailing column (no blank placeholder cell)", prism_ansi.prism_ansi_table(["A", "B"], [["x"]]) == "A  B  \n-  -  \nx  \n")
-    check("★ len() is BYTE length, not char_count() -- the root cause of the CJK column-width caveat below", len("田中") == 6 and char_count("田中") == 2)
-    check("★ CJK header+cell: the string is exact and well-defined, but column width used len()'s byte count (6) not char_count() (2) or true terminal display width (4) -- it will NOT visually align next to ASCII columns in a real terminal", prism_ansi.prism_ansi_table(["N", "名前"], [["1", "田中"]]) == "N  名前  \n-  ------  \n1  田中  \n")
+    check("★ len() is BYTE length, not char_count() -- the root cause of the CJK column-width bug this KAT section fixes", len("田中") == 6 and char_count("田中") == 2)
+    check("★ FIXED: CJK header+cell now sizes the column from prism_text_width (4 display cells), not len()'s byte count (6) -- separator is 4 dashes, not 6", prism_ansi.prism_ansi_table(["N", "名前"], [["1", "田中"]]) == "N  名前  \n-  ----  \n1  田中  \n")
+
+    print("8b. ★ FIXED: a column mixing a CJK cell with a plain-ASCII cell now visually aligns")
+    // Column 2 mixes "名前"/"田中" (CJK, display width 4, byte length 6) with "X" (ASCII, display
+    // width 1, byte length 1) in the SAME column. Under the OLD len()-based sizing, the column's
+    // byte-based "width" was 6 (from the CJK cells' byte length), and each cell was padded with
+    // (width - len(cell) + 2) spaces: the CJK cells (len 6) got 2 spaces -> 4 display cells + 2
+    // spaces = 6 display columns, but "X" (len 1) got 7 spaces -> 1 display cell + 7 spaces = 8
+    // display columns. Same nominal column, two different rendered widths -- misaligned. With
+    // prism_text_width-based sizing every cell in the column pads to the same DISPLAY width (4
+    // cells + 2-cell gap = 6), so every rendered line comes out to the same total display width.
+    // That equality -- not a hardcoded string -- is the real assertion.
+    let mixed = prism_ansi.prism_ansi_table(["N", "名前"], [["1", "田中"], ["2", "X"]])
+    check("★ exact rendered string for the mixed CJK/ASCII column", mixed == "N  名前  \n-  ----  \n1  田中  \n2  X     \n")
+    let mixed_lines = split(mixed, "\n")
+    let header_w = pt.prism_text_width(mixed_lines[0])
+    let sep_w = pt.prism_text_width(mixed_lines[1])
+    let row1_w = pt.prism_text_width(mixed_lines[2])
+    let row2_w = pt.prism_text_width(mixed_lines[3])
+    check("★ header/separator/CJK-row/ASCII-row all render at the SAME display width -- the table now visually aligns", header_w == sep_w and sep_w == row1_w and row1_w == row2_w)
+    check("★ that common display width is exactly 9 cells (col0: 1+2=3, col1: 4+2=6)", header_w == 9)
 
     print("")
     if STATS[1] == 0
