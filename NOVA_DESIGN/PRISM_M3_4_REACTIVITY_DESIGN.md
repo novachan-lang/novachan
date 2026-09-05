@@ -558,6 +558,29 @@ prerequisite the design had not identified:
   collection fields across `prism/`**. It is mechanical, it is not RED-tier, and nothing in §3, §4b,
   §9 or §10 functions without it.
 
+**⛔ CORRECTION 2026-09-05 — the prerequisite is 14 fields, not 63.** The "63 bare collection
+fields" figure above (and in the trackers) was an overstatement by 4.5×. Breaking it down properly:
+
+| | count | |
+|---|---|---|
+| collection fields, total | 63 | |
+| — `dict`/`map`/`set` | **21** | **excluded**: iterating one yields KEYS (strings), not element structs — and a dict's key is *already explicit*, so key inference does not need it |
+| — `list` | 42 | |
+|   of which **solidly typeable** | **11** | one candidate struct, ≥2 distinct field reads in the loop body |
+|   thin evidence (1 field read) | 3 | needs a human look |
+|   lists of primitives / never iterated | 28 | a list of strings has no key anyway — irrelevant to key inference |
+
+**So the real work is ~14 field declarations**, a small reviewable batch rather than a sweep of the
+library.
+
+Getting here took two wrong passes, both mine, and both the same class of error that has recurred
+throughout this campaign: the first collected field reads on the loop variable **across the whole
+corpus** instead of within the loop body, which produced nonsense like
+`wz_done -> list<PrismCanvasCtx>`; the second failed to exclude **dicts**, and since `for k in
+look.props` iterates a dict's string keys, it "inferred" `PrismLook.props -> list<PrismLook>` and
+`PrismNode.attrs -> list<PrismPickOption>` — the latter contradicting an explicit design note that
+`attrs` *"stays a generic dict"*. Verified against the source before correcting rather than after.
+
 Sanity checks passed before trusting any of this: the tool reproduces the known 9/10 nominal
 keyability for the console app and independently identifies `PrismConReaction` as the single
 unkeyable element type, matching §4b.
