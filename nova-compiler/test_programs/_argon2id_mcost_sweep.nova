@@ -1,0 +1,139 @@
+// m_cost sweep probe for std/crypto/argon2id -- the decisive instrument for the open macOS
+// intermittent-WRONG-VALUE bug tracked in reference_macos_crypto_cluster_closed_argon2id_open.md.
+// This is NOT a fix and does NOT reproduce the bug on Windows -- it is the tool the experiment needs:
+// hold pwd/salt/secret/ad/t/p/tag_len fixed and vary ONLY m_cost (memory in KiB == block count ==
+// allocation volume), grading each run against an INDEPENDENT reference tag so a WRONG VALUE is caught
+// as a wrong value and never confused with a crash or a hang. Run N times per level on macOS CI:
+//   - if the failure rate SCALES with m_cost, the fault is allocator/refcount churn under load, not
+//     argon2id's own arithmetic (which does the SAME per-block math at every level).
+//   - if the rate is FLAT across m_cost, allocation volume is refuted too.
+// Either outcome is decisive.
+//
+// REFERENCE ORACLE: the 5 expected tags below were computed with argon2-cffi's `argon2_ctx` binding,
+// which calls straight into the phc-winner-argon2 reference C library (the RFC 9106 reference
+// implementation) -- NOT this NOVA implementation, and NOT argon2-cffi's simplified hash_secret_raw()
+// wrapper (which cannot pass secret/ad at all). That SAME argon2_ctx call path was first validated by
+// reproducing the official RFC 9106 section 5.3 test vector byte for byte
+// (pwd=32x0x01, salt=16x0x02, secret=8x0x03, ad=12x0x04, t=3, m=32, p=4, tag_len=32 ->
+// 0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659, the SAME vector _argon2id_test.nova
+// and _argon2id_kat.nova assert) before being trusted to grade the 5 NEW vectors below. So the oracle
+// is proven RFC-conformant, not merely "a different library that might itself be wrong."
+//
+// FIXED PARAMETERS across every level: pwd = 32 bytes of 0x01, salt = 16 bytes of 0x02, secret = "",
+// ad = "" (i.e. plain argon2id_hash(), the ergonomic wrapper real callers use), passes t = 2, lanes
+// p = 1, tag_len = 32. m (KiB) is the ONLY variable, chosen as an exact multiple of 4*p (=4 when p=1)
+// so m_prime == m with no truncation in argon2id_raw's memory-geometry math:
+//   m=8    is the RFC 9106 FLOOR for p=1 (argon2id_raw requires m >= 8*p) -- lowest practical value.
+//   m=32, 128, 512, 2048 are each 4x the one before -- a 256x range in block count / allocation churn.
+//
+// LEVEL SELECTION: read from env var NOVA_ARGON_MCOST (a string: "8", "32", "128", "512", "2048", or
+// "NEGCTL"), so a driver script can invoke this SAME compiled exe once per (level x N runs), exactly
+// like _argon_carriers.ps1 sweeps NOVA_CARRIERS. A missing or unrecognized value is a CONFIG ERROR
+// (exit 2) -- never silently counted as a pass or as a crypto failure.
+//
+// NEGCTL is a NEGATIVE CONTROL, not a 6th m_cost level: it runs the REAL m=32 computation (identical
+// cost to level "32") but grades it against a DELIBERATELY WRONG tag (level 32's true tag with its
+// first hex nibble flipped, 2->3). NEGCTL must ALWAYS mismatch (exit 1). If a NEGCTL run ever reports
+// a match, the comparator itself is broken -- e.g. a string-equality bug that always reports equal --
+// and every PASS this instrument has ever reported at any level is worthless. This is exactly the
+// failure mode this project has paid for before: an instrument reporting success while measuring
+// nothing (a missing pwsh stage, a stale cached .ll, an unresolved import, GNU timeout absent on
+// macOS, a CRLF-mangled work-list) -- see reference_macos_intermittent_crypto_flake_open.md.
+//
+// EXIT-CODE CONTRACT (the driver classifies purely on this, plus its own kill-on-timeout wrapper):
+//   0 = MATCH        computed tag equals the oracle's tag for the requested level.
+//   1 = MISMATCH     computed tag DIFFERS from the oracle's tag -- a WRONG VALUE, detected IN-BAND by
+//                     this program's own comparison, never a crash. Also the ALWAYS-EXPECTED result
+//                     for NEGCTL (proves the FAIL path actually fires).
+//   2 = CONFIG ERROR NOVA_ARGON_MCOST was missing or not one of the 6 recognized values. Instrument
+//                     misuse -- must never be folded into either the pass or the wrong-value count.
+//   anything else    a CRASH. A segfault / unhandled trap surfaces as a large or negative OS exit code
+//                     on Windows (e.g. an access-violation exit code), never one of 0/1/2 above --
+//                     this program does not intentionally produce any other exit code.
+//   (no exit at all) a HANG. This program does no I/O, no locking, no network, and no unbounded loop --
+//                     the only way it fails to return is the allocator/scheduler path under test.
+//                     Kill-on-timeout (Invoke-Timed) in the driver is mandatory for exactly this case;
+//                     WaitForExit alone does not kill a hung process.
+import std/crypto/argon2id
+
+fn _fill(n: int, val: int) -> list
+    let b = bytes(0)
+    let i = 0
+    while i < n
+        b = bytes_append(b, val)
+        i = i + 1
+    b
+
+fn _hex(b) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let x = bytes_get(b, i)
+        out = out + char_at(digs, (x >> 4) & 15) + char_at(digs, x & 15)
+        i = i + 1
+    out
+
+fn main()
+    // fixed across every level -- ONLY m (memory KiB) varies below.
+    let pwd = _fill(32, 0x01)
+    let salt = _fill(16, 0x02)
+    let t = 2
+    let p = 1
+    let tag_len = 32
+
+    let level = env("NOVA_ARGON_MCOST")
+
+    // m_cost + oracle tag per level (argon2_ctx / phc-winner-argon2 reference C library; see header).
+    let m = 0
+    let want = ""
+    let is_negctl = false
+    if level == "8"
+        m = 8
+        want = "e9c9f86152102cc20b79936924d2fbde0d44572c57d7222345b6ae3f07612ac0"
+    else if level == "32"
+        m = 32
+        want = "269faa8db582cc87160ac7551e8e130a1f41e1a23de90ce21fab9a26216cd8bc"
+    else if level == "128"
+        m = 128
+        want = "b68b2d0ce0f4fdbd5ed67744dedd8cdc67c00be888993344c725494c6ceaa2d8"
+    else if level == "512"
+        m = 512
+        want = "34ef84b300f307b551751eaf7639d9737d048b61308c415f88ca9620f6fd19a1"
+    else if level == "2048"
+        m = 2048
+        want = "c37f1ff91f6c11b942ce5544b387a8f091e0d04fc7c89fbf0677e71b41541f89"
+    else if level == "NEGCTL"
+        // real m=32 computation (identical cost to level "32"), graded against a DELIBERATELY WRONG
+        // tag -- level 32's true tag with its first hex nibble flipped (2 -> 3). Must always mismatch.
+        m = 32
+        want = "369faa8db582cc87160ac7551e8e130a1f41e1a23de90ce21fab9a26216cd8bc"
+        is_negctl = true
+    else
+        print("CONFIG ERROR: NOVA_ARGON_MCOST='" + level + "' is not one of 8|32|128|512|2048|NEGCTL")
+        exit(2)
+
+    let tag = argon2id_hash(pwd, salt, t, m, p, tag_len)
+    let got = _hex(tag)
+
+    if got == want
+        if is_negctl
+            // The comparator says EQUAL for a pair built to be UNEQUAL -- the instrument itself is
+            // broken. Do not trust any PASS this exe has reported at any other level.
+            print("NEGCTL BROKEN: comparator reported MATCH for an intentionally-wrong pair")
+            print("  tag  " + got)
+            print("  want(wrong-on-purpose) " + want)
+            exit(1)
+        print("PASS level=" + level + " m=" + str(m) + " tag=" + got)
+        exit(0)
+    else
+        if is_negctl
+            print("PASS(negctl) level=NEGCTL m=32 correctly detected the intentional mismatch")
+            print("  got  " + got)
+            print("  want(wrong-on-purpose) " + want)
+            exit(1)
+        print("FAIL level=" + level + " m=" + str(m))
+        print("  got  " + got)
+        print("  want " + want)
+        exit(1)
