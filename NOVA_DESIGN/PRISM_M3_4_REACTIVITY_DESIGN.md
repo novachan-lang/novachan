@@ -1009,3 +1009,35 @@ RED tier, full arc: reconverge (`gen5.ll == gen6.ll`), `nova_ci` both memory mod
 wired into the gate. No exception for "it's just an analysis pass" — §14 already found the general
 shortcut everyone reaches for (typing to `PrismNode`) is exactly the mistake to avoid, and the same
 discipline applies to verification.
+
+### 15.6 Compiler reconnaissance (done 2026-09-05, before redispatch) — resolves §15's open questions
+
+Investigated the actual structures rather than leaving them for the implementer to rediscover.
+
+**The struct field-type oracle exists and is safe to use as complete.** `b.ir_sdefs: dict`
+(`IrBuilder.ir_sdefs`, declared line 11813) maps every struct AND enum-variant name to its
+`list<Param(name, type, default)>` field list. It is populated at `nova_compiler.nova:26639`
+(`b.ir_sdefs[name] = params`) inside a pass that walks every `type`/`enum` declaration across the
+whole program — **before** individual function bodies are code-generated (confirmed by tracing
+several consumers, e.g. `ir_bind_variant_payload_type` at line ~11887, which reads `b.ir_sdefs`
+while processing an arbitrary function body and assumes it is already complete).
+
+**Consequence for §15.2 point 4 ("is this field's type a struct"):** `contains(b.ir_sdefs, ftype)` —
+exactly the check the pass needs, reusing the existing table rather than building a second one.
+
+**⛔ There is no existing "function name → body" table — build one.** Grepped `tag == "fn"`: ~15
+separate one-off sweeps over the program's top-level statement list exist (arity collection, default
+handling, generics instantiation, etc.), each for its own narrow purpose. None persists a reusable
+`fn_name -> Stmt("fn", ...)` map. **The read-set pass's call-graph step (§15.2 point 5) needs one**,
+to resolve callee `g` at a call site into `g`'s actual body and parameter list.
+
+Consistent with the existing style (one more sweep of the same top-level statement list these other
+passes already walk), build `fn_bodies: dict` once, before computing any read-set, as
+`{fn_name: Stmt("fn", ...)}` over every top-level `Stmt` with `tag == "fn"` in the fully-resolved,
+post-import program (the same list the ~15 existing sweeps iterate). This is new state, not a
+reuse — say so plainly in the implementation, and build it exactly once per compilation, not once
+per `readset_of` call.
+
+**Net effect on §15.2:** point 4's oracle already exists (`ir_sdefs`); point 5 needs one new,
+cheaply-built table (`fn_bodies`) that nothing in the compiler currently provides. Both facts are
+now settled, not open questions for whoever implements next.
