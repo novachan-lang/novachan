@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      argon_sweep:
+        description: 'Run the argon2id m_cost sweep on macOS (long; diagnostic only)'
+        type: boolean
+        default: false
 
 # SUPERSEDE, don't queue. Every push spawns a full matrix, and each macOS job runs ~90 minutes
 # while the free runner pool serialises them -- so pushing six fixes in a row queued six matrices
@@ -916,6 +921,93 @@ jobs:
           fi
           exit 0
         timeout-minutes: 45
+
+      # ─── The DECISIVE probe for the last open macOS bug. OPT-IN: workflow_dispatch only. ───
+      #
+      # _argon2id_test fails ~1/6 on macOS ONLY, with WRONG VALUES (rc=1), not hangs, while scram
+      # and jwt are clean (0/8 plain, 0/10 ASAN). Three premises are already REFUTED with evidence
+      # -- carrier dependence (1/6 at CARRIERS=1 and at CARRIERS=4), join-on-garbage pthread_t, and
+      # that it hangs at all (zero watchdog output where the watchdog prints every 4s). The broken
+      # 1<<64 shift is eliminated too (all four rotate sites pass constant n in {32,24,16,63}).
+      #
+      # The surviving lead is ALLOCATION VOLUME: argon2id is memory-hard and is written in pure
+      # NOVA over `bytes`, so it churns thousands of small allocations where scram/jwt churn none.
+      # This varies m_cost over a 256x range with everything else fixed. Rate SCALES with m_cost =>
+      # the fault is in the allocator/refcount path under churn. Rate FLAT => allocation volume is
+      # refuted too and the fault is argon2id's own arithmetic. Either way it is decisive.
+      #
+      # NOT on push: a memory-hard KDF over 6 levels is minutes of runner time, and this job
+      # already runs ~90 minutes while the free pool serialises the matrix.
+      - name: argon2id m_cost sweep (opt-in, diagnostic, never fails the job)
+        if: ${{ inputs.argon_sweep }}
+        continue-on-error: true
+        run: |
+          set +e
+          cd nova-compiler
+          export NOVA_HOME="$(pwd)"
+          export NOVA_NO_CACHE=1
+          cd test_programs
+
+          # Same portable kill-on-timeout the core suite uses: GNU `timeout` DOES NOT EXIST on
+          # macOS, and assuming it once made this job report 0 PASS / 62 FAIL with nothing ever run.
+          if command -v timeout >/dev/null 2>&1; then
+            RUNTMO() { timeout "$@"; }
+          elif command -v gtimeout >/dev/null 2>&1; then
+            RUNTMO() { gtimeout "$@"; }
+          else
+            RUNTMO() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          fi
+
+          ../compiler/nova _argon2id_mcost_sweep.nova >/dev/null 2>&1
+          if [ ! -f _argon2id_mcost_sweep.ll ]; then
+            echo "::error title=argon-sweep::probe did not compile -- INSTRUMENT FAILURE, not a result"
+            exit 0
+          fi
+          clang -O2 -o _argon2id_mcost_sweep ../compiler/nova_runtime.c _argon2id_mcost_sweep.ll 2>/dev/null
+          if [ ! -x _argon2id_mcost_sweep ]; then
+            echo "::error title=argon-sweep::probe did not link -- INSTRUMENT FAILURE, not a result"
+            exit 0
+          fi
+
+          N=12
+          SUMMARY=""
+          NEGCTL_WRONG=0
+          for LEVEL in 8 32 128 512 2048 NEGCTL; do
+            att=0; ok=0; wrong=0; crash=0; hang=0; cfg=0
+            i=0
+            while [ "$i" -lt "$N" ]; do
+              i=$((i+1)); att=$((att+1))
+              NOVA_ARGON_MCOST="$LEVEL" RUNTMO 120 ./_argon2id_mcost_sweep >/dev/null 2>&1
+              rc=$?
+              case "$rc" in
+                0)   ok=$((ok+1)) ;;
+                1)   wrong=$((wrong+1)) ;;
+                2)   cfg=$((cfg+1)) ;;
+                124|142) hang=$((hang+1)) ;;
+                *)   crash=$((crash+1)) ;;
+              esac
+            done
+            # ATTEMPTED is reported beside every count: a failure count alone cannot distinguish
+            # "all passed" from "nothing ran", which has bitten this project repeatedly.
+            echo "level=$LEVEL attempted=$att (expect $N) ok=$ok wrong=$wrong crash=$crash hang=$hang configerr=$cfg"
+            [ "$att" -ne "$N" ] && echo "::error title=argon-sweep::attempted=$att != $N at level $LEVEL -- INSTRUMENT FAILURE"
+            [ "$cfg" -ne 0 ] && echo "::error title=argon-sweep::configerr=$cfg at level $LEVEL -- INSTRUMENT FAILURE, not a crypto result"
+            if [ "$LEVEL" = "NEGCTL" ]; then NEGCTL_WRONG=$wrong; else
+              SUMMARY="$SUMMARY m=$LEVEL:$((wrong+crash))/$att"
+            fi
+          done
+
+          # NEGATIVE CONTROL. NEGCTL runs the real m=32 computation graded against a tag with one
+          # nibble flipped, so it MUST mismatch every time. If it ever reports ok, the comparator
+          # is broken and every PASS at every level above is worthless.
+          if [ "$NEGCTL_WRONG" -ne "$N" ]; then
+            echo "::error title=argon-sweep::NEGATIVE CONTROL FAILED -- expected $N mismatches, got $NEGCTL_WRONG. The comparator is broken; DISREGARD every level above."
+          else
+            echo "::notice title=argon-sweep::negative control OK ($NEGCTL_WRONG/$N mismatched as required) -- the failure path genuinely fires"
+            echo "::notice title=argon-sweep-VERDICT::failure rate by m_cost:$SUMMARY -- rate RISING with m_cost implicates the allocator/refcount path under churn; rate FLAT across this 256x range refutes allocation volume and implicates argon2id's own arithmetic"
+          fi
+          exit 0
+        timeout-minutes: 90
 
   # ─── macOS (Kotlin bootstrap, legacy reference) ───────
 
