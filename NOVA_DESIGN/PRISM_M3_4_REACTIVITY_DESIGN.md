@@ -69,6 +69,19 @@ by-product of the update, not a diff.
 
 Both sides are static integer sets, so the intersection is a bitmask AND — not a graph walk.
 
+⛔ **The changeset as described here is INCOMPLETE — §9.4 found the hole.** Leaf paths alone
+describe a *field* changing value. They cannot describe an element being **inserted into or removed
+from a collection**, because no leaf's value changed — the collection's *shape* did. A structural
+edit is therefore invisible to the model above, which would leave a table stale after a row is
+added: a correctness bug, not a performance one.
+
+So the changeset carries **two** kinds of entry:
+- `path → v'` — a leaf's value changed (as above);
+- `path +key` / `path -key` — an element entered or left a keyed collection.
+
+This is a prerequisite for both §4(b) invalidation of a keyed row and §9's aggregate deltas, and it
+is why keying and the changeset format must be designed together rather than in sequence.
+
 ## 4. ⛔ The hard part: collections
 
 **This is the one thing M1.7 did not measure, and it is where this design earns or loses.**
@@ -242,10 +255,26 @@ Falsifiable, in order of cost:
      import-zero defect class). **The library is structurally compatible with this design today**,
      which also means the enforcement gate can be added without first fixing violations.
    - ⬜ enforcement in the compiler — a rejection, not a warning. Needs GO.
-5. Only then: compiler pass, RED tier, full arc (reconverge + both memory modes).
+5. **Design the changeset format and keying TOGETHER** — §3's structural-delta hole means they are
+   one design, not two. A keyed row cannot be invalidated, and an aggregate delta cannot be
+   computed, from a changeset that only carries leaf values.
+6. **Aggregates (§9) — only if §9.5's measurement justifies them**, and strictly after keying,
+   since a delta needs element identity.
+7. Only then: compiler pass, RED tier, full arc (reconverge + both memory modes).
 
-Steps 1–3 and 4(detection) need no compiler change and no GO. **Step 4(enforcement) and step 5
-do.**
+Steps 1–3 and 4(detection) need no compiler change and no GO. Steps 5–6 are design and also need
+no GO. **Step 4(enforcement) and step 7 do.**
+
+### Dependency order (the thing to get right)
+
+```
+§4b keyed sub-faces ──┬──> §3 changeset w/ structural deltas ──> §9 aggregates
+                      └──> per-row invalidation
+```
+
+Keying is upstream of everything: it is required for bounded per-row cost (§CRITERION), it is the
+prerequisite for aggregate deltas (§9.3), and it forces the changeset format (§3). Building it
+first is not a preference — nothing downstream is well-defined without it.
 
 ---
 
