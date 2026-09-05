@@ -20,7 +20,7 @@ A **terminal/ANSI** backend (`backend/ansi/`) is a fourth, already-real target f
 
 ## Status
 
-**The library is COMPLETE — 131 modules, 128 KATs, ~56.4k lines**, across all six library layers
+**The library is COMPLETE — 131 modules, 130 KATs, ~56.4k lines**, across all six library layers
 plus `app/` (Tier 2). Phase A (MA.1–MA.8) is done: the node-tree value type, the **22 primitives**
 as plain functions, typed `look`/`palette` values, an HTML server-side renderer, and the ANSI
 backend — all pure NOVA, no compiler changes, no WASM, no closures.

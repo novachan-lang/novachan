@@ -483,9 +483,9 @@ PRISM_STATUS.md          ← YOU ARE HERE. Always start here. Live status, what'
 | **7. ≤2 agents, never recursive, never `Workflow` fan-out** | Pro-plan constraint. Agents are told explicitly not to spawn children |
 | **8. Ask before writing code** | Design and structure are written freely. **No `.nova` implementation lands without an explicit go-ahead.** |
 
-## REPOSITORY STRUCTURE — ✅ BUILT (131 modules, 128 KATs, ~56.4k lines)
+## REPOSITORY STRUCTURE — ✅ BUILT (131 modules, 130 KATs, ~56.4k lines)
 
-**KAT coverage audit (2026-09-05), by NAME:** 131 modules, 129 KAT files. Every module is
+**KAT coverage audit (2026-09-05), by NAME:** 131 modules, 130 KAT files. Every module is
 gated, though not all one-to-one — the naming is not uniform and a count alone would mislead:
 
 * **8 modules are covered by AGGREGATE KATs**, not same-named ones: `prism_arrange`,
@@ -499,6 +499,8 @@ gated, though not all one-to-one — the naming is not uniform and a count alone
   is proven by reason-differentiation rather than by merely asserting an error occurred.
 * **1 module still has no dedicated KAT**: `prism_ansi` (the ANSI backend), exercised
   transitively by **13** KATs. Not untested; a legitimate, non-urgent gap.
+
+✅ **FULL GATE GREEN 2026-09-05** — all **130 KATs** built and run clean in one pass (`BUILD attempted=130 built=130 failed=0` · `RUN attempted=130 ran=130 FAILED=0`), with `attempted == expected` asserted at BOTH stages and **empty output counted as a failure** — so it cannot be the kind of false green that reported `failures: 0` while producing 12 of 14 binaries earlier the same day. First fully-verified baseline since the disk was freed (99% → 84%). Covers every library change of that day: 14 collection fields typed `list<T>`, `PrismNotice`'s identity field, `prism_ansi_table` display-width sizing, and the `ww_string_width` byte-count fix.
 
 **This is the authoritative map, and it now describes what EXISTS, not a proposal.** Layer counts: `core/` 7 · `text/` 5 · `widget/` 6 · `style/` 7 · `render/` 4 · `obs/` 5 · `dev/` 8 · `intl/` 4 · `a11y/` 1 · `ui/` 67 · `app/` 14. Each layer's own `README.md` is the by-name audit basis for that layer — ⛔ audit by NAME, never by count.
 

@@ -669,7 +669,7 @@ affect exactly one collection in the corpus.
 
 The 14 field annotations touched 12 library modules, so the 13 KATs run initially were not a
 sufficient gate. Built the transitive dependency graph over `prism/`: 11 changed modules reach
-**18 modules**, exercised by **20 of the 128 KATs**. All 20 rebuilt and re-run under
+**18 modules**, exercised by **20 of the 130 KATs**. All 20 rebuilt and re-run under
 kill-on-timeout: **RAN=20, FAILURES=0**, with zero-length output counted as a failure so a silent
 pass cannot register as green.
 
