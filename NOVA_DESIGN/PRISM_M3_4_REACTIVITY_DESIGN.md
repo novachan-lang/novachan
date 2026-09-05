@@ -357,3 +357,104 @@ a feature must justify itself against the complexity it adds. The deciding quest
   and holistic folds add real complexity for cases the data is unlikely to show as hot.
 
 Measurement pending; the verdict is recorded here when it lands rather than assumed now.
+
+---
+
+## 10. Key inference — the algorithm
+
+§4(b) established keyed sub-faces are **required**, and §3/§9 established everything downstream
+depends on them. This is the part that has to actually work: **where does the key come from, without
+the developer writing one?** React makes the developer supply `key` and silently accepts a wrong
+one. Getting this inferred — and refusing safely when it cannot be — is the whole of Bet 1 applied
+to collections.
+
+### 10.1 Recognising the pattern
+
+A face is a **collection face** when its body iterates a collection-typed field of its state
+parameter and builds output per element: `for x in s.rows` / `s.rows.map(…)` where the body reads
+fields of `x` and produces nodes. The compiler sees this in the IR as a loop over a collection
+whose body constructs nodes — no new analysis is required to *detect* it. The corpus population is
+43 such faces (§4b), so the pattern is real and common.
+
+### 10.2 Choosing the key — four rules, in priority order
+
+**Rule 1 — the program's own lookup key. (Strongest; behavioural, not nominal.)**
+If anywhere in the program an element of this collection is selected by a field —
+`find(xs, fn(x) x.f == target)`, a filter to one element, an index built on `x.f` — then **`f` is
+the identity the program itself already uses.** `prism_con_selected_project` is exactly this shape.
+
+This is the rule that matters, because it is derived from *behaviour* rather than from naming. A
+program that looks a row up by `conprj_id` has already declared what identifies a row; the compiler
+is reading an existing fact, not guessing. It is also strictly better than React, where the
+developer states the key separately from the lookup and the two can silently disagree.
+
+**Rule 2 — a declared primary key.** If the element type is ORM-mapped, its primary key is the
+identity, by definition. NOVA has an ORM with real primary keys, so this is free information for
+exactly the data most likely to be rendered in a table. Cross-system link worth taking.
+
+**Rule 3 — a nominal identity field.** `id` / `<prefix>_id` / `key` / `slug` / `uuid` / `code`.
+Weakest of the three, a naming heuristic — but it covers 62% of struct collections corpus-wide and
+9/10 element types in the console app, so it earns its place as a fallback rather than a basis.
+
+**Rule 4 — positional.** If the collection is only ever *rebuilt wholesale* and never inserted into
+or removed from mid-list, the index is a sound key. This is decidable from the reducers: if no
+reducer produces a structural `+key`/`-key` delta (§3) for that collection, positional keying is
+safe. `rt_seg_*` route segments are the canonical case — parsed as a unit, order *is* the meaning.
+
+⛔ **This is precisely where React's index-key trap lives, so the condition must be checked, not
+assumed.** React lets any developer use the index; it corrupts state on reorder or insert. Here the
+index is used *only* when the compiler can prove no insert or removal occurs.
+
+**Otherwise — refuse, and say so.** Whole-collection invalidation (§4a) plus a diagnostic naming
+the collection: *"`s.rows` has no inferable identity, so editing one row re-renders all of them;
+add an `id` field or select rows by a stable field."* Actionable, and it names the cost rather than
+hiding it.
+
+### 10.3 What makes a key VALID, and what cannot be proven
+
+A key must be **unique** within the collection and **stable** across updates. Neither is provable
+statically in general — and pretending otherwise is how this design would produce silent
+corruption, which is worse than the O(N) it is trying to avoid.
+
+- **Uniqueness:** not statically provable, but **cheaply checkable at runtime on insert** (the key
+  is being added to an index regardless). A duplicate key is a real bug in the developer's data, so
+  the honest behaviour is to *detect and report* it, not to silently mis-associate rows. Rule 2's
+  ORM primary key is the one case where uniqueness is guaranteed by construction.
+- **Stability:** a key field that a reducer *mutates* is not an identity. This **is** statically
+  checkable with machinery that already exists — §9's changeset tells us exactly which fields
+  reducers write. **A candidate key field that appears in any reducer's write-set is rejected**,
+  falling through to the next rule.
+
+That second point is the one to get right: an unstable key silently swaps two rows' state, which
+presents as a UI bug with no stack trace. Rejecting it at compile time costs nothing.
+
+### 10.4 Failure hunt
+
+| Case | Consequence | Handling |
+|---|---|---|
+| Two rules disagree (lookup field ≠ `id` field) | ambiguous identity | **Rule 1 wins** — behaviour beats naming. If they disagree, the `id` field is probably not what identifies the row *to this program* |
+| Key is a compound (`(project, number)`) | single-field rules all miss | Falls to §4(a) + diagnostic. Compound keys are a v2 extension, not a v1 hole to paper over |
+| Collection of primitives (`list<string>`) | no field to key on | Positional (Rule 4) or whole-collection. Fine — these are short in practice |
+| Nested collections (issue → comments) | inner needs its own key | Applies recursively; the console app exercises this at depth 3 |
+| Key changes type across branches | unsound to index on | Reject; fall through |
+
+### 10.5 Why this beats React, stated precisely
+
+| | React | PRISM (this design) |
+|---|---|---|
+| Who supplies the key | **the developer, every list** | inferred; developer writes nothing |
+| Wrong key | silently corrupts row state | Rule 1 derives it from the lookup the program already does |
+| Index key | always permitted, corrupts on insert/reorder | permitted **only** when no structural delta is provable |
+| Unstable key | undetected | **rejected at compile time** — key fields in a reducer write-set are disqualified |
+| No key available | renders anyway, subtly wrong | refuses to key, invalidates whole collection, **names the cost** |
+
+The claim is not that PRISM keys better than a careful React developer. It is that PRISM keys
+correctly **without requiring one**, and fails loudly rather than silently where React fails
+silently. That difference is the entire point of Bet 1.
+
+### 10.6 Unmeasured
+
+Rule 1's coverage is **not yet measured** — §4b measured how many element types *have* an identity
+field (nominal, Rule 3), not how many are *looked up by* one (behavioural, Rule 1). Rule 1 is the
+load-bearing rule, so this is the next measurement, and it should be done before any of this is
+built.
