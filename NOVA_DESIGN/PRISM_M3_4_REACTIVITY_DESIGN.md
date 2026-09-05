@@ -219,3 +219,85 @@ Falsifiable, in order of cost:
 
 Steps 1–3 and 4(detection) need no compiler change and no GO. **Step 4(enforcement) and step 5
 do.**
+
+---
+
+## 9. Aggregates — incremental view maintenance
+
+§5 identified aggregates as the gap keyed sub-faces cannot close: `prism_con_stat_row` reads 50 of
+52 leaves because it *folds over every element*, so any insert, delete or field change invalidates
+it. Keying fixes per-row rendering; it does nothing for a fold. This section designs the mechanism.
+**Whether to build it is gated on measurement** (`tools/m34_aggregates.py`) — see §9.5.
+
+### 9.1 Prior art, and why no frontend framework does this
+
+| System | Approach | Relevance |
+|---|---|---|
+| Materialized views (Oracle, PG) | maintain the view, apply deltas | The classic result below comes from here |
+| Differential Dataflow / DBSP (Materialize, Feldera) | Z-sets with multiplicities; aggregates as deltas | Strongest theory; proven at scale in databases |
+| Adapton / self-adjusting computation | general incremental recomputation | General, but high constant factor per node |
+| React / Solid / Vue / MobX | **none — the fold is recomputed in full** | A `computed` count over 10k rows re-runs entirely |
+
+**No mainstream UI framework maintains aggregates incrementally.** Solid's memo avoids recomputing
+when inputs are unchanged, but when one row *does* change it re-folds all N. So this is a genuine
+differentiator — and also a warning: the reason nobody ships it is that the general case is
+complex, and complexity is the thing PRISM must not accumulate.
+
+### 9.2 The classical result that makes it tractable
+
+An aggregate is **self-maintainable** iff its combining operator forms a **group** — associative,
+with an identity and an **inverse**. The inverse is what lets a departing element be subtracted
+without rescanning.
+
+| Class | Examples | Insert | Delete |
+|---|---|---|---|
+| **Group** | `count`, `sum`, XOR-fold | O(1) | **O(1)** — subtract |
+| **Semigroup only** | `min`, `max` | O(1) — compare | **O(N) rescan** when the current extreme leaves |
+| **Holistic** | median, percentile, distinct-count, top-N | — | no bounded update |
+
+This three-way split is not a heuristic; it is a property of the operator, so the compiler can
+classify a recognised fold **statically and with certainty**, which is exactly what a
+zero-annotation design needs.
+
+### 9.3 Mechanism, and its dependency on §4
+
+For a recognised fold `agg(op, xs, f)`:
+
+1. Maintain the aggregate's current value as derived state beside the collection.
+2. On a changeset entry for element `E` field `F` (`v → v'`), apply the delta:
+   `count` → `p(E') - p(E) ∈ {-1, 0, +1}`; `sum` → `f(E') - f(E)`.
+3. `min`/`max`: update on insert and on a non-extreme change; **rescan only** when the current
+   extreme is removed or worsened.
+4. Holistic: no incremental path — rescan, and **emit a diagnostic** so the developer knows that
+   particular readout is O(N) per change rather than discovering it as jank.
+
+⛔ **This depends on §4(b), and that ordering is not optional.** Computing a delta requires knowing
+*which element* changed — i.e. element identity. Without keyed collections the changeset says only
+"something under `rows` changed", which is precisely the information a delta cannot be derived
+from. **Keyed sub-faces are a prerequisite for incremental aggregates, not a parallel feature.**
+
+### 9.4 Failure hunt
+
+| Case | Consequence | Handling |
+|---|---|---|
+| **Insert / delete** changes the *collection*, not a leaf | §3's changeset carries leaf paths only, so a structural edit is invisible | ⛔ **Extends §3**: the changeset must also carry structural deltas (element added / removed, with key) |
+| **Predicate reads other state** — `count(issues where status == s.filter)` | changing `filter` invalidates the whole count | Correct and unavoidable: the aggregate's dependencies include its predicate's free variables. Full rescan, and it is *rare* — a filter change is a deliberate user action, not a data tick |
+| **Float `sum`** | subtracting on delete accumulates rounding error | Real: databases hit this. Periodic full recomputation, or restrict incremental `sum` to integers. **Integer-only is the right v1** — silently drifting totals are worse than an O(N) recount |
+| Fold not statically recognised | falls back to full recompute | Sound, and the honest default |
+| Nested aggregate (count of projects whose issue-count > 0) | delta must propagate through two levels | Deferred. Compose only if the measurement shows nested aggregates actually occur |
+
+### 9.5 Is it worth building? — gated on data
+
+The mechanism above is sound, but it is **new machinery**, and this project's design principles say
+a feature must justify itself against the complexity it adds. The deciding question is empirical:
+**how many faces are aggregates, and what share are group-class (the cheap, high-value case)?**
+
+- If aggregates are rare and mostly holistic → **do not build this.** Diagnose the O(N) readouts
+  and move on; `stat_row` alone does not justify incremental view maintenance.
+- If aggregates are common and mostly `count`/`sum` → build **Tier 1 only** (group class over keyed
+  collections). That is a small, closed, statically-decidable mechanism covering the dashboard case
+  every real app has.
+- Tiers 2 (min/max) and 3 (holistic) are **not** v1 under any outcome — semigroup rescan-on-delete
+  and holistic folds add real complexity for cases the data is unlikely to show as hot.
+
+Measurement pending; the verdict is recorded here when it lands rather than assumed now.
