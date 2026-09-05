@@ -1198,6 +1198,8 @@ section is the pointer, not a second tracker.
 | `forge_jwt_test` | — | **0/8 plain, 0/10 ASAN** |
 | `_argon2id_test` | 13% | **~1/6 — STILL OPEN** |
 
+**✅ The decisive probe is now BUILT AND WIRED (2026-09-05).** `_argon2id_mcost_sweep.nova` + an opt-in `macos-selfhosted` CI step (`argon_sweep` workflow_dispatch boolean). Varies `m_cost` over a **256× range** with all else fixed: rate RISING with m_cost ⇒ allocator/refcount path under churn; rate FLAT ⇒ allocation volume refuted too and the fault is argon2id's own arithmetic. Both readings stated in advance. Carries a NEGATIVE CONTROL that gates the whole report. **Nothing left to write — run the workflow with `argon_sweep = true`.**
+
 Sanitizer findings run-wide: **zero**. Root causes fixed this campaign, each measured not argued:
 Mach-O `filesize`/ELF `p_filesz` clamp · program literals relocated into the arena · `NOVA_LIT`
 runtime literals interned (the other half — 102 magic-prefixed statics were the last collision
