@@ -1268,6 +1268,8 @@ with a NESTED tree (>100 reachable leaves) is in progress as `prism/app/prism_ap
 
 **M3.4 DESIGN COMPLETE — both gating measurements done (2026-09-05).** §9.6: aggregates are **82% group-class with ZERO holistic** ⇒ build Tier 1 only. §10.7: the behavioural key rule I called load-bearing **never fires alone** — the naming heuristic carries 90% and the two never disagree, so it demotes to a validator. ⛔ **§10.8 is the one that changes the plan:** key inference requires `list<T>`-typed collections, and **85% of PRISM's collection fields (63 of 74, across 43 state types) are bare `list`.** Only `prism_app_console` is typed — which is why it scored 90% keyable. **Typing those fields is a mechanical, non-RED prerequisite to ALL of §3/§4b/§9/§10, and needs a go-ahead since it edits library modules.** Ordering argument for M3.4-before-M0.3: [`M0_3_VS_M3_4_DECISION.md`](M0_3_VS_M3_4_DECISION.md).
 
+**✅ M3.4 PREREQUISITE CLOSED (2026-09-05).** §10.8's blocker — key inference needs `list<T>`-typed collections — is **done**: 14 fields typed across 12 modules, visible collections 10→24, coverage **83.3%** with the remainder falling soundly to positional keying. Gated on all 20 transitively-affected KATs (**RAN=20 FAILURES=0**). The first run was a **false green** — a CRLF work-list made every loop iteration skip silently while printing `failures: 0`; standing countermeasure now is that **every batch asserts attempted == expected**. Next, out-of-tree and needing no GO: simulate invalidated WORK per user action (§8 step 3) before any compiler pass.
+
 **Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
 SINGLE blocker on the browser path, M1.7 having cleared. See
 [`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
