@@ -81,7 +81,7 @@ Sequence, with the cheap steps first:
 3. Build the read-set pass **out-of-tree** first, as `tools/m17_readset.py` already is. Prove the
    numbers on `prism_app_console` before touching the compiler.
 4. Reject faces reading module state — smallest correctness gate, already measured as violation-free
-   (0/130 modules), so it can land without cleanup.
+   (0/131 modules), so it can land without cleanup.
 5. **Then** the compiler pass, RED tier, full arc.
 6. **Then** M0.3, with a working reactive framework proving it was worth splitting for.
 

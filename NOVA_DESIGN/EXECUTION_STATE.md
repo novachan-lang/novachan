@@ -1228,7 +1228,7 @@ annotated as instrument failure rather than read as clean.
 
 ### Track 2 — Prism: the LIBRARY IS COMPLETE, and the M1.7 gate is CLEARED
 
-**130 modules · 127 KATs · 55.1k lines.** Every library layer matches its README **by name**
+**131 modules · 128 KATs · 56.4k lines.** Every library layer matches its README **by name**
 (`core/ text/ obs/ dev/ intl/ render/ style/ widget/ layout/ a11y/ ui/ backend/ embed/`) and
 `app/` (Tier 2) is 10/10: route, form, wire, guard, session, sync, wizard, shortcut, clipboard,
 download. Three residual README entries are documented naming discrepancies
