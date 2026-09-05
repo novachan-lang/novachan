@@ -615,3 +615,41 @@ the first library-wide (rather than one-file) measurement of key inference:
 
 **Still zero disagreements** where both rules fire, across a doubled population — so §10.4's
 "Rule 1 wins" tiebreak remains untested by real data, and remains low-stakes.
+
+### 10.10 FINAL — all 14 fields typed. And my §10.7 refutation was itself an artifact.
+
+With every typeable collection field annotated (24 collections visible, up from 10):
+
+| collections visible | 10 | 21 | **24** |
+|---|---|---|---|
+| **Rule 1 coverage** | 30% | 47.6% | **54.2%** |
+| Rule 1 fires *alone* | 0 | 1 | **2** |
+| any rule fires | 90%* | 81% | **83.3%** |
+| neither | 10%* | 19% | **16.7%** |
+
+<sub>*the 10-collection figure was one file (`prism_app_console`), whose structs were written with explicit `_id` fields.</sub>
+
+**⛔ The trend is the finding.** Rule 1's coverage rose monotonically — 30% → 47.6% → 54.2% — **as
+collections became visible, not as anything about the rule changed.** §10.7 concluded "Rule 1 is
+not load-bearing; the naming heuristic I ranked weakest carries the coverage." That conclusion was
+drawn on a corpus where 85% of collections were invisible to the analysis, and it weakened with
+every field typed. My original §10.2 ranking — Rule 1 strongest — may simply have been right, and
+its refutation was an artifact of missing type information rather than evidence against it.
+
+**The honest position: Rule 1 and Rule 3 are comparably strong** (54.2% vs 75%), they never
+disagree across 24 collections, and Rule 1 now contributes 2 collections the naming rule cannot
+reach. Neither is "the" rule.
+
+**And the 16.7% remainder is not a gap — it is exactly Rule 4's case.** All four:
+
+| collection | element | why it has no field key |
+|---|---|---|
+| `GdAuditReport.gd_ar_issues` | `GdIssue` | a **derived report list**, rebuilt wholesale each audit |
+| `PrismExplain.ex_hotspots` | `PrismHotspot` | a **derived report list**, rebuilt wholesale |
+| `PrismDoc.tm_doc_runs` | `PrismRun` | **inherently positional** — run order *is* the document, and runs are rebuilt canonically on every edit |
+| `PrismConComment.concmt_reactions` | `PrismConReaction` | needs a **compound key** `(emoji, by)` |
+
+Three of four are rebuilt-wholesale lists, which is precisely the condition §10.2 Rule 4 requires
+for index-keying to be *sound* rather than React's trap. So **effective coverage is ~100%**, and the
+single genuine gap is compound keys — already recorded in §10.4 as a v2 extension, and now known to
+affect exactly one collection in the corpus.
