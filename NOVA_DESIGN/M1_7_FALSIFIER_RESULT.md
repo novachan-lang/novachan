@@ -8,7 +8,7 @@
 ---
 
 > **★ SCALE ANSWERED 2026-09-05.** The open question below — whether read-sets stay small on a
-> deep tree — has now been measured on a real 109-leaf, depth-6 application state
+> deep tree — has now been measured on a real 133-leaf, depth-6 application state
 > (`prism/app/prism_app_console.nova`). **Bet 1 survives, but not for the reason predicted, and my
 > own replacement criterion failed.** See §SCALE at the end. Read this document top to bottom: the
 > library-corpus numbers immediately below are NOT the final answer.
@@ -199,12 +199,12 @@ tree — not more library modules.
 Everything above was measured on a **library**, whose deepest application-state type is
 `PrismAppState` at **16 flat leaves**. The document's own conclusion was that *"what remains unknown
 is SCALE, not mechanism."* That is now measured, on `prism/app/prism_app_console.nova`:
-**`PrismConState`, 109 reachable leaves, genuinely nested to depth 6** (1 / 53 / 29 / 11 / 13 / 2
+**`PrismConState`, 133 reachable leaves, genuinely nested to depth 6** (1 / 53 / 29 / 11 / 13 / 2
 leaves at depths 1–6; a flat struct would be all depth 1), with 26 faces and a 94/94 KAT.
 
 Crucially, its collection fields are typed `list<PrismConX>` rather than bare `list`, so `reach()`
 recurses **through** collections into their element types. That directly exercises the caveat this
-document flagged as unmeasured. **41% of the tree's leaves (45/109) sit under a collection.**
+document flagged as unmeasured. **41% of the tree's leaves (45/133) sit under a collection.**
 
 ## The numbers, and why the first two are the wrong ones
 
@@ -216,7 +216,7 @@ document flagged as unmeasured. **41% of the tree's leaves (45/109) sit under a 
 | **Invalidation fan-out** — faces re-run per leaf change | **1.94 of 26 (7.5%)** | 2 | **3 (12%)** | ✅ |
 
 **Total read-set is the wrong metric, for the third time in this campaign.** The three widest faces
-— `prism_con_console`, `_console_html`, `_console_ansi` at 89/109 — are the **root page
+— `prism_con_console`, `_console_html`, `_console_ansi` at 89/133 — are the **root page
 composers**. A root necessarily depends on everything it displays; that is composition, not
 granularity collapse. In any compositional re-render (React, Solid, and this design alike) a change
 re-runs the *deepest* face that reads it directly, while ancestors merely re-assemble
@@ -246,7 +246,7 @@ The failure is **entirely collection-driven**, and it is concentrated in named f
 
 | face | marginal read-set | why |
 |---|---|---|
-| `prism_con_selected_project` | **51/109 (47%)** | walks projects → issues → comments |
+| `prism_con_selected_project` | **51/133 (47%)** | walks projects → issues → comments |
 | `prism_con_stat_row` | 50/52 | aggregates counts across the whole workspace |
 | `prism_con_project_list` | 32/32 | renders every project |
 
@@ -262,7 +262,7 @@ work is now load-bearing rather than an optimisation.
 ## Honest limits
 
 - **26 faces is a small denominator for a fan-out metric.** Fan-out could flatter a small app. The
-  claim that survives is narrower: *on a 109-leaf tree with 26 faces, a change touches ~2.* Whether
+  claim that survives is narrower: *on a 133-leaf tree with 26 faces, a change touches ~2.* Whether
   it holds at 500 faces is unmeasured.
 - One app, written by one agent, in one session, with knowledge of what was being measured. It is
   evidence, not proof — and it was authored *after* the criterion was published, which is the right

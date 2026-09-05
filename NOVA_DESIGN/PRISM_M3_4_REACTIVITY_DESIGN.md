@@ -112,7 +112,7 @@ collection elements. Hybrid, and honest about the fact that the static approach'
 exactly the dynamic one's strong point. Falls back to Solid's per-read cost, but only for
 collections.
 
-★ **UPGRADED TO REQUIRED 2026-09-05 — on COST, not read-set size.** Modelling this on the 109-leaf console app (`tools/m34_keyed_subfaces.py`) showed the reason first given here (read-set size) was the metric M1.7 had just retired, and that fan-out passes with or without keying. The real argument is **invalidated WORK** (`M1_7_FALSIFIER_RESULT.md` §CRITERION): without keying, editing one comment re-runs `prism_con_selected_project`, which walks every project × issue × comment — **O(rows), unbounded in collection size**. With keying it re-runs one comment face, O(1). Marginal read-set mean 8.15 → 2.85, max 51 → 13; `selected_project` 51 → 1, `project_list` 32 → 0. That is a categorical difference, not a constant factor, and it is the one place PRISM would otherwise lose outright to React — which at least diffs its output. §4(b) is **load-bearing.**
+★ **UPGRADED TO REQUIRED 2026-09-05 — on COST, not read-set size.** Modelling this on the 133-leaf console app (`tools/m34_keyed_subfaces.py`) showed the reason first given here (read-set size) was the metric M1.7 had just retired, and that fan-out passes with or without keying. The real argument is **invalidated WORK** (`M1_7_FALSIFIER_RESULT.md` §CRITERION): without keying, editing one comment re-runs `prism_con_selected_project`, which walks every project × issue × comment — **O(rows), unbounded in collection size**. With keying it re-runs one comment face, O(1). Marginal read-set mean 8.15 → 2.85, max 51 → 13; `selected_project` 51 → 1, `project_list` 32 → 0. That is a categorical difference, not a constant factor, and it is the one place PRISM would otherwise lose outright to React — which at least diffs its output. §4(b) is **load-bearing.**
 
 **Recommendation: (b), with (a) as the sound fallback when a key cannot be inferred, and (c)
 explicitly rejected** — a hybrid means two dependency systems, two failure modes, and two mental
@@ -674,3 +674,66 @@ which had no trailing newline and therefore no `
 caller asserts attempted == expected. A failure count alone cannot distinguish "all passed" from
 "nothing ran" — the same failure mode as the four instruments in the macOS campaign that reported
 success while measuring nothing.
+
+---
+
+## 12. SIMULATED — what one user action costs (2026-09-05)
+
+`tools/m34_invalidation_sim.py`, over `PrismConState` (**133 leaves** — the 109 quoted earlier is
+stale; typing the collections grew the tree). Work per action, charging a collection-iterating face
+N units and a scalar face 1, at **N = 1000**:
+
+| action | A: no reactivity | B: leaf-granular, unkeyed | C: keyed | B/C | C is |
+|---|---|---|---|---|---|
+| **edit one comment's text** | 11015 | 6007 | **1** | **6007×** | **O(1)** |
+| add an issue (`+key`) | 11015 | 6007 | 1006 | 6.0× | O(N) |
+| dismiss a notification (`-key`) | 11015 | 3004 | 3000 | **1.0×** | O(N) |
+| change the sort column | 11015 | 2004 | 2004 | **1.0×** | O(N) |
+| session token refresh | 11015 | 5 | 5 | 1.0× | O(1) |
+| toggle a preference | 11015 | 5 | 5 | 1.0× | O(1) |
+
+### ⛔ Keying reaches O(1) for ONE of six actions
+
+`edit_comment_text` — the commonest editing action — goes **11015 → 1 unit**. That is the design
+working exactly as intended, and it is the single strongest number in this campaign.
+
+But three actions stay O(N) *with keying fully applied*, and the reason is the same each time:
+
+* **`add_new_issue` (6.0×, still O(N))** — the row faces key perfectly; `prism_con_stat_row` still
+  folds over every issue workspace-wide.
+* **`dismiss_notification` (1.0× — keying buys literally nothing)** — two causes at once.
+  `PrismNotice` (`nn_level`/`nn_text`/`nn_auto`/`nn_ttl`) has **no identity field**, so §10 cannot
+  key it in either direction; and three aggregates (`stat_row`, `notification_badge`,
+  `unread_notification_count`) fold regardless.
+* **`change_sort_column` (1.0×)** — a global predicate change. Every row's position may change, so
+  keying is inapplicable *by design*, not by omission. Correct and unavoidable.
+
+### The conclusion that changes priority
+
+**Aggregates — not collections — are now the dominant remaining cost.** §9.6 measured aggregates as
+82% group-class with zero holistic and concluded "build Tier 1 only." This simulation upgrades that
+from *justified* to **necessary**: without incremental aggregates, three of six realistic actions
+remain O(N) no matter how well collections are keyed.
+
+Revised ordering: **§4b keying → §3 structural changeset → §9 Tier-1 aggregates**, and the third is
+no longer optional.
+
+### One concrete, small fix
+
+**`PrismNotice` should carry an identity field.** A notification queue is among the most common UI
+elements in existence, and today it is unkeyable — which is why `dismiss_notification` is the worst
+row in the table. This is a one-field change to `prism/widget/prism_notice.nova`, not a design
+problem, and it converts that action from 1.0× to keyable. (Deferred here: it is a library edit
+needing its own KAT re-run, not a design change.)
+
+### Limits, as flagged by the tool itself
+
+* **Model B already assumes §3's structural changeset fix.** A genuinely pre-§3 system could not
+  observe a row insert at all — a *correctness* bug, not a cost one. So B is not "the worst possible
+  system"; B and C are compared on cost with both already correct.
+* The simulator's `build_models()` duplicates `m34_keyed_subfaces.main()`'s orchestration order
+  rather than importing it — a maintenance risk if that order changes.
+* `m34_keyed_subfaces.py`'s generic scanner only detects `fn(v) EXPR` closures, so plain `for`-loop
+  aggregates need a hand override. Verified load-bearing: **0 of those 3 faces** ever receive a
+  `PrismNotice`-owned field from any generic detector.
+* All six actions run with `in_scope=True`; the scoping fallback is documented but unexercised.

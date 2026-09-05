@@ -26,7 +26,7 @@ have a `_kat_<name>.nova` in `prism/kat/`.
 
 | Module | Purpose |
 |---|---|
-| `prism_app_console.nova` | ★ The **operations console** — a workspace → projects → issues → comments application. Built for milestone **M1.7**: its `PrismConState` is a genuinely nested **109-leaf, depth-6** state tree, which is what allowed Bet 1 to be measured at application scale rather than on flat library types. See `NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md` §SCALE |
+| `prism_app_console.nova` | ★ The **operations console** — a workspace → projects → issues → comments application. Built for milestone **M1.7**: its `PrismConState` is a genuinely nested **133-leaf, depth-6** state tree, which is what allowed Bet 1 to be measured at application scale rather than on flat library types. See `NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md` §SCALE |
 | `prism_app_dashboard.nova` | A dashboard app over a flat 16-leaf `PrismAppState` — the earlier, simpler demo |
 | `prism_app_docs.nova` | Generated component documentation |
 | `prism_forge.nova` | Forge integration — serving PRISM's HTML renderer from a NOVA server |
