@@ -1,0 +1,120 @@
+// KAT for prism/backend/ansi/prism_ansi.nova -- the ANSI/terminal backend (framework #5's
+// fourth real target: CLI/TUI, alongside DOM/GPU/print). Relocated 2026-08-15 from
+// nova-compiler/test_programs/prism.nova v0.1 (milestone MA.1); this is the LAST module in
+// PRISM with no dedicated KAT -- it was exercised only transitively by 13 downstream KATs.
+//
+// ANSI output is a pure STRING backend, which makes it exact-string testable (not just
+// shape-testable). The properties this KAT exists for:
+//   1. ★ EXACT ESCAPE SEQUENCES. An ANSI backend's entire job is emitting precise control
+//      bytes -- "contains an escape" is not good enough, the literal bytes must match.
+//   2. ★ RESET/BALANCE. Every SGR sequence that opens styling (bold/italic/underline) must
+//      close it, and nested wraps must close in LIFO order -- an unbalanced escape leaks
+//      formatting into everything printed after it, the characteristic ANSI bug.
+//   3. Non-ASCII text (CJK, accented) passes through intact everywhere -- no corruption, no
+//      truncation, no silent byte-slicing.
+//   4. ★ `prism_ansi_table`'s column widths are computed from `len()`, which is BYTE length,
+//      not `char_count()` (codepoint count) or display width. For CJK content this makes the
+//      computed padding differ from both the character count AND the true terminal display
+//      width (CJK renders double-width) -- columns will not visually align in a real
+//      terminal when mixed with ASCII. This is a real, previously-untested limitation of this
+//      module; it is NOT data corruption (no bytes are lost, nothing crashes) -- see the KAT
+//      report for the minimal repro. This KAT asserts the CURRENT byte-based behavior exactly.
+//   5. Every function in this module returns a plain `string` unconditionally -- there is no
+//      Result/error path anywhere in the public API, so there are no is_err/unwrap checks here.
+//   6. Boundary cases: empty string, zero/negative width or height, a value exactly at a
+//      clamp boundary vs. one past it, and negative integer indices/coordinates (which this
+//      module does NOT validate or clamp -- it passes them straight into str()).
+
+import prism_ansi
+
+let STATS = [0, 0]
+
+fn check(name: string, cond: bool) -> bool
+    if cond
+        STATS[0] = STATS[0] + 1
+        return true
+    print("  FAIL  {name}")
+    STATS[1] = STATS[1] + 1
+    return false
+
+fn main()
+    print("== _kat_prism_ansi ==")
+    let ESC = chr(27)
+    let BEL = chr(7)
+
+    print("1. ★ exact escape sequences")
+    check("★ clear = ESC[2J + ESC[H", prism_ansi.prism_ansi_clear() == ESC + "[2J" + ESC + "[H")
+    check("★ move(x,y) = ESC[y;xH -- row(y) before col(x)", prism_ansi.prism_ansi_move(5, 10) == ESC + "[10;5H")
+    check("move(0,0)", prism_ansi.prism_ansi_move(0, 0) == ESC + "[0;0H")
+    check("negative coordinates pass straight through, unclamped", prism_ansi.prism_ansi_move(-1, -2) == ESC + "[-2;-1H")
+    check("★ 24-bit fg color = ESC[38;2;r;g;bm", prism_ansi.prism_ansi_color_fg(10, 20, 30) == ESC + "[38;2;10;20;30m")
+    check("out-of-range RGB is not validated or clamped", prism_ansi.prism_ansi_color_fg(300, -5, 999) == ESC + "[38;2;300;-5;999m")
+    check("★ 24-bit bg color = ESC[48;2;r;g;bm", prism_ansi.prism_ansi_color_bg(0, 0, 0) == ESC + "[48;2;0;0;0m")
+    check("★ reset = ESC[0m", prism_ansi.prism_ansi_reset() == ESC + "[0m")
+
+    print("2. ★ reset/balance -- every opened SGR sequence must close, nesting must be LIFO")
+    check("★ bold opens [1m and closes [22m (not the blanket [0m reset)", prism_ansi.prism_ansi_bold("x") == ESC + "[1m" + "x" + ESC + "[22m")
+    check("★ italic opens [3m and closes [23m", prism_ansi.prism_ansi_italic("x") == ESC + "[3m" + "x" + ESC + "[23m")
+    check("★ underline opens [4m and closes [24m", prism_ansi.prism_ansi_underline("x") == ESC + "[4m" + "x" + ESC + "[24m")
+    check("★ triple nesting closes in REVERSE (LIFO) order: 4,3,1 opened -> 24,23,22 closed", prism_ansi.prism_ansi_bold(prism_ansi.prism_ansi_italic(prism_ansi.prism_ansi_underline("hi"))) == ESC + "[1m" + ESC + "[3m" + ESC + "[4m" + "hi" + ESC + "[24m" + ESC + "[23m" + ESC + "[22m")
+    check("★ an empty string still gets a matching open+close (no dropped reset)", prism_ansi.prism_ansi_bold("") == ESC + "[1m" + ESC + "[22m")
+
+    print("3. hyperlink (OSC 8)")
+    check("★ OSC 8 link = ESC]8;;URL BEL LABEL ESC]8;; BEL", prism_ansi.prism_ansi_link("https://nova-lang.dev", "Home") == ESC + "]8;;" + "https://nova-lang.dev" + BEL + "Home" + ESC + "]8;;" + BEL)
+    check("empty url and label still balance", prism_ansi.prism_ansi_link("", "") == ESC + "]8;;" + BEL + ESC + "]8;;" + BEL)
+    check("★ a non-ASCII label passes through intact", prism_ansi.prism_ansi_link("https://x", "日本語サイト") == ESC + "]8;;" + "https://x" + BEL + "日本語サイト" + ESC + "]8;;" + BEL)
+
+    print("4. box geometry + boundary")
+    check("box(5,3): top+one interior row+bottom", prism_ansi.prism_ansi_box(5, 3) == "+---+\n|   |\n+---+\n")
+    check("box(2,3): minimal 2-wide box, no interior padding", prism_ansi.prism_ansi_box(2, 3) == "++\n||\n++\n")
+    check("★ box(1,3): a sub-minimal width does not crash, collapses to the width=2 box (negative repeat-count is a no-op)", prism_ansi.prism_ansi_box(1, 3) == "++\n||\n++\n")
+    check("box(5,2): height=2 has NO interior row", prism_ansi.prism_ansi_box(5, 2) == "+---+\n+---+\n")
+    check("★ box(5,1): a degenerate height does not crash, collapses to the height=2 box", prism_ansi.prism_ansi_box(5, 1) == "+---+\n+---+\n")
+    check("★ box(5,0): a zero/negative-going height also collapses safely, never fewer than 2 lines", prism_ansi.prism_ansi_box(5, 0) == "+---+\n+---+\n")
+
+    print("5. hline/vline boundary + non-ASCII")
+    check("hline(5,\"*\")", prism_ansi.prism_ansi_hline(5, "*") == "*****")
+    check("hline width=0 is empty", prism_ansi.prism_ansi_hline(0, "*") == "")
+    check("★ hline negative width does not crash, yields empty", prism_ansi.prism_ansi_hline(-3, "*") == "")
+    check("hline repeats the WHOLE ch string as a unit, not just its first character", prism_ansi.prism_ansi_hline(3, "ab") == "ababab")
+    check("★ hline with a CJK ch passes through intact (whole codepoint repeated)", prism_ansi.prism_ansi_hline(3, "日") == "日日日")
+    check("vline(3,\"|\")", prism_ansi.prism_ansi_vline(3, "|") == "|\n|\n|\n")
+    check("vline height=0 is empty", prism_ansi.prism_ansi_vline(0, "|") == "")
+    check("★ vline negative height does not crash, yields empty", prism_ansi.prism_ansi_vline(-2, "|") == "")
+    check("★ vline with a CJK ch passes through intact, one full character per line", prism_ansi.prism_ansi_vline(2, "田") == "田\n田\n")
+
+    print("6. ★ progress bar boundaries -- a declared pct is not clamped, only the bar fill is")
+    check("50% of width 10", prism_ansi.prism_ansi_progress_bar(50, 10) == "[#####-----] 50%")
+    check("0% is an empty bar", prism_ansi.prism_ansi_progress_bar(0, 10) == "[----------] 0%")
+    check("100% exactly fills the bar (boundary)", prism_ansi.prism_ansi_progress_bar(100, 10) == "[##########] 100%")
+    check("★ 110% (one unit past the boundary): the BAR clamps full, but the LABEL still reads 110%", prism_ansi.prism_ansi_progress_bar(110, 10) == "[##########] 110%")
+    check("150% clamps the same way, further past the boundary", prism_ansi.prism_ansi_progress_bar(150, 10) == "[##########] 150%")
+    check("★ a negative pct clamps the bar to zero fill but the label still reads negative", prism_ansi.prism_ansi_progress_bar(-20, 10) == "[----------] -20%")
+    check("width=0 boundary: an empty bracket, not a crash", prism_ansi.prism_ansi_progress_bar(50, 0) == "[] 50%")
+    check("★ a negative width behaves like width=0, not a crash", prism_ansi.prism_ansi_progress_bar(50, -5) == "[] 50%")
+
+    print("7. spinner wraparound (frames . |, /, -, \\)")
+    check("spinner(0)", prism_ansi.prism_ansi_spinner(0) == "|")
+    check("spinner(1)", prism_ansi.prism_ansi_spinner(1) == "/")
+    check("spinner(2)", prism_ansi.prism_ansi_spinner(2) == "-")
+    check("spinner(3)", prism_ansi.prism_ansi_spinner(3) == "\\")
+    check("spinner(4) wraps back to frame 0", prism_ansi.prism_ansi_spinner(4) == "|")
+    check("spinner(8) wraps twice", prism_ansi.prism_ansi_spinner(8) == "|")
+    check("★ spinner(-1): a negative index does not crash -- wraps to the LAST frame", prism_ansi.prism_ansi_spinner(-1) == "\\")
+    check("★ spinner(-4) wraps to the FIRST frame", prism_ansi.prism_ansi_spinner(-4) == "|")
+    check("★ spinner(-5) wraps to the LAST frame again", prism_ansi.prism_ansi_spinner(-5) == "\\")
+
+    print("8. ★ table alignment + boundary + the CJK width caveat")
+    check("2 headers, 1 row, widths grow to fit the wider cell", prism_ansi.prism_ansi_table(["A", "B"], [["1", "22"]]) == "A  B   \n-  --  \n1  22  \n")
+    check("an empty rows list still renders the header + separator", prism_ansi.prism_ansi_table(["A", "B"], []) == "A  B  \n-  -  \n")
+    check("★ an empty headers list (0 columns) with one row emits 3 blank lines, not an error", prism_ansi.prism_ansi_table([], [["x"]]) == "\n\n\n")
+    check("★ a row SHORTER than the header count silently drops its missing trailing column (no blank placeholder cell)", prism_ansi.prism_ansi_table(["A", "B"], [["x"]]) == "A  B  \n-  -  \nx  \n")
+    check("★ len() is BYTE length, not char_count() -- the root cause of the CJK column-width caveat below", len("田中") == 6 and char_count("田中") == 2)
+    check("★ CJK header+cell: the string is exact and well-defined, but column width used len()'s byte count (6) not char_count() (2) or true terminal display width (4) -- it will NOT visually align next to ASCII columns in a real terminal", prism_ansi.prism_ansi_table(["N", "名前"], [["1", "田中"]]) == "N  名前  \n-  ------  \n1  田中  \n")
+
+    print("")
+    if STATS[1] == 0
+        print("_kat_prism_ansi: ALL PASS ({STATS[0]} passed)")
+    else
+        print("_kat_prism_ansi: {STATS[1]} FAILURE(S), {STATS[0]} passed")
+        exit(1)
