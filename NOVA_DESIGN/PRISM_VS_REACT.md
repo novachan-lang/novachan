@@ -22,6 +22,31 @@ These are not aspirations. Every row is built, KAT-gated, and verified in this r
 | **Ambiguity** | first match wins, silently | **rejected**: two same-shape routes, two identically-labelled buttons | Would break existing apps |
 | **Component sprawl** | unbounded | **closed 22-primitive vocabulary** (A7); 67 `ui/` components are compositions, not new primitives | Cannot close an open vocabulary retroactively |
 
+### ★ Added 2026-09-05 — the reactivity axis, now DESIGNED rather than aspirational
+
+These rows are **design, not built** — stated separately from the table above precisely because
+everything above this line is KAT-gated and this is not. They rest on measurements in
+`M1_7_FALSIFIER_RESULT.md` and `PRISM_M3_4_REACTIVITY_DESIGN.md` §10.
+
+| Property | React | PRISM (designed) | Why React cannot simply fix it |
+|---|---|---|---|
+| **Dependency tracking cost** | none — re-renders and diffs instead | **compile-time**; runtime cost is a bitmask AND | JS cannot yield a static read-set (dynamic property access, mutable closure scope, `eval`) |
+| **Who supplies a list's `key`** | **the developer, on every list** | **inferred** — from the lookup the program already performs | React has no whole-program view to infer it from |
+| **A wrong `key`** | silently corrupts row state | Rule 1 derives it from the program's own lookup, so key and lookup **cannot disagree** | The key is written separately from the lookup; nothing ties them |
+| **Index as key** | always permitted; corrupts on insert/reorder | permitted **only** where no structural change is provable | Requires proving what reducers do — not available in JS |
+| **An UNSTABLE key** (a mutated id) | undetected | **rejected at compile time** — a key field in any reducer's write-set is disqualified | Same |
+| **No key available** | renders anyway, subtly wrong | refuses to key, invalidates the whole collection, and **names the cost** | React cannot refuse without breaking apps |
+
+**The precise claim** — and it is narrower than "PRISM beats React at reactivity": PRISM is not
+better than a *careful* React developer who keys every list correctly. It is that PRISM keys
+correctly **without requiring one**, and fails **loudly** exactly where React fails **silently**.
+
+⛔ **And one place PRISM would lose outright without §4(b):** un-keyed, a single-row edit costs
+**O(rows)** — React at least diffs its output. That is why keyed sub-faces are REQUIRED rather than
+an optimisation, and it is the sharpest thing the measurement produced.
+
+---
+
 **The pattern:** React expresses these as *conventions, lint rules and best practices*. PRISM
 expresses them as *types and constructors*. A lint rule is advisory; a constructor that refuses to
 build the bad state is not. That difference is not something React can retrofit, because its
