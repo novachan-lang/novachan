@@ -840,3 +840,43 @@ program actually uses, and, now, *nothing else*. "Behaviour beats naming" is wit
 
 **Unchanged:** the simulator's six action rows are byte-identical (`attempted 6, completed 6`), since
 it asks only the boolean "is any key derivable" and Rule 3 independently supplies `nn_id`.
+
+### 12.1 ⛔ The simulator UNDERSTATES keying for sort and filter — a unit-model limitation
+
+`m34_invalidation_sim.py` marks `change_sort_column` as `global_predicate=True` and charges a full
+rescan under both models, giving **1.0× — keying appears to buy nothing.** That is an artifact of
+the cost model, not a property of the design.
+
+**Sorting changes the ORDER of rows, not their CONTENT.** Under §4(b) keying:
+
+* each row face's read-set is *that row's own fields*;
+* `consrt_field` lives in the viewer slice and appears in **no row's read-set**;
+* therefore **no row face is invalidated** — the rows are unchanged, only their sequence differs.
+
+A keyed reconciler handles that by **moving** already-rendered rows, which is exactly what React's
+`key` buys. Unkeyed, every row must be re-rendered because nothing identifies which output
+corresponds to which element.
+
+**The same holds for a FILTER change**: rows that remain are untouched; only rows *entering* the
+view need rendering, and rows leaving need removing.
+
+**Where the model goes wrong:** it charges "a collection-iterating face = N units" without
+distinguishing two very different costs —
+
+| cost | sort/filter under keying | relative expense |
+|---|---|---|
+| recompute the **ordering** | O(N log N) comparisons on extracted keys | cheap |
+| re-**render** each row (build its node subtree) | **0 rows** | expensive |
+
+The table face genuinely does re-run to recompute the ordering — that part is real. But it re-runs
+a *comparison*, not N *renders*, and rendering is the dominant term. The simulator collapses both
+into one unit.
+
+**Consequence: keying is MORE valuable than §12's table shows**, on two of the most common
+interactions in any real UI. The honest reading of that 1.0× row is *"the simulator cannot see the
+difference here"*, not *"there is no difference"*.
+
+**Not fixed here deliberately.** Correcting it means splitting the unit model into compare-cost vs
+render-cost and re-deriving every row of §12, which is a larger change than the finding warrants
+today — and a wrong fix would silently move numbers the design now depends on. Recorded so the 1.0×
+is not quoted as evidence against keying.
