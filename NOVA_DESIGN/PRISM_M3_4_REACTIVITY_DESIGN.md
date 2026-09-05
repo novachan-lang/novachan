@@ -880,3 +880,55 @@ difference here"*, not *"there is no difference"*.
 render-cost and re-deriving every row of §12, which is a larger change than the finding warrants
 today — and a wrong fix would silently move numbers the design now depends on. Recorded so the 1.0×
 is not quoted as evidence against keying.
+
+---
+
+## 14. ⛔ IMPLEMENTATION PREREQUISITE FOUND (2026-09-05, on receiving GO)
+
+Before writing any compiler code, one check: **the compiler has ZERO occurrences of `face`.** It has
+no notion of one. Every §3–§13 mechanism assumes the pass can identify *which functions are faces*,
+and nothing in the compiler can.
+
+### The shortcut that must be refused
+
+The obvious fix — "a face is any fn returning `PrismNode`" — would **hardcode PRISM into a
+general-purpose compiler.** NOVA is a language, not a UI framework; `nova_compiler.nova` must not
+know what a `PrismNode` is. That coupling would be far harder to remove later than to avoid now.
+
+### The correct decomposition
+
+**The read-set analysis is a GENERAL capability. PRISM is a consumer of it, not its owner.**
+
+> For a function `F` and a parameter `p` of struct type `T`, compute the set of leaf paths of `T`
+> that `F` reads — transitively through callees, sliced through field-wise reconstructors.
+
+Stated that way it mentions no UI concept at all, and it is independently useful (dead-field
+elimination, effect analysis, incremental recomputation generally).
+
+### Where it lands in the compiler
+
+Field reads are **already visible in the IR**: `x.price` lowers to a `field_get` instruction
+(`nova_compiler.nova:11501`), and struct reflection (`__field_get`) is already generated. So the
+pass is: walk each function's instruction list, trace `field_get` chains back to a parameter, record
+the leaf path, then take the fixed point over the call graph (the algorithm `tools/m17_readset.py`
+already prototypes and `m17_slicing.py` extends).
+
+### Revised order under GO
+
+| # | step | tier | depends on |
+|---|---|---|---|
+| 1 | **general read-set pass over IR** — no PRISM knowledge | RED, full arc | nothing |
+| 2 | expose it (attribute or query) so a consumer can ask "what does `F` read of `p`?" | RED | 1 |
+| 3 | **a way to mark a face** — M3.1's `face` declaration, or an attribute | YELLOW | — |
+| 4 | face-purity enforcement (reject a face reading module state) | YELLOW | 3 |
+| 5 | changeset + keyed invalidation (§3/§4b) | RED | 1, 3 |
+| 6 | Tier-1 aggregates (§9) | RED | 5 |
+
+**Step 4 was previously listed as the smallest first increment. It is not available first** — it
+cannot be written until step 3 exists, because "a face reading module state" is unstatable while the
+compiler cannot identify a face. Step 1 is the true starting point, and it is the largest single
+piece.
+
+**Consequence for the M0.3-vs-M3.4 ordering:** unchanged. M3.4 step 1 still needs no browser and is
+still provable on the ANSI/HTML backends. But its first increment is bigger than the §8 sequence
+implied, which is worth knowing before committing weeks to it.
