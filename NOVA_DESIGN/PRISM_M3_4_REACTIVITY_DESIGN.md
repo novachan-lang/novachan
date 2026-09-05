@@ -741,3 +741,53 @@ needing its own KAT re-run, not a design change.)
   aggregates need a hand override. Verified load-bearing: **0 of those 3 faces** ever receive a
   `PrismNotice`-owned field from any generic detector.
 * All six actions run with `in_scope=True`; the scoping fallback is documented but unexercised.
+
+### ⛔ 10.12 §10.4's "Rule 1 wins" is UNSAFE AS WRITTEN — a real false positive found it
+
+§10.10 concluded that Rule 1 and Rule 3 "never disagree across 24 collections, so §10.4's
+Rule-1-wins ordering remains low-stakes." **A disagreement has now appeared, and it is the
+catastrophic kind:**
+
+| collection | Rule 1 says the key is | Rule 3 says |
+|---|---|---|
+| `PrismNoticeQueue.nq_items` | **`nn_auto`** — a 0/1 flag | `nn_id` |
+
+**Following §10.4 as written would key a notification queue by a two-valued flag**, collapsing every
+auto-dismissing notice into one key. Not a subtle imprecision — total collapse of row identity.
+
+**Why the detector was fooled.** Rule 1 looks for an equality comparison on an element field. In
+`prism_notice.nova` those are `if it.nn_auto == 0` (line 140) and `it.nn_auto == 1` (113, 160) — the
+overflow-eviction logic "find the oldest AUTO-DISMISSING entry". Those are **filter predicates**, not
+identity lookups, and a bare "is there an `==` on this field" test cannot tell them apart.
+
+### The discriminator, and it is precise
+
+An **identity lookup** compares a field against a **variable or parameter** — `x.id == target`, where
+the right-hand side is the thing being searched for. A **filter predicate** compares against a
+**literal constant** — `x.nn_auto == 0`. So:
+
+> **Rule 1 admits a candidate only when the comparison's other operand is a variable, never a
+> literal.** A field compared solely against constants is a *classifier*, not an identity.
+
+Additional guards worth having, since one false positive nearly keyed a UI by a boolean:
+* **reject a field whose domain is provably tiny** — an `int` flag documented `0/1`, or an enum with
+  a handful of variants, cannot be an identity however it is compared;
+* **require the field be read but never written by any reducer** (§10.3 already demands stability);
+* where Rule 1 and Rule 3 disagree, **prefer neither silently** — diagnose, because a disagreement
+  now means one of the two detectors is wrong, which is exactly what happened here.
+
+### Two of my own conclusions are revised
+
+1. **§10.4's "behaviour beats naming" is withdrawn as an unconditional rule.** It is sound only for
+   comparisons against a variable. Unguarded, naming (Rule 3) was the *safer* signal — the opposite
+   of what §10.2 claimed.
+2. **Rule 1's measured coverage is INFLATED.** The 30% → 47.6% → 54.2% progression in §10.7/§10.10
+   counted filter predicates as lookups. The true Rule 1 coverage is lower by an unmeasured amount,
+   and the "Rule 1 rose as visibility rose" trend is partly an artifact of that. **Re-measure with
+   the literal/variable discriminator before relying on any Rule 1 figure.**
+
+**The lesson, which is the campaign's recurring one at a new level:** every earlier error was a
+measurement artifact that made a number wrong. This one would have made the *shipped framework*
+wrong — a UI keyed by a boolean. It was caught only because an agent questioned a tool it was told
+to reuse rather than trust, and because a `nn_id` field added an hour earlier finally created the
+first disagreement for the policy to be tested against.

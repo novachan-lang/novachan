@@ -30,6 +30,11 @@ METHOD (four steps, matching the milestone brief)
                               classify_leaves (which leaves sit under which collection),
                               scan_row_closures/propagate_row_closures/find_finders/resolve_face
                               (the keyed-sub-face AFTER model -- per-face narrowed dependencies).
+       `m34_key_inference.py` -- corpus_text/collection_fields/keyability_by_elem_type (the Rule 1
+                              behavioural-lookup / Rule 3 nominal-identity analysis that decides,
+                              per action's `elem_type`, whether ANY key is derivable at all -- see
+                              `derive_unkeyable` below). Keyability is DERIVED from this every run;
+                              it is never a hardcoded per-action fact in this file.
      This tool's OWN code is the six action definitions and the cost/invalidation arithmetic over
      those reused facts -- it does not re-derive read-sets, finders, or keyability from scratch.
 
@@ -83,23 +88,41 @@ call arguments.  `prism_notice.prism_nt_pending_ack` -- the function `prism_con_
 count` delegates to -- folds over `nq_items` with a PLAIN `for it in q.nq_items: if it.nn_auto==0:
 ...` loop, which this pattern does not match.  Consequence: the reused AFTER-model would (wrongly,
 if trusted blindly) report `prism_con_unread_notification_count`/`prism_con_notification_badge` as
-having NO real dependency on notification content after keying -- i.e. it would show keying making
-the notification-dismiss action cost ZERO for these two faces, which is false: `PrismNotice` has NO
-identity field (verified against the corpus: `nn_level`/`nn_text`/`nn_auto`/`nn_ttl`, none of the
-`id`/`key`/`name`/`slug`/`code`/`label`/`title` tokens) and its eviction (`prism_nt_post`) can evict
-ANY auto-dismissing slot, not just the ends -- so index-keying is UNSOUND (the classic React
-index-key trap) and Rule 3/4 both fail; there is NO valid key, so keying cannot help this collection
-AT ALL, in EITHER direction.  This tool overrides the generic mechanism for exactly THREE faces --
-`prism_con_unread_notification_count` and `prism_con_notification_badge` (which call it), PLUS
-`prism_con_stat_row` (which also directly reports an "Unread" stat off the same function, verified
-at `prism_app_console.nova`'s `prism_con_stat_row` line `s4 = ... prism_con_unread_notification_
-count(state) ...`) -- on exactly the `dismiss_notification` action (see
-`_NOTIFICATION_AGGREGATE_OVERRIDE`), verified by reading `prism_notice.nova` directly rather than
-trusted from the generic read-set intersection.  This is the ONLY hand override in this tool;
-everything else is the generic mechanical test.  The run's own "DETECTION PATHS" section prints,
-for each of these three, whether ANY generic detector (inline closure / propagation / named-mapper /
-finder-slicing) ever attributes a `PrismNotice`-owned field to it -- confirming the gap is real
-(0/3) rather than asserting it from prose alone.
+having NO real dependency on notification content after keying -- i.e. it would show these two faces
+as NOT INVALIDATED AT ALL by a notification change, which is false REGARDLESS of keyability: this is
+a DETECTION gap (the read is real but syntactically invisible to `scan_row_closures`), not a
+keyability question, and the two must not be conflated (an earlier version of this file did, by
+tying the override to a hardcoded `unkeyable=True` flag -- see below). This tool overrides the
+generic mechanism for exactly THREE faces -- `prism_con_unread_notification_count` and
+`prism_con_notification_badge` (which call it), PLUS `prism_con_stat_row` (which also directly
+reports an "Unread" stat off the same function, verified at `prism_app_console.nova`'s
+`prism_con_stat_row` line `s4 = ... prism_con_unread_notification_count(state) ...`) -- on any
+action touching `PrismNotice` (see `_NOTIFICATION_AGGREGATE_OVERRIDE`), verified by reading
+`prism_notice.nova` directly rather than trusted from the generic read-set intersection.  This
+override forces INVALIDATION only; it never forces the cost REDUCTION keying would give a
+row-render face, because these three are `agg`-classified (see COST_TYPE) and are excluded from
+`element_reads`/`row_hits` by construction (`build_models`'s `prism_con_stat_row` special case) --
+SS4b keyed sub-faces (all Model C implements) narrows a ROW-render face's dependency to the ONE
+changed element; it does not implement incremental aggregation (SS9's group-class IVM), so an
+aggregate that folds over all N elements pays N when invalidated REGARDLESS of whether its
+collection is keyable.  This is the ONLY hand override left in this tool; everything else is the
+generic mechanical test, INCLUDING KEYABILITY ITSELF -- which used to be hand-asserted here as
+"PrismNotice has no identity field, so keying cannot help this collection AT ALL, in EITHER
+direction" and is now DERIVED, per action, from `m34_key_inference.py`'s live Rule 1 (behavioural
+lookup) / Rule 3 (nominal identity) analysis, imported not reimplemented (see `derive_unkeyable` /
+`_assert_manual_exceptions_still_hold` below).  THAT premise was STALE: `prism_notice.nova` now
+declares `nn_id` (a caller-supplied stable identity, see its own header) -- added precisely because
+this analysis identified the missing identity field as the reason keying bought nothing here --
+and `m34_key_inference.py` confirms it live: `PrismNoticeQueue.nq_items (PrismNotice)` now falls in
+its "both rules fire" bucket (11 -> 12).  POSITIONAL keying is STILL UNSOUND for this collection --
+`prism_nt_dismiss` deletes by index and eviction (`prism_nt_post`) can evict ANY auto-dismissing
+slot, not just the ends, so an index is never a stable identity (the classic React index-key trap)
+-- but ID-BASED keying (via `nn_id`) is now sound, which is a DIFFERENT claim from "no valid key
+exists at all", and this file no longer conflates them.  The run's own "DETECTION PATHS" section
+prints, for each of the three override faces, whether ANY generic detector (inline closure /
+propagation / named-mapper / finder-slicing) ever attributes a `PrismNotice`-owned field to it --
+confirming the DETECTION gap is real (0/3), independent of the keyability question, which each
+action now reports separately under "keyability (derived...)".
 
 LIMITS -- read before trusting a number in this file's output.
   * Static and syntactic throughout, same limits as `m17_readset.py`/`m34_keyed_subfaces.py`: a read
@@ -148,6 +171,9 @@ m34ks = _load('m34_keyed_subfaces')          # reused for base_faces/classify_le
                                               # closures/propagate_row_closures/find_finders/
                                               # resolve_face/collection_chain/strip_generic/
                                               # field_type/is_identity_field -- NOT reimplemented.
+m34ki = _load('m34_key_inference')           # reused for corpus_text/collection_fields/
+                                              # keyability_by_elem_type (Rule 1 / Rule 3 keyability
+                                              # analysis) -- NOT reimplemented.
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else 'prism'
 TARGET_TYPE = 'PrismConState'
@@ -171,6 +197,12 @@ def build_models(root):
 
     faces, callees, marginal = m34ks.base_faces(types, F, direct, trans, R)
     under = m34ks.classify_leaves(types, R)
+
+    # LIVE keyability (Rule 1 behavioural lookup / Rule 3 nominal identity), reused by import from
+    # m34_key_inference.py -- NOT hardcoded per action. See `derive_unkeyable` below for how each
+    # action's elem_type is looked up in this map.
+    alltext = "\n".join(t for _, t in m34ki.corpus_text(root))
+    keyability = m34ki.keyability_by_elem_type(types, alltext)
 
     field_owner = defaultdict(set)
     for t, flds in types.items():
@@ -270,7 +302,8 @@ def build_models(root):
                 memo=memo, rc_trans=rc_trans, detect_inline_direct=detect_inline_direct,
                 detect_inline_propagated=detect_inline_propagated,
                 detect_named_mapper=detect_named_mapper,
-                detect_finder_narrowed=detect_finder_narrowed)
+                detect_finder_narrowed=detect_finder_narrowed,
+                keyability=keyability)
 
 
 def leaves_under_field(types, R, target_field):
@@ -363,10 +396,15 @@ ACTIONS = [
     dict(name='dismiss_notification',
          desc="Dismiss (acknowledge) one notification -- the corpus's ACTUAL mechanism "
               "(`prism_nt_dismiss`, a structural delete by index; there is no per-notice 'read' "
-              "flag). PrismNotice has no identity field and eviction can remove any index, so "
-              "positional keying is UNSOUND here -- a genuinely unkeyable collection.",
+              "flag). POSITIONAL keying is UNSOUND here regardless of anything else (the index is "
+              "not a stable identity -- eviction, `prism_nt_post`, can remove any auto-dismissing "
+              "slot, the classic index-key trap) -- but `PrismNotice` now declares `nn_id` (a "
+              "caller-supplied stable identity; see prism_notice.nova's header), so ID-based "
+              "keying is a separate question and may now be sound. Whether it actually is, and "
+              "whether that helps THIS action, is DERIVED below (not asserted) from the live "
+              "Rule 1/Rule 3 analysis in m34_key_inference.py -- see 'keyability (derived)'.",
          kind='struct', op='delete', elem_type='PrismNotice', collection_field='nq_items',
-         in_scope=True, unkeyable=True),
+         in_scope=True),
     dict(name='change_sort_column',
          desc="Change the issue table's sort field (a viewer-slice SETTING, not an element's "
               "data) -- a global predicate change; SS9.4 says this is a full rescan regardless of "
@@ -390,10 +428,62 @@ ACTIONS = [
 
 # The one hand-verified correction (see module docstring): PrismNotice's aggregate faces are not
 # caught by scan_row_closures (a plain `for` loop inside a library helper, not an `fn(v)` closure),
-# so the generic AAFTER model would under-report them as having no real dependency left. Verified by
-# reading prism_notice.nova directly. Applied ONLY to dismiss_notification.
+# so the generic AFTER model would under-report them as having no real dependency left. Verified by
+# reading prism_notice.nova directly. Applied to any action touching PrismNotice. NOTE: this is a
+# DETECTION-gap override (these faces ARE invalidated; the generic model just can't see the read),
+# not a keyability override -- it forces invalidation (inv_b/inv_c) unconditionally, but it does NOT
+# force row_hits.pop() because keyability demands it; it does so because these three are
+# `agg`-classified and agg faces are excluded from `element_reads`/`row_hits` by construction
+# already (see build_models' `prism_con_stat_row` special case) -- the pop() below is a defensive
+# no-op stating that invariant explicitly, not a second keyability judgment.
 _NOTIFICATION_AGGREGATE_OVERRIDE = {
     'prism_con_unread_notification_count', 'prism_con_notification_badge', 'prism_con_stat_row'}
+
+
+# Manual exceptions to the LIVE keyability derivation (see `derive_unkeyable`), for a collection
+# whose element type this tool asserts is unkeyable EVEN IF m34_key_inference.py's Rule 1/Rule 3
+# scan finds a candidate field -- because that candidate is a false positive (e.g. an `==`
+# comparison against a shared boolean/status flag used as a FILTER predicate, not a genuine
+# per-element lookup key), so "some rule fired" does not actually mean "a stable identity exists".
+# Empty today: PrismNotice's own known false positive (Rule 1 fires on `nn_auto`, a boolean flag
+# compared in `prism_nt_pending_ack`'s `if it.nn_auto==0` filter -- see m34_key_inference.py's
+# DISAGREEMENTS section) does NOT need an entry here, because this tool only asks the boolean
+# question "is ANY key derivable for this elem_type", never "which specific field is THE key" --
+# and Rule 3 independently and correctly finds `nn_id`, so the bottom-line `keyable` bool is right
+# regardless of the Rule-1 false positive. An entry would only be needed for an elem_type where
+# EVERY rule that fires is a false positive (keyable=True with no real identity behind it at all).
+#
+# Each entry MUST be asserted against the live analysis by `_assert_manual_exceptions_still_hold`,
+# called once in `main()` before any action is simulated: a stale entry (one the live tool no
+# longer agrees is unkeyable) raises loudly instead of silently reproducing exactly the bug this
+# fix addresses -- an "unkeyable" premise that quietly outlived the fact it was describing.
+_MANUAL_UNKEYABLE_EXCEPTIONS = {
+    # 'ElemType': "why this elem type is unkeyable despite whatever the live tool currently reports",
+}
+
+
+def _assert_manual_exceptions_still_hold(keyability):
+    for et, reason in _MANUAL_UNKEYABLE_EXCEPTIONS.items():
+        info = keyability.get(et, {'lookup': set(), 'nominal': set(), 'keyable': False})
+        assert not info['keyable'], (
+            "STALE MANUAL EXCEPTION: '{}' is hardcoded unkeyable here ({!r}) but the LIVE "
+            "m34_key_inference analysis now reports it keyable (lookup={}, nominal={}) -- the "
+            "premise this exception documents no longer holds; remove it, do not trust it."
+        ).format(et, reason, sorted(info['lookup']), sorted(info['nominal']))
+
+
+def derive_unkeyable(elem_type, keyability):
+    """Whether keying can help a face touching this element type AT ALL -- derived, per run, from
+    the LIVE Rule 1 (behavioural lookup) / Rule 3 (nominal identity) analysis in
+    m34_key_inference.py, not a hardcoded per-action fact. `elem_type=None` (a non-collection /
+    global-predicate action) is never 'unkeyable' in this sense -- those actions are excluded from
+    keying by their own `not_a_collection`/`global_predicate` flags instead (see module LIMITS)."""
+    if elem_type is None:
+        return False
+    if elem_type in _MANUAL_UNKEYABLE_EXCEPTIONS:
+        return True
+    info = keyability.get(elem_type)
+    return not (info and info['keyable'])
 
 
 # =================================================================================================
@@ -411,6 +501,7 @@ def invalidated_struct_crude(types, R, model_reads, target_field):
 def simulate(models, action):
     types, R = models['types'], models['R']
     faces, total_after, element_reads = models['faces'], models['total_after'], models['element_reads']
+    unkeyable = derive_unkeyable(action.get('elem_type'), models['keyability'])
 
     if action['kind'] == 'value':
         changed_paths = {leaf_for_field(R, f) for f in action['fields']}
@@ -445,16 +536,21 @@ def simulate(models, action):
             continue
         inv_b.add(fn)          # crude model ALSO fires here (over-approximation includes this face)
         inv_c.add(fn)
-        if action.get('unkeyable'):
+        if unkeyable:
             continue            # no reduction possible -- stays at full N (handled by cost table)
         row_hits[fn] = 1
 
-    # the one hand-verified correction (module docstring + ACTIONS comment)
-    if action.get('unkeyable') and action['elem_type'] == 'PrismNotice':
+    # the one hand-verified correction (module docstring + ACTIONS comment): a DETECTION-gap fix,
+    # NOT a keyability judgment -- fires on any action touching PrismNotice regardless of the
+    # `unkeyable` verdict above, because the dependency these 3 faces have on notification content
+    # is real either way; whether keying could reduce their COST is a separate question, answered
+    # by the pop() below purely as a defensive statement of the agg/row_hits invariant (see comment
+    # at _NOTIFICATION_AGGREGATE_OVERRIDE's definition), not by consulting `unkeyable`.
+    if action.get('elem_type') == 'PrismNotice':
         for fn in _NOTIFICATION_AGGREGATE_OVERRIDE:
             inv_b.add(fn)
             inv_c.add(fn)
-            row_hits.pop(fn, None)   # explicitly NOT reduced -- unkeyable collection
+            row_hits.pop(fn, None)   # agg faces are never row-reduced -- see comment above
 
     # global-predicate actions (sort column): keying cannot help a row-render face whose OWN
     # invalidation trigger is the predicate/order itself, not one element's data -- force full N.
@@ -462,7 +558,7 @@ def simulate(models, action):
         for fn in list(row_hits):
             row_hits.pop(fn)
 
-    return inv_b, inv_c, row_hits
+    return inv_b, inv_c, row_hits, unkeyable
 
 
 def cost(faces_inv, n, row_hits=None):
@@ -484,6 +580,8 @@ def main():
     models = build_models(ROOT)
     faces = models['faces']
     n_faces = len(faces)
+
+    _assert_manual_exceptions_still_hold(models['keyability'])
 
     hr()
     print("POPULATION")
@@ -573,7 +671,24 @@ def main():
         print("ACTION: {}".format(action['name']))
         print("  {}".format(action['desc']))
         hr('-')
-        inv_b, inv_c, row_hits = simulate(models, action)
+        inv_b, inv_c, row_hits, unkeyable = simulate(models, action)
+        et = action.get('elem_type')
+        if et is None:
+            print("  keyability (derived, m34_key_inference.py): n/a -- action has no single "
+                  "collection element type (scalar/global-predicate/non-collection action)")
+        else:
+            info = models['keyability'].get(et, {'lookup': set(), 'nominal': set(), 'keyable': False})
+            forced = " [MANUAL EXCEPTION, asserted against live analysis]" if et in _MANUAL_UNKEYABLE_EXCEPTIONS else ""
+            rules = []
+            if info['lookup']:
+                rules.append("Rule1 lookup={}".format(sorted(info['lookup'])))
+            if info['nominal']:
+                rules.append("Rule3 nominal={}".format(sorted(info['nominal'])))
+            if not rules:
+                rules.append("no rule fires")
+            print("  keyability (derived, m34_key_inference.py, LIVE not hardcoded): elem_type={} "
+                  "-> {}{}  ({})".format(et, "UNKEYABLE" if unkeyable else "KEYABLE", forced,
+                                         "; ".join(rules)))
         print("  invalidated under B (crude, unkeyed): {}/{}  -- {}".format(
             len(inv_b), n_faces, ", ".join(sorted(inv_b)) or "(none)"))
         print("  invalidated under C (keyed sub-faces): {}/{}  -- {}".format(

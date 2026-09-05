@@ -51,28 +51,61 @@ def corpus_text(root='prism'):
     return out
 
 
-def main():
-    types = m17.load_types('prism')
-    files = corpus_text()
-    alltext = "\n".join(t for _, t in files)
-
-    # collection fields whose element type is a known struct
+def collection_fields(types):
+    """(owner_type, field, element_type) for every collection field across `types` whose element
+    is itself a known struct type. Pulled out of main() so other tools (m34_invalidation_sim.py)
+    can IMPORT this population instead of reimplementing it."""
     colls = []
     for t, fs in types.items():
         for f, ft in fs:
             inner = re.sub(r'^.*<|>.*$', '', ft)
             if (ft.startswith('list') or ft.startswith('dict')) and inner in types:
                 colls.append((t, f, inner))
+    return colls
 
-    # Rule 1: an equality comparison on a field of the element type, inside a loop or closure.
-    # Collect per element-type the set of fields compared with ==.
+
+def keyability_by_elem_type(types, alltext):
+    """For every element type used as SOME collection's element anywhere in `types`: does Rule 1
+    (behavioural -- an `==` comparison against one of its fields appears anywhere in `alltext`,
+    inside a loop or closure) and/or Rule 3 (nominal -- a field name matching NOMINAL) fire?
+
+    Returns {elem_type: {'lookup': set_of_fields, 'nominal': set_of_fields, 'keyable': bool}}.
+    `keyable` is True iff EITHER rule fires, i.e. SOME stable per-element identity is derivable by
+    either mechanism this tool checks. (Rule 2/positional and Rule 4/explicit-annotation, from
+    PRISM_M3_4_REACTIVITY_DESIGN.md SS10, are not modeled by either rule here -- a caller reasoning
+    about POSITIONAL keying specifically must not read `keyable=True` as "position is safe too".)
+
+    This is the ONE place this fact is computed -- callers (this file's own main(), and
+    m34_invalidation_sim.py's per-action keyability report) both read it from here rather than
+    re-deriving it, so a change to the corpus (a new identity field, a new lookup) is picked up by
+    every caller automatically, on the next run, with no separate fact to update by hand.
+    """
+    colls = collection_fields(types)
+    elem_types = {c[2] for c in colls}
     cmp_fields = defaultdict(set)
-    for et in {c[2] for c in colls}:
+    for et in elem_types:
         for fld, _ in types[et]:
             # x.fld == ...   or   ... == x.fld
             if re.search(r'\.' + re.escape(fld) + r'\s*==', alltext) or \
                re.search(r'==\s*\w+\.' + re.escape(fld) + r'\b', alltext):
                 cmp_fields[et].add(fld)
+    out = {}
+    for et in elem_types:
+        lookup = cmp_fields.get(et, set())
+        nominal = {f for f, _ in types[et] if NOMINAL.search(f)}
+        out[et] = {'lookup': lookup, 'nominal': nominal, 'keyable': bool(lookup or nominal)}
+    return out
+
+
+def main():
+    types = m17.load_types('prism')
+    files = corpus_text()
+    alltext = "\n".join(t for _, t in files)
+
+    # collection fields whose element type is a known struct, and their derived keyability.
+    colls = collection_fields(types)
+    keymap = keyability_by_elem_type(types, alltext)
+    cmp_fields = {et: info['lookup'] for et, info in keymap.items()}
 
     print("=" * 78)
     print("POPULATION")
@@ -88,8 +121,8 @@ def main():
     disagree = []
     rows = []
     for owner, fld, et in sorted(colls):
-        lookup = cmp_fields.get(et, set())
-        nominal = {f for f, _ in types[et] if NOMINAL.search(f)}
+        info = keymap[et]
+        lookup, nominal = info['lookup'], info['nominal']
         has1, has3 = bool(lookup), bool(nominal)
         if has1 and has3:
             both += 1
