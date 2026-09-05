@@ -334,3 +334,40 @@ positional.
 - The reported 7 is itself conservative: the resolver misses relay calls nested inside `str(...)`,
   leaving 5 spurious workspace scalars. The true figure is ≈2.
 - Static and syntactic throughout: a `len(x)`-only use is counted as a full read.
+
+---
+
+# §RESTATED — the corpus numbers moved when collections became typed (2026-09-05)
+
+⛔ **Typing the 14 collection fields (§10.8) changed the corpus this document measured.** `reach()`
+now recurses *into* those collections, so every library-wide figure in the VERDICT section above was
+computed on a corpus where 85% of collections were opaque. Re-run:
+
+| app-state faces | before typing | **after typing** |
+|---|---|---|
+| n | 535 | 612 |
+| **median read-set** | **1.0 leaf** | **1.0 leaf** |
+| mean read-set | 1.87 | **3.94** |
+| mean as % of reachable | 35.9% | 40.2% |
+| scaling slope | 0.334 | 0.274 |
+| **r²** | **0.15** | **0.50** |
+
+**What still holds:** the median face reads **one leaf**. That was the headline and it is unchanged.
+
+**What does not:** the mean doubled, and — more importantly — **r² went 0.15 → 0.50.** The earlier
+"no correlation; read-set is flat" reading was an artifact of collections being invisible. With them
+visible, half the variance in read-set *is* explained by state size, and the flat model can no
+longer be preferred on the data. Extrapolated, slope 0.274 on a 500-leaf tree gives ~27%, above the
+25% line.
+
+**Why the verdict nevertheless stands.** The library-corpus numbers were always the weaker evidence
+— that is precisely why §SCALE was required. §SCALE measured `prism_app_console`, which **already
+had typed collections**, using the metric that survived four revisions (**invalidated work**, not
+read-set size): marginal read-set median **2 leaves**, and a single-row edit re-running one face for
+one element rather than O(rows). None of that is affected by this re-run.
+
+**The lesson, and it is the campaign's recurring one in a new form:** a measurement is only as good
+as what the instrument can *see*. Three separate conclusions here — "read-set is flat"
+(r²=0.15), "Rule 1 never fires alone", and "90% keyable" — were all artifacts of the untyped corpus,
+and all three moved once the same 14 declarations made the data visible. Two got weaker and one got
+stronger. The fix was not a better analysis; it was better *input*.
