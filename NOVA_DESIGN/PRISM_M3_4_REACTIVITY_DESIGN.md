@@ -511,6 +511,11 @@ Neither gap changes the verdict: zero holistic and 82% group-class are not close
 
 ### 10.7 MEASURED 2026-09-05 — Rule 1 is NOT load-bearing. Rule 3 is.
 
+> ⛔ **EVERY Rule 1 COVERAGE FIGURE IN §10.7–§10.10 IS INFLATED.** §10.12 found the
+> detector counts *filter predicates* (`x.nn_auto == 0`) as identity lookups. The percentages
+> below are upper bounds pending a re-measure with the literal/variable discriminator. The
+> *conclusions* they support are affected too — read §10.12 before quoting any of this.
+
 §10.6 named Rule 1's coverage as the load-bearing unknown and said it should be measured before any
 of this is built. Measured (`tools/m34_key_inference.py`), and **the design's own premise is wrong**:
 
@@ -600,7 +605,7 @@ the first library-wide (rather than one-file) measurement of key inference:
 | **Rule 1 only** | **0 (0%)** | **1 (4.8%)** |
 | Rule 3 only | 6 (60%) | 7 (33.3%) |
 | neither | 1 (10%) | 4 (**19.0%**) |
-| **Rule 1 coverage** | 30% | **47.6%** |
+| **Rule 1 coverage** ⛔[INFLATED — see §10.12] | 30% | **47.6%** |
 | **any rule fires** | 90% | **81.0%** |
 
 **Two corrections to §10.7, both against my earlier wording:**
@@ -626,7 +631,7 @@ With every typeable collection field annotated (24 collections visible, up from 
 
 | collections visible | 10 | 21 | **24** |
 |---|---|---|---|
-| **Rule 1 coverage** | 30% | 47.6% | **54.2%** |
+| **Rule 1 coverage** ⛔[INFLATED — see §10.12] | 30% | 47.6% | **54.2%** |
 | Rule 1 fires *alone* | 0 | 1 | **2** |
 | any rule fires | 90%* | 81% | **83.3%** |
 | neither | 10%* | 19% | **16.7%** |
@@ -640,7 +645,9 @@ drawn on a corpus where 85% of collections were invisible to the analysis, and i
 every field typed. My original §10.2 ranking — Rule 1 strongest — may simply have been right, and
 its refutation was an artifact of missing type information rather than evidence against it.
 
-**The honest position: Rule 1 and Rule 3 are comparably strong** (54.2% vs 75%), they never
+**The honest position** — ⛔ **superseded by §10.12: the 54.2% is INFLATED (it counted filter
+predicates as lookups) and a disagreement HAS since appeared.** As written at the time:
+**Rule 1 and Rule 3 are comparably strong** (54.2% vs 75%), they never
 disagree across 24 collections, and Rule 1 now contributes 2 collections the naming rule cannot
 reach. Neither is "the" rule.
 
