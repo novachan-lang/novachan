@@ -1264,6 +1264,8 @@ state** (`PrismCanvasCtx` alone drove the slope 0.13→0.46, enough to fake a "B
 is `PrismAppState` at **16 FLAT leaves**, which structurally cannot answer the question. A real app
 with a NESTED tree (>100 reachable leaves) is in progress as `prism/app/prism_app_console.nova`.
 
+**✅ M1.7 CLOSED AT SCALE + M3.4 DESIGNED (2026-09-05).** `prism_app_console` (109 leaves, depth 6, 26 faces, 94/94 KAT) answered the scale question: **Bet 1 HOLDS** — marginal read-set median **2 leaves** at 6× the state size. The criterion took **four forms** before it was right (% of reachable → absolute size → fan-out over face definitions → **invalidated WORK**); all four and their failure reasons are recorded in [`M1_7_FALSIFIER_RESULT.md`](M1_7_FALSIFIER_RESULT.md) §CRITERION rather than quietly swapped. **Keyed sub-faces are REQUIRED on cost**, not read-set size: without them a one-row edit is O(rows), unbounded. §9 designs incremental aggregates but **deliberately does not decide to build them** — gated on measurement. Design doc: [`PRISM_M3_4_REACTIVITY_DESIGN.md`](PRISM_M3_4_REACTIVITY_DESIGN.md). Steps 1-6 need no compiler change and no GO; the pass itself does.
+
 **Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
 SINGLE blocker on the browser path, M1.7 having cleared. See
 [`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
