@@ -504,3 +504,60 @@ running it; I ran it and checked its population against the known figures (414 a
 reproduced from `m17_readset.py`). It is static and syntactic, so a fold hidden behind an unusual
 helper is missed, and 2 of 38 remain unclassified (`prism_sy_flush_ready`, `prism_sy_in_conflict`).
 Neither gap changes the verdict: zero holistic and 82% group-class are not close calls.
+
+### 10.7 MEASURED 2026-09-05 — Rule 1 is NOT load-bearing. Rule 3 is.
+
+§10.6 named Rule 1's coverage as the load-bearing unknown and said it should be measured before any
+of this is built. Measured (`tools/m34_key_inference.py`), and **the design's own premise is wrong**:
+
+| | collections | share |
+|---|---|---|
+| **both rules fire** | 3 | 30% |
+| **Rule 1 only** (behavioural) | **0** | **0%** |
+| **Rule 3 only** (nominal) | **6** | **60%** |
+| neither | 1 | 10% |
+| **Rule 1 coverage** | 3 | **30%** (lower bound) |
+| **any rule fires** | 9 | **90%** |
+
+**Rule 1 never fires alone.** Every collection it identifies, Rule 3 also identifies — and the two
+**never disagree**: the looked-up fields are `concmt_id`, `coniss_id`, `conprj_id`, which are
+exactly the nominal identity fields. So §10.4's "Rule 1 wins on disagreement" tiebreak is
+**low-stakes**, because there are no disagreements to break.
+
+**I over-claimed Rule 1.** §10.2 called it "the strongest; behavioural, not nominal" and "the rule
+that matters." On this evidence the naming heuristic I ranked *third and weakest* is carrying 90% of
+the coverage, and the principled behavioural rule adds nothing on top of it.
+
+**But Rule 1's real value is different from what I designed it for.** Zero disagreements across
+every case where both fire means Rule 1 works as a **validator**, not a primary source: where the
+program's own lookup agrees with the nominal `id`, that is independent confirmation the name is a
+real identity and not just a suggestive label. That is worth keeping — it converts Rule 3 from a
+naming *guess* into a naming guess *corroborated by behaviour*. **Revised ordering: Rule 3 proposes,
+Rule 1 confirms or overrides.**
+
+### ⛔ 10.8 The finding that matters more: key inference needs TYPED collections
+
+The corpus has **131 state types but only 10 collection fields whose element type is knowable** —
+and **all 10 are in `prism_app_console.nova`**, the one file that types its collections as
+`list<PrismConX>` rather than bare `list`.
+
+Everywhere else in PRISM's 130 modules, a collection is a bare `list`, so **the element type is not
+recoverable and no key can be inferred at all.** The analysis is not failing to find keys; there is
+nothing for it to look at.
+
+This makes the corpus-wide numbers above *entirely* a measurement of one file, and it is a hard
+prerequisite the design had not identified:
+
+- **Key inference — and therefore §4(b), §3's structural deltas, and §9's aggregate deltas — all
+  require `list<T>`-typed collection fields.** Everything downstream in this design assumes an
+  element type that mostly does not exist in the code today.
+- The console app got 90% coverage *because* it was written with typed collections. That was
+  described as a technique for making the falsifier work; it is in fact a **precondition of the
+  whole reactivity design**.
+- So there is a concrete, unglamorous prerequisite task ahead of any compiler work: **type the
+  collection fields across `prism/`**. It is mechanical, it is not RED-tier, and nothing in §3, §4b,
+  §9 or §10 functions without it.
+
+Sanity checks passed before trusting any of this: the tool reproduces the known 9/10 nominal
+keyability for the console app and independently identifies `PrismConReaction` as the single
+unkeyable element type, matching §4b.
