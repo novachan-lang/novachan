@@ -356,7 +356,7 @@ a feature must justify itself against the complexity it adds. The deciding quest
 - Tiers 2 (min/max) and 3 (holistic) are **not** v1 under any outcome — semigroup rescan-on-delete
   and holistic folds add real complexity for cases the data is unlikely to show as hot.
 
-Measurement pending; the verdict is recorded here when it lands rather than assumed now.
+**Measured. See §9.6 below — the verdict is: build Tier 1, and only Tier 1.**
 
 ---
 
@@ -458,3 +458,49 @@ Rule 1's coverage is **not yet measured** — §4b measured how many element typ
 field (nominal, Rule 3), not how many are *looked up by* one (behavioural, Rule 1). Rule 1 is the
 load-bearing rule, so this is the next measurement, and it should be done before any of this is
 built.
+
+### 9.6 VERDICT — measured 2026-09-05: **build Tier 1, and only Tier 1**
+
+`tools/m34_aggregates.py` over the whole corpus (131 state types, 2245 fns, 414 app-state faces):
+
+| | count | share |
+|---|---|---|
+| **Aggregate faces** | **38** of 414 | 9.2% |
+| — **self-maintainable** (group: `count`, `sum`) | **31** | **82%** |
+| — not self-maintainable on delete (`min`/`max`) | 5 | 13% |
+| — **holistic** (median, percentile, distinct, top-N) | **0** | **0%** |
+| — unclassified | 2 | 5% |
+
+**§9.5 said: "if aggregates are common and mostly `count`/`sum` → build Tier 1 only." That is
+exactly what the data shows.**
+
+Three findings decide it:
+
+1. **Zero holistic aggregates.** The class with no bounded incremental update simply does not occur
+   in real PRISM code. Tier 3 was designed for a case that does not exist here — do not build it.
+2. **82% are group-class**, i.e. O(1) on both insert and delete. That is the cheap, closed,
+   statically-decidable mechanism, and it covers essentially all of the real cost.
+3. **The 5 `min`/`max` cases are concentrated in the root page composers** (`prism_con_console`,
+   `_html`, `_ansi`, `breadcrumb`) — which inherit the worst class from something they call rather
+   than folding themselves. Tier 2 therefore buys little: **do not build it either.**
+
+**Cost.** Aggregate faces carry a **median read-set of 2.5 leaves against 1.0 for non-aggregates** —
+2.5× — so they are meaningfully the more expensive faces despite being under a tenth of the
+population. (The tool also reports mean 14.97 vs 3.19, but that mean is **skewed by the root
+composers** at 89 leaves each and should not be quoted; the median is the robust figure. Same
+population trap as §CRITERION, third occurrence.)
+
+**What they actually fold over** is exactly what the design predicted: `nq_items` (unread
+notification badge), `conws_projects` (open- and urgent-issue counts), `rt_router_routes`,
+`sy_conflicts`, `gd_ar_issues`. Dashboard counters — the case every real application has.
+
+**Decision: implement group-class incremental aggregates only** (`count`, `sum`, and folds with a
+group inverse), strictly after §4(b) keying, since a delta needs element identity. `min`/`max` and
+holistic folds fall back to full recomputation with a diagnostic — which the data says costs
+almost nothing.
+
+**Limits of this measurement.** The tool was written by a subagent that hit its session limit before
+running it; I ran it and checked its population against the known figures (414 app-state faces
+reproduced from `m17_readset.py`). It is static and syntactic, so a fold hidden behind an unusual
+helper is missed, and 2 of 38 remain unclassified (`prism_sy_flush_ready`, `prism_sy_in_conflict`).
+Neither gap changes the verdict: zero holistic and 82% group-class are not close calls.
