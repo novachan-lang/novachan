@@ -70,6 +70,32 @@ reconverge gate is the only thing that would catch the deepest cases.
   post-split, the orderings become entangled. I do not believe it does — a changeset is a value, not
   a host facility — but it is not proven.
 
+## ★ MEASURED EVIDENCE ADDED 2026-09-05 — the M3.4-first case is now quantified
+
+When this brief was written the argument for M3.4-first was structural. It is now measured
+(`PRISM_M3_4_REACTIVITY_DESIGN.md` §12, `tools/m34_invalidation_sim.py`). Work per user action on
+the real 133-leaf console state, at a 1000-element collection:
+
+| action | today (no reactivity) | with plain leaf-granular reactivity |
+|---|---|---|
+| session token refresh | 11015 units | **5** |
+| toggle a preference | 11015 units | **5** |
+| edit one comment | 11015 units | 6007 → **1** with keying |
+
+**The first two rows are the argument.** They need **no keying, no aggregates, no browser** — only
+the basic read-set intersection, which is the cheapest part of M3.4. A **2200×** reduction on
+ordinary interactions, available on the ANSI and HTML backends that already work.
+
+That reframes the ordering question. M0.3 is 6–10 weeks of RED-tier surgery on the 32k-line runtime
+every NOVA program links against, and it buys **reach**. The first increment of M3.4 is additive,
+gated by ordinary means, and buys **a 2200× cost reduction on a framework that already ships
+server-side**. One of those is a bet on where users are; the other is a measured improvement to what
+exists today.
+
+It also tightens the fallback: if Bet 1 broke in implementation, we would learn it while holding a
+working server-rendered framework — rather than after having rebuilt the runtime for a browser
+target that had nothing worth running in it yet.
+
 ## Recommendation
 
 **Do M3.4 first, on the ANSI/HTML backends. Then M0.3.**
