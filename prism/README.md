@@ -20,12 +20,27 @@ A **terminal/ANSI** backend (`backend/ansi/`) is a fourth, already-real target f
 
 ## Status
 
-Pre-1.0. The library-first slice (**Phase A**, milestones MA.1–MA.8 in `PRISM_ROADMAP.md`) is being
-built now — a node-tree value type, the 26 primitives as plain functions, typed `look`/`palette`
-values, an HTML server-side renderer, and the ANSI backend — all pure NOVA, no compiler changes, no
-WASM, no closures. The `face`/`look`/`palette`/`->` *syntax* is compiler sugar added later (Phase 3);
-until then, a face is just a NOVA function that returns a node tree, exactly how `forge_html` builds
-pages today. See `NOVA_DESIGN/PRISM_STATUS.md` for the live task tracker — it is the single source of
+**The library is COMPLETE — 130 modules, 127 KATs, ~55.1k lines**, across all six library layers
+plus `app/` (Tier 2). Phase A (MA.1–MA.8) is done: the node-tree value type, the **22 primitives**
+as plain functions, typed `look`/`palette` values, an HTML server-side renderer, and the ANSI
+backend — all pure NOVA, no compiler changes, no WASM, no closures.
+
+What is **not** built is the part that makes it a *reactive* framework:
+
+* **Reactivity (M3.4)** — designed, not implemented. `prism_exp_readsets_available()` returns
+  `false` deliberately rather than fabricating a number. The gating experiment (**M1.7**) has now
+  RUN and **Bet 1 survives**: on a real 109-leaf application state tree, the marginal read-set per
+  face is a median of **2 leaves**. See `NOVA_DESIGN/M1_7_FALSIFIER_RESULT.md` and
+  `PRISM_M3_4_REACTIVITY_DESIGN.md`.
+* **The browser path (M0.3)** — blocked on splitting the 32k-line runtime into a wasm-capable core
+  and a native-only host. This is the single remaining blocker on running PRISM in a browser.
+
+So PRISM today renders **server-side HTML, ANSI, canvas, PDF, CSV and PNG** from one node tree, and
+is usable from Forge now. The `face`/`look`/`palette`/`->` *syntax* is compiler sugar added later
+(Phase 3); until then a face is just a NOVA function returning a node tree, exactly how
+`forge_html` builds pages today.
+
+See `NOVA_DESIGN/PRISM_STATUS.md` for the live task tracker — it is the single source of
 truth for what is actually built versus designed.
 
 ## Read these, in order
