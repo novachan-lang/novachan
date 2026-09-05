@@ -103,7 +103,7 @@ Three things, in dependency order. Nothing else is on the critical path.
    a browser, and "better than React" is not assessable by anyone who would compare them.
 3. **M3.4 — reactivity**, in whatever form M1.7 licenses.
 
-Everything currently green — six library layers plus `app/`, **131 modules, 128 KATs, ~55.1k
+Everything currently green — six library layers plus `app/`, **131 modules, 128 KATs, ~56.4k
 lines** — is real and is a genuine advantage on correctness. It is not a substitute for the items
 above.
 
