@@ -500,6 +500,22 @@ gated, though not all one-to-one — the naming is not uniform and a count alone
 * **1 module still has no dedicated KAT**: `prism_ansi` (the ANSI backend), exercised
   transitively by **13** KATs. Not untested; a legitimate, non-urgent gap.
 
+⛔ **CORRECTION 2026-09-05 — "the library is COMPLETE" was an OVERCLAIM.** The eleven layers with
+content (core, text, widget, style, render, obs, dev, intl, a11y, ui, app — 131 modules) are
+complete and fully KAT-gated. **Four directories are not:**
+
+| | modules | status |
+|---|---|---|
+| `embed/` | **0 of 1** | not started — the sandboxed escape hatch (spec §17, #110 #131) |
+| `layout/` | **0 of 3** | **deliberately deferred** — constraint/solve/rtl are the **GPU backend's** layout engine; the DOM backend defers to CSS. Gated on Phase-2 GPU milestones, explicitly out of Phase A's pure-library scope |
+| `backend/dom/` | **0** | ⭐ **this is M0.3** — there is no browser renderer at all |
+| `backend/gpu/` | **0** | Phase 2 |
+
+The error was auditing the layers that HAD content and calling the whole complete — exactly the
+failure the "audit by NAME, never by count" rule exists to prevent, since two empty directories sat
+in plain sight. `layout/` empty is legitimate and documented; `embed/` is a real 1-module gap;
+`backend/dom/` empty is the reason M0.3 exists.
+
 ✅ **FULL GATE GREEN 2026-09-05** — all **130 KATs** built and run clean in one pass (`BUILD attempted=130 built=130 failed=0` · `RUN attempted=130 ran=130 FAILED=0`), with `attempted == expected` asserted at BOTH stages and **empty output counted as a failure** — so it cannot be the kind of false green that reported `failures: 0` while producing 12 of 14 binaries earlier the same day. First fully-verified baseline since the disk was freed (99% → 84%). Covers every library change of that day: 14 collection fields typed `list<T>`, `PrismNotice`'s identity field, `prism_ansi_table` display-width sizing, and the `ww_string_width` byte-count fix.
 
 **This is the authoritative map, and it now describes what EXISTS, not a proposal.** Layer counts: `core/` 7 · `text/` 5 · `widget/` 6 · `style/` 7 · `render/` 4 · `obs/` 5 · `dev/` 8 · `intl/` 4 · `a11y/` 1 · `ui/` 67 · `app/` 14. Each layer's own `README.md` is the by-name audit basis for that layer — ⛔ audit by NAME, never by count.

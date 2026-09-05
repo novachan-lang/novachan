@@ -20,6 +20,22 @@ A **terminal/ANSI** backend (`backend/ansi/`) is a fourth, already-real target f
 
 ## Status
 
+⛔ **CORRECTION 2026-09-05 — "the library is COMPLETE" was an OVERCLAIM.** The eleven layers with
+content (core, text, widget, style, render, obs, dev, intl, a11y, ui, app — 131 modules) are
+complete and fully KAT-gated. **Four directories are not:**
+
+| | modules | status |
+|---|---|---|
+| `embed/` | **0 of 1** | not started — the sandboxed escape hatch (spec §17, #110 #131) |
+| `layout/` | **0 of 3** | **deliberately deferred** — constraint/solve/rtl are the **GPU backend's** layout engine; the DOM backend defers to CSS. Gated on Phase-2 GPU milestones, explicitly out of Phase A's pure-library scope |
+| `backend/dom/` | **0** | ⭐ **this is M0.3** — there is no browser renderer at all |
+| `backend/gpu/` | **0** | Phase 2 |
+
+The error was auditing the layers that HAD content and calling the whole complete — exactly the
+failure the "audit by NAME, never by count" rule exists to prevent, since two empty directories sat
+in plain sight. `layout/` empty is legitimate and documented; `embed/` is a real 1-module gap;
+`backend/dom/` empty is the reason M0.3 exists.
+
 **The library is COMPLETE — 131 modules, 130 KATs, ~56.4k lines**, across all six library layers
 plus `app/` (Tier 2). Phase A (MA.1–MA.8) is done: the node-tree value type, the **22 primitives**
 as plain functions, typed `look`/`palette` values, an HTML server-side renderer, and the ANSI
