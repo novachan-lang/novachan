@@ -1230,3 +1230,44 @@ already-parsed annotations), but the full RED-tier gate still applies because it
 **Deliberately still deferred:** `readset_of` is not yet *called* on faces. `@face` marks and
 validates; wiring the read-set through to invalidation is §3/§4b and needs the changeset design.
 Keeping those separate keeps each change independently gateable.
+
+### 16.3 ⛔ A committed stale `_gen4.exe` makes two gates silently test the WRONG compiler
+
+Found while gating `@face` (2026-09-06). The move-semantics gate failed with 7 assertions —
+**reproducibly**, which ruled out the concurrency hazard of §16.2 and initially looked like a real
+regression from the `@face` change.
+
+It was neither. `_move_gate.ps1:20` (and `_farray_perf_gate.ps1:30`, identically) resolve the
+compiler as:
+
+```powershell
+$nova = if (Test-Path "$PSScriptRoot\_gen4.exe") { ..._gen4.exe } else { ...gen3_test.exe }
+```
+
+`_gen4.exe` is meant to be a **freshly built** gen4 (that is what `_gen4build.ps1` exists for). But a
+**stale copy is committed to the repo** — 1.49 MB against the real compiler's 2.65 MB — and a stale
+file satisfies `Test-Path` exactly as well as a fresh one. So the gate silently ran a compiler old
+enough to predate the very feature it validates:
+
+```
+error[E1002]: unknown identifier 'move'; did you mean 'remove'?
+```
+
+**Proof it was the binary, not the code:** with the stale `_gen4.exe` moved aside and *no source
+change whatsoever*, the same gate reports `MOVE-GATE OK (14/14 assertions)`.
+
+**Why this one was more dangerous than §16.2's race.** The concurrency bug produced *non*-reproducible
+failures, which at least signals "environment". This one reproduces perfectly, so every instinct says
+"real regression in your diff" — it burns time in exactly the wrong direction, and it silently
+weakens two gates for anyone who never notices.
+
+**The fix is not "delete the file"** — `Test-Path`-then-prefer is the actual defect. A gate that can
+transparently run a stale binary is a gate that can pass while proving nothing. It should either
+rebuild `_gen4.exe` itself, or verify freshness (timestamp/hash against `gen3_test.exe`) and **fail
+loudly** rather than fall back silently. Refreshed the committed copy for now so the gates are
+honest; the `Test-Path` pattern remains a live hazard in both scripts.
+
+**Generalised rule for this repo, now three-for-three:** when a gate fails, ask *"is it testing what I
+think it is?"* before asking *"what did I break?"* — tonight that was a concurrent orphaned run
+(§16.2), a stale mismatched `.ll`/`.exe` pair, and now a stale committed compiler. All three made a
+gate report something true about the **wrong artifact**.
