@@ -75,10 +75,62 @@ function Invoke-Timed {
 #   an orphan. Kill it first -> a clean, single-writer build every time.
 # ─────────────────────────────────────────────────────────────────────────────
 function Stop-StrayCompilers {
-    foreach ($name in @('gen3_test','gen4','gen4_test','gen5','gen6','gen2_move','nova_p1','nova_p2','nova_p3')) {
+    # `clang` belongs here: an orphaned LINK holds nova_p*.exe/.ll open just as surely as an
+    # orphaned compile does. Its omission was the second half of the 2026-09-06 diagnosis below --
+    # killing the stray gen*/nova_p* processes alone still left clang children racing the build.
+    foreach ($name in @('gen3_test','gen4','gen4_test','gen5','gen6','gen2_move','nova_p1','nova_p2','nova_p3','clang')) {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Where-Object { $_.Id -ne $PID } |
             ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⛔ CONCURRENT-RUN GUARD (added 2026-09-06 after it cost hours of misdiagnosis).
+#
+# THE BUG THIS PREVENTS: the lib//std/ sync below runs UNCONDITIONALLY every time ANY script
+# dot-sources this file. Two concurrent runs therefore each rewrite the very library files the
+# other is compiling against. The symptom is NOT an obvious clash -- it is a compile exiting
+# -1 with `timedout=False`, at a DIFFERENT pass each time, never reproducible by hand.
+#
+# On 2026-09-06 that signature was misdiagnosed three times (stray process, then disk, then
+# Invoke-Timed) before the real cause was found: an orphaned `nova_ci.ps1` (started by an agent
+# that died mid-verification) still running 20+ minutes later, silently corrupting every
+# reconverge attempt. It also inflated a perf-tracking bench by 168%, which read as a real
+# regression.
+#
+# So: refuse to start rather than produce a wrong answer. A build that declines to run is a
+# minor annoyance; a build that reports a false FAIL (or a false PASS) costs hours and, worse,
+# can be believed. Set NOVA_ALLOW_CONCURRENT=1 to override deliberately.
+# ─────────────────────────────────────────────────────────────────────────────
+function Assert-NoConcurrentNovaRun {
+    param([string]$Context = "this script")
+    if ($env:NOVA_ALLOW_CONCURRENT -eq "1") { return }
+    $me = $PID
+    $others = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ProcessId -ne $me -and
+            $_.CommandLine -and
+            ($_.CommandLine -match 'nova_ci\.ps1' -or $_.CommandLine -match '_bootstrap_reconverge\.ps1' -or $_.CommandLine -match '_run_final_regression\.ps1')
+        })
+    if ($others.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  ##########################################################################"
+        Write-Host "  ##  REFUSING TO START: another NOVA build/CI run is already active.     ##"
+        Write-Host "  ##  Concurrent runs REWRITE each other's `$NOVA_HOME/lib and /std while  ##"
+        Write-Host "  ##  the other is compiling against them -- the result is a compile that ##"
+        Write-Host "  ##  exits -1 at a random pass and does NOT reproduce by hand.           ##"
+        Write-Host "  ##########################################################################"
+        foreach ($o in $others) {
+            $cl = $o.CommandLine
+            if ($cl.Length -gt 120) { $cl = $cl.Substring(0, 120) + "..." }
+            Write-Host ("  active: PID " + $o.ProcessId + "  " + $cl)
+        }
+        Write-Host ""
+        Write-Host "  Wait for it to finish, or kill it, then re-run $Context."
+        Write-Host "  (Override deliberately with NOVA_ALLOW_CONCURRENT=1 if you know why.)"
+        Write-Host ""
+        exit 1
     }
 }
 

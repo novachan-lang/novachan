@@ -19,6 +19,7 @@ $ErrorActionPreference = "Continue"
 # Clean slate: kill any orphaned build process from a prior/aborted run before the gate
 # starts — an orphan racing the bootstrap's nova_compiler.ll build would stall it at 0 bytes.
 . "$PSScriptRoot\_proc_util.ps1"
+Assert-NoConcurrentNovaRun "the CI"   # refuse to start if another run is active (see _proc_util.ps1)
 Stop-StrayCompilers
 
 if (-not $SkipReconverge) {

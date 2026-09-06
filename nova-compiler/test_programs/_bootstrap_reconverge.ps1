@@ -1,5 +1,6 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
+Assert-NoConcurrentNovaRun "the reconverge"   # refuse to start if another run is active (see _proc_util.ps1)
 Stop-StrayCompilers   # clean slate: an orphaned build racing nova_compiler.ll would stall it at 0 bytes
 
 $env:NOVA_NO_CACHE = "1"
