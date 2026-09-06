@@ -1,0 +1,368 @@
+diff --git a/nova-compiler/compiler/nova_compiler.nova b/nova-compiler/compiler/nova_compiler.nova
+index 42b7bbbc..053eb0d1 100644
+--- a/nova-compiler/compiler/nova_compiler.nova
++++ b/nova-compiler/compiler/nova_compiler.nova
+@@ -11862,9 +11862,14 @@ type IrBuilder
+     // they carry no such promise, and specializing them is what makes unannotated struct params
+     // lower to fmul instead of nova_rt_mul.
+     ir_any_params: dict
++    // PRISM M3.4 §18: fn_name -> FaceReadsetInfo(leaf_count, words) for every `@face` function,
++    // computed ONCE by build_face_readsets (~34990 area) right after this builder is created.
++    // Consumed only by the @main registration-call emission (mirrors ir_sredact's own
++    // build-then-register-at-@main shape) -- empty dict for every program with no `@face` usage.
++    ir_face_readsets: dict
+ 
+ fn new_ir_builder() -> IrBuilder
+-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {}, {})
++    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, {}, [], {}, {}, {}, {}, {}, {}, {}, {})
+ 
+ // When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
+ // payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
+@@ -26480,6 +26485,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
+     let b = new_ir_builder()
+     b.ir_filename = filename
+     b.ir_fn_param_stypes = ti_state.ti_fn_param_types
++    // PRISM M3.4 §18: fold every @face function's read-set into a runtime-registrable
++    // multi-word bitmask now (build_face_readsets is a self-contained pass over `stmts`, same
++    // shape as check_face_annotations's own build_readset_tables call during parse_program) --
++    // the @main emission pass below reads b.ir_face_readsets to emit the registration calls.
++    // Zero cost for every program with no @face usage (fast-path guard inside).
++    b.ir_face_readsets = build_face_readsets(stmts)
+     let resolved_target = resolve_target(target)
+     let e = new_ir_emitter(filename, resolved_target)
+     // NOVA_COV=1 environment toggle: when set, the IR emitter injects
+@@ -26978,6 +26989,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
+     ire_line(e, "declare void @nova_rt_register_struct_name(i64, i64) nounwind")
+     ire_line(e, "declare void @nova_rt_register_struct_meta(i64, i64, i64) nounwind")
+     ire_line(e, "declare void @nova_rt_register_struct_field(i64, i64, i64, i64) nounwind")
++    // PRISM M3.4 §18: face read-set registry (readset_of + build_face_readsets folded these at
++    // compile time; nothing consumes them yet -- see the emission site below for the call shape).
++    ire_line(e, "declare void @nova_rt_register_face_readset_meta(i64, i64, i64) nounwind")
++    ire_line(e, "declare void @nova_rt_register_face_readset_word(i64, i64, i64) nounwind")
+     ire_line(e, "declare i64 @nova_rt_field_names(i64) nounwind")
+     ire_line(e, "declare i64 @nova_rt_field_types(i64) nounwind")
+     ire_line(e, "declare i64 @nova_rt_field_get(i64, i64) nounwind")
+@@ -29387,6 +29402,27 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
+                             _fi = _fi + 1
+                             fld_i = fld_i + 1
+             sreg_i = sreg_i + 1
++    // PRISM M3.4 §18: register each @face's read-set for the runtime to hold (§3's "the runtime
++    // learns a face's read-set" bridge). Same idempotent meta-call-then-per-index-calls shape as
++    // the struct-meta/struct-field registration above, keyed by type_name_hash(face_name) (the
++    // SAME hash function used for struct-name hashing, ~11754) rather than a struct's own hash,
++    // since a face is a FUNCTION, not a type. Iterates b.ir_face_readsets in whatever order
++    // build_face_readsets inserted its entries -- deterministic because that insertion order is
++    // itself derived from a single top-to-bottom walk of the parsed program's statement list,
++    // never from hash order (load-bearing for reconverge: see build_face_readsets's own doc
++    // comment). readset_of only computes a face's DEPENDENCIES -- nothing yet consumes this data
++    // at runtime (invalidation is a later slice, §3/§4b); this only makes it reachable.
++    if len(keys(b.ir_face_readsets)) > 0
++        ire_line(e, "  ; FACE-READSET: register @face read-sets (PRISM M3.4 §18 bridge)")
++        for _frface in keys(b.ir_face_readsets)
++            match b.ir_face_readsets[_frface]
++                FaceReadsetInfo(_frleaf_count, _frwords) =>
++                    let _frid = type_name_hash(_frface)
++                    ire_indent(e, "call void @nova_rt_register_face_readset_meta(i64 " + fmt_i64_decimal(_frid) + ", i64 " + str(_frleaf_count) + ", i64 " + str(len(_frwords)) + ")")
++                    let _frwi = 0
++                    for _frw in _frwords
++                        ire_indent(e, "call void @nova_rt_register_face_readset_word(i64 " + fmt_i64_decimal(_frid) + ", i64 " + str(_frwi) + ", i64 " + fmt_i64_decimal(_frw) + ")")
++                        _frwi = _frwi + 1
+     // P4 distributed: register every user function by name so call_by_name /
+     // remote_spawn can resolve it at runtime. Emitted ONLY when the program uses
+     // them (e.ire_uses_byname) — otherwise zero cost and no address-taking that
+@@ -34875,6 +34911,147 @@ fn readset_of(fn_name: string, param_name: string, param_type: string, ctx: Read
+     ctx.memo[memo_key] = result
+     result
+ 
++// ── §18 bridge: fold a face's read-set into a runtime-registrable multi-word bitmask ──
++//
++// PRISM_M3_4_REACTIVITY_DESIGN.md §18: readset_of computes WHICH leaf paths a face reads; this
++// section turns that into WHERE each leaf lives in a fixed bit numbering, and folds a face's
++// read-set into that numbering. §3's whole performance argument ("intersection is a bitmask
++// AND, not a graph walk") requires the numbering to be STABLE across compilations of the SAME
++// source -- so it is derived from each struct's DECLARED field order (tables.sdefs, itself
++// built by a plain top-to-bottom sweep of the parsed program, build_readset_tables ~34592),
++// never from dict iteration. A single uint64 (the shape @redact's ir_sredact/redact_mask uses,
++// ~26628 / nova_runtime.c:22296) is NOT enough: §18 measured PrismConState at 134 reachable
++// leaves, so the mask here is a WORD ARRAY (index = leaf/64, bit = leaf%64), matching §18's own
++// recommendation over an interned-path-set id (which would lose the "one instruction" property).
++
++type FaceReadsetInfo
++    leaf_count: int     // total reachable leaves of the face's state type (informational only
++                         // for now -- nothing consumes it yet; a future changeset/invalidation
++                         // slice sizes a changeset bitmask against this SAME numbering)
++    words: list           // list<int> -- word i covers leaves [64*i, 64*i+64); bit j of word i
++                          // is set iff leaf (64*i+j) is a key of the face's read-set
++
++// Enumerate ALL reachable leaf paths of `type_name` (a struct or enum-variant name), in a FIXED
++// depth-first order determined SOLELY by each struct's DECLARED field order -- the numbering
++// leaf-index-to-bit assignment is built on. Mirrors readset_of's own "leaf vs struct field" rule
++// exactly (§15.2 point 4, rs_walk_expr ~34799): a field whose declared type is itself a known
++// struct is expanded IN PLACE (so a face's dotted read-set paths, e.g. "inventory.gold", always
++// resolve to a path this same enumeration also produces); any other declared type terminates the
++// path there as a leaf.
++//
++// `visiting` tracks types on the CURRENT path only (removed via `del` on the way back out, not
++// "ever seen") -- so two sibling fields of the SAME struct type (two Address fields on one
++// Order, say) both expand fully and independently. A type re-entered while still an ancestor of
++// itself (a cyclic struct graph, which could never be a finite-size value anyway) is treated as
++// a leaf instead of recursing forever -- defensive robustness, not a real program shape this
++// corpus contains.
++fn leaf_paths_of(type_name: string, tables: ReadsetTables, prefix: string, visiting: dict, out: list)
++    if not contains(tables.sdefs, type_name) or contains(visiting, type_name)
++        if prefix != ""
++            push(out, prefix)
++        return
++    let fields = tables.sdefs[type_name]
++    if len(fields) == 0
++        if prefix != ""
++            push(out, prefix)
++        return
++    visiting[type_name] = 1
++    for p in fields
++        match p
++            Param(pname, ptype, pdefault) =>
++                let path = pname
++                if prefix != ""
++                    path = prefix + "." + pname
++                leaf_paths_of(ptype, tables, path, visiting, out)
++    del(visiting, type_name)
++
++// Fold a face's read-set (leaf-path -> 1, from readset_of) into a multi-word bitmask over
++// `leaves` (the FULL declared-order leaf enumeration from leaf_paths_of): bit j of word i is set
++// iff leaves[64*i + j] is a key of `readset`. Word count = ceil(len(leaves) / 64) -- NEVER
++// silently truncated to one word the way `ir_sredact`'s single uint64 is (that cap is fine for
++// @redact's real-world field counts; it is NOT fine for a 134-leaf state type). `1 << 63` is
++// exact in NOVA (verified: shifts 1..63 all produce the correct two's-complement bit pattern --
++// only a shift COUNT of 64 is broken), so a word genuinely covers all 64 bits, not 63.
++fn fold_readset_mask(readset: dict, leaves: list) -> list
++    let word_count = (len(leaves) + 63) / 64
++    let words = []
++    let wi = 0
++    while wi < word_count
++        push(words, 0)
++        wi = wi + 1
++    let i = 0
++    for leaf in leaves
++        if contains(readset, leaf)
++            let word_idx = i / 64
++            let bit = i % 64
++            words[word_idx] = words[word_idx] + (1 << bit)
++        i = i + 1
++    words
++
++// Does `annotations` (a Stmt's annotation list) carry `@face`? Factored out because
++// build_face_readsets needs the same test twice (a whole-program fast-path scan, then a
++// per-function check) -- mirrors check_face_annotations's own two-pass shape (~34912).
++fn _has_face_annotation(annotations: list) -> bool
++    for a in annotations
++        match a
++            Expr(at, av, an2, ac, af, al) =>
++                if at == "ann" and av == "face"
++                    return true
++    false
++
++// The other half of §18's bridge: for every `@face` function in the fully-desugared program,
++// compute its read-set (readset_of) and fold it (fold_readset_mask) into a multi-word bitmask
++// over its state parameter's full leaf enumeration (leaf_paths_of) -- exactly the data a
++// `nova_rt_register_face_readset_*` call needs. Called once per compilation from
++// compile_ir_core_named, stashed on IrBuilder (b.ir_face_readsets) for the @main emission pass
++// to register at runtime, following the nova_rt_register_struct_redact call-emission pattern
++// (~29364).
++//
++// By the time this runs (post parse_program), every @face function has ALREADY passed
++// check_face_annotations's rules 1-3 -- a violation is a fatal parse_errors exit(1) long before
++// compile_ir_core_named even builds an IrBuilder -- so "at least one struct-typed parameter" is
++// guaranteed for any program that reached codegen. The `if sp_type != ""` guard below is
++// defensive only: this function makes no assumption that its caller always went through that
++// gate (e.g. a KAT may call it directly against a hand-built fixture).
++//
++// "The state parameter" = the FIRST parameter (in declared order) whose type is a known struct
++// -- the canonical `f(s: T) -> Node` shape §3/§4 assume throughout; a face with more than one
++// struct-typed parameter is not a shape this design has a story for yet (none exist in the
++// corpus today), so only the first is registered rather than guessing which one matters.
++fn build_face_readsets(stmts: list) -> dict
++    let any_face = false
++    for s in stmts
++        match s
++            Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
++                if tag == "fn" and _has_face_annotation(annotations)
++                    any_face = true
++    if not any_face
++        return {}
++    let tables = build_readset_tables(stmts)
++    let ctx = ReadsetCtx(tables, {})
++    let result = {}
++    let seen = {}
++    for s in stmts
++        match s
++            Stmt(tag, name, ret_expr, body, params, else_body, annotations, sline) =>
++                if tag == "fn" and not ends_with(name, "__ens_impl") and not ends_with(name, "__memo_impl") and _has_face_annotation(annotations) and not contains(seen, name)
++                    seen[name] = 1
++                    let sp_name = ""
++                    let sp_type = ""
++                    for p in params
++                        match p
++                            Param(pname, ptype, pdefault) =>
++                                if sp_type == "" and contains(tables.sdefs, ptype)
++                                    sp_name = pname
++                                    sp_type = ptype
++                    if sp_type != ""
++                        let leaves = []
++                        leaf_paths_of(sp_type, tables, "", {}, leaves)
++                        let rs = readset_of(name, sp_name, sp_type, ctx)
++                        let words = fold_readset_mask(rs, leaves)
++                        result[name] = FaceReadsetInfo(len(leaves), words)
++    result
++
+ // KAT helpers: exact-set equality and a debug-friendly dump, used only by run_self_test.
+ fn _rs_set_eq(result: dict, expected: list) -> bool
+     if len(result) != len(expected)
+@@ -35242,6 +35419,76 @@ fn run_self_test()
+ 
+     print("@face contract: ALL KAT CASES PASSED")
+ 
++    // ── §18 bridge KAT (PRISM M3.4 step 2, PRISM_M3_4_REACTIVITY_DESIGN.md §18) ──
++    // Reuses the readset_of KAT's GameState/Inventory fixture (rs_tables, rs1, rs2, rs5 above):
++    // GameState declares 12 fields, one of which (`inventory: Inventory`) is itself a 2-field
++    // struct, so its full leaf enumeration is 13 leaves with the nested pair expanded IN PLACE
++    // of the `inventory` field (indices 10-11, between `stamina` at 9 and `untouched` at 12) --
++    // exactly the "declared order, struct expanded in place" contract leaf_paths_of promises.
++    let frm_leaves = []
++    leaf_paths_of("GameState", rs_tables, "", {}, frm_leaves)
++    let frm_expected_leaves = ["hp", "mana", "level", "xp", "score", "combo", "lives", "shield", "speed", "stamina", "inventory.gold", "inventory.gems", "untouched"]
++    assert(len(frm_leaves) == len(frm_expected_leaves), "leaf_paths_of: expected " + str(len(frm_expected_leaves)) + " leaves, got " + str(len(frm_leaves)) + ": " + join(frm_leaves, ","))
++    let frm_li = 0
++    while frm_li < len(frm_expected_leaves)
++        assert(frm_leaves[frm_li] == frm_expected_leaves[frm_li], "leaf_paths_of: leaf " + str(frm_li) + " expected '" + frm_expected_leaves[frm_li] + "', got '" + frm_leaves[frm_li] + "' (declared-order determinism is load-bearing for reconverge -- see leaf_paths_of's own doc comment)")
++        frm_li = frm_li + 1
++
++    // Fold case1_direct's read-set ({hp}, index 0) and case2_nested's ({inventory.gold}, index
++    // 10) and case5_slice's ({stamina}, index 9) against this SAME 13-leaf enumeration -- single
++    // word (13 < 64), asserted by EXACT value so a stray bit anywhere else in the word would
++    // fail this, not just "bit N is set".
++    let frm_w1 = fold_readset_mask(rs1, frm_leaves)
++    assert(len(frm_w1) == 1 and frm_w1[0] == (1 << 0), "fold_readset_mask: case1_direct ({hp}) expected word0 == 1<<0, got " + str(len(frm_w1)) + " word(s), word0=" + str(frm_w1[0]))
++    let frm_w2 = fold_readset_mask(rs2, frm_leaves)
++    assert(len(frm_w2) == 1 and frm_w2[0] == (1 << 10), "fold_readset_mask: case2_nested ({inventory.gold}) expected word0 == 1<<10, got word0=" + str(frm_w2[0]))
++    let frm_w5 = fold_readset_mask(rs5, frm_leaves)
++    assert(len(frm_w5) == 1 and frm_w5[0] == (1 << 9), "fold_readset_mask: case5_slice ({stamina}) expected word0 == 1<<9, got word0=" + str(frm_w5[0]))
++
++    print("leaf_paths_of / fold_readset_mask (small state, <64 leaves): ALL KAT CASES PASSED")
++
++    // ── The >64-leaf case -- §18's whole reason for existing. PrismConState measured at 134
++    // reachable leaves (§18); a single uint64 (@redact's ir_sredact shape) cannot represent
++    // that. Synthesized here (134 flat int fields, generated by a loop rather than hand-typed)
++    // rather than importing real PRISM source, so the KAT has no dependency on prism/ and stays
++    // a pure compiler-internal fixture, matching every other KAT in this function.
++    let frm_big_fields = ""
++    let frm_fi = 0
++    while frm_fi < 134
++        frm_big_fields = frm_big_fields + "    bf" + str(frm_fi) + ": int\n"
++        frm_fi = frm_fi + 1
++    // The @face function reads 4 fields spanning THREE words: bf0 (word0 bit0), bf63 (word0
++    // bit63 -- the last bit of word0), bf64 (word1 bit0 -- the first bit past the 64-bit
++    // boundary), bf133 (word2 bit5 -- the last leaf, since 134 leaves needs ceil(134/64)=3
++    // words). If a word boundary were off by one anywhere, one of these four would land in the
++    // wrong word or the wrong bit, and the exact-word asserts below would catch it.
++    let frm_big_src = "type BigState\n" + frm_big_fields + "\n@face\nfn big_face(s: BigState) -> int\n    return s.bf0 + s.bf63 + s.bf64 + s.bf133\n"
++    let frm_big_tokens = tokenize(frm_big_src)
++    let frm_big_pe = []
++    let frm_big_stmts = parse_program(frm_big_tokens, frm_big_pe)
++    assert(len(frm_big_pe) == 0, "§18 big-state KAT fixture failed to parse/validate (" + str(len(frm_big_pe)) + " error(s)): " + join(frm_big_pe, ";"))
++
++    let frm_big_tables = build_readset_tables(frm_big_stmts)
++    let frm_big_leaves = []
++    leaf_paths_of("BigState", frm_big_tables, "", {}, frm_big_leaves)
++    assert(len(frm_big_leaves) == 134, "leaf_paths_of: BigState expected 134 leaves, got " + str(len(frm_big_leaves)))
++    assert(frm_big_leaves[0] == "bf0" and frm_big_leaves[63] == "bf63" and frm_big_leaves[64] == "bf64" and frm_big_leaves[133] == "bf133", "leaf_paths_of: BigState leaf index<->name mismatch at a word boundary (0, 63, 64, or 133)")
++
++    let frm_big_result = build_face_readsets(frm_big_stmts)
++    assert(contains(frm_big_result, "big_face"), "build_face_readsets: 'big_face' missing from result")
++    match frm_big_result["big_face"]
++        FaceReadsetInfo(frm_big_leaf_count, frm_big_words) =>
++            assert(frm_big_leaf_count == 134, "build_face_readsets: big_face leaf_count expected 134, got " + str(frm_big_leaf_count))
++            assert(len(frm_big_words) == 3, "build_face_readsets: big_face expected 3 words (ceil(134/64)), got " + str(len(frm_big_words)))
++            let frm_exp_w0 = (1 << 0) + (1 << 63)
++            let frm_exp_w1 = (1 << 0)
++            let frm_exp_w2 = (1 << 5)
++            assert(frm_big_words[0] == frm_exp_w0, "build_face_readsets: big_face word0 expected (bf0,bf63) == " + str(frm_exp_w0) + ", got " + str(frm_big_words[0]))
++            assert(frm_big_words[1] == frm_exp_w1, "build_face_readsets: big_face word1 expected (bf64) == " + str(frm_exp_w1) + ", got " + str(frm_big_words[1]))
++            assert(frm_big_words[2] == frm_exp_w2, "build_face_readsets: big_face word2 expected (bf133) == " + str(frm_exp_w2) + ", got " + str(frm_big_words[2]))
++
++    print("§18 bridge (>64-leaf multi-word mask, PrismConState-scale): ALL KAT CASES PASSED")
++
+     print("NOVA Self-Hosting Compiler: ALL TESTS PASSED")
+ 
+ compiler_main()
+diff --git a/nova-compiler/compiler/nova_runtime.c b/nova-compiler/compiler/nova_runtime.c
+index 40cdc10f..933897e3 100644
+--- a/nova-compiler/compiler/nova_runtime.c
++++ b/nova-compiler/compiler/nova_runtime.c
+@@ -22333,6 +22333,66 @@ static const char* nova_struct_meta_name(int64_t hash) {
+     return m ? m->name : NULL;
+ }
+ 
++/* ── Face read-set registry (PRISM M3.4 §3's runtime bridge, PRISM_M3_4_REACTIVITY_DESIGN.md
++   §18) ── The compiler folds each `@face` function's read-set (readset_of + build_face_readsets,
++   nova_compiler.nova ~34861/~35060) into a bitmask over its state type's leaf paths at compile
++   time, and emits a registration call here -- the EXACT same shape as the struct-redact registry
++   above (a meta call establishes the entry, then per-index calls fill it in). The one thing that
++   is NOT the same shape: `redact_mask` is a single uint64_t, which §18 measured is not enough --
++   the real corpus's PrismConState has 134 reachable leaves. So this is a WORD ARRAY, word i
++   covering leaves [64i, 64i+64), keeping invalidation a register-level AND across a handful of
++   words rather than forcing a hash-set lookup. Keyed by `face_id` = type_name_hash(face_name)
++   (the SAME compile-time DJB2 hash used for struct-name hashing, nova_compiler.nova ~11754) --
++   a face is a FUNCTION, not a type, so it gets its own id space rather than borrowing a struct's.
++
++   SCOPE: this only STORES the data so it exists at runtime. Nothing consumes it yet --
++   invalidation (AND against a changeset) is a later slice (§3/§4b). */
++typedef struct {
++    int64_t   face_id;
++    int32_t   leaf_count;   /* total reachable leaves of the state type; informational only for
++                                now, kept so a future changeset slice can size itself against the
++                                SAME leaf numbering without re-deriving it */
++    int32_t   word_count;
++    uint64_t* words;        /* calloc'd to word_count words; NULL (and word_count reset to 0) if
++                                allocation failed at registration time -- fails closed to "no
++                                words stored", exactly like nova_rt_register_struct_meta above
++                                does for its fnames/ftypes arrays, never aborts the process */
++} NovaFaceReadset;
++#define NOVA_MAX_FACE_READSETS 4096
++static NovaFaceReadset g_face_readset[NOVA_MAX_FACE_READSETS];
++static int             g_face_readset_count = 0;
++void nova_rt_register_face_readset_meta(int64_t face_id, int64_t leaf_count, int64_t word_count) {
++    if (g_face_readset_count >= NOVA_MAX_FACE_READSETS) return;
++    for (int i = 0; i < g_face_readset_count; i++)
++        if (g_face_readset[i].face_id == face_id) return;   /* idempotent */
++    int wc = (int)word_count; if (wc < 0) wc = 0;
++    uint64_t* w = NULL;
++    if (wc > 0) {
++        w = (uint64_t*)calloc((size_t)wc, sizeof(uint64_t));
++        if (!w) wc = 0;   /* OOM: store an empty (zero-word) entry rather than crash or corrupt */
++    }
++    int idx = g_face_readset_count++;
++    g_face_readset[idx].face_id    = face_id;
++    g_face_readset[idx].leaf_count = (int32_t)((leaf_count < 0) ? 0 : leaf_count);
++    g_face_readset[idx].word_count = (int32_t)wc;
++    g_face_readset[idx].words      = w;
++}
++void nova_rt_register_face_readset_word(int64_t face_id, int64_t word_idx, int64_t word_bits) {
++    for (int i = 0; i < g_face_readset_count; i++) {
++        if (g_face_readset[i].face_id == face_id) {
++            int j = (int)word_idx;
++            if (g_face_readset[i].words && j >= 0 && j < g_face_readset[i].word_count)
++                g_face_readset[i].words[j] = (uint64_t)word_bits;
++            return;
++        }
++    }
++}
++static const NovaFaceReadset* nova_face_readset_for_id(int64_t face_id) {
++    for (int i = 0; i < g_face_readset_count; i++)
++        if (g_face_readset[i].face_id == face_id) return &g_face_readset[i];
++    return NULL;
++}
++
+ /* ── Function-by-name registry (distributed spawn / dynamic apply) ────────────
+    The compiler emits nova_rt_register_fn("name", @fn, arity) at program init
+    (single-threaded, in @main before nova_rt_main_dispatch — i.e. before any

@@ -1323,6 +1323,8 @@ verification, both traced to a stray `nova_p1.exe` left running by the agent's o
 session racing shared build files — not code regressions. Documented so the next `-1
 timedout=False` on this host gets checked for a stray process before being read as a real failure.
 
+⏸ **SESSION PAUSED 2026-09-06 — read [`RESUME_HERE.md`](RESUME_HERE.md) FIRST.** Everything committed is gated green; working tree clean. Next step (§3 read-set emission) was started and its partial, UNVERIFIED work is saved as `NOVA_DESIGN/WIP_readset_emission.patch` — deliberately NOT committed, since it never passed reconverge and its determinism (the hard part) is unproven.
+
 **✅ 2026-09-06 — M3.4 FOUNDATION COMPLETE: read-set analysis + `@face` both landed, RED-tier gated.**
 Three compiler commits (`fcf47864`, `b2fb2d8c`, `f6765c12`), ~900 lines, each with reconverge
 byte-identical + full regression BOTH memory modes (3592 PASS / 0 FAIL).
