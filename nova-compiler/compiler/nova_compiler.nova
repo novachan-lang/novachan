@@ -5042,7 +5042,13 @@ fn parse_program(tokens: list, pe: list) -> list
                 if stag != "error"
                     push(stmts, sr.stmt)
     let _p0 = fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(_lift_block_lambdas(stmts))))
-    let _p1 = inject_routes(inject_tests(inject_memo(inject_ensures(_p0)), pe), pe)
+    // PRISM M3.4 §17: @face contract enforcement runs at the SAME stage as @test (after
+    // memo/ensures expansion, so a fn wearing both @memo/@ensures and @face is checked on its
+    // final desugared shape, not a pre-expansion stand-in) -- see check_face_annotations's own
+    // doc comment for why. Marks and validates ONLY; readset_of is not wired to it yet (§3/§4b).
+    let _p0b = inject_memo(inject_ensures(_p0))
+    check_face_annotations(_p0b, pe)
+    let _p1 = inject_routes(inject_tests(_p0b, pe), pe)
     let _p2 = inject_entity(inject_service(inject_middleware(inject_inject(inject_deprecated(inject_comptime(_p1))))))
     let _p3 = inject_builder(inject_validate(inject_log(inject_retry(inject_timeout(inject_singleton(_p2))))))
     let _p4 = inject_observable(inject_async(inject_cache(inject_event(_p3))))
@@ -34889,6 +34895,188 @@ fn _rs_keys_str(d: dict) -> string
         i = i + 1
     out
 
+// ── @face contract enforcement (PRISM M3.4 step 3, PRISM_M3_4_REACTIVITY_DESIGN.md §17) ──
+//
+// `@face` is a GENERAL annotation about a function's SHAPE -- it takes state and produces a
+// value from it. The compiler knows nothing about PrismNode or any other PRISM concept (§14's
+// non-negotiable: no UI-framework coupling in a general-purpose compiler); PRISM is merely the
+// consumer that will later attach meaning to functions this annotation marks. This is the exact
+// pattern @test already established (inject_tests, ~4705): the annotation's real job is to
+// enforce a compile-time CONTRACT, with a clear diagnostic per violation, rather than let a
+// violation cause silently-wrong behaviour later -- here, a face that never re-renders because
+// its dependency on some value is invisible to static read-set analysis (readset_of, ~34855).
+//
+// Deliberately still deferred (§17's own scope line): readset_of is NOT called from here. This
+// pass only marks and validates; wiring the read-set through to invalidation is §3/§4b, kept
+// separate so each change stays independently gateable (no codegen change here at all).
+fn check_face_annotations(stmts: list, pe: list)
+    // Fast path: the overwhelmingly common case is zero @face usage anywhere (true of every
+    // program in this repo today, including all 131 PRISM modules -- @face is brand new). Don't
+    // pay for build_readset_tables's sweep, or the module-state sweep below, unless at least one
+    // function actually carries the annotation.
+    let _cfa_any = false
+    for s in stmts
+        match s
+            Stmt(tag, name, ret_expr, body, params, else_body, annotations, sline) =>
+                if tag == "fn"
+                    for a in annotations
+                        match a
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "face"
+                                    _cfa_any = true
+    if not _cfa_any
+        return
+    let tables = build_readset_tables(stmts)
+    // Module-level mutable state: a top-level `let X = ...` desugars to the SAME `assign` Stmt
+    // shape as any reassignment (rs_handle_assign's doc comment, ~34726 -- there is no separate
+    // AST tag for a fresh binding), with `len(annotations) == 0` the established way (rs_walk_stmt,
+    // ~34836) to exclude an INDEXED assignment `arr[i] = v` / `obj.f = v`, whose target expression
+    // is stashed in the `annotations` slot instead of a plain name (that reuse is why the guard
+    // exists at all). Every such top-level binding is a mutable cell in NOVA -- `tools/
+    // m34_face_purity.py`'s own docstring establishes this ("a module-level `let X = [...]` is a
+    // mutable CELL") -- so ANY reference to it from inside a face is unsound, not merely a
+    // reference that HAPPENS to be mutated somewhere. That is a strict superset of the python
+    // tool's narrower "flag only if the same function also mutates it" detector, and the more
+    // conservative (sound) reading of "must not read mutable module-level state": the staleness
+    // failure does not require the READING function to be the one that mutates the cell, only
+    // that SOME code can.
+    let mod_state = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+                if tag == "assign" and name != "" and len(annotations) == 0
+                    mod_state[name] = 1
+    let _seen = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, ret_expr, body, params, else_body, annotations, sline) =>
+                // Skip compiler-generated split impls the same way inject_tests does (~4716):
+                // inject_ensures/inject_memo copy the wrapper's annotations, including @face,
+                // onto <name>__ens_impl/__memo_impl, so checking those too would double-report
+                // the SAME source-level violation under a synthetic name. _seen also guards a fn
+                // carrying two @face annotations from being checked (and thus reported) twice.
+                if tag == "fn" and not ends_with(name, "__ens_impl") and not ends_with(name, "__memo_impl")
+                    for a in annotations
+                        match a
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "face" and not contains(_seen, name)
+                                    _seen[name] = 1
+                                    _check_one_face(name, ret_expr, params, body, tables, mod_state, pe, sline)
+
+// The three checks, each with its own diagnostic (E1320/E1321/E1322) so a violation is
+// actionable rather than a bare "rejected". Rule 1 returns early on failure -- rules 2 and 3
+// both presuppose a state parameter actually exists, and re-reporting "no struct param" AND a
+// second, confusing error about a param that isn't there would be worse than just the first.
+fn _check_one_face(name: string, ret_expr: Expr, params: list, body: list, tables: ReadsetTables, mod_state: dict, pe: list, sline: int)
+    // Rule 1: at least one parameter whose DECLARED type is a known struct (or enum-variant --
+    // tables.sdefs carries both, see build_readset_tables, ~34592). Without one there is no
+    // state to compute a read-set over, so the annotation would be meaningless. This checks the
+    // textual type annotation only (the same pre-type-check-AST limitation @test's own contract
+    // check accepts, ~4728) -- an unannotated param can't be classified here, before inference
+    // has run; NOVA's own call-site specialization already makes an explicit state-param
+    // annotation the norm for a face's canonical `f(s: T) -> Node` shape (§5's HOF investigation).
+    let state_types = {}
+    for p in params
+        match p
+            Param(pname, ptype, pdefault) =>
+                if contains(tables.sdefs, ptype)
+                    state_types[ptype] = 1
+    if len(state_types) == 0
+        push(pe, "error[E1320]: @face function '" + name + "' must take at least one parameter whose declared type is a known struct (a face computes UI from state -- with none, there is no state to compute a read-set over) [line " + str(sline) + "]")
+        return
+    // Rule 3: must not return its OWN state parameter's type. A function shaped `f(s: T) -> T`
+    // is a REDUCER (it transforms state into new state), not a face (it renders state into a
+    // view) -- conflating the two categories caused the 71.9% category error §CRITERION records.
+    // Same pre-inference limitation as rule 1: only an EXPLICIT return-type annotation is seen.
+    let ret_type = ""
+    match ret_expr
+        Expr(rtt, rtv, rtn, rtc, rtf, rtl) =>
+            if rtt == "rettype"
+                ret_type = rtv
+    if ret_type != "" and contains(state_types, ret_type)
+        push(pe, "error[E1322]: @face function '" + name + "' must not return its own state parameter's type '" + ret_type + "' (a function that both takes and returns the same state type is a REDUCER, not a face) [line " + str(sline) + "]")
+    // Rule 2: must not read mutable module-level state -- §5's one failure mode that costs
+    // CORRECTNESS rather than performance. Such a read is invisible to readset_of (which only
+    // ever traces a face's PARAMETERS), so the face would never re-run when that module state
+    // changes: a stale UI, and the intermittent, invisible kind (§1).
+    if len(mod_state) > 0
+        let locals = {}
+        for p in params
+            match p
+                Param(pname2, ptype2, pdefault2) =>
+                    locals[pname2] = 1
+        _face_collect_locals(body, locals)
+        let violations = {}
+        for st in body
+            _face_walk_stmt_for_module_read(st, locals, mod_state, violations)
+        if len(violations) > 0
+            // NovaDict iterates in INSERTION order (not hash order), so the first key is the
+            // first module-state read encountered walking the body top-to-bottom -- deterministic,
+            // not an arbitrary hash-order pick (load-bearing for the KAT's exact-message assert).
+            let vname = keys(violations)[0]
+            push(pe, "error[E1321]: @face function '" + name + "' reads mutable module-level state '" + vname + "' (invisible to static read-set analysis -- the face would never re-run when '" + vname + "' changes, producing a stale UI; pass it as a parameter instead) [line " + str(sline) + "]")
+
+// Every name BOUND within a face's body -- assignment targets (let and reassignment share the
+// identical `assign` Stmt shape, rs_handle_assign's doc comment ~34726 -- there is no AST-level
+// way to tell a fresh binding from a reassignment), for-loop variables, and match/pattern-bound
+// variables (`pat_var`) -- so a local binding that merely SHARES a module-level `let`'s name is
+// never mistaken for a read of that module state (shadowing, not aliasing).
+fn _face_collect_locals(body: list, locals: dict)
+    for s in body
+        match s
+            Stmt(tag, name, expr, sbody, params, else_body, annotations, sline) =>
+                if tag == "assign" and name != ""
+                    locals[name] = 1
+                else if tag == "for" and name != ""
+                    locals[name] = 1
+                // `expr` is a plain condition/iterable/callee-arg for most tags, but for a
+                // match "arm" Stmt it IS the pattern (readset_of's rs_walk_stmt relies on this
+                // same uniform-shape fact, ~34833) -- so this call is how a pattern's bound
+                // names (`pat_var`) get collected; on every other tag it simply finds none.
+                _face_collect_pat_vars(expr, locals)
+                _face_collect_locals(sbody, locals)
+                _face_collect_locals(else_body, locals)
+
+fn _face_collect_pat_vars(e: Expr, locals: dict)
+    match e
+        Expr(etag, eval, enm, echildren, efields, eline) =>
+            if etag == "pat_var" and eval != "_"
+                locals[eval] = 1
+            for c in echildren
+                _face_collect_pat_vars(c, locals)
+            for f in efields
+                _face_collect_pat_vars(f, locals)
+
+// Rule 2's actual detector: an `ident` expression naming a module-level mutable binding that is
+// NOT shadowed by a local. Mirrors rs_walk_expr's generic-walk shape (~34799) so the same
+// "member"/"call" AST conventions apply automatically -- a member base or a call argument that
+// is itself such an ident is still found, since both fall through to the catch-all child walk;
+// a `call`'s CALLEE name is never itself an `ident` child (it lives in the tag's own `eval`
+// slot, per rs_walk_call, ~34768), so calling a function never masquerades as reading one.
+// Deliberately READS only, matching rule 2's literal wording -- an assignment's indexed target
+// (stashed in `annotations`, never walked here, same as rs_walk_stmt) is out of scope; banning
+// every possible mutation of module state would be a full effect-purity analysis, not this rule.
+fn _face_walk_expr_for_module_read(e: Expr, locals: dict, mod_state: dict, violations: dict)
+    match e
+        Expr(etag, eval, enm, echildren, efields, eline) =>
+            if etag == "ident"
+                if contains(mod_state, eval) and not contains(locals, eval)
+                    violations[eval] = 1
+            else
+                for c in echildren
+                    _face_walk_expr_for_module_read(c, locals, mod_state, violations)
+                for f in efields
+                    _face_walk_expr_for_module_read(f, locals, mod_state, violations)
+
+fn _face_walk_stmt_for_module_read(s: Stmt, locals: dict, mod_state: dict, violations: dict)
+    match s
+        Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+            _face_walk_expr_for_module_read(expr, locals, mod_state, violations)
+            for bs in body
+                _face_walk_stmt_for_module_read(bs, locals, mod_state, violations)
+            for es in else_body
+                _face_walk_stmt_for_module_read(es, locals, mod_state, violations)
+
 // ── Self-Test ────────────────────────────────────────────────────────────────
 
 fn run_self_test()
@@ -35015,6 +35203,44 @@ fn run_self_test()
     assert(not contains(rs7, "untouched") and not contains(rs8, "untouched") and not contains(rs9, "untouched") and not contains(rs10, "untouched") and not contains(rs11, "untouched"), "readset case12 (negative, control-flow): 'untouched' must never appear; case11=\{" + _rs_keys_str(rs11) + "\}")
 
     print("readset_of: ALL 12 KAT CASES PASSED")
+
+    // ── @face contract KAT (PRISM M3.4 step 3, PRISM_M3_4_REACTIVITY_DESIGN.md §17) ──
+    // Parsed directly (tokenize + parse_program), same style as the readset_of KAT above: the
+    // contract check runs INSIDE parse_program itself (check_face_annotations is called from
+    // there, right where @test's own E1301/E1302 checks run), so calling parse_program is enough
+    // to exercise it -- no codegen, no compile() needed. One valid @face, one fn per rule
+    // violation (isolated so each diagnostic can be asserted exactly, not just "something
+    // failed"), and one UNANNOTATED fn that would violate every rule if it were tagged -- proving
+    // @face is opt-in and cannot break existing code that never asked for the contract.
+    let face_src = "type FaceState\n    count: int\n    name: string\n\nlet g_counter = 0\n\n@face\nfn good_face(s: FaceState) -> int\n    return s.count\n\n@face\nfn face_no_struct_param(x: int) -> int\n    return x + 1\n\n@face\nfn face_reads_module_state(s: FaceState) -> int\n    return s.count + g_counter\n\n@face\nfn face_returns_own_state(s: FaceState) -> FaceState\n    return s\n\nfn unannotated_like_a_violation(x: int) -> int\n    return x + g_counter\n"
+    let face_tokens = tokenize(face_src)
+    let face_pe = []
+    parse_program(face_tokens, face_pe)
+
+    // Exactly 3 diagnostics: one per violating fn, in source order (good_face and the
+    // unannotated fn contribute none). Asserting the COUNT first means a regression that adds a
+    // 4th spurious error, or silently drops one of the 3, fails loudly instead of the weaker
+    // "at least one error" check the task explicitly warned against ("worthless" if it passes on
+    // the wrong error).
+    assert(len(face_pe) == 3, "@face KAT: expected exactly 3 diagnostics, got " + str(len(face_pe)) + " (fixture must still parse -- these are semantic errors collected during parse_program, same mechanism as @test's E1301/E1302, not syntax errors)")
+
+    // Case A: face_no_struct_param(x: int) -- rule 1, no known-struct-typed parameter.
+    assert(contains(face_pe[0], "E1320") and contains(face_pe[0], "face_no_struct_param") and contains(face_pe[0], "known struct"), "@face KAT case A (no struct param): wrong diagnostic: " + face_pe[0])
+
+    // Case B: face_reads_module_state(s: FaceState) -- rule 2, reads module-level `g_counter`.
+    assert(contains(face_pe[1], "E1321") and contains(face_pe[1], "face_reads_module_state") and contains(face_pe[1], "g_counter"), "@face KAT case B (reads module state): wrong diagnostic: " + face_pe[1])
+
+    // Case C: face_returns_own_state(s: FaceState) -> FaceState -- rule 3, a reducer shape.
+    assert(contains(face_pe[2], "E1322") and contains(face_pe[2], "face_returns_own_state") and contains(face_pe[2], "FaceState"), "@face KAT case C (returns own state type): wrong diagnostic: " + face_pe[2])
+
+    // Case D (negative): the valid @face and the UNANNOTATED fn (which reads g_counter AND has
+    // no struct param -- it would fail rules 1 AND 2 if tagged) must never appear in ANY
+    // diagnostic. This is the proof that @face is opt-in, not a blanket new restriction.
+    let _face_all_pe = face_pe[0] + "|" + face_pe[1] + "|" + face_pe[2]
+    assert(not contains(_face_all_pe, "good_face"), "@face KAT case D (negative): valid @face 'good_face' must never be rejected: " + _face_all_pe)
+    assert(not contains(_face_all_pe, "unannotated_like_a_violation"), "@face KAT case D (negative): an UNANNOTATED fn must never be checked, even though it would violate rules 1 and 2 if @face were applied: " + _face_all_pe)
+
+    print("@face contract: ALL KAT CASES PASSED")
 
     print("NOVA Self-Hosting Compiler: ALL TESTS PASSED")
 
