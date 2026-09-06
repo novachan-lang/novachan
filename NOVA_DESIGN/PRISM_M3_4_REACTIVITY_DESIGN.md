@@ -1096,3 +1096,38 @@ Found by checking `Get-Process` before assuming a code regression. **A future `-
 timedout=False` on this host should be investigated as environmental (stray process, file
 lock) before being read as a real failure** — this is now the second documented instance of
 that exact signature.
+
+### 16.1 The concrete validation target for the control-flow gap
+
+`prism_ss_is_usable` (`prism/app/prism_session.nova`) is the case that proves §16's gap matters, and
+should be the acceptance test once §16's KAT broadening lands:
+
+```nova
+fn prism_ss_is_usable(s: PrismSession, now_ms) -> bool
+    if type_of(now_ms) != "int"
+        return false
+    let adv = _ss_advance(s, now_ms)          // reconstructor -- sliced (§10.11)
+    if adv.ss_access_sec == 0                 // read inside an `if` condition
+        return false
+    let st = prism_ss_status_name(adv.ss_status)   // read passed into a CALL
+    if st != "active" and st != "refreshing"
+        return false
+    adv.ss_seen_ms < adv.ss_expires_at        // reads in the tail expression
+```
+
+It exercises **every mechanism the pass has, simultaneously**: four `if` statements, an alias
+(`adv`) bound to a reconstructor result requiring the §10.11 slice, a call into another function
+(`prism_ss_status_name`), and reads in a tail expression.
+
+⛔ **Why this is the right target and not just a nice example:** *every* field that matters here —
+`ss_access_sec`, `ss_status`, `ss_seen_ms`, `ss_expires_at` — is read **inside or after an `if`**.
+If the generic statement walker mishandled conditionals, this function would return an
+**incomplete** read-set — and an omitted read is precisely the failure §1 named as the worst kind:
+a face that should re-run doesn't, so the UI goes stale, intermittently and invisibly. A read-set
+that is too *large* costs performance; one that is too *small* costs correctness.
+
+**Expected result** (hand-derived, matching §SCALE's independent measurement of this same function):
+`{ss_access_sec, ss_status, ss_seen_ms, ss_expires_at}` — four leaves, sliced, **not** all 11 fields
+of `PrismSession`. `tools/m17_readset.py` computes the same answer by a completely different route
+(regex over source text rather than the real AST), so the two are a genuine cross-check of each
+other rather than one restating the other.
