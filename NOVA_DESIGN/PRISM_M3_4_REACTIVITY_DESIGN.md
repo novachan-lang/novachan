@@ -1271,3 +1271,49 @@ honest; the `Test-Path` pattern remains a live hazard in both scripts.
 think it is?"* before asking *"what did I break?"* — tonight that was a concurrent orphaned run
 (§16.2), a stale mismatched `.ll`/`.exe` pair, and now a stale committed compiler. All three made a
 gate report something true about the **wrong artifact**.
+
+### 17.1 ✅ `@face` LANDED AND GATED (2026-09-06)
+
+Committed `f6765c12`. Reconverge byte-identical, direct self-test observation, full regression both
+memory modes **3592 PASS / 0 FAIL / 0 SKIP**.
+
+**§17's prediction held**: no parser change was needed. The general annotation mechanism absorbed
+`@face` as a pure consumer, and §14's steps 3 and 4 genuinely collapsed into one change.
+
+**One deviation from spec, reviewed and accepted.** Rule 2 is implemented *stricter* than
+`tools/m34_face_purity.py`: the Python tool flags a module-level cell only when the same function
+also mutates it; the compiler rejects **any read** of one. That is the sound reading — staleness does
+not require the *reading* function to be the mutator, only that some code *can* mutate the cell.
+Verified safe empirically rather than by argument: **no existing code uses `@face`**, so the stricter
+rule cannot break anything, and a fast-path guard makes the check free until someone opts in.
+
+**Verified behaviours** (probed by hand against the real compiler, not inferred from the KAT):
+
+| case | result |
+|---|---|
+| valid `@face` | compiles clean |
+| no struct parameter | **E1320** |
+| reads mutable module state | **E1321** |
+| returns its own state type | **E1322** |
+| **unannotated** fn violating all three | **compiles** — opt-in proven |
+
+That last row is the load-bearing one: it proves this cannot break existing code.
+
+### ⭐ 17.2 What is now true, and what the next step is
+
+The **foundation is complete**: the compiler can compute a face's read-set (§16), and can identify
+and validate a face (§17). Both are general capabilities with no PRISM coupling.
+
+⛔ **Nothing consumes either yet.** `readset_of` is not called from `@face`. That is deliberate and
+is why every change so far has been reconverge-safe: they add analysis without altering emitted
+output.
+
+**The next step is the one that changes behaviour** — §3's changeset plus §4b's keyed invalidation:
+a state update must produce the set of changed leaf paths, and invalidation must re-run only the
+faces whose read-sets intersect it. That is where reactivity stops being analysis and starts being
+a framework, and it is the first change in this sequence that will *not* be trivially
+reconverge-safe, because it touches what the runtime does at update time.
+
+Acceptance target remains §16.1's `prism_ss_is_usable`: four sliced leaves, not eleven fields, with
+the read-set computed through four `if` statements, an aliased reconstructor result, and a call into
+another function.

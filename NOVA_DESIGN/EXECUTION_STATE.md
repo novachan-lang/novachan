@@ -1323,6 +1323,32 @@ verification, both traced to a stray `nova_p1.exe` left running by the agent's o
 session racing shared build files — not code regressions. Documented so the next `-1
 timedout=False` on this host gets checked for a stray process before being read as a real failure.
 
+**✅ 2026-09-06 — M3.4 FOUNDATION COMPLETE: read-set analysis + `@face` both landed, RED-tier gated.**
+Three compiler commits (`fcf47864`, `b2fb2d8c`, `f6765c12`), ~900 lines, each with reconverge
+byte-identical + full regression BOTH memory modes (3592 PASS / 0 FAIL).
+
+* **`readset_of`** — given a function and a struct param, the leaf fields it reads, transitively
+  through callees and sliced through reconstructors. Runs on the typed AST (the IR erases some
+  receiver types to `any`). KAT covers 12 cases incl. `if`/`while`/`for`/`match`.
+* **`@face`** — marks a face and enforces three rules at compile time: E1320 (needs a struct
+  param), **E1321 (must not read mutable module state — the one failure mode that costs
+  CORRECTNESS: invisible to analysis ⇒ face never re-runs ⇒ stale UI)**, E1322 (must not return its
+  own state type — that is a reducer).
+* Both are **PRISM-agnostic**: the compiler knows nothing about `PrismNode`. §14's shortcut ("a face
+  is any fn returning PrismNode") was deliberately refused — it would permanently couple a
+  general-purpose compiler to one UI framework.
+
+⛔ **NOTHING CONSUMES EITHER YET** — deliberate, and why all three commits were trivially
+reconverge-safe. **Next: §3 changeset + §4b keyed invalidation**, the first change here that will
+NOT be reconverge-trivial, since it alters what the runtime does at update time.
+
+**Infrastructure fixed along the way** (three landmines, all the same shape — a gate reporting
+something true about the WRONG artifact): a concurrency guard now refuses to start when another
+NOVA run is active (`3974a2a1`; an orphaned CI silently corrupted four reconverge attempts via the
+unconditional `lib/`+`std/` sync), `clang` added to the stray-process kill list, and a stale
+committed `_gen4.exe` (1.49 MB, predating the `move` feature) refreshed — two gates silently prefer
+it via `Test-Path`, so the move gate had been testing a compiler that rejects `move` outright.
+
 **Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
 SINGLE blocker on the browser path, M1.7 having cleared. See
 [`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
