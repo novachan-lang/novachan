@@ -1041,3 +1041,58 @@ per `readset_of` call.
 **Net effect on §15.2:** point 4's oracle already exists (`ir_sdefs`); point 5 needs one new,
 cheaply-built table (`fn_bodies`) that nothing in the compiler currently provides. Both facts are
 now settled, not open questions for whoever implements next.
+
+---
+
+## 16. ✅ STEP 1 IMPLEMENTED AND GATED (2026-09-06)
+
+`readset_of(fn_name, param_name, param_type) -> dict` is now real code in
+`nova_compiler.nova` (~406 lines, before `run_self_test()`), wired into CI as
+`_readset_gate.ps1` / `[CI 2h2/3]`. Full RED-tier gate passed: reconverge byte-identical,
+direct `self-test` observation of the 6-case KAT, full regression both memory modes
+(3592 PASS / 0 FAIL / 0 SKIP).
+
+### §15.6 correction — the implementation does NOT reuse `ir_sdefs`
+
+§15.6 assumed the pass would query a live `IrBuilder.ir_sdefs`. The implementation instead
+builds its **own** self-contained `sdefs`/`field_types`/`fn_bodies` tables directly from the
+parsed statement list. This is the right call, not a deviation to fix: `ir_sdefs` only exists
+**mid-codegen**, inside a live `IrBuilder` — and §15.4's own KAT design parses the fixture via
+`tokenize`+`parse_program` directly, **never invoking codegen at all**. Requiring `ir_sdefs`
+would have made the pass inseparable from the codegen pipeline, exactly the kind of coupling
+this design has repeatedly refused elsewhere. §15.6 undersold this; corrected here.
+
+### Two things reviewed and found true, one limitation found and NOT yet fixed
+
+- **Verified independently**: `let` and plain reassignment desugar to the *identical*
+  `Stmt("assign", ...)` — there is no separate AST tag for a fresh binding (confirmed against
+  a pre-existing comment at `nova_compiler.nova:3792`, itself left by earlier match-arm work).
+  The whole alias-tracking mechanism depends on this being true.
+- **Call-graph traversal specializes per call-site** using the *argument's* resolved type
+  rather than the callee's declared parameter type — this is deliberate and correct: it
+  matches the compiler's own existing call-site specialization for unannotated struct params
+  (the property found in §5's HOF investigation), rather than fighting it.
+- ⛔ **The six-case KAT exercises only straight-line code** — assign, return, call. No `if`,
+  `while`, `for`, or `match`. The generic statement walker *claims* a uniform
+  `(tag,name,expr,body,else_body)` shape covers every statement kind, including conditionals
+  and loops, but **nothing in this diff tests that claim**. Real PRISM faces use `if`/`match`
+  constantly (`prism_ss_is_usable`, for one). **This must be broadened before the pass is
+  trusted for real face read-sets** — it is fine for step 1's scope (general capability, no
+  consumer yet) but is the first thing step 2/3 needs to close.
+- The memoization is an honestly-disclosed **least-fixed-point-from-empty approximation**:
+  sound for termination on a recursive call graph, not a claim of precision on mutual
+  recursion. For M3.4's actual purpose this direction of error is dangerous (an omitted read
+  means a face that should re-run doesn't — stale UI, the exact failure §1 named as the worst
+  kind). Real PRISM code has essentially no relevant recursion, so this is acceptable for now
+  but must be revisited before the pass is relied on for a real face's correctness.
+
+### Environmental lesson worth keeping
+
+Two spurious `exit=-1 timedout=False` failures during verification, on this exact source and
+on an unrelated pre-existing test, neither reproducible by hand. Root cause: a stray
+`nova_p1.exe` left running by the implementation agent's own incomplete session, racing file
+writes in the shared `test_programs/` directory with every subsequent verification attempt.
+Found by checking `Get-Process` before assuming a code regression. **A future `-1
+timedout=False` on this host should be investigated as environmental (stray process, file
+lock) before being read as a real failure** — this is now the second documented instance of
+that exact signature.

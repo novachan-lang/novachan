@@ -1298,6 +1298,31 @@ Root cause was Docker's `docker_data.vhdx` at 96 GB; after pruning 73 GB of buil
 shutdown it compacted to 23.8 GB, taking C: from **8.5 GB free to 81 GB**. Results before that
 point were re-verified.
 
+**✅ 2026-09-06 — M3.4 STEP 1 LANDED: the general read-set pass is REAL COMPILER CODE, gated.**
+`readset_of(fn, param, type) -> dict` is now in `nova_compiler.nova` (~406 lines) and CI-gated
+(`_readset_gate.ps1`, `[CI 2h2/3]`). Owner gave explicit GO on both M0.3 and M3.4 and delegated the
+ordering; decided **M3.4 first** (additive, provable without a browser, cheap failure if Bet 1
+breaks — see `M0_3_VS_M3_4_DECISION.md`). §14 found the compiler had **zero notion of a face**;
+the correct first piece is this general capability, not a PRISM-specific shortcut.
+
+**Full RED-tier gate passed, verified independently** (not taken from the implementing agent's own
+report — it died on session-limit repeatedly before finishing its own verification): reconverge
+byte-identical (`gen5.ll == gen6.ll`), direct `self-test` observation of the 6-case KAT
+(`readset_of: ALL 6 KAT CASES PASSED`), full regression **both memory modes**
+(3592 PASS / 0 FAIL / 0 SKIP of 3590).
+
+⛔ **One real limitation found, not yet fixed**: the KAT exercises only straight-line code
+(assign/return/call) — no `if`/`while`/`match`. Real PRISM faces use `if`/`match` constantly, so this
+must be broadened before the pass is trusted for actual face read-sets. Recorded in
+`PRISM_M3_4_REACTIVITY_DESIGN.md` §16 alongside a second, honestly-disclosed limitation (recursion
+handling is sound-for-termination but not precision-maximal, which matters for M3.4's actual
+purpose though not for step 1's scope).
+
+**Environmental lesson recorded**: two spurious `exit=-1 timedout=False` failures during
+verification, both traced to a stray `nova_p1.exe` left running by the agent's own incomplete
+session racing shared build files — not code regressions. Documented so the next `-1
+timedout=False` on this host gets checked for a stray process before being read as a real failure.
+
 **Blocking decision (unchanged):** owner GO/NO-GO on **T11 / M0.3, the runtime split** — now the
 SINGLE blocker on the browser path, M1.7 having cleared. See
 [`PRISM_VS_REACT.md`](PRISM_VS_REACT.md).
