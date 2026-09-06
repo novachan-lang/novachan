@@ -1176,3 +1176,57 @@ reports a false FAIL — or a false PASS — costs hours and can be believed.
 **The generalisable lesson:** on this host, `exit=-1 timedout=False` on a build step that runs fine
 by hand means **check for a concurrent or orphaned run first**. Not disk, not the timeout wrapper,
 not the code.
+
+## 17. Marking a face — no new syntax needed (2026-09-06)
+
+§14 listed "a way to mark a face" as step 3, tier YELLOW, and assumed it meant M3.1's `face`
+declaration syntax. **It does not have to.** The compiler already has a general annotation
+mechanism, and using it collapses §14 steps 3 and 4 into one small change.
+
+### The mechanism already exists
+
+`nova_compiler.nova` parses annotations generically into `Expr("ann", name, ...)` /
+`Expr("ann_with_arg", name, [arg], ...)` attached to a `Stmt`'s `annotations` list. Existing
+consumers: `@test`, `@entity`, `@service`, `@deprecated`, `@get`/`@post`/`@put`/`@delete`/`@patch`,
+`@export`, `@repr(C)`, `@redact`, `@opaque`. **Adding `@face` requires no parser change at all** —
+only a consumer.
+
+### `@test` is the template to copy, and it is a good one
+
+`@test` (`nova_compiler.nova:4720`) does not merely tag a function — it **enforces its contract at
+compile time**: the function must return `bool` and take no parameters, or compilation fails with a
+clear diagnostic. The reasoning in its own comment is worth preserving: NOVA's uniform `i64`
+lowering means a `void`/`int` return would silently slip through the generated `if name()` and
+report a passing test as failed. So it rejects at compile time rather than producing a silently
+wrong answer later.
+
+**That is exactly the shape face-marking needs**, and exactly the shape §5's face-purity rule
+demands.
+
+### What `@face` should enforce
+
+A function marked `@face` must satisfy, checked at compile time with a named diagnostic:
+
+1. **At least one parameter of a known struct type** — otherwise there is no state to compute a
+   read-set over, and the annotation is meaningless.
+2. **⛔ It must not read mutable module-level state** — §5 identified this as the one failure mode
+   that costs *correctness* rather than performance: such a read is invisible to read-set analysis,
+   so the face never re-runs and the UI goes stale, intermittently and invisibly. `tools/
+   m34_face_purity.py` already measured that **0 of 131 PRISM modules violate this**, so the rule
+   can be enforced immediately with no cleanup backlog — the rare, valuable case of a correctness
+   gate that costs nothing to adopt.
+3. **It must not return its own state parameter's type** — that is a *reducer*, not a face
+   (§CRITERION's distinction; conflating the two was the original 71.9% category error).
+
+### Why this ordering is now better than §14's
+
+§14 said step 4 (face-purity enforcement) was blocked behind step 3 (marking a face) and could not
+be built first. With `@face` as an annotation, **they are the same change**: the annotation gives
+the compiler the set of faces, and the enforcement is the annotation's own contract check — the
+`@test` pattern exactly. Tier stays YELLOW (no codegen change, a new diagnostic and a pass over
+already-parsed annotations), but the full RED-tier gate still applies because it edits
+`nova_compiler.nova`.
+
+**Deliberately still deferred:** `readset_of` is not yet *called* on faces. `@face` marks and
+validates; wiring the read-set through to invalidation is §3/§4b and needs the changeset design.
+Keeping those separate keeps each change independently gateable.
