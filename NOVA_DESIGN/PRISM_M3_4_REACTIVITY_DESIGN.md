@@ -1317,3 +1317,64 @@ reconverge-safe, because it touches what the runtime does at update time.
 Acceptance target remains §16.1's `prism_ss_is_usable`: four sliced leaves, not eleven fields, with
 the read-set computed through four `if` statements, an aliased reconstructor result, and a call into
 another function.
+
+## 18. §3's runtime bridge — reconnaissance before implementation (2026-09-06)
+
+§3 says *"Both sides are static integer sets, so the intersection is a bitmask AND — not a graph
+walk."* Implementing that raises a question §3 never answered: **how does the runtime learn a face's
+read-set?** It is computed at compile time by `readset_of`; nothing carries it into the running
+program.
+
+### The precedent exists, and it is exact
+
+`@redact` already does precisely this shape of thing. The compiler folds a per-struct bitmap at
+compile time (`ir_sredact`, populated at `nova_compiler.nova:26628`) and **emits a registration
+call** into the generated program (`:29364`):
+
+```llvm
+call void @nova_rt_register_struct_redact(i64 <struct_hash>, i64 <bitmask>)
+```
+
+and the runtime stores it against the struct's metadata (`nova_runtime.c:22296`). Read-set emission
+can follow this pattern exactly: fold each `@face`'s read-set into a mask at compile time, emit a
+`nova_rt_register_face_readset(face_id, mask…)` call, and let the runtime hold it.
+
+This matters because it means **§3's runtime side needs no new mechanism** — only a new consumer of
+an established one. It is also the point where these changes stop being reconverge-trivial: this is
+the first one that alters emitted output.
+
+### ⛔ BUT: the 64-bit assumption is already violated by the acceptance target
+
+`redact_mask` is a `uint64_t`. §3's "bitmask AND" silently assumes a state type has **≤64 reachable
+leaves**. Measured against the real corpus:
+
+| state type | reachable leaves |
+|---|---|
+| **`PrismConState`** | **134** ⛔ |
+| `PrismConWorkspace` | 50 |
+| `PrismConProject` | 32 |
+| `PrismConIssue` | 23 |
+
+Exactly one type exceeds 64 — and it is **`PrismConState`, the state of the ops console**, which
+§16.1 names as the acceptance target for this whole feature. So the very case the design must
+handle is the case a single-word mask cannot represent. This is not a hypothetical future scaling
+concern; it is true today, on the only realistic app in the corpus.
+
+### Consequences for the implementation
+
+1. **A single `i64` mask is insufficient.** Options: a multi-word mask (an array of `i64`, index =
+   leaf/64, bit = leaf%64 — keeps the AND cheap and is the obvious extension of the existing
+   pattern), or an interned path-set id with a runtime-side set structure (more general, loses the
+   "one instruction" property §3 was buying).
+2. **Prefer the multi-word mask.** §3's whole performance argument is that invalidation is a
+   register-level AND rather than a graph walk; a 3-word AND for a 134-leaf state preserves that
+   property, where a hash-set lookup would not.
+3. **The leaf→bit assignment must be deterministic and stable**, or the emitted IR is
+   non-deterministic and *reconverge breaks* (`quality-standards.md`'s LLVM determinism rule). The
+   ordering must come from the struct's declared field order walked in a fixed traversal, never
+   from dict iteration.
+
+**Recorded before implementation deliberately.** Discovering the 64-leaf ceiling *after* building a
+single-word mask would mean rewriting both the emission and the runtime side, and would likely be
+found by `PrismConState` failing in a way that looks like an analysis bug rather than a
+representation limit.
