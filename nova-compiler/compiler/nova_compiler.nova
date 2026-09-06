@@ -34525,6 +34525,370 @@ fn compiler_main()
     else
         print("Compiled: " + input_path + " -> " + output_path)
 
+// ── Read-set analysis (PRISM M3.4 step 1) ────────────────────────────────────
+// GENERAL, PRISM-agnostic capability -- nothing here knows what a "face" or a
+// PrismNode is. For a function F and a parameter p of struct type T, compute the
+// set of leaf field-paths of T that F reads: transitively through callees, sliced
+// through positional reconstructors. Spec: NOVA_DESIGN/PRISM_M3_4_REACTIVITY_DESIGN.md
+// §15 (§15.6 resolved the two open questions this relies on: `ir_sdefs`-equivalent
+// field-type oracle, and the fact that no fn-name -> body table existed before this).
+//
+// Runs on the TYPED AST (post-parse Stmt/Expr trees), not IR instructions -- some IR
+// lowering paths erase a receiver's type to `any` (§15.1); the AST never does, every
+// `member` expression's base still carries whatever the source wrote.
+//
+// SCOPE (§15.3): pure analysis. No notion of a "face", no changeset, no keying, no
+// invalidation, NO CODEGEN CHANGE. Nothing in the compiler calls any of this yet --
+// it is exercised only by the KAT in run_self_test() below. That is what keeps early
+// iterations reconverge-safe by construction: dead code w.r.t. every existing pass.
+
+type ReadsetTables
+    sdefs: dict          // struct/enum-variant name -> list<Param> (declared field list)
+    field_types: dict    // "StructOrVariantName.fieldName" -> RAW declared field type
+    fn_bodies: dict      // fn name -> Stmt("fn", ...) -- built ONCE per compilation/fixture
+
+// A resolved alias: `prefix` is the dotted path from the ORIGINAL tracked parameter to
+// whatever this name currently refers to ("" = the parameter itself); `stype` is the
+// struct type at that point in the chain. stype == "" is the sentinel for "unresolved /
+// not derived from the tracked parameter" (this file's existing convention for "no value"
+// on string fields, e.g. IrBuilder's recv_stype, rather than an Option type).
+type AliasRef
+    prefix: string
+    stype: string
+
+// Detected shape of a candidate "reconstructor" function G: its body is EXACTLY one
+// statement, a positional construction of its own declared return type from its own
+// parameters (`_ss_advance`-shaped: `fn advance(self: T) -> T \n return T(self.a, ...)`).
+// Deliberately narrow (single-statement bodies only) so that when is_recon is false the
+// caller ALWAYS falls back to sound (if imprecise) whole-union call-graph traversal --
+// widening this to multi-statement bodies is future work, not needed by any KAT case here.
+type ReconInfo
+    is_recon: bool
+    rtype: string        // the struct type G reconstructs (G's declared return type)
+    ctor_args: list       // list<Expr> -- G's body's positional constructor arguments
+    fn_params: list       // list<Param> -- G's OWN parameters (for positional substitution)
+
+// A deferred "the value bound to this name is the as-yet-unsliced result of calling a
+// reconstructor" marker. Slicing happens lazily, the first time a field of it is actually
+// read (rs_slice_field) -- so a reconstructed value that is never narrowed to a field
+// contributes nothing (sound under ReconInfo's single-statement-body restriction: the
+// ENTIRE body IS the constructor call, so nothing else could have been read anyway).
+type ReconAlias
+    recon_fn: string      // "" is the "no recon" sentinel
+    call_args: list        // list<Expr> -- the ACTUAL arguments at the call site
+
+type ReadsetCtx
+    tables: ReadsetTables
+    memo: dict           // "fnName#paramName" -> dict (memoized read-set; breaks recursion)
+
+// Build once per compilation (or once per fixture, for the KAT below) by sweeping the
+// top-level statement list -- the SAME list every other one-off `tag == "fn"` pass in
+// this file already walks (arity collection, default handling, generics instantiation,
+// the ir_sdefs population at compile_ir_core_named ~26639, etc.). §15.6 confirmed
+// ir_sdefs-equivalent data already exists once codegen starts, but no fn-name -> body
+// table did anywhere in the compiler -- this builds that missing table alongside a
+// self-contained sdefs/field_types pair, so the read-set pass never has to reach into a
+// live IrBuilder mid-compile.
+fn build_readset_tables(stmts: list) -> ReadsetTables
+    let sdefs = {}
+    let field_types = {}
+    let fn_bodies = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+                if tag == "fn"
+                    fn_bodies[name] = s
+                else if tag == "type"
+                    sdefs[name] = params
+                    for p in params
+                        match p
+                            Param(pname, ptype, pdefault) =>
+                                field_types[name + "." + pname] = ptype
+                else if tag == "enum"
+                    for variant in body
+                        match variant
+                            Stmt(vtag, vname, vexpr, vbody, vparams, velse, vann, vln) =>
+                                if vtag == "type"
+                                    sdefs[vname] = vparams
+                                    for vp in vparams
+                                        match vp
+                                            Param(vpname, vptype, vpdefault) =>
+                                                field_types[vname + "." + vpname] = vptype
+    ReadsetTables(sdefs, field_types, fn_bodies)
+
+// Resolve an expression to an AliasRef IFF it is a pure chain of idents/member-accesses
+// rooted at a tracked alias -- no calls, no binops, no branching (§15.2 point 2's "let y =
+// <alias-or-field-chain-with-no-branching>"). Anything else (a call, an arithmetic op, a
+// literal) returns the unresolved sentinel AliasRef("", "").
+fn resolve_alias_expr(e: Expr, aliases: dict, tables: ReadsetTables) -> AliasRef
+    match e
+        Expr(etag, eval, enm, echildren, efields, eline) =>
+            if etag == "ident"
+                if contains(aliases, eval)
+                    return aliases[eval]
+            else if etag == "member"
+                let base_ref = resolve_alias_expr(echildren[0], aliases, tables)
+                if base_ref.stype != ""
+                    let fkey = base_ref.stype + "." + eval
+                    if contains(tables.field_types, fkey)
+                        let ftype = tables.field_types[fkey]
+                        let new_prefix = eval
+                        if base_ref.prefix != ""
+                            new_prefix = base_ref.prefix + "." + eval
+                        return AliasRef(new_prefix, ftype)
+    AliasRef("", "")
+
+// Is `fn_stmt` shaped like a positional reconstructor? See ReconInfo's doc comment for
+// the deliberately narrow definition (single-statement body only).
+fn detect_reconstructor(fn_stmt: Stmt, tables: ReadsetTables) -> ReconInfo
+    match fn_stmt
+        Stmt(ftag, fname, fexpr, fbody, fparams, felse, fann, fln) =>
+            if ftag != "fn"
+                return ReconInfo(false, "", [], [])
+            let rtype = ""
+            match fexpr
+                Expr(rtt, rtv, rtn, rtc, rtf, rtl) =>
+                    if rtt == "rettype" and rtv != ""
+                        rtype = rtv
+            if rtype == "" or not contains(tables.sdefs, rtype)
+                return ReconInfo(false, "", [], [])
+            if len(fbody) != 1
+                return ReconInfo(false, "", [], [])
+            let tail_expr = fexpr
+            let tail_ok = false
+            match fbody[0]
+                Stmt(lt, ln2, le, lb, lp, lel, la, ll) =>
+                    if lt == "return" or lt == "expr"
+                        tail_expr = le
+                        tail_ok = true
+            if not tail_ok
+                return ReconInfo(false, "", [], [])
+            match tail_expr
+                Expr(ct, cv, cn, cc, cf, cl) =>
+                    if ct == "call" and cv == rtype
+                        let field_list = tables.sdefs[rtype]
+                        if len(cc) == len(field_list)
+                            return ReconInfo(true, rtype, cc, fparams)
+            ReconInfo(false, "", [], [])
+
+// Is `e` itself (an ident already bound as a recon-alias, or an INLINE call directly to a
+// reconstructor) a deferred reconstructor result? Handles both `let r = advance(s); r.f`
+// and the inline `advance(s).f` uniformly.
+fn rs_lookup_recon(e: Expr, recon_aliases: dict, tables: ReadsetTables) -> ReconAlias
+    match e
+        Expr(etag, eval, enm, echildren, efields, eline) =>
+            if etag == "ident" and contains(recon_aliases, eval)
+                return recon_aliases[eval]
+            if etag == "call" and contains(tables.fn_bodies, eval)
+                let info = detect_reconstructor(tables.fn_bodies[eval], tables)
+                if info.is_recon
+                    return ReconAlias(eval, echildren)
+    ReconAlias("", [])
+
+// §15.2 point 6: resolve which of G's constructor arguments produced `field_name`, and
+// recurse ONLY into that argument's sub-expression -- not G's whole body -- so an unread
+// field's producing expression is never explored (the actual slice).
+fn rs_slice_field(recon: ReconAlias, field_name: string, aliases: dict, result: dict, ctx: ReadsetCtx)
+    if not contains(ctx.tables.fn_bodies, recon.recon_fn)
+        return
+    let info = detect_reconstructor(ctx.tables.fn_bodies[recon.recon_fn], ctx.tables)
+    if not info.is_recon
+        return
+    if not contains(ctx.tables.sdefs, info.rtype)
+        return
+    let field_list = ctx.tables.sdefs[info.rtype]
+    let idx = -1
+    let i = 0
+    for fp in field_list
+        match fp
+            Param(fpn, fpt, fpd) =>
+                if fpn == field_name
+                    idx = i
+        i = i + 1
+    if idx < 0 or idx >= len(info.ctor_args)
+        return
+    let producing_expr = info.ctor_args[idx]
+    // Positional substitution: G's OWN parameter names -> whatever the CALLER's actual
+    // argument at that position resolves to, so walking `producing_expr` (written in G's
+    // scope, e.g. `self.stamina + 1`) lands directly on paths in the CALLER's terms.
+    let sub_aliases = {}
+    let j = 0
+    for gp in info.fn_params
+        match gp
+            Param(gpn, gpt, gpd) =>
+                if j < len(recon.call_args)
+                    let arg_ref = resolve_alias_expr(recon.call_args[j], aliases, ctx.tables)
+                    if arg_ref.stype != ""
+                        sub_aliases[gpn] = arg_ref
+        j = j + 1
+    rs_walk_expr(producing_expr, sub_aliases, {}, result, ctx)
+
+// §15.2 point 2: `let y = <alias-or-field-chain>` extends the alias set. NOTE: this AST has
+// NO distinct "let" Stmt tag for a simple binding -- the parser desugars `let y = expr`
+// (nova_compiler.nova ~2508-2604, `_ta_ann_build`/`_parse_else_tail`) to the SAME
+// `Stmt("assign", y, expr, ...)` shape as a plain reassignment `y = expr`; there is no
+// AST-level way to tell them apart (a comment at ~3793 notes a bare `Stmt("let", ...)` is
+// silently ignored by the type checker -- it is not what real `let` parses to). Both are
+// therefore treated as potential alias sites here, which is exactly right: a reassignment
+// that re-aliases an existing binding must extend the chain the same way `let` does.
+fn rs_handle_assign(name: string, expr: Expr, aliases: dict, recon_aliases: dict, result: dict, ctx: ReadsetCtx)
+    let direct_ref = resolve_alias_expr(expr, aliases, ctx.tables)
+    if direct_ref.stype != ""
+        aliases[name] = direct_ref
+        if contains(recon_aliases, name)
+            recon_aliases[name] = ReconAlias("", [])
+        return
+    let is_recon_call = false
+    match expr
+        Expr(ecall_t, ecall_v, ecall_n, ecall_c, ecall_f, ecall_l) =>
+            if ecall_t == "call" and contains(ctx.tables.fn_bodies, ecall_v)
+                let info = detect_reconstructor(ctx.tables.fn_bodies[ecall_v], ctx.tables)
+                if info.is_recon
+                    recon_aliases[name] = ReconAlias(ecall_v, ecall_c)
+                    is_recon_call = true
+    if is_recon_call
+        if contains(aliases, name)
+            aliases[name] = AliasRef("", "")
+        return
+    // Ordinary RHS (not a pure alias chain, not a reconstructor call): drop any stale
+    // binding this name previously had, then walk the RHS generically for ordinary reads
+    // (e.g. `let y = f(s) + 1` still needs the call-graph traversal below).
+    if contains(aliases, name)
+        aliases[name] = AliasRef("", "")
+    if contains(recon_aliases, name)
+        recon_aliases[name] = ReconAlias("", [])
+    rs_walk_expr(expr, aliases, recon_aliases, result, ctx)
+
+// §15.2 point 5: an alias passed as an argument to a known function G at position i
+// contributes G's OWN read-set for that parameter (recursively, memoized) -- unless G is a
+// reconstructor being narrowed to a field, which rs_lookup_recon/rs_slice_field handle
+// instead (see rs_walk_expr's "member" case; that path never reaches here for a sliced
+// call). Also walks every argument generically, so nested member/alias reads and nested
+// calls INSIDE an argument expression (`h(s.a, compute(s))`) are still found.
+fn rs_walk_call(e: Expr, aliases: dict, recon_aliases: dict, result: dict, ctx: ReadsetCtx)
+    match e
+        Expr(etag, callee, enm, cargs, efields, eline) =>
+            for a in cargs
+                rs_walk_expr(a, aliases, recon_aliases, result, ctx)
+            if contains(ctx.tables.fn_bodies, callee)
+                match ctx.tables.fn_bodies[callee]
+                    Stmt(ct, cn, ce, cb, cparams, cel, ca, csl) =>
+                        let i = 0
+                        for cp in cparams
+                            match cp
+                                Param(cpn, cpt, cpd) =>
+                                    if i < len(cargs)
+                                        let arg_ref = resolve_alias_expr(cargs[i], aliases, ctx.tables)
+                                        if arg_ref.stype != ""
+                                            let sub = readset_of(callee, cpn, arg_ref.stype, ctx)
+                                            for leaf in keys(sub)
+                                                let full = leaf
+                                                if arg_ref.prefix != ""
+                                                    full = arg_ref.prefix + "." + leaf
+                                                result[full] = 1
+                            i = i + 1
+
+// §15.2 points 3-4: walk a `member` expression by resolving its base through the alias
+// set; a fully-resolved chain records ONE dotted path (whatever the field's declared type
+// is -- struct or leaf -- the WALK simply has nowhere further to go on a leaf, which is
+// exactly "terminate as a leaf"; a struct-typed field only gets a LONGER path recorded if
+// the source actually writes a deeper `.subfield`, so an intermediate struct value is never
+// independently recorded unless the source reads it as a value on its own). A resolved
+// chain's base is NEVER also generically re-walked -- that would double-record shorter
+// prefixes of the same access (e.g. both "a" and "a.b" for a single `s.a.b`).
+fn rs_walk_expr(e: Expr, aliases: dict, recon_aliases: dict, result: dict, ctx: ReadsetCtx)
+    match e
+        Expr(etag, eval, enm, echildren, efields, eline) =>
+            if etag == "member"
+                let base = echildren[0]
+                let base_ref = resolve_alias_expr(base, aliases, ctx.tables)
+                if base_ref.stype != ""
+                    let path = eval
+                    if base_ref.prefix != ""
+                        path = base_ref.prefix + "." + eval
+                    result[path] = 1
+                else
+                    let recon = rs_lookup_recon(base, recon_aliases, ctx.tables)
+                    if recon.recon_fn != ""
+                        rs_slice_field(recon, eval, aliases, result, ctx)
+                    else
+                        rs_walk_expr(base, aliases, recon_aliases, result, ctx)
+            else if etag == "call"
+                rs_walk_call(e, aliases, recon_aliases, result, ctx)
+            else
+                for c in echildren
+                    rs_walk_expr(c, aliases, recon_aliases, result, ctx)
+                for f in efields
+                    rs_walk_expr(f, aliases, recon_aliases, result, ctx)
+
+// Generic statement walker. Every Stmt shape (if/while/for/match/return/expr/...) shares
+// the SAME (tag,name,expr,body,else_body,...) fields, so a single default -- walk `expr`,
+// recurse `body`, recurse `else_body` -- correctly covers a condition/subject/iterable in
+// `expr` and nested blocks (an if's then/else, a while/for's body, a match's arms-as-stmts)
+// in `body`/`else_body`, with no per-tag special-casing needed beyond "assign" (the only
+// alias-establishing shape). A `for` loop's own bound variable is deliberately NOT aliased
+// to the collection's element type -- that is the collections problem (design doc §4),
+// explicitly out of scope for this pass; it is a sound under-approximation (a field read
+// only through a loop variable simply will not resolve, rather than resolving wrongly).
+fn rs_walk_stmt(s: Stmt, aliases: dict, recon_aliases: dict, result: dict, ctx: ReadsetCtx)
+    match s
+        Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+            if tag == "assign" and name != "" and len(annotations) == 0
+                rs_handle_assign(name, expr, aliases, recon_aliases, result, ctx)
+            else
+                rs_walk_expr(expr, aliases, recon_aliases, result, ctx)
+            for bs in body
+                rs_walk_stmt(bs, aliases, recon_aliases, result, ctx)
+            for es in else_body
+                rs_walk_stmt(es, aliases, recon_aliases, result, ctx)
+
+// The general query (§15.2's core function): the set of leaf field-paths of `param_type`
+// that `fn_name` reads through its parameter `param_name`, transitively through callees,
+// sliced through positional reconstructors. Memoized per (fn_name, param_name) -- the
+// placeholder is inserted BEFORE recursing so a cycle in the call graph terminates instead
+// of looping forever (a least-fixed-point-from-empty approximation, not a full iterative
+// solver: sound for termination, as the spec asks, not a claim of maximal precision on
+// mutual recursion). ctx (tables + memo) is an explicit parameter rather than ambient
+// state, matching every existing pass in this file (IrBuilder/TiState are threaded the
+// same way) -- NOVA has no module-global mutable state that reads back correctly (see the
+// module-level-let notes elsewhere in this file).
+fn readset_of(fn_name: string, param_name: string, param_type: string, ctx: ReadsetCtx) -> dict
+    let memo_key = fn_name + "#" + param_name
+    if contains(ctx.memo, memo_key)
+        return ctx.memo[memo_key]
+    let result = {}
+    ctx.memo[memo_key] = result
+    if contains(ctx.tables.fn_bodies, fn_name)
+        match ctx.tables.fn_bodies[fn_name]
+            Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+                let aliases = {}
+                aliases[param_name] = AliasRef("", param_type)
+                let recon_aliases = {}
+                for s in body
+                    rs_walk_stmt(s, aliases, recon_aliases, result, ctx)
+    ctx.memo[memo_key] = result
+    result
+
+// KAT helpers: exact-set equality and a debug-friendly dump, used only by run_self_test.
+fn _rs_set_eq(result: dict, expected: list) -> bool
+    if len(result) != len(expected)
+        return false
+    for ex in expected
+        if not contains(result, ex)
+            return false
+    true
+
+fn _rs_keys_str(d: dict) -> string
+    let ks = keys(d)
+    let out = ""
+    let i = 0
+    while i < len(ks)
+        if i > 0
+            out = out + ","
+        out = out + ks[i]
+        i = i + 1
+    out
+
 // ── Self-Test ────────────────────────────────────────────────────────────────
 
 fn run_self_test()
@@ -34569,6 +34933,48 @@ fn run_self_test()
     let str_result = compile(str_source)
     assert(contains(str_result, "@.str."), "codegen: has string constant")
     assert(contains(str_result, "nova_rt_print_any"), "codegen: string print call")
+
+    // ── readset_of KAT (PRISM M3.4 step 1, NOVA_DESIGN/PRISM_M3_4_REACTIVITY_DESIGN.md §15) ──
+    // Parsed directly (tokenize + parse_program), NOT via compile() -- this fixture is pure
+    // declarations (types + fns, no top-level executable code, no `main`), and the read-set
+    // pass only needs the AST, never codegen. Six cases, asserted EXACTLY (case6 is folded
+    // into the others as a negative check on the never-touched `untouched` field).
+    let rs_src = "type Inventory\n    gold: int\n    gems: int\n\ntype GameState\n    hp: int\n    mana: int\n    level: int\n    xp: int\n    score: int\n    combo: int\n    lives: int\n    shield: int\n    speed: int\n    stamina: int\n    inventory: Inventory\n    untouched: int\n\nfn case1_direct(s: GameState) -> int\n    return s.hp\n\nfn case2_nested(s: GameState) -> int\n    return s.inventory.gold\n\nfn case3_alias(s: GameState) -> int\n    let t = s\n    return t.mana\n\nfn helper_reads_level(state: GameState) -> int\n    return state.level\n\nfn case4_callgraph(s: GameState) -> int\n    return helper_reads_level(s)\n\nfn advance(self: GameState) -> GameState\n    return GameState(self.hp, self.mana, self.level, self.xp, self.score, self.combo, self.lives, self.shield, self.speed, self.stamina + 1, self.inventory, self.untouched)\n\nfn case5_slice(s: GameState) -> int\n    let r = advance(s)\n    return r.stamina\n"
+    let rs_tokens = tokenize(rs_src)
+    let rs_pe = []
+    let rs_stmts = parse_program(rs_tokens, rs_pe)
+    assert(len(rs_pe) == 0, "readset KAT fixture failed to parse (" + str(len(rs_pe)) + " error(s))")
+    let rs_tables = build_readset_tables(rs_stmts)
+    let rs_ctx = ReadsetCtx(rs_tables, {})
+
+    // Case 1: direct read `s.hp`.
+    let rs1 = readset_of("case1_direct", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs1, ["hp"]), "readset case1 (direct read): expected {hp}, got {" + _rs_keys_str(rs1) + "}")
+
+    // Case 2: nested chain `s.inventory.gold` (inventory is itself a struct).
+    let rs2 = readset_of("case2_nested", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs2, ["inventory.gold"]), "readset case2 (nested chain): expected {inventory.gold}, got {" + _rs_keys_str(rs2) + "}")
+
+    // Case 3: alias `let t = s; t.mana`.
+    let rs3 = readset_of("case3_alias", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs3, ["mana"]), "readset case3 (alias): expected {mana}, got {" + _rs_keys_str(rs3) + "}")
+
+    // Case 4: call-graph traversal -- f calls g(s), g reads s.field.
+    let rs4 = readset_of("case4_callgraph", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs4, ["level"]), "readset case4 (call-graph): expected {level}, got {" + _rs_keys_str(rs4) + "}")
+
+    // Case 5: reconstructor slice -- advance() rebuilds GameState positionally (11 fields
+    // passed through unchanged via `self.<field>`, `stamina` rewritten as `self.stamina + 1`).
+    // Reading only `r.stamina` must slice to {stamina}, NOT the whole struct.
+    let rs5 = readset_of("case5_slice", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs5, ["stamina"]), "readset case5 (reconstructor slice): expected {stamina} (SLICED, not the whole struct), got {" + _rs_keys_str(rs5) + "}")
+
+    // Case 6 (negative): `untouched` is a passthrough ctor arg in advance() but is never
+    // read through any case above -- it must never appear, especially in case5's result
+    // (the one case where a naive whole-union fallback WOULD have pulled it in).
+    assert(not contains(rs1, "untouched") and not contains(rs2, "untouched") and not contains(rs3, "untouched") and not contains(rs4, "untouched") and not contains(rs5, "untouched"), "readset case6 (negative): 'untouched' must never appear; case5={" + _rs_keys_str(rs5) + "}")
+
+    print("readset_of: ALL 6 KAT CASES PASSED")
 
     print("NOVA Self-Hosting Compiler: ALL TESTS PASSED")
 

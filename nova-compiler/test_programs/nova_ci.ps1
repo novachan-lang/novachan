@@ -111,6 +111,10 @@ Write-Host "`n[CI 2h/3] #35 const-fn-eval gate (compile-time fold of const fn ca
 & .\_s35_constfn_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2h (const-fn-eval) ==="; exit 1 }
 
+Write-Host "`n[CI 2h2/3] PRISM M3.4 step 1 read-set analysis gate (readset_of 6-case KAT)..."
+& .\_readset_gate.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2h2 (read-set analysis) ==="; exit 1 }
+
 Write-Host "`n[CI 2i/3] #34 AST-reprint formatter gate (canonical+faithful+idempotent+comments; safe fallback)..."
 & .\_s34_fmt_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2i (AST-reprint formatter) ==="; exit 1 }
