@@ -1131,3 +1131,48 @@ that is too *large* costs performance; one that is too *small* costs correctness
 of `PrismSession`. `tools/m17_readset.py` computes the same answer by a completely different route
 (regex over source text rather than the real AST), so the two are a genuine cross-check of each
 other rather than one restating the other.
+
+### 16.2 ✅ Control-flow gap CLOSED — and §16's environmental diagnosis was only half right
+
+**The gap is closed.** The KAT went 6 → 12 cases (`if` both-branches, `if` no-else, `while`,
+`for`, `match` arms, plus a negative spanning all of them). The algorithm was **not touched** —
+these are tests that verify `rs_walk_stmt`'s uniform-walk claim rather than a patch working around
+it. The claim held. Gated RED-tier: reconverge byte-identical, direct `self-test` observation of
+`ALL 12 KAT CASES PASSED`, full regression both modes 3592/0/0.
+
+**★ Structural fact the KAT surfaced, worth keeping:** a `match` arm is **not** shaped like an `if`
+body. It is its own `Stmt("arm", ...)` with the **pattern occupying the `expr` slot**. The generic
+walker handles it only because pattern tags (`pat_ctor`, `pat_var`, …) never collide with the
+`member`/`call` tags the expression walker acts on — so patterns are walked *harmlessly* rather than
+*by design*. That is a real invariant the pass now depends on. If a future pattern form ever lowers
+to something containing a `member` expression, this silently starts recording phantom reads.
+
+### ⛔ §16's "Environmental lesson" was WRONG in its cause — corrected
+
+§16 attributed the spurious `exit=-1 timedout=False` failures to *a stray leftover process*. That
+was a symptom, not the cause, and the correction matters because the real cause is a **standing
+infrastructure hazard**, not a one-off.
+
+**Actual cause:** an **orphaned `nova_ci.ps1`** (PID 28060), left running by an implementation agent
+that died on its session limit mid-verification, still active 20+ minutes later.
+
+**Mechanism:** `_proc_util.ps1` rewrites `$NOVA_HOME/lib` and `$NOVA_HOME/std` — copying `prism/`,
+`forge/`, `std/` in — **unconditionally, every time any script dot-sources it**. Two concurrent runs
+each rewrite the library files the other is compiling against. Concurrency is unsafe *by
+construction*.
+
+**Why it resisted diagnosis for four attempts:** the failure moved between passes (1, then 3, then
+1 again) and never reproduced by hand, because it depended on the timing of an invisible background
+job. It was misdiagnosed three times — stray process, then disk pressure, then `Invoke-Timed`
+itself. It **also inflated a perf bench by 168%**, which read as a genuine performance regression
+and vanished the instant the orphan was killed.
+
+**Fixed, not just documented** (commit `3974a2a1`): `Stop-StrayCompilers` now includes `clang` (an
+orphaned *link* holds files open exactly as an orphaned compile does), and a new
+`Assert-NoConcurrentNovaRun` guard makes both entry points **refuse to start** while another run is
+active, naming the offending PID. A build that declines to run is a minor annoyance; one that
+reports a false FAIL — or a false PASS — costs hours and can be believed.
+
+**The generalisable lesson:** on this host, `exit=-1 timedout=False` on a build step that runs fine
+by hand means **check for a concurrent or orphaned run first**. Not disk, not the timeout wrapper,
+not the code.
