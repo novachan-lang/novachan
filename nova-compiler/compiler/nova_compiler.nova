@@ -34939,7 +34939,7 @@ fn run_self_test()
     // declarations (types + fns, no top-level executable code, no `main`), and the read-set
     // pass only needs the AST, never codegen. Six cases, asserted EXACTLY (case6 is folded
     // into the others as a negative check on the never-touched `untouched` field).
-    let rs_src = "type Inventory\n    gold: int\n    gems: int\n\ntype GameState\n    hp: int\n    mana: int\n    level: int\n    xp: int\n    score: int\n    combo: int\n    lives: int\n    shield: int\n    speed: int\n    stamina: int\n    inventory: Inventory\n    untouched: int\n\nfn case1_direct(s: GameState) -> int\n    return s.hp\n\nfn case2_nested(s: GameState) -> int\n    return s.inventory.gold\n\nfn case3_alias(s: GameState) -> int\n    let t = s\n    return t.mana\n\nfn helper_reads_level(state: GameState) -> int\n    return state.level\n\nfn case4_callgraph(s: GameState) -> int\n    return helper_reads_level(s)\n\nfn advance(self: GameState) -> GameState\n    return GameState(self.hp, self.mana, self.level, self.xp, self.score, self.combo, self.lives, self.shield, self.speed, self.stamina + 1, self.inventory, self.untouched)\n\nfn case5_slice(s: GameState) -> int\n    let r = advance(s)\n    return r.stamina\n"
+    let rs_src = "type Inventory\n    gold: int\n    gems: int\n\ntype GameState\n    hp: int\n    mana: int\n    level: int\n    xp: int\n    score: int\n    combo: int\n    lives: int\n    shield: int\n    speed: int\n    stamina: int\n    inventory: Inventory\n    untouched: int\n\nfn case1_direct(s: GameState) -> int\n    return s.hp\n\nfn case2_nested(s: GameState) -> int\n    return s.inventory.gold\n\nfn case3_alias(s: GameState) -> int\n    let t = s\n    return t.mana\n\nfn helper_reads_level(state: GameState) -> int\n    return state.level\n\nfn case4_callgraph(s: GameState) -> int\n    return helper_reads_level(s)\n\nfn advance(self: GameState) -> GameState\n    return GameState(self.hp, self.mana, self.level, self.xp, self.score, self.combo, self.lives, self.shield, self.speed, self.stamina + 1, self.inventory, self.untouched)\n\nfn case5_slice(s: GameState) -> int\n    let r = advance(s)\n    return r.stamina\n\nenum Msg\n    Inc()\n    Dec()\n\nfn case7_if_both(s: GameState, cond: bool) -> int\n    if cond\n        return s.combo\n    else\n        return s.lives\n\nfn case8_if_one_branch(s: GameState, cond: bool) -> int\n    if cond\n        return s.speed\n    return 0\n\nfn case9_while(s: GameState) -> int\n    let total = 0\n    let i = 0\n    while i < 3\n        total = total + s.xp\n        i = i + 1\n    return total\n\nfn case10_for(s: GameState) -> int\n    let total = 0\n    for x in [1, 2, 3]\n        total = total + s.score\n    return total\n\nfn case11_match(s: GameState, m: Msg) -> int\n    match m\n        Inc() =>\n            return s.shield\n        Dec() =>\n            return s.speed\n"
     let rs_tokens = tokenize(rs_src)
     let rs_pe = []
     let rs_stmts = parse_program(rs_tokens, rs_pe)
@@ -34974,7 +34974,47 @@ fn run_self_test()
     // (the one case where a naive whole-union fallback WOULD have pulled it in).
     assert(not contains(rs1, "untouched") and not contains(rs2, "untouched") and not contains(rs3, "untouched") and not contains(rs4, "untouched") and not contains(rs5, "untouched"), "readset case6 (negative): 'untouched' must never appear; case5={" + _rs_keys_str(rs5) + "}")
 
-    print("readset_of: ALL 6 KAT CASES PASSED")
+    // ── Control-flow coverage (§16's documented gap: the 6-case KAT above is straight-line
+    // only -- assign/return/call, no if/while/for/match). rs_walk_stmt's generic
+    // (tag,name,expr,body,else_body) walk is CLAIMED to cover every Stmt shape uniformly;
+    // these cases verify that claim rather than trust the comment. Not path-sensitive by
+    // design -- a field read in only one branch/arm still ends up in the SAME unioned
+    // result as a field read in another branch/arm of the SAME function; that is correct,
+    // not a bug (see rs_walk_stmt's own doc comment).
+
+    // Case 7: `if`, BOTH branches read a different field -- both must be recorded.
+    let rs7 = readset_of("case7_if_both", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs7, ["combo", "lives"]), "readset case7 (if both branches): expected \{combo,lives\}, got \{" + _rs_keys_str(rs7) + "\}")
+
+    // Case 8: `if` with NO else -- only the touched branch's field appears, nothing spurious.
+    let rs8 = readset_of("case8_if_one_branch", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs8, ["speed"]), "readset case8 (if one branch, no else): expected \{speed\}, got \{" + _rs_keys_str(rs8) + "\}")
+
+    // Case 9: `while` loop body reads a field -- the walker recurses into `body` regardless
+    // of the statement's tag, so a read inside a loop is found the same as straight-line code.
+    let rs9 = readset_of("case9_while", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs9, ["xp"]), "readset case9 (while loop body): expected \{xp\}, got \{" + _rs_keys_str(rs9) + "\}")
+
+    // Case 10: `for` loop reads a field inside its body (NOT through the loop variable --
+    // that is explicitly out of scope per rs_walk_stmt's own doc comment; `x` here just
+    // ranges over int literals, unrelated to `s`).
+    let rs10 = readset_of("case10_for", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs10, ["score"]), "readset case10 (for loop body): expected \{score\}, got \{" + _rs_keys_str(rs10) + "\}")
+
+    // Case 11: `match` on an enum, different arms reading different struct fields -- the
+    // most important case, since PRISM state machines are built on `match`. A match arm is
+    // its own `Stmt("arm", ..., body=arm_stmts, ...)`; its pattern occupies the `expr` slot
+    // (walked harmlessly -- pat_ctor/pat_var/etc. never hit the "member"/"call" tags) and its
+    // body is walked exactly like any other nested statement list. Both arms' fields must
+    // appear, unioned.
+    let rs11 = readset_of("case11_match", "s", "GameState", rs_ctx)
+    assert(_rs_set_eq(rs11, ["shield", "speed"]), "readset case11 (match arms): expected \{shield,speed\}, got \{" + _rs_keys_str(rs11) + "\}")
+
+    // Case 12 (negative, folded like case 6): 'untouched' must never leak into any of the
+    // control-flow cases above either.
+    assert(not contains(rs7, "untouched") and not contains(rs8, "untouched") and not contains(rs9, "untouched") and not contains(rs10, "untouched") and not contains(rs11, "untouched"), "readset case12 (negative, control-flow): 'untouched' must never appear; case11=\{" + _rs_keys_str(rs11) + "\}")
+
+    print("readset_of: ALL 12 KAT CASES PASSED")
 
     print("NOVA Self-Hosting Compiler: ALL TESTS PASSED")
 

@@ -4,8 +4,9 @@
 # reconstructors. See NOVA_DESIGN/PRISM_M3_4_REACTIVITY_DESIGN.md §15 for the spec and
 # nova_compiler.nova's "Read-set analysis (PRISM M3.4 step 1)" section for the implementation.
 #
-# The 6-case KAT (direct read, nested chain, alias, call-graph traversal, reconstructor
-# slice, negative) lives inside run_self_test() and is exercised by `nova self-test` --
+# The 12-case KAT (direct read, nested chain, alias, call-graph traversal, reconstructor
+# slice, negative, if-both-branches, if-one-branch, while-loop, for-loop, match-arms,
+# negative-over-control-flow) lives inside run_self_test() and is exercised by `nova self-test` --
 # there is no separate CLI entry point for this (§15.4: "exercised by a KAT rather than by
 # end-user syntax; there is no `face` keyword yet"). This gate just runs self-test and
 # checks for the KAT's own success marker, so a future regression in readset_of specifically
@@ -26,7 +27,7 @@ if ($r.ExitCode -ne 0) {
     Write-Host $r.StdErr
     exit 1
 }
-if ($r.StdOut -notmatch "readset_of: ALL 6 KAT CASES PASSED") {
+if ($r.StdOut -notmatch "readset_of: ALL 12 KAT CASES PASSED") {
     Write-Host "FAIL readset gate: KAT success marker not found in self-test output"
     Write-Host $r.StdOut
     exit 1
@@ -36,5 +37,5 @@ if ($r.StdOut -notmatch "NOVA Self-Hosting Compiler: ALL TESTS PASSED") {
     Write-Host $r.StdOut
     exit 1
 }
-Write-Host "PASS readset gate: readset_of 6-case KAT (direct read / nested chain / alias / call-graph / reconstructor slice / negative)"
+Write-Host "PASS readset gate: readset_of 12-case KAT (direct read / nested chain / alias / call-graph / reconstructor slice / negative / if-both-branches / if-one-branch / while / for / match-arms / negative-control-flow)"
 exit 0
